@@ -1,0 +1,111 @@
+# Linen — While Playing Screen (.wps)
+# 320x240 iPod Video. Design: Theme1NowPlaying (themes.jsx).
+
+%wd
+
+# Custom fonts: id 1 is .cfg user font, 2-7 are extras.
+%Fl(2,nunito-9.fnt)
+%Fl(3,nunito-11.fnt)
+%Fl(4,nunito-17-bold.fnt)
+%Fl(5,nunito-13-bold.fnt)
+%Fl(6,nunito-10.fnt)
+
+# Bitmap chrome.
+%xl(B,battery.bmp,0,0,12)
+%xl(S,shuffle.bmp,0,0,2)
+%xl(R,repeat.bmp,0,0,3)
+%xl(D,divider.bmp,0,0,1)
+%xl(T,stars.bmp,0,0,11)
+%xl(F,fmtbox.bmp,0,0,1)
+
+# ============ Top status row (y=8) ============
+# Left: state label, 11 px Medium
+%V(12,8,160,11,3)
+%Vf(1A1714)
+%?mp<Stopped|Now Playing|Paused|Now Playing|Now Playing|REC|REC|FM|FM>
+
+# Right cluster: shuffle/repeat/battery, padded 12 from right edge.
+# Cluster width 64 (12+6+12+6+32-4); ends at x=308 = 320-12.
+%V(240,8,12,9,-)
+%?ps<%xd(Sb)|%xd(Sa)>
+
+%V(258,8,12,9,-)
+%?mm<%xd(Ra)|%xd(Rb)|%xd(Rc)|%xd(Rb)|%xd(Rb)>
+
+%V(276,7,32,11,-)
+%?bc<%xd(Bl)|%?bl<%xd(Ba)|%xd(Bb)|%xd(Bc)|%xd(Bd)|%xd(Be)|%xd(Bf)|%xd(Bg)|%xd(Bh)|%xd(Bi)|%xd(Bj)|%xd(Bk)>>
+
+# Battery percent overlay (right-aligned inside the icon body).
+%V(280,8,22,11,2)
+%Vf(1A1714)
+%ar%bl
+
+# ============ Album art @ (18,35), 84x84 ============
+# Block starts after status row (height 27) + 8 px padding = y=35.
+%Cl(18,35,84,84,c,c)
+%Cd
+
+# ============ "TRACK n OF total" caps (9 px, muted, uppercase) ============
+%V(116,37,188,11,2)
+%Vf(9A8E80)
+TRACK %pp OF %pe
+
+# ============ Title (17 px Bold, ink) ============
+%V(116,49,188,20,4)
+%Vf(1A1714)
+%s%?it<%it|%fn>
+
+# ============ Artist (12 px Medium → nunito-13 medium, deep muted) ============
+%V(116,68,188,13,3)
+%Vf(5A5048)
+%s%ia
+
+# ============ Album (11 px Regular, light muted) ============
+%V(116,82,188,11,3)
+%Vf(9A8E80)
+%s%id
+
+# ============ Stars rating (10 px high, ink filled / 18% muted) ============
+%V(116,98,47,10,-)
+%?rr<%xd(Ta)|%xd(Tb)|%xd(Tc)|%xd(Td)|%xd(Te)|%xd(Tf)|%xd(Tg)|%xd(Th)|%xd(Ti)|%xd(Tj)|%xd(Tk)>
+
+# ============ Format badge: "MP3"-style box + bitrate ============
+%V(170,96,28,11,-)
+%xd(F)
+
+%V(170,97,28,9,2)
+%Vf(1A1714)
+%ac%fc
+
+%V(202,97,80,9,2)
+%Vf(8D8A89)
+%fb kbps
+
+# ============ "UP NEXT" label (9 px, muted, uppercase) ============
+# bottom:42 → top y=240-42-11 = 187
+%V(18,187,42,11,2)
+%Vf(9A8E80)
+UP NEXT
+
+# Vertical divider 1x8
+%V(64,189,1,8,-)
+%xd(D)
+
+# Up next title (10 px, deep muted)
+%V(72,187,230,11,6)
+%Vf(5A5048)
+%s%It
+
+# ============ Time strings (10 px, deep muted, tabular) ============
+%V(18,210,90,11,6)
+%Vf(5A5048)
+%pc
+
+%V(212,210,90,11,6)
+%Vf(A7A09A)
+%ar−%pr
+
+# ============ Progress bar (3 px, 12% bg, ink fill) ============
+%V(18,224,284,3,-)
+%Vf(1A1714)
+%pb(0,0,284,3,progress.bmp)

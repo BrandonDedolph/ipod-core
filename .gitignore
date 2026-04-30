@@ -1,0 +1,12 @@
+# Extracted from the standalone zip; reproducible.
+design_standalone/
+
+# WSL Zone.Identifier alternate-stream files.
+*:Zone.Identifier
+
+# Headless test screenshots are regenerated; the manually-captured
+# ones in screenshots/ are kept.
+build/headless/
+
+# Plugin source intermediate
+*.o

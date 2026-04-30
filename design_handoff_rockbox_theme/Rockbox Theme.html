@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Rockbox Theme — iPod Video</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; background: #ebe7e0; font-family: 'Nunito', system-ui, sans-serif; color: #1a1714; }
+  * { box-sizing: border-box; }
+  .intro {
+    max-width: 760px;
+    padding: 32px 28px 8px;
+    margin: 0 auto;
+  }
+  .intro h1 { font-size: 28px; font-weight: 800; letter-spacing: -0.5px; margin: 0 0 6px; }
+  .intro p { font-size: 14px; line-height: 1.55; color: #5a5048; margin: 0 0 8px; max-width: 60ch; }
+  .meta { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 16px; font-size: 12px; color: #7a7068; }
+  .meta b { color: #1a1714; font-weight: 700; }
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>Rockbox Theme · iPod Video (5G)</h1>
+  <p>A clean, original Rockbox theme designed at the iPod's native 320×240. Rounded geometric type (Nunito), a warm-light palette, and four Now Playing layout directions to compare. The right-hand iPod is interactive — use the click wheel.</p>
+  <div class="meta">
+    <span><b>Resolution</b> 320×240</span>
+    <span><b>Type</b> Nunito 400/500/700/800</span>
+    <span><b>Palette</b> #f4f1ec / #1a1714 / oklch(0.7 0.12 40)</span>
+  </div>
+</div>
+
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="ipod-frame.jsx"></script>
+<script type="text/babel" src="themes.jsx"></script>
+<script type="text/babel" src="menus.jsx"></script>
+<script type="text/babel" src="collection-detail.jsx"></script>
+<script type="text/babel" src="interactive-ipod.jsx"></script>
+<script type="text/babel" src="volume-demo.jsx"></script>
+<script type="text/babel" src="system-screens.jsx"></script>
+
+<script type="text/babel">
+function Wrap({ children, label }) {
+  // Just renders children - the iPod component is self-sized
+  return (
+    <div style={{ display: "flex", justifyContent: "center", alignItems: "center", padding: 16 }}>
+      {children}
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <DesignCanvas initialZoom={0.7}>
+      <DCSection id="volume" title="Volume overlay — appears when scrolling the wheel during playback">
+        <DCArtboard id="vol-demo" label="Interactive demo — drag the slider" width={420} height={340}>
+          <Wrap><VolumeDemo /></Wrap>
+        </DCArtboard>
+        <DCArtboard id="vol-light" label="On Theme 02 (Paper) — 60%" width={360} height={300}>
+          <Wrap>
+            <div style={{ position: "relative", width: 320, height: 240 }}>
+              <Theme2NowPlaying playing={true} />
+              <VolumeOverlay volume={0.6} dark={false} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="vol-dark" label="On Theme 03 (Ink) — 35%" width={360} height={300}>
+          <Wrap>
+            <div style={{ position: "relative", width: 320, height: 240 }}>
+              <Theme3NowPlaying />
+              <VolumeOverlay volume={0.35} dark={true} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="vol-low" label="Volume — 10%" width={360} height={300}>
+          <Wrap>
+            <div style={{ position: "relative", width: 320, height: 240 }}>
+              <Theme2NowPlaying playing={true} />
+              <VolumeOverlay volume={0.1} dark={false} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="vol-max" label="Volume — 100%" width={360} height={300}>
+          <Wrap>
+            <div style={{ position: "relative", width: 320, height: 240 }}>
+              <Theme2NowPlaying playing={true} />
+              <VolumeOverlay volume={1} dark={false} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="native" title="Native 320×240 — actual size on the iPod">
+        <DCArtboard id="native-now" label="Now Playing — 1×" width={340} height={260}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.15), 0 4px 16px -6px rgba(0,0,0,0.2)" }}>
+              <Theme1NowPlaying />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="native-menu" label="Main Menu — 1×" width={340} height={260}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.15), 0 4px 16px -6px rgba(0,0,0,0.2)" }}>
+              <MainMenu selectedIdx={0} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="native-album" label="Album detail — 1×" width={340} height={260}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.15), 0 4px 16px -6px rgba(0,0,0,0.2)" }}>
+              <AlbumDetail selectedIdx={3} nowPlayingIdx={3} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="native-pod" label="iPod at 1× — true device size" width={420} height={580}>
+          <Wrap><InteractiveIPod themeId={1} scale={1} /></Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="interactive" title="Interactive Prototype">
+        <DCArtboard id="interactive-pod" label="Live iPod — Theme 1 (Linen)" width={760} height={1080}>
+          <Wrap><InteractiveIPod themeId={1} /></Wrap>
+        </DCArtboard>
+        <DCArtboard id="interactive-pod-3" label="Live iPod — Theme 3 (Ink, dark)" width={760} height={1080}>
+          <Wrap><InteractiveIPod themeId={3} /></Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="now-playing" title="Now Playing — 4 directions">
+        <DCArtboard id="np-1" label="01 · Linen — text-forward, warm light" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <Theme1NowPlaying />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="np-2" label="02 · Paper — minimal, art-centered" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <Theme2NowPlaying />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="np-3" label="03 · Ink — true dark, accent" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <Theme3NowPlaying />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="np-4" label="04 · Card — soft floating card" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <Theme4NowPlaying />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="menus" title="Menus & Browsing">
+        <DCArtboard id="menu-light" label="Main Menu — light" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <MainMenu selectedIdx={0} dark={false} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="menu-dark" label="Main Menu — dark" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <MainMenu selectedIdx={0} dark={true} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="tracks-light" label="Track List — light" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <TrackList selectedIdx={3} dark={false} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="tracks-dark" label="Track List — dark" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <TrackList selectedIdx={3} dark={true} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+      <DCSection id="music" title="Music — sub-menus">
+        <DCArtboard id="music-menu" label="Music menu" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <MusicMenu selectedIdx={1} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="artists" label="Artists" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <ArtistsList selectedIdx={2} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="albums" label="Albums" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <AlbumsList selectedIdx={1} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="songs" label="Songs" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <SongsList selectedIdx={3} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="genres" label="Genres" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <GenresList selectedIdx={2} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="lists" title="Playlists, Podcasts, Audiobooks">
+        <DCArtboard id="playlists" label="Playlists" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <PlaylistsList selectedIdx={0} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="podcasts" label="Podcasts (shows)" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <PodcastsList selectedIdx={1} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="podcast-episodes" label="Podcast episodes" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <PodcastEpisodes selectedIdx={0} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="audiobooks" label="Audiobooks" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <AudiobooksList selectedIdx={0} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="detail" title="Album & Playlist detail">
+        <DCArtboard id="album-detail" label="Album — songs in album" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <AlbumDetail selectedIdx={3} nowPlayingIdx={3} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="playlist-detail" label="Playlist — songs in playlist" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <PlaylistDetail selectedIdx={1} nowPlayingIdx={1} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="power-lock" title="Power & Lock states — charging, locked, unlocked">
+        <DCArtboard id="charging" label="Charging — 62%" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <ChargingScreen level={0.62} charging={true} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="charging-low" label="Charging — 14% (low)" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <ChargingScreen level={0.14} charging={true} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="charged" label="Fully charged — still plugged in" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <ChargingScreen level={1} charging={true} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="unplugged" label="Unplugged — battery view" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <ChargingScreen level={0.78} charging={false} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="locked" label="Locked — Hold engaged" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <LockedScreen playing={true} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="unlocked" label="Unlocked — Hold released" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <UnlockedScreen />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="system" title="System screens — boot, shutdown, file browser, EQ, theme picker">
+        <DCArtboard id="boot" label="Boot splash — power-on" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <BootSplash progress={0.6} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="shutdown" label="Shutdown — sleep" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <ShutdownScreen />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="file-browser" label="File browser — raw FS" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <FileBrowser selectedIdx={1} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="eq" label="Equalizer — 5-band" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <Equalizer selectedIdx={2} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="theme-picker" label="Theme picker — Settings" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <ThemePicker selectedIdx={1} currentId={2} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="wps" title="WPS info pages — cycle on Now Playing">
+        <DCArtboard id="wps-bigart" label="Page 1 · Big art" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <NowPlayingBigArt />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="wps-meter" label="Page 2 · Peak meter" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <NowPlayingPeakMeter />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="wps-info" label="Page 3 · Track info" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <NowPlayingTrackInfo />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="settings" title="Settings">
+        <DCArtboard id="settings-main" label="Settings — main" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <SettingsMenu selectedIdx={2} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="settings-playback" label="Settings — Playback" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <SettingsPlayback selectedIdx={2} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="settings-sound" label="Settings — Sound" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <SettingsSound selectedIdx={0} />
+            </div>
+          </Wrap>
+        </DCArtboard>
+        <DCArtboard id="settings-about" label="Settings — About" width={360} height={300}>
+          <Wrap>
+            <div style={{ width: 320, height: 240, boxShadow: "0 0 0 1px rgba(0,0,0,0.08), 0 8px 30px -10px rgba(0,0,0,0.15)" }}>
+              <SettingsAbout />
+            </div>
+          </Wrap>
+        </DCArtboard>
+      </DCSection>
+    </DesignCanvas>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+</body>
+</html>
