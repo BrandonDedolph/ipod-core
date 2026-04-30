@@ -234,7 +234,13 @@ static int list_count = 0;
 static const char *MAIN_ITEMS[] = {
     "Music", "Playlists", "Podcasts", "Audiobooks", "Settings", "Now Playing"
 };
-#define MAIN_LEN ((int)(sizeof(MAIN_ITEMS) / sizeof(MAIN_ITEMS[0])))
+#define MAIN_LEN_FULL ((int)(sizeof(MAIN_ITEMS) / sizeof(MAIN_ITEMS[0])))
+
+/* "Now Playing" only shows when audio is loaded (playing/paused/queued). */
+static int main_items_count(void) {
+    return rb->audio_status() ? MAIN_LEN_FULL : MAIN_LEN_FULL - 1;
+}
+#define MAIN_LEN main_items_count()
 
 static const char *MUSIC_ITEMS[] = {
     "Artists", "Albums", "Songs", "Genres", "Composers"
@@ -1671,10 +1677,8 @@ static bool handle_select(void) {
             push(F_SETTINGS);
             top()->sel = 0;
         } else if (f->sel == 5) {              /* Now Playing */
-            if (rb->audio_status() & AUDIO_STATUS_PLAY)
-                push(F_PLAYING);
-            else
-                rb->splash(HZ, "No track playing");
+            /* Only present in the menu when audio is loaded; safe to drill. */
+            push(F_PLAYING);
         }
         /* Podcasts (2), Audiobooks (3) — Rockbox doesn't natively
          * distinguish these; would need a folder convention. */
@@ -1830,6 +1834,9 @@ enum plugin_status plugin_start(const void *parameter)
                   : rb->button_get(true);
         f = top();
         int n = frame_count(f);
+        /* Clamp selection in case the frame count just shrunk
+         * (e.g. Now Playing disappeared from main menu). */
+        if (n > 0 && f->sel >= n) f->sel = n - 1;
         switch (btn) {
         case BUTTON_NONE:
             /* Timeout — just redraw next loop. */
