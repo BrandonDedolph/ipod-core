@@ -186,7 +186,38 @@ static struct frame *push(enum frame_kind k) {
     depth++;
     return f;
 }
-static void pop(void) { if (depth > 1) depth--; }
+/* Forward decls — these are defined further down the file. */
+static void load_artists(void);
+static void load_albums_for_artist(int artist_seek);
+static void load_songs_filtered(int artist_seek, int album_seek,
+                                int genre_seek, int composer_seek);
+static void load_tag_list(int tag);
+static void load_playlists(void);
+
+static void refresh_frame(struct frame *f) {
+    /* Repopulate list_buf for the now-active frame, since drilling into a
+     * child overwrote the global list. No-op for static-content frames
+     * (F_MAIN, F_MUSIC, F_SETTINGS, F_ABOUT, F_PLAYING). */
+    switch (f->kind) {
+    case F_ARTISTS:   load_artists(); break;
+    case F_ALBUMS:    load_albums_for_artist(f->parent_artist_seek); break;
+    case F_SONGS:     load_songs_filtered(f->parent_artist_seek,
+                                          f->parent_album_seek,
+                                          f->parent_genre_seek,
+                                          f->parent_composer_seek); break;
+    case F_GENRES:    load_tag_list(tag_genre); break;
+    case F_COMPOSERS: load_tag_list(tag_composer); break;
+    case F_PLAYLISTS: load_playlists(); break;
+    default: break;
+    }
+}
+
+static void pop(void) {
+    if (depth > 1) {
+        depth--;
+        refresh_frame(top());
+    }
+}
 
 /* ===== List storage ===== */
 #define MAX_LIST 256
