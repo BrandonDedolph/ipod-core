@@ -1,0 +1,23 @@
+# Meson build directories
+build-hw/
+build-sim/
+build/
+
+# Object files / artifacts
+*.o
+*.a
+*.elf
+*.bin
+
+# Go build artifacts
+cli/core
+cli/core-*
+
+# Test outputs
+tests/runs/
+tests/diffs/
+
+# Editor
+.vscode/
+.idea/
+*.swp

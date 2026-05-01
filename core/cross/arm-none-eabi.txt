@@ -1,0 +1,36 @@
+# Meson cross file for the iPod 5G/5.5G ARM target.
+#
+# The PortalPlayer PP5022 SoC has dual ARM7TDMI cores running at up to
+# 80 MHz. We target ARMv4T (the ARM7TDMI ISA). Toolchain is the standard
+# arm-none-eabi-gcc bundle (gcc 14 on Arch's official package).
+#
+# Usage:
+#   meson setup build-hw --cross-file cross/arm-none-eabi.txt -Dtarget=hw
+
+[binaries]
+c          = 'arm-none-eabi-gcc'
+cpp        = 'arm-none-eabi-g++'
+ar         = 'arm-none-eabi-ar'
+strip      = 'arm-none-eabi-strip'
+objcopy    = 'arm-none-eabi-objcopy'
+ld         = 'arm-none-eabi-ld'
+pkg-config = 'pkg-config'
+
+[host_machine]
+system     = 'none'
+cpu_family = 'arm'
+cpu        = 'arm7tdmi'
+endian     = 'little'
+
+[built-in options]
+c_args = [
+  '-mcpu=arm7tdmi',
+  '-ffreestanding',
+]
+c_link_args = [
+  '-nostdlib',
+  '-nostartfiles',
+]
+# Note: -mthumb-interwork was removed — it's a no-op on arm-none-eabi-gcc
+# 5+ (which has handled ARM/Thumb interworking automatically since then).
+# Add -mthumb explicitly per-file if/when we want Thumb code.
