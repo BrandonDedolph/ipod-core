@@ -11,3 +11,4 @@ build/headless/
 # Plugin source intermediate
 *.o
 .scratch/
+tools/.venv/
