@@ -126,6 +126,14 @@ uint32_t clock_us(void);
  */
 void sleep_ms(uint32_t ms);
 
+/*
+ * Sim-only: dump the current framebuffer to a 24-bit BMP at `path`.
+ * Returns 0 on success, negative on I/O failure. Stub on hw target.
+ *
+ * Used by the headless test harness and ad-hoc screenshot capture.
+ */
+int lcd_screenshot_bmp(const char *path);
+
 /* ---------- Audio --------------------------------------------------- */
 
 /*

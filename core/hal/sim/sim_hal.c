@@ -115,6 +115,73 @@ void lcd_present(void) {
     SDL_RenderPresent(g_renderer);
 }
 
+/*
+ * Write a 24-bit BGR BMP (top-down, no compression). The resulting
+ * file is the framebuffer at native 320x240, no scaling, exactly
+ * what we'd see on the device's LCD.
+ */
+int lcd_screenshot_bmp(const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return -1;
+
+    const int W = LCD_WIDTH, H = LCD_HEIGHT;
+    const int row_bytes_unpadded = W * 3;
+    const int row_pad = (4 - (row_bytes_unpadded % 4)) % 4;
+    const int row_stride = row_bytes_unpadded + row_pad;
+    const int pixel_bytes = row_stride * H;
+    const int file_size   = 14 + 40 + pixel_bytes;
+
+    /* BITMAPFILEHEADER (14 bytes). */
+    uint8_t fh[14] = {
+        'B','M',
+        (uint8_t)(file_size      ), (uint8_t)(file_size >>  8),
+        (uint8_t)(file_size >> 16), (uint8_t)(file_size >> 24),
+        0,0,0,0,
+        54,0,0,0,    /* pixel data offset */
+    };
+    fwrite(fh, 1, 14, fp);
+
+    /* BITMAPINFOHEADER (40 bytes). Negative height = top-down. */
+    int32_t neg_h = -H;
+    uint8_t ih[40] = {
+        40,0,0,0,                                    /* DIB size */
+        (uint8_t)W, (uint8_t)(W>>8), (uint8_t)(W>>16), (uint8_t)(W>>24),
+        (uint8_t)neg_h, (uint8_t)(neg_h>>8),
+        (uint8_t)(neg_h>>16), (uint8_t)(neg_h>>24),
+        1,0,                                         /* planes */
+        24,0,                                        /* bpp */
+        0,0,0,0,                                     /* compression = BI_RGB */
+        (uint8_t)(pixel_bytes      ), (uint8_t)(pixel_bytes >>  8),
+        (uint8_t)(pixel_bytes >> 16), (uint8_t)(pixel_bytes >> 24),
+        0x13,0x0B,0,0,                               /* x ppm = 2835 (~72 dpi) */
+        0x13,0x0B,0,0,                               /* y ppm */
+        0,0,0,0, 0,0,0,0,                            /* colors used / important */
+    };
+    fwrite(ih, 1, 40, fp);
+
+    /* Pixel data: rows top-to-bottom; each pixel BGR; pad rows to 4 bytes. */
+    static const uint8_t zeros[3] = {0,0,0};
+    uint8_t *row = malloc((size_t)row_stride);
+    if (!row) { fclose(fp); return -2; }
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            lcd_pixel_t p = g_framebuffer[y * W + x];
+            uint8_t r = (uint8_t)(((p >> 11) & 0x1F) << 3);
+            uint8_t g = (uint8_t)(((p >> 5)  & 0x3F) << 2);
+            uint8_t b = (uint8_t)(((p)       & 0x1F) << 3);
+            row[x * 3 + 0] = b;
+            row[x * 3 + 1] = g;
+            row[x * 3 + 2] = r;
+        }
+        for (int i = 0; i < row_pad; i++) row[row_bytes_unpadded + i] = 0;
+        fwrite(row, 1, (size_t)row_stride, fp);
+    }
+    free(row);
+    (void)zeros;
+    fclose(fp);
+    return 0;
+}
+
 /* ---------- Buttons (keyboard mapping) ----------------------------- */
 
 static button_t key_to_button(SDL_Keycode k) {
