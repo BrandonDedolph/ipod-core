@@ -108,7 +108,10 @@ int main(int argc, char **argv) {
         log_printf("warning: %s not found; SPACE will be a no-op", FIXTURE_PATH);
     }
 
-    audio_engine_t engine;
+    /* The audio engine is ~512 KB (statically-sized ring buffer),
+     * so it goes in BSS rather than on the main stack — matches what
+     * the hw target's audio task will need too. */
+    static audio_engine_t engine;
     audio_engine_init(&engine);
 
     log_printf("core-sim starting; q/Esc exits, SPACE plays/pauses %s",

@@ -13,8 +13,15 @@
  *   The actual array index = idx & (AUDIO_RING_FRAMES - 1) since the
  *   capacity is a power of two.
  *
+ * Ordering (matters on dual-core PP5022; no-op on x86 TSO sim):
+ *   Producer publishes write_idx with __ATOMIC_RELEASE after writing
+ *   ring slots; consumer reads write_idx with __ATOMIC_ACQUIRE before
+ *   reading ring slots. Same pattern in reverse for read_idx. The
+ *   release/acquire pair gives the consumer a happens-before view of
+ *   every ring store the producer committed up to that index.
+ *
  * No malloc on the hot path. play() allocates one buffer of `len`
- * bytes for the source file copy; stop() frees it. Decoder may
+ * bytes for the source-file copy; stop() frees it. Decoder may
  * malloc internally on open() — when we land the audio engine on
  * hw, the caller will pass a non-NULL decoder_alloc_t backed by our
  * static sub-allocator.
@@ -24,24 +31,29 @@
 #include "../../codecs/decoder.h"
 #include "../../hal/hal.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* Power-of-two capacity → wrap by mask. */
 #define RING_MASK (AUDIO_RING_FRAMES - 1u)
 
-/* ---------- Ring helpers (SPSC) ----------------------------------- */
+/* ---------- SPSC index ordering helpers ---------------------------- */
 
-/* Frames currently buffered. Consumer-side count: read by the producer
- * to decide if there's space to write; read by the consumer to decide
- * if there's data to drain. Both sides treat the indices as volatile;
- * a stale read just means "I'll act on slightly outdated info" which
- * for SPSC is always conservative. */
-static inline uint32_t ring_used(const audio_engine_t *e) {
-    return (uint32_t)(e->write_idx - e->read_idx);
+/* Each side publishes its own index with release ordering. */
+static inline void ring_publish(uint32_t *p, uint32_t v) {
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
 }
-static inline uint32_t ring_free(const audio_engine_t *e) {
-    return AUDIO_RING_FRAMES - ring_used(e);
+
+/* Reading the *other* side's index uses acquire ordering. */
+static inline uint32_t ring_observe(const uint32_t *p) {
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+/* Same-thread reads of one's own index. Relaxed is sufficient because
+ * a thread always sees its own writes program-order. */
+static inline uint32_t ring_own(const uint32_t *p) {
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
 }
 
 /* ---------- HAL fill callback (consumer side) -------------------- */
@@ -49,12 +61,14 @@ static inline uint32_t ring_free(const audio_engine_t *e) {
 static int engine_fill_cb(void *user, int16_t *out, int frames) {
     audio_engine_t *e = (audio_engine_t *)user;
 
-    int wrote = 0;
-    uint32_t r = e->read_idx;
-    uint32_t w = e->write_idx;
+    /* Acquire-load write_idx so all ring stores up to that point are
+     * visible to us before we read them. */
+    uint32_t w = ring_observe(&e->write_idx);
+    uint32_t r = ring_own(&e->read_idx);
     uint32_t avail = (uint32_t)(w - r);
     if (avail > (uint32_t)frames) avail = (uint32_t)frames;
 
+    int wrote = 0;
     while (wrote < (int)avail) {
         uint32_t idx = (r + wrote) & RING_MASK;
         out[wrote * 2 + 0] = e->ring[idx * 2 + 0];
@@ -62,11 +76,11 @@ static int engine_fill_cb(void *user, int16_t *out, int frames) {
         wrote++;
     }
 
-    /* Bulk update read_idx exactly once at the end. The producer may
-     * read a stale (smaller) value mid-update; that just means it
+    /* Release-publish read_idx exactly once at the end. The producer
+     * may read a stale (smaller) value mid-update; that just means it
      * sees the ring as fuller than it really is and produces less.
      * Always conservative, never corrupting. */
-    e->read_idx = r + (uint32_t)wrote;
+    ring_publish(&e->read_idx, r + (uint32_t)wrote);
     return wrote;
 }
 
@@ -118,10 +132,8 @@ int audio_engine_play(audio_engine_t *e,
 
     int rc = ops->open(&e->decoder, e->src_bytes, len, /*alloc=*/NULL);
     if (rc != DECODER_OK) {
-        free(e->src_bytes);
-        e->src_bytes = NULL;
-        e->src_len = 0;
-        return -3;
+        rc = -3;
+        goto fail_after_alloc;
     }
     e->ops          = ops;
     e->has_decoder  = true;
@@ -129,8 +141,9 @@ int audio_engine_play(audio_engine_t *e,
     e->sample_rate  = e->decoder.sample_rate;
     e->channels     = e->decoder.channels;
 
-    /* Reset the ring. Safe — we know nothing else is using it (we
-     * either just initialized, or just stopped which clears these). */
+    /* Reset the ring before any concurrent observer sees us — at this
+     * point set_source(NULL) was called by the prior stop(), so the
+     * HAL won't call back into us. */
     e->write_idx = 0;
     e->read_idx  = 0;
 
@@ -138,14 +151,27 @@ int audio_engine_play(audio_engine_t *e,
      * stereo from the engine, regardless of source channel count
      * (mono gets duplicated in the pump). */
     if (hal_audio_init(e->sample_rate, /*channels=*/2) != 0) {
-        engine_release_decoder(e);
-        return -4;
+        rc = -4;
+        goto fail_after_decoder;
     }
 
     hal_audio_set_source(engine_fill_cb, e);
     hal_audio_start();
     e->playing = true;
     return 0;
+
+fail_after_decoder:
+    /* Decoder is open; close it before unwinding the source buffer. */
+    ops->close(&e->decoder);
+    e->ops          = NULL;
+    e->has_decoder  = false;
+    memset(&e->decoder, 0, sizeof(e->decoder));
+    /* fall through */
+fail_after_alloc:
+    free(e->src_bytes);
+    e->src_bytes = NULL;
+    e->src_len   = 0;
+    return rc;
 }
 
 void audio_engine_pause(audio_engine_t *e) {
@@ -166,10 +192,13 @@ void audio_engine_stop(audio_engine_t *e) {
         hal_audio_stop();
         e->playing = false;
     }
-    /* Detach the source before tearing down — quiescence guarantee
-     * means the next callback definitely won't observe stale state. */
+    /* Detach the source before tearing down — the HAL's quiescence
+     * guarantee (PR 8) means no callback can observe stale state
+     * after this returns. */
     hal_audio_set_source(NULL, NULL);
     engine_release_decoder(e);
+    /* Reset indices as plain stores — there's no concurrent observer
+     * after set_source(NULL) returned. */
     e->write_idx = 0;
     e->read_idx  = 0;
 }
@@ -179,7 +208,11 @@ void audio_engine_stop(audio_engine_t *e) {
 int audio_engine_pump(audio_engine_t *e) {
     if (!e->has_decoder || e->decoder_eof) return 0;
 
-    uint32_t free_frames = ring_free(e);
+    /* Same-thread read of write_idx; acquire-read of read_idx so we
+     * see how far the consumer has drained. */
+    uint32_t w = ring_own(&e->write_idx);
+    uint32_t r = ring_observe(&e->read_idx);
+    uint32_t free_frames = AUDIO_RING_FRAMES - (uint32_t)(w - r);
     if (free_frames == 0) return 0;
 
     /* Decode in two passes if we straddle the ring's wrap point.
@@ -187,7 +220,7 @@ int audio_engine_pump(audio_engine_t *e) {
      * start-of-array to read_idx (if needed). */
     int total = 0;
     while (free_frames > 0 && !e->decoder_eof) {
-        uint32_t w_pos     = e->write_idx & RING_MASK;
+        uint32_t w_pos     = w & RING_MASK;
         uint32_t to_end    = AUDIO_RING_FRAMES - w_pos;
         uint32_t this_chunk = (free_frames < to_end) ? free_frames : to_end;
         if (this_chunk > 4096) this_chunk = 4096;   /* keep batches modest */
@@ -203,6 +236,7 @@ int audio_engine_pump(audio_engine_t *e) {
             int16_t mono[1024];
             int batch = (this_chunk < 1024) ? (int)this_chunk : 1024;
             got = e->ops->decode(&e->decoder, mono, batch);
+            assert(got <= batch);  /* would scribble past dst otherwise */
             for (int i = 0; i < got; i++) {
                 dst[i * 2 + 0] = mono[i];
                 dst[i * 2 + 1] = mono[i];
@@ -214,13 +248,12 @@ int audio_engine_pump(audio_engine_t *e) {
             e->decoder_eof = true;
             break;
         }
-        e->write_idx += (uint32_t)got;
-        free_frames  -= (uint32_t)got;
-        total        += got;
+        w           += (uint32_t)got;
+        free_frames -= (uint32_t)got;
+        total       += got;
 
-        /* If decoder gave us less than asked, it might be at a frame
-         * boundary; loop again with fresh free_frames count and try
-         * to pull more this same call. */
+        /* Publish progress so the consumer can drain even mid-batch. */
+        ring_publish(&e->write_idx, w);
     }
     return total;
 }
@@ -228,7 +261,10 @@ int audio_engine_pump(audio_engine_t *e) {
 /* ---------- Status ------------------------------------------------- */
 
 bool audio_engine_eos(const audio_engine_t *e) {
-    return e->decoder_eof && (e->write_idx == e->read_idx);
+    /* Acquire on read_idx so we see the consumer's latest progress. */
+    uint32_t w = ring_own((const uint32_t *)&e->write_idx);
+    uint32_t r = ring_observe((const uint32_t *)&e->read_idx);
+    return e->decoder_eof && (w == r);
 }
 
 bool audio_engine_is_playing(const audio_engine_t *e) {
@@ -236,5 +272,7 @@ bool audio_engine_is_playing(const audio_engine_t *e) {
 }
 
 uint32_t audio_engine_ring_fill(const audio_engine_t *e) {
-    return ring_used(e);
+    uint32_t w = ring_own((const uint32_t *)&e->write_idx);
+    uint32_t r = ring_observe((const uint32_t *)&e->read_idx);
+    return (uint32_t)(w - r);
 }

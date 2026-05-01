@@ -16,9 +16,13 @@
  *     context (hw) via the source callback the engine registers
  *     with hal_audio_set_source. The drain side never touches the
  *     decoder, so there's no contention.
- *   - The ring is single-producer single-consumer (SPSC). Fine on
- *     ARM7 with two relaxed atomic indices; the cache stays clean
- *     because each side only writes one index.
+ *   - The ring is single-producer single-consumer (SPSC). Index
+ *     publishes use release/acquire ordering (via __atomic_store_n /
+ *     __atomic_load_n with explicit memorders) so that on the
+ *     dual-core PP5022 the consumer can't observe a bumped write_idx
+ *     before the ring stores that filled that slot — and vice versa
+ *     for read_idx. On the sim host (x86 TSO) these compile to plain
+ *     loads/stores; on ARM they emit `dmb ish` barriers. Same source.
  *
  * Lifecycle:
  *
@@ -48,12 +52,14 @@
 #include <stdint.h>
 
 /*
- * Ring capacity in PCM frames. 88,200 frames = 2 seconds at 44.1 kHz
- * stereo = ~344 KB. Sized so that on hw a single HDD spin-up fills it
- * and the disk can spin down for many minutes; on sim it's just
- * comfortable headroom so a stalled main loop doesn't underrun.
+ * Ring capacity in PCM frames. 131,072 frames ≈ 2.97 s at 44.1 kHz
+ * stereo, ~512 KB.
  *
- * Keep as a power of two so the index wrap is a mask instead of a mod.
+ * On hw this is sized so a single HDD spin-up fills it and the disk
+ * can spin down for many seconds before the next refill. On sim it's
+ * just comfortable headroom so a stalled main loop doesn't underrun.
+ *
+ * Must be a power of two so the index wrap is a mask instead of a mod.
  */
 #define AUDIO_RING_FRAMES (1u << 17)   /* 131,072 frames ≈ 2.97 s @ 44.1 kHz */
 
@@ -74,13 +80,17 @@ typedef struct audio_engine {
     bool                 decoder_eof;        /* decoder returned 0 (EOS) */
 
     /* SPSC ring of interleaved s16 stereo frames.
-     * write_idx is touched by the producer (pump); read_idx by the
-     * consumer (HAL audio callback). Both are uint32_t, atomic
-     * accesses via plain reads/writes — sufficient on ARM7 for
-     * naturally-aligned 32-bit words. */
+     *
+     * write_idx is published by the producer (pump) with release
+     * ordering; read with acquire by the consumer.
+     * read_idx is published by the consumer (HAL audio callback)
+     * with release ordering; read with acquire by the producer.
+     *
+     * Same-thread reads (producer reading its own write_idx, etc.)
+     * use relaxed loads. See engine.c for the helpers. */
     int16_t              ring[AUDIO_RING_FRAMES * 2];
-    volatile uint32_t    write_idx;          /* total frames produced */
-    volatile uint32_t    read_idx;           /* total frames consumed */
+    uint32_t             write_idx;          /* total frames produced */
+    uint32_t             read_idx;           /* total frames consumed */
 
     /* Stream metadata, captured at play() time. */
     uint32_t             sample_rate;
