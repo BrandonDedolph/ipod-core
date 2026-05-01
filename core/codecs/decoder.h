@@ -29,9 +29,10 @@
  *
  * No allocations on the hot path. The decoder_t itself holds enough
  * state for the wrapper; if the underlying lib needs heap, it goes
- * through decoder_alloc / decoder_free hooks injected at open time
- * (TODO: not in this scaffold; both dr_flac and Helix can be made to
- * use stack/static buffers).
+ * through the decoder_alloc_t struct passed to open(). On the host
+ * (sim, KAT) callers may pass NULL, which means "use the wrapper's
+ * default allocator" (typically malloc/free for sim). On hw the audio
+ * engine will pass a non-NULL struct backed by our static sub-allocator.
  */
 
 #ifndef CORE_CODECS_DECODER_H
@@ -42,6 +43,25 @@
 
 /* Forward decls (recursive). */
 struct decoder_ops;
+
+/*
+ * decoder_alloc_t — allocator hooks injected at open() time. Codec
+ * wrappers translate these into the underlying lib's allocator API
+ * (e.g. dr_flac's drflac_allocation_callbacks, Helix's MemAllocFn).
+ *
+ * Pass NULL to open() to use the wrapper's default (typically
+ * malloc/free for sim builds; not available on hw, where the audio
+ * engine always provides a non-NULL struct).
+ *
+ * userdata is opaque to the wrapper; useful for passing an arena
+ * pointer that alloc/free close over.
+ */
+typedef struct decoder_alloc {
+    void *(*alloc)(void *userdata, size_t bytes);
+    void *(*realloc)(void *userdata, void *ptr, size_t bytes);
+    void  (*free)(void *userdata, void *ptr);
+    void *userdata;
+} decoder_alloc_t;
 
 /*
  * decoder_t — open instance of a decoder. Lives on the caller's stack
@@ -77,14 +97,23 @@ typedef struct decoder_ops {
     /*
      * Open the decoder on a memory buffer.
      *
+     * `alloc` may be NULL — wrappers fall back to a default allocator
+     * (malloc/free on sim; the audio engine on hw always provides a
+     * non-NULL struct backed by our static sub-allocator).
+     *
      * Returns 0 on success, negative on error (DECODER_ERR_*). On
      * success, fills d->opaque, d->sample_rate, d->channels,
      * d->bits_per_sample, d->total_frames.
      *
      * The src buffer must remain valid for the lifetime of the
      * decoder (until close()). Wrappers borrow, they don't copy.
+     *
+     * Note: this ABI assumes the entire compressed file is in memory.
+     * Streaming-pull (Ogg/Opus from a long-running file source) will
+     * need a separate open_stream() variant when we vendor those.
      */
-    int (*open)(decoder_t *d, const void *src, size_t src_len);
+    int (*open)(decoder_t *d, const void *src, size_t src_len,
+                const decoder_alloc_t *alloc);
 
     /*
      * Decode up to max_frames PCM frames into out.

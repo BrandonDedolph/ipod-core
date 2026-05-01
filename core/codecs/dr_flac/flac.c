@@ -1,15 +1,24 @@
 /*
  * core/codecs/dr_flac/flac.c — FLAC decoder, wrapping dr_flac.
  *
- * dr_flac decodes natively to int32_t PCM at the file's actual bit
- * depth (16/20/24-bit). We expose s16 to the audio engine, so the
- * wrapper does an arithmetic downshift when bps > 16.
+ * dr_flac decodes natively to int32_t at the source's bit depth
+ * (16/20/24-bit). We expose 16-bit signed interleaved PCM via
+ * drflac_read_pcm_frames_s16, which downconverts internally with an
+ * arithmetic right-shift (truncate-toward-negative-infinity, no
+ * dither). That introduces a sub-LSB DC bias on 24-bit material —
+ * acceptable for playback; the audio engine doesn't get to dither
+ * because we ship 16-bit out anyway.
  *
- * The decoder_t.opaque field holds a drflac* directly. dr_flac uses
- * malloc/free internally (default DRFLAC_MALLOC); for the firmware
- * target we'll later override with our static sub-allocator via
- * DRFLAC_MALLOC / DRFLAC_FREE macros. On the host (sim, KAT) the
- * default allocator is fine.
+ * Allocator: dr_flac exposes drflac_allocation_callbacks so we can
+ * thread our static sub-allocator through cleanly. When the caller
+ * passes a non-NULL decoder_alloc_t we translate; NULL falls through
+ * to dr_flac's default (DRFLAC_MALLOC / DRFLAC_FREE / DRFLAC_REALLOC,
+ * which are libc malloc unless we override the macros at compile time).
+ *
+ * Channels: we hard-cap at 2 (stereo). FLAC supports up to 8 channels;
+ * the audio engine downstream only expects mono/stereo, and a 5.1
+ * FLAC would silently overflow caller buffers on decode. We refuse
+ * to open such streams with DECODER_ERR_UNSUPPORTED.
  */
 
 #define DR_FLAC_IMPLEMENTATION
@@ -23,13 +32,51 @@
 #include <stddef.h>
 #include <stdint.h>
 
-static int flac_open(decoder_t *d, const void *src, size_t src_len) {
+/* ---------- Allocator translation ---------------------------------- */
+
+static void *flac_malloc_thunk(size_t bytes, void *user) {
+    const decoder_alloc_t *a = (const decoder_alloc_t *)user;
+    return a->alloc(a->userdata, bytes);
+}
+static void *flac_realloc_thunk(void *ptr, size_t bytes, void *user) {
+    const decoder_alloc_t *a = (const decoder_alloc_t *)user;
+    return a->realloc(a->userdata, ptr, bytes);
+}
+static void flac_free_thunk(void *ptr, void *user) {
+    const decoder_alloc_t *a = (const decoder_alloc_t *)user;
+    a->free(a->userdata, ptr);
+}
+
+/* ---------- ops ---------------------------------------------------- */
+
+static int flac_open(decoder_t *d, const void *src, size_t src_len,
+                     const decoder_alloc_t *alloc) {
     if (!d || !src || src_len == 0) {
         return DECODER_ERR_INVALID;
     }
-    drflac *f = drflac_open_memory(src, src_len, NULL);
+
+    drflac *f;
+    if (alloc && alloc->alloc && alloc->realloc && alloc->free) {
+        drflac_allocation_callbacks cb = {
+            .pUserData = (void *)alloc,
+            .onMalloc  = flac_malloc_thunk,
+            .onRealloc = flac_realloc_thunk,
+            .onFree    = flac_free_thunk,
+        };
+        f = drflac_open_memory(src, src_len, &cb);
+    } else {
+        f = drflac_open_memory(src, src_len, NULL);
+    }
     if (!f) {
+        /* dr_flac collapses all open failures (malformed header,
+         * truncated stream, OOM) into a NULL return; we can't
+         * distinguish them. */
         return DECODER_ERR_INVALID;
+    }
+
+    if (f->channels > 2) {
+        drflac_close(f);
+        return DECODER_ERR_UNSUPPORTED;
     }
 
     d->opaque          = f;
@@ -46,14 +93,15 @@ static int flac_decode(decoder_t *d, int16_t *out, int max_frames) {
     }
     drflac *f = (drflac *)d->opaque;
 
-    /* dr_flac has a direct s16 reader — saves us the manual downshift. */
     drflac_uint64 got = drflac_read_pcm_frames_s16(
         f, (drflac_uint64)max_frames, out);
 
-    if (got > (drflac_uint64)INT32_MAX) {
-        /* Shouldn't happen given max_frames is int, but guard the cast. */
-        return DECODER_ERR_INTERNAL;
-    }
+    /* dr_flac returns 0 for both EOS and mid-stream decode failure;
+     * we can't distinguish without inspecting state, so EOS wins.
+     * If the stream is corrupt mid-decode, downstream will hear
+     * silence and the position counter will drift — acceptable for
+     * a music player; we don't promise glitch-free decode of broken
+     * files. */
     return (int)got;
 }
 

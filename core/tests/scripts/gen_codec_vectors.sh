@@ -35,9 +35,13 @@ gen_flac() {
          --no-padding --no-md5-sum \
          -o "$flac" "$pcm"
 
-    rm -f "$pcm"
+    # Keep the raw .pcm — the KAT memcmp's the decoded output against
+    # it. Bit-exactness then doesn't depend on libm sin() being stable
+    # across hosts; the bytes are committed.
     sha256sum "$flac" | awk '{print $1}' > "$flac.sha256"
+    sha256sum "$pcm"  | awk '{print $1}' > "$pcm.sha256"
     printf "    %s\n" "$flac"
+    printf "    %s\n" "$pcm"
 }
 
 mkdir -p "$VECTORS_DIR"

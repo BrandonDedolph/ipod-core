@@ -20,8 +20,12 @@ import sys
 def gen_sine_440hz_1s_44k_stereo() -> bytes:
     """1 second of 440 Hz sine, 44.1 kHz, 16-bit stereo, ~50% amplitude.
 
-    Deterministic: same bytes on every run, every platform. C-side
-    test regenerates this with the same formula and byte order.
+    NOTE: deterministic *on the machine that runs this script* —
+    Python's math.sin() calls the host's libm, which is not bit-stable
+    across glibc / musl / macOS libm / etc. The .pcm output is
+    committed alongside the .flac, and the KAT memcmps against the
+    committed bytes — so the cross-libm wobble doesn't affect tests
+    once the fixture is generated. Regenerate only on a pinned host.
     """
     SAMPLE_RATE = 44100
     DURATION_S = 1
