@@ -41,6 +41,22 @@
 
 #define NP_NEXT_MAX   80
 
+/*
+ * The four NP pages, cycled through with center button (SELECT) per
+ * the design (system-screens.jsx). Order matches the JSX:
+ *   0 = default (title/art/scrubber/up-next)
+ *   1 = big art (full-screen on dark backdrop)
+ *   2 = peak meter (synthesized levels per channel)
+ *   3 = track info (key-value rows)
+ */
+typedef enum {
+    NP_PAGE_DEFAULT     = 0,
+    NP_PAGE_BIG_ART     = 1,
+    NP_PAGE_PEAK_METER  = 2,
+    NP_PAGE_TRACK_INFO  = 3,
+    NP_PAGE_COUNT       = 4,
+} np_page_t;
+
 typedef struct {
     char     title[NP_TITLE_MAX];
     char     artist[NP_ARTIST_MAX];
@@ -52,7 +68,14 @@ typedef struct {
     uint32_t total_frames;     /* 0 if unknown */
     uint32_t sample_rate;
     bool     loaded;
+    np_page_t page;
 } now_playing_t;
+
+/*
+ * Cycle to the next page (called when the user presses SELECT while
+ * the NP frame is active).
+ */
+void now_playing_advance_page(now_playing_t *np);
 
 /*
  * Snapshot the engine's current metadata into `np`. Strings are

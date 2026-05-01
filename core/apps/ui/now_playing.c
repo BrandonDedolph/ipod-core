@@ -48,10 +48,15 @@ void now_playing_load(now_playing_t *np, const audio_engine_t *engine) {
              engine->sample_rate / 1000);
     snprintf(np->up_next,       NP_NEXT_MAX,   "(end of test playlist)");
     np->stars = 4;
+    np->page  = NP_PAGE_DEFAULT;
 
     np->total_frames = (uint32_t)engine->decoder.total_frames;
     np->sample_rate  = engine->sample_rate;
     np->loaded       = true;
+}
+
+void now_playing_advance_page(now_playing_t *np) {
+    np->page = (np->page + 1) % NP_PAGE_COUNT;
 }
 
 /* ---------- Helpers ---------------------------------------------- */
@@ -134,9 +139,26 @@ static int draw_format_badge(int x, int y_baseline, const char *label,
     return detail_x + detail_w;
 }
 
-/* ---------- Draw --------------------------------------------------- */
+/* ---------- Draw: dispatch on page -------------------------------- */
+
+static void draw_default(const now_playing_t *np, const audio_engine_t *engine);
+static void draw_big_art(const now_playing_t *np, const audio_engine_t *engine);
+static void draw_peak_meter(const now_playing_t *np, const audio_engine_t *engine);
+static void draw_track_info(const now_playing_t *np, const audio_engine_t *engine);
 
 void now_playing_draw(const now_playing_t *np, const audio_engine_t *engine) {
+    switch (np->page) {
+        case NP_PAGE_BIG_ART:    draw_big_art(np, engine);    break;
+        case NP_PAGE_PEAK_METER: draw_peak_meter(np, engine); break;
+        case NP_PAGE_TRACK_INFO: draw_track_info(np, engine); break;
+        case NP_PAGE_DEFAULT:
+        default:                 draw_default(np, engine);    break;
+    }
+}
+
+/* ---------- Page 0: default --------------------------------------- */
+
+static void draw_default(const now_playing_t *np, const audio_engine_t *engine) {
     lcd_fill(COL_BG);
 
     /* Battery is stubbed at 87% until the power HAL lands. */
@@ -226,4 +248,221 @@ void now_playing_draw(const now_playing_t *np, const audio_engine_t *engine) {
     atlas_render(&NUNITO_BOLD_9, bar_x, label_y, left, COL_INK_DEEP);
     int rw = atlas_text_width(&NUNITO_BOLD_9, right);
     atlas_render(&NUNITO_BOLD_9, bar_x + bar_w - rw, label_y, right, COL_INK_DEEP);
+}
+
+/* ---------- Page 1: big art on dark backdrop --------------------- */
+
+#define COL_DARK_BG       lcd_rgb(0x0E, 0x0D, 0x0C)
+#define COL_DARK_TEXT     lcd_rgb(0xE8, 0xE4, 0xDD)
+#define COL_DARK_MUTED    lcd_rgb(0xA8, 0x9E, 0x92)
+/* Stripes for the big art — same hue but slightly darker than page 0. */
+#define COL_BIG_STRIPE_A  lcd_rgb(0xC8, 0xB2, 0x9F)
+#define COL_BIG_STRIPE_B  lcd_rgb(0xB6, 0xA0, 0x8C)
+
+static void draw_big_art(const now_playing_t *np, const audio_engine_t *engine) {
+    (void)engine;
+
+    /* Dark backdrop. */
+    chrome_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, COL_DARK_BG);
+
+    /*
+     * 180x180 art centered, per design — ((320-180)/2, (240-180)/2) =
+     * (70, 30). Slightly different stripe colors so the art still
+     * reads as warm-tan against the near-black bg.
+     */
+    int art_w = 180, art_h = 180;
+    int art_x = (LCD_WIDTH  - art_w) / 2;
+    int art_y = (LCD_HEIGHT - art_h) / 2;
+    chrome_diagonal_stripes(art_x, art_y, art_w, art_h,
+                            10, 6, COL_BIG_STRIPE_A, COL_BIG_STRIPE_B);
+
+    /*
+     * Top status row: "1 OF 3" left, battery right, both in cream
+     * (per design line 318+). Use Bold-9 for the page label.
+     */
+    atlas_render(&NUNITO_BOLD_9, 10, 14, "1 OF 3", COL_DARK_TEXT);
+    int bat_x = LCD_WIDTH - 10 - 31;
+    chrome_battery(bat_x, 5, 87, COL_DARK_TEXT);
+
+    /*
+     * Bottom title gradient: design uses an alpha gradient. We
+     * approximate with a solid 60%-dark band — enough for legibility,
+     * cheaper than a true vertical-alpha gradient. Title + artist on top.
+     */
+    int band_h = 56;
+    chrome_fill_rect(0, LCD_HEIGHT - band_h, LCD_WIDTH, band_h, COL_DARK_BG);
+    /* The band overlaps the art; we just overwrite. The "soft fade"
+     * is faked by drawing the art first; in a real gradient pass we
+     * could alpha-blend. */
+    if (np->loaded) {
+        atlas_render(&NUNITO_BOLD_13,    14, 218, np->title, COL_DARK_TEXT);
+        char sub[NP_TITLE_MAX + NP_ARTIST_MAX + 4];
+        snprintf(sub, sizeof(sub), "%s  %s", np->artist, np->album);
+        atlas_render(&NUNITO_REGULAR_11, 14, 232, sub, COL_DARK_MUTED);
+    }
+}
+
+/* ---------- Page 2: peak meter ----------------------------------- */
+
+#define PEAK_SEGS       24
+#define PEAK_SEG_W      28
+#define PEAK_SEG_H      4
+#define PEAK_SEG_GAP    2
+
+#define COL_PEAK_NORMAL lcd_rgb(0x1A, 0x17, 0x14)
+#define COL_PEAK_AMBER  lcd_rgb(0xC0, 0x8C, 0x2A)
+#define COL_PEAK_RED    lcd_rgb(0xC4, 0x50, 0x2A)
+#define COL_PEAK_DIM    lcd_rgb(0xE6, 0xE2, 0xDB)   /* 8% ink on cream */
+
+/* Synthesize a "level" 0..1 for a channel from engine state +
+ * time, so the meter looks alive even though we don't yet pull
+ * real DSP peak data. */
+static float synth_level(const audio_engine_t *engine, int channel) {
+    /* Base on read_idx so it tracks playback; phase-shift the right
+     * channel so the two columns don't move identically. */
+    uint32_t r = (uint32_t)engine->read_idx;
+    uint32_t t = clock_ms();
+    float phase = (float)((r / 100u + t / 50u + channel * 47u) % 100u) / 100.0f;
+    /* Bias toward 0.55..0.85 so the meter looks active. */
+    float level = 0.55f + 0.30f * (phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f);
+    return level;
+}
+
+static void draw_meter_column(int cx, int top_y, float level,
+                              const char *label) {
+    /* Column label on top, in Bold-9 muted. */
+    int lw = atlas_text_width(&NUNITO_BOLD_9, label);
+    atlas_render(&NUNITO_BOLD_9, cx - lw / 2, top_y - 2, label, COL_INK_DEEP);
+
+    /* 24 segments stacked top-down. Top of meter = top_y; each
+     * segment is PEAK_SEG_H tall + PEAK_SEG_GAP px gap. Highest
+     * segments are the loudest; lit if ratio <= level. */
+    for (int i = 0; i < PEAK_SEGS; i++) {
+        float ratio = (float)(PEAK_SEGS - i) / (float)PEAK_SEGS;
+        bool lit = ratio <= level;
+        lcd_pixel_t color =
+            ratio > 0.85f ? COL_PEAK_RED   :
+            ratio > 0.65f ? COL_PEAK_AMBER :
+                            COL_PEAK_NORMAL;
+        if (!lit) color = COL_PEAK_DIM;
+        int seg_x = cx - PEAK_SEG_W / 2;
+        int seg_y = top_y + 4 + i * (PEAK_SEG_H + PEAK_SEG_GAP);
+        chrome_fill_rect(seg_x, seg_y, PEAK_SEG_W, PEAK_SEG_H, color);
+    }
+
+    /* dB label below. Approximate 20 * log10(level) without
+     * pulling in <math.h> at this hot path — synthesize it from
+     * a small lookup of the synthesized levels. */
+    int db = -1;
+    if      (level > 0.95f) db = 0;
+    else if (level > 0.85f) db = -1;
+    else if (level > 0.75f) db = -2;
+    else if (level > 0.65f) db = -4;
+    else if (level > 0.55f) db = -6;
+    else                    db = -10;
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%d dB", db);
+    int dw = atlas_text_width(&NUNITO_BOLD_9, buf);
+    int db_y = top_y + 4 + PEAK_SEGS * (PEAK_SEG_H + PEAK_SEG_GAP) + 12;
+    atlas_render(&NUNITO_BOLD_9, cx - dw / 2, db_y, buf, COL_INK_MUTED);
+}
+
+static void draw_peak_meter(const now_playing_t *np, const audio_engine_t *engine) {
+    lcd_fill(COL_BG);
+
+    /* Header: title left, "PAGE 2 OF 3" right, 1 px border below. */
+    atlas_render(&NUNITO_BOLD_11, 12, 16, np->title, COL_INK);
+    const char *page_label = "PAGE 2 OF 3";
+    int pw = atlas_text_width(&NUNITO_BOLD_9, page_label);
+    atlas_render(&NUNITO_BOLD_9, LCD_WIDTH - 12 - pw, 16, page_label, COL_INK_MUTED);
+    chrome_fill_rect(0, 22, LCD_WIDTH, 1, lcd_rgb(0xE2, 0xDE, 0xDA));
+
+    /* Two channels, centered with 22 px gap. */
+    int meter_top = 28;
+    int gap_between = 32;
+    int total_w = PEAK_SEG_W * 2 + gap_between;
+    int left_cx = (LCD_WIDTH - total_w) / 2 + PEAK_SEG_W / 2;
+    int right_cx = left_cx + PEAK_SEG_W + gap_between;
+
+    float L = synth_level(engine, 0);
+    float R = synth_level(engine, 1);
+
+    draw_meter_column(left_cx,  meter_top, L, "L");
+    draw_meter_column(right_cx, meter_top, R, "R");
+
+    /* Bottom labels: "PRE-AMP 0DB" left, "M:SS / M:SS" right. */
+    uint32_t played = (uint32_t)engine->read_idx;
+    uint32_t total  = np->total_frames;
+    uint32_t played_s = (np->sample_rate > 0) ? played / np->sample_rate : 0;
+    uint32_t total_s  = (total > 0 && np->sample_rate > 0)
+                        ? total / np->sample_rate : 0;
+    char left_buf[16], right_buf[24];
+    snprintf(left_buf, sizeof(left_buf), "PRE-AMP 0DB");
+    char a[16], b[16];
+    format_time(played_s, a, sizeof(a));
+    format_time(total_s,  b, sizeof(b));
+    snprintf(right_buf, sizeof(right_buf), "%s / %s", a, b);
+    atlas_render(&NUNITO_BOLD_9, 14, 232, left_buf, COL_INK_DEEP);
+    int rw = atlas_text_width(&NUNITO_BOLD_9, right_buf);
+    atlas_render(&NUNITO_BOLD_9, LCD_WIDTH - 14 - rw, 232, right_buf, COL_INK_DEEP);
+}
+
+/* ---------- Page 3: track info ----------------------------------- */
+
+static void draw_track_info(const now_playing_t *np, const audio_engine_t *engine) {
+    (void)engine;
+    lcd_fill(COL_BG);
+
+    /* Header: "Track Info" left, "PAGE 3 OF 3" right, border below. */
+    atlas_render(&NUNITO_BOLD_11, 12, 16, "Track Info", COL_INK);
+    const char *page_label = "PAGE 3 OF 3";
+    int pw = atlas_text_width(&NUNITO_BOLD_9, page_label);
+    atlas_render(&NUNITO_BOLD_9, LCD_WIDTH - 12 - pw, 16, page_label, COL_INK_MUTED);
+    chrome_fill_rect(0, 22, LCD_WIDTH, 1, lcd_rgb(0xE2, 0xDE, 0xDA));
+
+    /*
+     * Key-value rows per design (line 388+). Keys uppercase tracking
+     * Bold-9 muted at 78 px wide; values Regular-11 ink. ~11 rows
+     * total but we only have a few real pieces of data — pad with the
+     * stuff we do know for the FLAC fixture.
+     */
+    char track[16];
+    snprintf(track, sizeof(track), "1 of 1");
+
+    char length[16];
+    if (np->total_frames > 0 && np->sample_rate > 0) {
+        uint32_t total_s = np->total_frames / np->sample_rate;
+        format_time(total_s, length, sizeof(length));
+    } else {
+        snprintf(length, sizeof(length), "--:--");
+    }
+
+    char rate[16];
+    snprintf(rate, sizeof(rate), "%u kHz", np->sample_rate / 1000);
+
+    char format_full[NP_FORMAT_MAX + NP_FORMAT_MAX + 4];
+    snprintf(format_full, sizeof(format_full), "%s · %s",
+             np->format, np->format_detail);
+
+    static const char *const KEYS[] = {
+        "TITLE", "ARTIST", "ALBUM", "TRACK", "FORMAT",
+        "SAMPLE RATE", "LENGTH", "PATH",
+    };
+    const char *vals[] = {
+        np->title, np->artist, np->album, track, format_full,
+        rate, length,
+        "tests/codec-vectors/sine_440hz_1s_44k_s16_stereo.flac",
+    };
+    int n = (int)(sizeof(KEYS) / sizeof(KEYS[0]));
+
+    int row_top = 32;
+    int row_h   = 16;
+    int key_x   = 14;
+    int val_x   = 14 + 86;     /* 78 + 8 px gap, matches design's 78 px column */
+
+    for (int i = 0; i < n; i++) {
+        int baseline = row_top + i * row_h + 11;
+        atlas_render(&NUNITO_BOLD_9, key_x, baseline, KEYS[i], COL_INK_MUTED);
+        atlas_render(&NUNITO_REGULAR_11, val_x, baseline, vals[i], COL_INK);
+    }
 }
