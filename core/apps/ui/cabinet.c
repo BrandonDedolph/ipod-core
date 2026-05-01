@@ -191,7 +191,10 @@ void cabinet_draw(cabinet_t *c) {
     draw_status_bar(m->title);
 
     list_view_t v = current_view(c);
-    list_view_draw(&v, m->items, m->count, COL_INK, COL_CREAM, COL_ACCENT);
+    /* Per themes.jsx:464 (Theme 1 light), selBg = ink, selFg = cream.
+     * Terracotta (COL_ACCENT) is reserved for progress / play indicators,
+     * NOT the menu selector. */
+    list_view_draw(&v, m->items, m->count, COL_INK, COL_CREAM, COL_INK);
 }
 
 void cabinet_handle_button(cabinet_t *c, button_t btn) {
