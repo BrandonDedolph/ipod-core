@@ -157,22 +157,39 @@ button_t button_get(int timeout_ms) {
 
 /* ---------- Clock --------------------------------------------------- */
 
+/*
+ * Compute (now - g_start_ts) carefully: tv_nsec can be smaller than
+ * the start's tv_nsec, in which case the subtraction underflows when
+ * cast to unsigned. Handle the borrow first as signed math, then go
+ * unsigned.
+ */
+static void elapsed(struct timespec *now,
+                    int64_t *out_sec, int32_t *out_nsec) {
+    clock_gettime(CLOCK_MONOTONIC, now);
+    int64_t sec  = (int64_t)now->tv_sec  - (int64_t)g_start_ts.tv_sec;
+    int32_t nsec = (int32_t)now->tv_nsec - (int32_t)g_start_ts.tv_nsec;
+    if (nsec < 0) {
+        sec  -= 1;
+        nsec += 1000000000;
+    }
+    *out_sec  = sec;
+    *out_nsec = nsec;
+}
+
 uint32_t clock_ms(void) {
     struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    uint64_t delta_ms =
-        ((uint64_t)(now.tv_sec  - g_start_ts.tv_sec)) * 1000u +
-        ((uint64_t)(now.tv_nsec - g_start_ts.tv_nsec)) / 1000000u;
-    return (uint32_t)delta_ms;
+    int64_t sec; int32_t nsec;
+    elapsed(&now, &sec, &nsec);
+    uint64_t delta = (uint64_t)sec * 1000u + (uint64_t)nsec / 1000000u;
+    return (uint32_t)delta;
 }
 
 uint32_t clock_us(void) {
     struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    uint64_t delta_us =
-        ((uint64_t)(now.tv_sec  - g_start_ts.tv_sec)) * 1000000u +
-        ((uint64_t)(now.tv_nsec - g_start_ts.tv_nsec)) / 1000u;
-    return (uint32_t)delta_us;
+    int64_t sec; int32_t nsec;
+    elapsed(&now, &sec, &nsec);
+    uint64_t delta = (uint64_t)sec * 1000000u + (uint64_t)nsec / 1000u;
+    return (uint32_t)delta;
 }
 
 void sleep_ms(uint32_t ms) {
