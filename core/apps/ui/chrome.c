@@ -3,6 +3,7 @@
  */
 
 #include "chrome.h"
+#include "atlas.h"
 #include "../../hal/hal.h"
 
 #include <stdint.h>
@@ -155,21 +156,44 @@ void chrome_diagonal_stripes(int x, int y, int w, int h,
 }
 
 void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color) {
-    /* 14x7 body + 1x3 nub. */
-    /* Outline */
-    chrome_fill_rect(x,         y,     12, 1, color);    /* top */
-    chrome_fill_rect(x,         y + 6, 12, 1, color);    /* bottom */
-    chrome_fill_rect(x,         y,     1,  7, color);    /* left */
-    chrome_fill_rect(x + 11,    y,     1,  7, color);    /* right */
-    /* Nub */
-    chrome_fill_rect(x + 12,    y + 2, 2,  3, color);
-    /* Fill */
+    /*
+     * 32x11 body + 2x5 nub at right. Matches the SVG in
+     * design_handoff_rockbox_theme/themes.jsx Battery() — viewBox
+     * 0..32, body rect 0.5..28.5 / 0.5..10.5, nub at x=29 y=3 size 2x5,
+     * inner soft fill rect at x=2 y=2 width 25*level height 7 opacity 0.18.
+     *
+     * Inner fill rendered as ~20% blend toward the rectangle color so
+     * we don't need true alpha framebuffer ops; chrome_fill_rect
+     * over-writes, so we approximate by skipping the fill rect and
+     * relying on the percentage text being readable on the page bg.
+     * Good enough for the placeholder; revisit when a proper "tinted
+     * fill" primitive lands.
+     */
+
+    /* Outline (1 px stroke). */
+    chrome_fill_rect(x,         y,      29, 1,  color);    /* top */
+    chrome_fill_rect(x,         y + 10, 29, 1,  color);    /* bottom */
+    chrome_fill_rect(x,         y,      1,  11, color);    /* left */
+    chrome_fill_rect(x + 28,    y,      1,  11, color);    /* right */
+    /* Nub. */
+    chrome_fill_rect(x + 29,    y + 3,  2,  5,  color);
+
+    /* Percent text inside the body, centered horizontally. The design
+     * uses 7 px tabular bold; we use Bold-9 (closest atlas) and tuck
+     * the baseline so it fits inside the 11 px body. */
     if (level_pct < 0)   level_pct = 0;
     if (level_pct > 100) level_pct = 100;
-    int fill_w = (level_pct * 9) / 100;   /* interior is 10 wide; leave 1px margin */
-    if (fill_w > 0) {
-        chrome_fill_rect(x + 1, y + 2, fill_w, 3, color);
-    }
+    char buf[8];
+    int n = level_pct;
+    /* Hand-format "NN%" without snprintf (cheap, no <stdio> dep). */
+    if (n >= 100) { buf[0]='1'; buf[1]='0'; buf[2]='0'; buf[3]='%'; buf[4]=0; }
+    else if (n >= 10) { buf[0]='0'+(n/10); buf[1]='0'+(n%10); buf[2]='%'; buf[3]=0; }
+    else { buf[0]='0'+n; buf[1]='%'; buf[2]=0; }
+
+    int tw = atlas_text_width(&NUNITO_BOLD_9, buf);
+    int tx = x + (28 - tw) / 2;
+    int baseline = y + 9;
+    atlas_render(&NUNITO_BOLD_9, tx, baseline, buf, color);
 }
 
 void chrome_chevron(int x, int y, int size, lcd_pixel_t color) {

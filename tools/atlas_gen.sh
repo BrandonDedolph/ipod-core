@@ -37,4 +37,6 @@ gen Nunito-Regular.ttf  9 NUNITO_REGULAR_9  nunito_regular_9.h
 gen Nunito-Regular.ttf 11 NUNITO_REGULAR_11 nunito_regular_11.h
 gen Nunito-Regular.ttf 13 NUNITO_REGULAR_13 nunito_regular_13.h
 gen Nunito-Bold.ttf     9 NUNITO_BOLD_9     nunito_bold_9.h
+gen Nunito-Bold.ttf    11 NUNITO_BOLD_11    nunito_bold_11.h
+gen Nunito-Bold.ttf    13 NUNITO_BOLD_13    nunito_bold_13.h
 gen Nunito-Bold.ttf    17 NUNITO_BOLD_17    nunito_bold_17.h

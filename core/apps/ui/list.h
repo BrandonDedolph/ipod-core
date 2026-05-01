@@ -19,11 +19,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Geometry: 13px Nunito + 9 px vertical padding = 22 px per row.
- * 220 px tall (LCD_HEIGHT 240 - 20 status bar) / 22 = 10 visible rows. */
+/* Geometry: 13 px Nunito + 9 px vertical padding = 22 px per row.
+ * Status bar is 28 px (per the JSX spec — title + battery sit at
+ * y~8 with the row beneath the title starting around y~28). 212 px
+ * remain for the list / 22 = 9 visible rows. */
 #define LIST_ROW_H        22
-#define LIST_VISIBLE_ROWS 10
-#define LIST_TOP_Y        20
+#define LIST_VISIBLE_ROWS 9
+#define LIST_TOP_Y        28
 
 typedef struct list_view {
     int selected;        /* 0..count-1; the highlighted row */

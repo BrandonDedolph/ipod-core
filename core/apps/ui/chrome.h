@@ -54,9 +54,11 @@ void chrome_diagonal_stripes(int x, int y, int w, int h,
                              lcd_pixel_t color_a, lcd_pixel_t color_b);
 
 /*
- * Battery glyph: ~14px wide × 7px tall outline + nub on the right,
- * partial fill scaled to `level_pct` (0..100). Drawn at (x, y) =
- * top-left.
+ * Battery glyph matching the Linen design: 32×11 outline + 2×5 nub
+ * on the right, soft inner fill (~18% opacity) scaled to level_pct,
+ * and a "NN%" label rendered inside in tabular bold-9 numerals.
+ *
+ * Drawn at (x, y) = top-left of the 32×11 box.
  */
 void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color);
 

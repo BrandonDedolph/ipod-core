@@ -22,6 +22,8 @@
 #include "atlas/nunito_regular_11.h"
 #include "atlas/nunito_regular_13.h"
 #include "atlas/nunito_bold_9.h"
+#include "atlas/nunito_bold_11.h"
+#include "atlas/nunito_bold_13.h"
 #include "atlas/nunito_bold_17.h"
 
 /* ---------- Measurement -------------------------------------------- */

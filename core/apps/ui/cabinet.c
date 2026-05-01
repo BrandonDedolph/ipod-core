@@ -129,12 +129,20 @@ static void store_view(cabinet_t *c, const list_view_t *v) {
     c->list_state[c->depth - 1].scroll_offset = v->scroll_offset;
 }
 
+/*
+ * Menu status bar per design_handoff_rockbox_theme/themes.jsx
+ * Theme1MenuStrip (line 467+): no black band; title goes upper-left
+ * in Bold-13 ink color, battery glyph upper-right. Same cream
+ * background as the rest of the page. Padding 8 px top, 12 px sides.
+ */
 static void draw_status_bar(const char *title) {
-    chrome_fill_rect(0, 0, LCD_WIDTH, 20, COL_INK);
-    const atlas_t *t = &NUNITO_BOLD_17;
-    int w = atlas_text_width(t, title);
-    int x = (LCD_WIDTH - w) / 2;
-    atlas_render(t, x, 16, title, COL_CREAM);
+    /* Title left, ink Bold-13. Baseline ~18 (8 padding + 10 ascender). */
+    atlas_render(&NUNITO_BOLD_13, 12, 18, title, COL_INK);
+    /* Battery right, vertically centered against the title baseline.
+     * Glyph is 11 tall; align to ~y=8 so its body lines up with
+     * Bold-13 cap height. */
+    int bat_x = LCD_WIDTH - 12 - 31;
+    chrome_battery(bat_x, 8, 78, COL_INK);
 }
 
 static void push_menu(cabinet_t *c, int menu_id) {

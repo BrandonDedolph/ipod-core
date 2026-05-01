@@ -28,9 +28,15 @@
 #define COL_INK_MUTED   lcd_rgb(0x9A, 0x8E, 0x80)   /* labels / album */
 #define COL_TRACK_FAINT lcd_rgb(0xD8, 0xD2, 0xC8)   /* progress-bar bg */
 
-/* Album art stripe: two warm-tan tones, ~6 px stripe width. */
-#define COL_STRIPE_A    lcd_rgb(0xC7, 0xAF, 0x96)
-#define COL_STRIPE_B    lcd_rgb(0xB0, 0x99, 0x82)
+/*
+ * Album art stripe: two close-luminance warm tans, per the JSX
+ * `repeating-linear-gradient(135deg, oklch(0.78 0.04 30) 0 6px,
+ *                                    oklch(0.74 0.04 30) 6px 12px)`.
+ * OKLCH(0.78, 0.04, 30) ≈ #CDB8A6, OKLCH(0.74, 0.04, 30) ≈ #C0AB99 —
+ * subtle ~5% luminance difference, not the high-contrast tans I had.
+ */
+#define COL_STRIPE_A    lcd_rgb(0xCD, 0xB8, 0xA6)
+#define COL_STRIPE_B    lcd_rgb(0xC0, 0xAB, 0x99)
 
 /* ---------- Snapshot --------------------------------------------- */
 
@@ -49,20 +55,17 @@ void now_playing_load(now_playing_t *np, const audio_engine_t *engine) {
 
 /* Status bar specific to the NP screen — "Now Playing" left, simple
  * battery indicator + clock text right. */
+/*
+ * NP status bar per design_handoff_rockbox_theme/themes.jsx
+ * Theme1NowPlaying (line 178+): cream background (no band), padding
+ * 8 px top + 12 px sides, "Now Playing" title-case Bold-11 ink left,
+ * battery glyph right. Shuffle/repeat icons are still TODO.
+ */
 static void np_status_bar(int battery_pct) {
-    chrome_fill_rect(0, 0, LCD_WIDTH, 18, COL_BG);
-
-    /* Bottom-edge separator (1px faint). */
-    chrome_fill_rect(0, 17, LCD_WIDTH, 1,
-                     lcd_rgb(0xE8, 0xE0, 0xD4));
-
-    /* Left: "NOW PLAYING" small caps. Bold-9 in muted ink. */
-    atlas_render(&NUNITO_BOLD_9, 12, 12,
-                 "NOW PLAYING", COL_INK_MUTED);
-
-    /* Right: battery glyph. */
-    int bat_x = LCD_WIDTH - 12 - 14;
-    chrome_battery(bat_x, 5, battery_pct, COL_INK_MUTED);
+    /* Background already filled cream by the caller. */
+    atlas_render(&NUNITO_BOLD_11, 12, 17, "Now Playing", COL_INK);
+    int bat_x = LCD_WIDTH - 12 - 31;
+    chrome_battery(bat_x, 8, battery_pct, COL_INK);
 }
 
 static void format_time(uint32_t total_seconds, char *buf, size_t buflen) {
