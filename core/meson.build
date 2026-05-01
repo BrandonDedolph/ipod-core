@@ -64,17 +64,19 @@ else
   error('Unknown target "@0@" (use -Dtarget=hw or -Dtarget=sim)'.format(target))
 endif
 
-# Subsystems will be wired in here as they land:
+subdir('hal')         # hardware abstraction layer (sim or hw backend)
+
+# Sim target also gets the simulator entry point.
+if target == 'sim'
+  subdir('sim')
+endif
+
+# Future subsystems land here as they're written:
 #
-# subdir('boot')        # crt0, linker, image header
+# subdir('boot')        # crt0, linker, image header (hw only)
 # subdir('kernel')      # tasks, IPC, IRQs
-# subdir('hal')         # hardware abstraction
 # subdir('fs')          # FAT32
 # subdir('codecs')      # vendored decoders
 # subdir('apps/audio')  # audio engine
 # subdir('apps/db')     # tagcache
 # subdir('apps/ui')     # Cabinet shell
-# subdir('sim')         # sim main entry point (sim target only)
-#
-# Each subdir's meson.build adds files to a global library and lets the
-# top-level executable() pick them up.
