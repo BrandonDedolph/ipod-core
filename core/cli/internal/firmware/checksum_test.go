@@ -35,17 +35,14 @@ func TestChecksum_LargeNoWrap(t *testing.T) {
 }
 
 func TestChecksum_Wraps32Bit(t *testing.T) {
-	// 32 MB + 1 of 0xFF bytes: 0x101 * 0x100000 * 0xFF = 0xFF_FF_00_00 + 0xFF + carry
-	// Use 17 MB ≈ 0xFF_3F_FF_F1 which is just under wrap; then one more byte wraps.
-	// Practical test: feed (0xFFFF_FFFF / 0xFF) + 1 = ~16 MB + 4 bytes of 0xFF and
-	// confirm it wraps cleanly.
-	const size = (0xFFFF_FFFF / 0xFF) + 1 // 16,909,061 bytes
+	// Feed enough 0xFF bytes to overflow uint32 by 0xFF and confirm wrap to 0xFE.
+	// Size chosen so size*0xFF == 0xFFFFFFFF + 0xFF.
+	const size = (0xFFFF_FFFF / 0xFF) + 1
 	data := bytes.Repeat([]byte{0xFF}, size)
-	got := Checksum(0, data) // model = 0 to keep arithmetic simple
-	// Expected: (size * 0xFF) mod 2^32. size*0xFF = 0xFFFF_FFFF + 0xFF, wrap to 0xFE.
+	got := Checksum(0, data) // seed = 0; the wrap is the only thing under test
 	want := uint32(0xFE)
 	if got != want {
-		t.Errorf("Checksum(wrap) = %#x, want %#x (verifying 32-bit wrap)", got, want)
+		t.Errorf("Checksum(wrap) = %#x, want %#x", got, want)
 	}
 }
 

@@ -31,10 +31,10 @@ Both targets share one source tree; -Dtarget switches the configuration.`,
 				return err
 			}
 
-			make := exec.Command("make", "-C", coreDir, target)
-			make.Stdout = os.Stdout
-			make.Stderr = os.Stderr
-			return make.Run()
+			mk := exec.Command("make", "-C", coreDir, target)
+			mk.Stdout = os.Stdout
+			mk.Stderr = os.Stderr
+			return mk.Run()
 		},
 	}
 	return cmd
