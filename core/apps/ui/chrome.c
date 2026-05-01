@@ -123,6 +123,55 @@ void chrome_rounded_rect(int x, int y, int w, int h, int radius,
     }
 }
 
+void chrome_diagonal_stripes(int x, int y, int w, int h,
+                             int stripe_w, int radius,
+                             lcd_pixel_t color_a, lcd_pixel_t color_b) {
+    if (stripe_w < 1) stripe_w = 1;
+    int r2 = radius * radius;
+
+    for (int j = 0; j < h; j++) {
+        int py = y + j;
+        if (py < 0 || py >= LCD_HEIGHT) continue;
+        for (int i = 0; i < w; i++) {
+            int px = x + i;
+            if (px < 0 || px >= LCD_WIDTH) continue;
+
+            /* Corner cull for rounded rects. */
+            if (radius > 0) {
+                int dx = 0, dy = 0;
+                if (i < radius) dx = radius - i - 1;
+                else if (i >= w - radius) dx = i - (w - radius);
+                if (j < radius) dy = radius - j - 1;
+                else if (j >= h - radius) dy = j - (h - radius);
+                if (dx > 0 && dy > 0 && dx * dx + dy * dy >= r2) continue;
+            }
+
+            /* Diagonal lines: (i + j) // stripe_w alternates. */
+            int band = (i + j) / stripe_w;
+            lcd_pixel_t color = (band & 1) ? color_b : color_a;
+            lcd_framebuffer()[py * LCD_WIDTH + px] = color;
+        }
+    }
+}
+
+void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color) {
+    /* 14x7 body + 1x3 nub. */
+    /* Outline */
+    chrome_fill_rect(x,         y,     12, 1, color);    /* top */
+    chrome_fill_rect(x,         y + 6, 12, 1, color);    /* bottom */
+    chrome_fill_rect(x,         y,     1,  7, color);    /* left */
+    chrome_fill_rect(x + 11,    y,     1,  7, color);    /* right */
+    /* Nub */
+    chrome_fill_rect(x + 12,    y + 2, 2,  3, color);
+    /* Fill */
+    if (level_pct < 0)   level_pct = 0;
+    if (level_pct > 100) level_pct = 100;
+    int fill_w = (level_pct * 9) / 100;   /* interior is 10 wide; leave 1px margin */
+    if (fill_w > 0) {
+        chrome_fill_rect(x + 1, y + 2, fill_w, 3, color);
+    }
+}
+
 void chrome_chevron(int x, int y, int size, lcd_pixel_t color) {
     /*
      * Right-pointing triangle from (x, y) to (x+size, y+size).
