@@ -130,19 +130,19 @@ static void store_view(cabinet_t *c, const list_view_t *v) {
 }
 
 /*
- * Menu status bar per design_handoff_rockbox_theme/themes.jsx
- * Theme1MenuStrip (line 467+): no black band; title goes upper-left
- * in Bold-13 ink color, battery glyph upper-right. Same cream
- * background as the rest of the page. Padding 8 px top, 12 px sides.
+ * Menu status bar per themes.jsx MainMenu (line 467+):
+ *   padding "9px 14px 8px" + borderBottom 1px rgba(26,23,20,0.08)
+ *   "iPod" Bold-13 ink upper-left; Battery upper-right.
  */
 static void draw_status_bar(const char *title) {
-    /* Title left, ink Bold-13. Baseline ~18 (8 padding + 10 ascender). */
-    atlas_render(&NUNITO_BOLD_13, 12, 18, title, COL_INK);
-    /* Battery right, vertically centered against the title baseline.
-     * Glyph is 11 tall; align to ~y=8 so its body lines up with
-     * Bold-13 cap height. */
-    int bat_x = LCD_WIDTH - 12 - 31;
-    chrome_battery(bat_x, 8, 78, COL_INK);
+    /* Title left, Bold-13 ink. Baseline at y=22 (9 padding + ~13 ascender). */
+    atlas_render(&NUNITO_BOLD_13, 14, 22, title, COL_INK);
+    /* Battery right. Vertically aligned with the title's cap height. */
+    int bat_x = LCD_WIDTH - 14 - 31;
+    chrome_battery(bat_x, 12, 78, COL_INK);
+    /* Border line at y=30 — pre-composited 8% ink on cream. */
+    chrome_fill_rect(0, 30, LCD_WIDTH, 1,
+                     lcd_rgb(0xE2, 0xDE, 0xDA));
 }
 
 static void push_menu(cabinet_t *c, int menu_id) {
