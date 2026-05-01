@@ -1,59 +1,35 @@
 /*
  * core/sim/main.c — entry point for the host simulator (core-sim).
  *
- * Initializes the HAL, draws a test pattern, and runs an event loop.
- * Press SPACE to toggle a 440 Hz sine wave through the audio HAL —
- * a smoke test that the audio pipeline is wired end-to-end. Real
- * Cabinet UI + decoder integration lands in later PRs.
+ * Initializes the HAL, draws a Linen-palette test pattern, and runs an
+ * event loop. SPACE plays the FLAC fixture through the full audio
+ * pipeline (file -> dr_flac -> ring -> hal_audio -> SDL2 -> speakers).
+ * SPACE again pauses; pressing SPACE after EOS replays from the start.
+ *
+ * Real Cabinet UI port lands in a later PR; this is a smoke test that
+ * the audio engine works end-to-end with real codec input.
  */
 
+#include "../apps/audio/engine.h"
+#include "../codecs/dr_flac/flac.h"
 #include "../hal/hal.h"
 
-#include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+#define FIXTURE_PATH "tests/codec-vectors/sine_440hz_1s_44k_s16_stereo.flac"
 
 /* Linen palette colors (subset). Hex codes from the original mockups. */
 static lcd_pixel_t g_ink, g_cream, g_accent;
 
-/* ---------- Audio: sine-wave demo source --------------------------- */
-
-#define DEMO_SAMPLE_RATE 44100
-#define DEMO_CHANNELS    2
-#define DEMO_FREQ_HZ     440.0f
-#define DEMO_AMPLITUDE   8000     /* ~25% scale; quieter than fixture */
-
-typedef struct {
-    /* Phase accumulator in turns (0..1), to keep precision and avoid
-     * the 'sin(big number)' libm slowdown. */
-    float phase;
-    float phase_inc;       /* turns per frame */
-} sine_demo_t;
-
-static int sine_source_cb(void *user, int16_t *buf, int frames) {
-    sine_demo_t *s = (sine_demo_t *)user;
-    for (int i = 0; i < frames; i++) {
-        float v = sinf(2.0f * (float)M_PI * s->phase);
-        int16_t sample = (int16_t)(DEMO_AMPLITUDE * v);
-        for (int c = 0; c < DEMO_CHANNELS; c++) {
-            buf[i * DEMO_CHANNELS + c] = sample;
-        }
-        s->phase += s->phase_inc;
-        if (s->phase >= 1.0f) s->phase -= 1.0f;
-    }
-    return frames;
-}
-
 /* ---------- LCD: test pattern -------------------------------------- */
 
-static void draw_test_pattern(uint32_t frame, bool audio_on) {
+static void draw_test_pattern(uint32_t frame,
+                              bool audio_playing,
+                              uint32_t ring_fill) {
     lcd_pixel_t *fb = lcd_framebuffer();
-
-    /* Cream background. */
     lcd_fill(g_cream);
 
     /* Status bar — top 16 px in ink. */
@@ -71,9 +47,18 @@ static void draw_test_pattern(uint32_t frame, bool audio_on) {
         }
     }
 
-    /* "Selector" rectangle — color signals audio on/off so the demo is
-     * visible without sound (helpful when running headless). */
-    lcd_pixel_t sel = audio_on ? g_accent : g_ink;
+    /* Ring-fill bar — width proportional to how full the engine's
+     * audio ring is. Lights up only while audio is playing. */
+    int bar_w = (int)((ring_fill * (LCD_WIDTH - 32)) / AUDIO_RING_FRAMES);
+    if (bar_w > LCD_WIDTH - 32) bar_w = LCD_WIDTH - 32;
+    for (int y = 110; y < 120; y++) {
+        for (int x = 16; x < 16 + bar_w; x++) {
+            fb[y * LCD_WIDTH + x] = g_accent;
+        }
+    }
+
+    /* "Selector" rectangle — color signals audio on/off. */
+    lcd_pixel_t sel = audio_playing ? g_accent : g_ink;
     for (int y = 140; y < 165; y++) {
         for (int x = 16; x < LCD_WIDTH - 16; x++) {
             int cy = (y == 140 || y == 164) ? 1 : 0;
@@ -84,41 +69,70 @@ static void draw_test_pattern(uint32_t frame, bool audio_on) {
     }
 }
 
+/* ---------- Fixture loading --------------------------------------- */
+
+static long load_fixture(const char *path, void **out_buf) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    fseek(fp, 0, SEEK_END);
+    long n = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    void *buf = malloc((size_t)n);
+    if (!buf) { fclose(fp); return -1; }
+    if (fread(buf, 1, (size_t)n, fp) != (size_t)n) {
+        free(buf); fclose(fp); return -1;
+    }
+    fclose(fp);
+    *out_buf = buf;
+    return n;
+}
+
 /* ---------- main --------------------------------------------------- */
 
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
-    if (hal_init() != 0) {
-        return EXIT_FAILURE;
-    }
+    if (hal_init() != 0) return EXIT_FAILURE;
 
     g_ink    = lcd_rgb(0x1A, 0x17, 0x14);
     g_cream  = lcd_rgb(0xF4, 0xF1, 0xEC);
     g_accent = lcd_rgb(0xC4, 0x5A, 0x3A);
 
-    /* Set up the audio sine generator but don't start it yet. */
-    sine_demo_t sine = {
-        .phase     = 0.0f,
-        .phase_inc = DEMO_FREQ_HZ / (float)DEMO_SAMPLE_RATE,
-    };
-
-    bool audio_ok = false;
-    if (hal_audio_init(DEMO_SAMPLE_RATE, DEMO_CHANNELS) != 0) {
-        log_printf("hal_audio_init failed; sim runs without audio");
-    } else {
-        hal_audio_set_source(sine_source_cb, &sine);
-        audio_ok = true;
+    /* Try to load the FLAC fixture. The sim is expected to be run
+     * from core/ (either via `core build sim && ./build-sim/...` or
+     * `make sim && ./build-sim/sim/core-sim`). */
+    void *fixture_bytes = NULL;
+    long  fixture_len   = load_fixture(FIXTURE_PATH, &fixture_bytes);
+    if (fixture_len < 0) {
+        log_printf("warning: %s not found; SPACE will be a no-op", FIXTURE_PATH);
     }
 
-    log_printf("core-sim starting; q/Esc exits, SPACE toggles 440 Hz sine");
+    /* The audio engine is ~512 KB (statically-sized ring buffer),
+     * so it goes in BSS rather than on the main stack — matches what
+     * the hw target's audio task will need too. */
+    static audio_engine_t engine;
+    audio_engine_init(&engine);
+
+    log_printf("core-sim starting; q/Esc exits, SPACE plays/pauses %s",
+               fixture_len > 0 ? FIXTURE_PATH : "(no fixture)");
 
     uint32_t frame = 0;
     bool running   = true;
-    bool audio_on  = false;
     while (running) {
-        draw_test_pattern(frame, audio_on);
+        /* Pump the engine. Cheap if the ring is full or nothing is
+         * playing. */
+        audio_engine_pump(&engine);
+
+        /* If we hit EOS, stop cleanly so the next SPACE replays. */
+        if (audio_engine_eos(&engine)) {
+            log_printf("frame %u: EOS, stopping", frame);
+            audio_engine_stop(&engine);
+        }
+
+        draw_test_pattern(frame,
+                          audio_engine_is_playing(&engine),
+                          audio_engine_ring_fill(&engine));
         lcd_present();
 
         button_t b = button_get(16);
@@ -127,26 +141,38 @@ int main(int argc, char **argv) {
                 running = false;
                 break;
             case BUTTON_PLAY:
-                if (!audio_ok) {
-                    log_printf("frame %u: audio unavailable; SPACE ignored", frame);
-                } else if (audio_on) {
-                    hal_audio_stop();
-                    audio_on = false;
-                    log_printf("frame %u: audio off", frame);
+                if (fixture_len <= 0) {
+                    log_printf("frame %u: no fixture loaded; SPACE ignored", frame);
+                    break;
+                }
+                if (audio_engine_is_playing(&engine)) {
+                    /* Already playing → pause. */
+                    audio_engine_pause(&engine);
+                    log_printf("frame %u: paused", frame);
+                } else if (engine.has_decoder) {
+                    /* Paused mid-track → resume. */
+                    audio_engine_resume(&engine);
+                    log_printf("frame %u: resumed", frame);
                 } else {
-                    hal_audio_start();
-                    audio_on = true;
-                    log_printf("frame %u: audio on (440 Hz sine)", frame);
+                    /* Stopped or fresh → play from start. */
+                    int rc = audio_engine_play(&engine, flac_decoder_ops(),
+                                               fixture_bytes, (size_t)fixture_len);
+                    if (rc != 0) {
+                        log_printf("frame %u: audio_engine_play failed: %d", frame, rc);
+                    } else {
+                        log_printf("frame %u: playing %u Hz / %u ch",
+                                   frame, engine.sample_rate, engine.channels);
+                    }
                 }
                 break;
             case BUTTON_SELECT:
-                log_printf("frame %u: SELECT pressed", frame);
+                log_printf("frame %u: SELECT", frame);
                 break;
             case BUTTON_MENU:
-                log_printf("frame %u: MENU pressed", frame);
+                log_printf("frame %u: MENU", frame);
                 break;
             case BUTTON_SCROLL_FWD:
-                log_printf("frame %u: scroll forward", frame);
+                log_printf("frame %u: scroll fwd", frame);
                 break;
             case BUTTON_SCROLL_BACK:
                 log_printf("frame %u: scroll back", frame);
@@ -166,6 +192,8 @@ int main(int argc, char **argv) {
 
     log_printf("core-sim shutting down (ran %u frames, %u ms)",
                frame, clock_ms());
+    audio_engine_close(&engine);
+    free(fixture_bytes);
     hal_shutdown();
     return EXIT_SUCCESS;
 }

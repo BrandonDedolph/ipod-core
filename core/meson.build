@@ -65,7 +65,8 @@ else
 endif
 
 subdir('hal')         # hardware abstraction layer (sim or hw backend)
-subdir('codecs')      # vendored audio decoders (currently FLAC only)
+subdir('codecs')      # vendored audio decoders (FLAC + MP3)
+subdir('apps/audio')  # playback engine: decoder_t -> ring -> hal_audio
 
 # Sim target also gets the simulator entry point + the test harness.
 if target == 'sim'
@@ -78,6 +79,5 @@ endif
 # subdir('boot')        # crt0, linker, image header (hw only)
 # subdir('kernel')      # tasks, IPC, IRQs
 # subdir('fs')          # FAT32
-# subdir('apps/audio')  # audio engine
 # subdir('apps/db')     # tagcache
 # subdir('apps/ui')     # Cabinet shell
