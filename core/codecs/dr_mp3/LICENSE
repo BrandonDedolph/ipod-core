@@ -1,0 +1,26 @@
+dr_mp3 is dual-licensed under the public domain and MIT-0. We
+distribute it under the public domain option.
+
+The full license text is at the bottom of dr_mp3.h. The relevant
+public-domain dedication:
+
+    This is free and unencumbered software released into the public
+    domain.
+
+    Anyone is free to copy, modify, publish, use, compile, sell, or
+    distribute this software, either in source code form or as a
+    compiled binary, for any purpose, commercial or non-commercial,
+    and by any means.
+
+    [...]
+
+    For more information, please refer to <http://unlicense.org/>
+
+dr_mp3 is in turn based on minimp3 by Lieff (https://github.com/lieff/minimp3),
+licensed CC0 / public domain. The relevant copyright notice is preserved in
+dr_mp3.h.
+
+Source: https://github.com/mackron/dr_libs
+
+Vendored version: 0.7.4 (single header at master HEAD on 2026-04-30).
+To update: re-run core/codecs/dr_mp3/vendor.sh.

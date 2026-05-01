@@ -16,7 +16,10 @@ if target == 'sim'
   )
 
   vectors_dir = meson.current_source_dir() / 'codec-vectors'
-  test('codec-kat-flac', codec_kat,
+  # codec_kat runs every vendored codec's KAT in one binary; one
+  # meson test entry covers all of them. Failures print which codec
+  # failed via the [codec] label in stderr.
+  test('codec-kat', codec_kat,
        args: [vectors_dir],
        suite: 'unit')
 endif
