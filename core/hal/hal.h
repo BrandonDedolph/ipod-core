@@ -166,6 +166,13 @@ typedef int (*audio_source_fn)(void *userdata, int16_t *buf, int frames);
  * sample_rate is in Hz (typical: 44100, 48000). channels must be 1 or 2.
  * Returns 0 on success, negative on failure.
  *
+ * Strict on the device's capabilities: if the underlying audio system
+ * cannot give us *exactly* the requested rate and channel count, we
+ * return failure rather than silently resampling — wrong-pitch audio
+ * would be a worse failure mode than "device unavailable, fall back."
+ * Callers (the audio engine) are expected to retry with a different
+ * rate if the first try fails.
+ *
  * Idempotent — calling twice with the same parameters is a no-op;
  * calling with different parameters tears down and re-opens.
  *
@@ -174,8 +181,15 @@ typedef int (*audio_source_fn)(void *userdata, int16_t *buf, int frames);
 int hal_audio_init(uint32_t sample_rate, uint16_t channels);
 
 /*
- * Register the source callback. Must be called between hal_audio_init
- * and hal_audio_start. Pass fn = NULL to clear (silence on next pull).
+ * Register the source callback. Safe to call from any thread, at any
+ * time after hal_audio_init.
+ *
+ * Quiescence guarantee: when this function returns, the previously
+ * registered fn/userdata are no longer in flight in any callback.
+ * It is therefore safe to free `userdata` immediately after
+ * set_source returns with a different fn (or NULL).
+ *
+ * Pass fn = NULL to clear (silence on next pull).
  */
 void hal_audio_set_source(audio_source_fn fn, void *userdata);
 

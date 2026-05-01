@@ -104,10 +104,12 @@ int main(int argc, char **argv) {
         .phase_inc = DEMO_FREQ_HZ / (float)DEMO_SAMPLE_RATE,
     };
 
+    bool audio_ok = false;
     if (hal_audio_init(DEMO_SAMPLE_RATE, DEMO_CHANNELS) != 0) {
         log_printf("hal_audio_init failed; sim runs without audio");
     } else {
         hal_audio_set_source(sine_source_cb, &sine);
+        audio_ok = true;
     }
 
     log_printf("core-sim starting; q/Esc exits, SPACE toggles 440 Hz sine");
@@ -125,7 +127,9 @@ int main(int argc, char **argv) {
                 running = false;
                 break;
             case BUTTON_PLAY:
-                if (audio_on) {
+                if (!audio_ok) {
+                    log_printf("frame %u: audio unavailable; SPACE ignored", frame);
+                } else if (audio_on) {
                     hal_audio_stop();
                     audio_on = false;
                     log_printf("frame %u: audio off", frame);

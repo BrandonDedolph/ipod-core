@@ -221,6 +221,7 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels) {
         return 0;
     }
     if (g_audio_dev != 0) {
+        SDL_PauseAudioDevice(g_audio_dev, 1);
         SDL_CloseAudioDevice(g_audio_dev);
         g_audio_dev = 0;
     }
@@ -242,12 +243,30 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels) {
         .userdata = NULL,
     };
     SDL_AudioSpec got;
+    /* Pass `0` for allowed-changes — SDL will fail to open if it
+     * can't match exactly. We refuse silent resampling because the
+     * audio engine will produce wrong-pitch output if the rates
+     * differ; better to fail loud and let the engine retry at the
+     * device's preferred rate. */
     g_audio_dev = SDL_OpenAudioDevice(
         NULL, /* default output */ 0, &want, &got, 0);
     if (g_audio_dev == 0) {
         log_printf("hal/sim: SDL_OpenAudioDevice: %s", SDL_GetError());
         return -3;
     }
+
+    /* Belt-and-suspenders: even with allowed_changes=0, validate
+     * what SDL gave us. */
+    if (got.freq != want.freq || got.channels != want.channels
+        || got.format != want.format) {
+        log_printf("hal/sim: SDL gave %d Hz / %d ch / fmt=0x%04x; wanted %d / %d / 0x%04x",
+                   got.freq, got.channels, got.format,
+                   want.freq, want.channels, want.format);
+        SDL_CloseAudioDevice(g_audio_dev);
+        g_audio_dev = 0;
+        return -4;
+    }
+
     g_audio_spec_active = got;
     log_printf("hal/sim: audio open (%d Hz, %d ch, fmt=0x%04x, samples=%d)",
                got.freq, got.channels, got.format, got.samples);
@@ -271,12 +290,22 @@ void hal_audio_stop(void) {
 }
 
 void hal_audio_close(void) {
+    /* Lock so we don't race with a final in-flight callback. After
+     * SDL_CloseAudioDevice returns, no more callbacks fire — but
+     * one could be in flight when we enter this function. */
     if (g_audio_dev != 0) {
+        SDL_LockAudioDevice(g_audio_dev);
+        g_audio_src  = NULL;
+        g_audio_user = NULL;
+        SDL_UnlockAudioDevice(g_audio_dev);
+
+        SDL_PauseAudioDevice(g_audio_dev, 1);
         SDL_CloseAudioDevice(g_audio_dev);
         g_audio_dev = 0;
+    } else {
+        g_audio_src  = NULL;
+        g_audio_user = NULL;
     }
-    g_audio_src  = NULL;
-    g_audio_user = NULL;
 }
 
 /* ---------- Log ---------------------------------------------------- */
