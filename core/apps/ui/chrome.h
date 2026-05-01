@@ -17,6 +17,9 @@
 
 #include "../../hal/hal.h"
 
+#include <stdbool.h>
+#include <stdint.h>
+
 /*
  * Solid-fill rectangle, no AA. Clips to the LCD bounds.
  */
@@ -61,5 +64,39 @@ void chrome_diagonal_stripes(int x, int y, int w, int h,
  * Drawn at (x, y) = top-left of the 32×11 box.
  */
 void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color);
+
+/*
+ * Bresenham line, 1 px wide. Endpoints inclusive. Clipped to the
+ * LCD bounds.
+ */
+void chrome_line(int x0, int y0, int x1, int y1, lcd_pixel_t color);
+
+/*
+ * Blit an alpha-coverage bitmap into the framebuffer at (x, y), w × h
+ * pixels, blending `color` by each byte's alpha (0..255). Used for
+ * the small SVG-derived icons (shuffle, repeat, stars).
+ */
+void chrome_blit_alpha(int x, int y, int w, int h,
+                       const uint8_t *alpha, lcd_pixel_t color);
+
+/*
+ * Stylized shuffle / repeat / play icons matching the JSX SVGs in
+ * themes.jsx ShuffleIcon / RepeatIcon. Each renders into an 11×9 box
+ * at (x, y). Anti-aliased outlines via line drawing.
+ */
+void chrome_shuffle(int x, int y, lcd_pixel_t color);
+void chrome_repeat(int x, int y, lcd_pixel_t color);
+
+/*
+ * 5-point filled or outlined star, 8×8. Used for the rating row.
+ */
+void chrome_star(int x, int y, bool filled, lcd_pixel_t color);
+
+/*
+ * Soft-rounded outline rectangle (used for format badges). Just an
+ * outline — the interior is left untouched. radius typically ~2 px.
+ */
+void chrome_outline_rect(int x, int y, int w, int h, int radius,
+                         lcd_pixel_t color);
 
 #endif /* CORE_APPS_UI_CHROME_H */

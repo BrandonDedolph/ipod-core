@@ -233,6 +233,141 @@ void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color) {
     atlas_render(&NUNITO_BOLD_9, tx, baseline, buf, color);
 }
 
+void chrome_line(int x0, int y0, int x1, int y1, lcd_pixel_t color) {
+    /* Standard Bresenham. Clipping is per-pixel via put_pixel. */
+    int dx =  (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    int dy = -((y1 > y0) ? (y1 - y0) : (y0 - y1));
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    while (1) {
+        put_pixel(x0, y0, color, 255);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+void chrome_blit_alpha(int x, int y, int w, int h,
+                       const uint8_t *alpha, lcd_pixel_t color) {
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            uint8_t a = alpha[j * w + i];
+            if (a == 0) continue;
+            put_pixel(x + i, y + j, color, a);
+        }
+    }
+}
+
+void chrome_outline_rect(int x, int y, int w, int h, int radius,
+                         lcd_pixel_t color) {
+    if (w <= 0 || h <= 0) return;
+    if (radius < 1) {
+        chrome_fill_rect(x,         y,         w, 1, color);
+        chrome_fill_rect(x,         y + h - 1, w, 1, color);
+        chrome_fill_rect(x,         y,         1, h, color);
+        chrome_fill_rect(x + w - 1, y,         1, h, color);
+        return;
+    }
+    /* Top + bottom (skipping corner squares) */
+    chrome_fill_rect(x + radius, y,         w - 2 * radius, 1, color);
+    chrome_fill_rect(x + radius, y + h - 1, w - 2 * radius, 1, color);
+    /* Left + right */
+    chrome_fill_rect(x,         y + radius, 1, h - 2 * radius, color);
+    chrome_fill_rect(x + w - 1, y + radius, 1, h - 2 * radius, color);
+    /* Corner softening — partial-alpha inset pixels. */
+    for (int j = 0; j < radius; j++) {
+        for (int i = 0; i < radius; i++) {
+            int dx = radius - i;
+            int dy = radius - j;
+            int d2 = dx * dx + dy * dy;
+            int r2 = radius * radius;
+            /* On the outline ring (within ±0.5 of radius) — coverage ~70%.
+             * Skip pixels well outside (corner cull) and well inside. */
+            if (d2 >= r2 + radius || d2 < r2 - radius) continue;
+            put_pixel(x + i,             y + j,             color, 180);
+            put_pixel(x + w - 1 - i,     y + j,             color, 180);
+            put_pixel(x + i,             y + h - 1 - j,     color, 180);
+            put_pixel(x + w - 1 - i,     y + h - 1 - j,     color, 180);
+        }
+    }
+}
+
+/*
+ * Shuffle icon — two crossing arrow paths from themes.jsx ShuffleIcon.
+ * Drawn into 11×11 (slightly taller than the SVG's 11×9 to fit better
+ * with the battery's 11 px height in the status bar).
+ */
+void chrome_shuffle(int x, int y, lcd_pixel_t color) {
+    /* Top arrow path: enters from left, jumps diagonal, exits right with arrowhead. */
+    chrome_line(x + 0, y + 2, x + 3, y + 2, color);
+    chrome_line(x + 3, y + 2, x + 7, y + 8, color);
+    chrome_line(x + 7, y + 8, x + 9, y + 8, color);
+    /* Top arrowhead (right side, pointing right) */
+    chrome_line(x + 9, y + 8, x + 8,  y + 7,  color);
+    chrome_line(x + 9, y + 8, x + 8,  y + 9,  color);
+    /* Bottom arrow path */
+    chrome_line(x + 0, y + 8, x + 3, y + 8, color);
+    chrome_line(x + 3, y + 8, x + 5, y + 5, color);
+    chrome_line(x + 6, y + 4, x + 7, y + 2, color);
+    chrome_line(x + 7, y + 2, x + 9, y + 2, color);
+    /* Bottom arrowhead */
+    chrome_line(x + 9, y + 2, x + 8, y + 1, color);
+    chrome_line(x + 9, y + 2, x + 8, y + 3, color);
+}
+
+/*
+ * Repeat icon — looped arrows in a rounded rectangle path, with a
+ * small arrowhead on each end. Stylized vs the design (which has
+ * curved corners).
+ */
+void chrome_repeat(int x, int y, lcd_pixel_t color) {
+    /* Top half: horizontal stroke with arrowhead pointing right at end. */
+    chrome_line(x + 1, y + 1, x + 8, y + 1, color);
+    chrome_line(x + 8, y + 1, x + 8, y + 4, color);
+    /* Top arrowhead */
+    chrome_line(x + 8, y + 0, x + 9, y + 1, color);
+    chrome_line(x + 9, y + 1, x + 8, y + 2, color);
+    /* Bottom half: horizontal stroke with arrowhead pointing left at end. */
+    chrome_line(x + 9, y + 8, x + 2, y + 8, color);
+    chrome_line(x + 2, y + 8, x + 2, y + 5, color);
+    /* Bottom arrowhead */
+    chrome_line(x + 2, y + 7, x + 1, y + 8, color);
+    chrome_line(x + 1, y + 8, x + 2, y + 9, color);
+}
+
+/*
+ * 5-point star, 8×8, hand-pixeled alpha mask. Filled and outline
+ * variants. Coverage values approximate AA along the slanted edges.
+ */
+static const uint8_t STAR_FILLED[8 * 8] = {
+    0,    0,    0,    255,  255,  0,    0,    0,
+    0,    0,    0,    255,  255,  0,    0,    0,
+    255,  255,  255,  255,  255,  255,  255,  255,
+    180,  255,  255,  255,  255,  255,  255,  180,
+    0,    180,  255,  255,  255,  255,  180,  0,
+    0,    255,  255,  180,  180,  255,  255,  0,
+    0,    255,  180,  0,    0,    180,  255,  0,
+    180,  120,  0,    0,    0,    0,    120,  180,
+};
+
+static const uint8_t STAR_OUTLINE[8 * 8] = {
+    0,    0,    0,    255,  255,  0,    0,    0,
+    0,    0,    0,    255,  255,  0,    0,    0,
+    255,  255,  255,  0,    0,    255,  255,  255,
+    180,  0,    0,    0,    0,    0,    0,    180,
+    0,    180,  0,    0,    0,    0,    180,  0,
+    0,    255,  0,    180,  180,  0,    255,  0,
+    0,    255,  180,  0,    0,    180,  255,  0,
+    180,  120,  0,    0,    0,    0,    120,  180,
+};
+
+void chrome_star(int x, int y, bool filled, lcd_pixel_t color) {
+    chrome_blit_alpha(x, y, 8, 8,
+                      filled ? STAR_FILLED : STAR_OUTLINE, color);
+}
+
 void chrome_chevron(int x, int y, int size, lcd_pixel_t color) {
     /*
      * Thin right-pointing angle bracket (›) — two 1-px diagonals

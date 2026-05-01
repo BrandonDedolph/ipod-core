@@ -39,10 +39,16 @@
 #define NP_ARTIST_MAX 64
 #define NP_FORMAT_MAX 32
 
+#define NP_NEXT_MAX   80
+
 typedef struct {
     char     title[NP_TITLE_MAX];
     char     artist[NP_ARTIST_MAX];
-    char     format[NP_FORMAT_MAX];
+    char     album[NP_TITLE_MAX];          /* the album text under artist */
+    char     format[NP_FORMAT_MAX];        /* "FLAC" / "MP3" / etc — short */
+    char     format_detail[NP_FORMAT_MAX]; /* "44.1 kHz" / "192 kbps" / etc */
+    char     up_next[NP_NEXT_MAX];         /* next-track title */
+    int      stars;                        /* 0..5 */
     uint32_t total_frames;     /* 0 if unknown */
     uint32_t sample_rate;
     bool     loaded;
