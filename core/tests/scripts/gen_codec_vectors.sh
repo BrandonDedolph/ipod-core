@@ -23,6 +23,16 @@ trap 'rm -f "$CAPTURE_BIN"' EXIT
 
 mkdir -p "$VECTORS_DIR"
 
+# Preflight: ffmpeg must have libmp3lame for the MP3 encode step.
+# Without this check the user gets a less obvious "Unknown encoder"
+# error mid-run.
+if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libmp3lame; then
+    echo "ERROR: ffmpeg is installed but lacks libmp3lame support." >&2
+    echo "       MP3 fixture generation needs it; install ffmpeg with the" >&2
+    echo "       libmp3lame option (or rebuild from source) and retry." >&2
+    exit 1
+fi
+
 # Build the one-shot capture tool. This is intentionally NOT part of
 # the meson build — it's a fixture-generation helper, not a runtime
 # component. It's compiled fresh each run from the same dr_mp3.h the

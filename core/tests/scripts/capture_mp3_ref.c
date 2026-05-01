@@ -51,6 +51,16 @@ int main(int argc, char **argv) {
         free(buf);
         return 1;
     }
+    /* Match the runtime wrapper's channel guard so a 5.1 MP3 (which
+     * shouldn't ever exist in our test corpus) can't silently
+     * overflow our stereo-sized batch buffer below. */
+    if (d.channels > 2) {
+        fprintf(stderr, "channels=%u > 2; capture_mp3_ref only supports mono/stereo\n",
+                d.channels);
+        drmp3_uninit(&d);
+        free(buf);
+        return 1;
+    }
 
     FILE *fout = fopen(argv[2], "wb");
     if (!fout) { perror("open output"); drmp3_uninit(&d); free(buf); return 1; }

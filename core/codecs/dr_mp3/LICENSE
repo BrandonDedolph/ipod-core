@@ -22,5 +22,5 @@ dr_mp3.h.
 
 Source: https://github.com/mackron/dr_libs
 
-Vendored version: 0.7.4 (single header at master HEAD on 2026-05-01).
+Vendored version: 0.7.4 (single header at master HEAD on 2026-04-30).
 To update: re-run core/codecs/dr_mp3/vendor.sh.

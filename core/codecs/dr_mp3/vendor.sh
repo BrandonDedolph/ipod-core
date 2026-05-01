@@ -16,3 +16,8 @@ VER=$(awk -F'[" ]+' '/dr_mp3 - v[0-9]/ {print $4; exit}' "$DIR/dr_mp3.h")
 echo "    dr_mp3 version: $VER"
 
 echo "==> Update LICENSE manually with the new version string."
+echo "==> If dr_mp3 actually changed, re-run:"
+echo "      core/tests/scripts/gen_codec_vectors.sh"
+echo "    to re-bake the MP3 reference PCM (dr_mp3 output may have"
+echo "    drifted; the committed fixture is what dr_mp3 produced at"
+echo "    the previous version)."

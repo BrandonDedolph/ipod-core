@@ -8,7 +8,11 @@
  * decode hot path.
  *
  * Allocator: dr_mp3 mirrors dr_flac's drmp3_allocation_callbacks
- * struct. Same translation pattern as flac.c.
+ * struct. Same translation pattern as flac.c. When the caller passes
+ * NULL for decoder_alloc_t, we fall through to libc malloc — fine on
+ * sim; on hw (no malloc) the caller MUST pass a non-NULL struct
+ * backed by the audio engine's static sub-allocator, otherwise dr_mp3
+ * will silently fail at its first internal alloc.
  *
  * Channels: dr_mp3 only ever emits mono or stereo (MP3 doesn't have
  * higher channel counts in the formats we care about), so no guard
