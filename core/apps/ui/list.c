@@ -11,6 +11,8 @@
 #include "chrome.h"
 #include "../../hal/hal.h"
 
+#include <stdint.h>
+
 void list_view_init(list_view_t *v) {
     v->selected = 0;
     v->scroll_offset = 0;
@@ -24,9 +26,54 @@ void list_view_init(list_view_t *v) {
 #define CHEV_UNSEL  lcd_rgb(0xB0, 0xA8, 0x9E)   /* 0.4 ink on cream */
 #define CHEV_SEL    lcd_rgb(0xA0, 0x9C, 0x97)   /* 0.7 cream on ink */
 
+/* Internal: shared draw routine. `provider` returns the i'th item
+ * string. Both list_view_draw and list_view_draw_dyn delegate here. */
+static void draw_internal(const list_view_t *v,
+                          int count,
+                          const char *(*provider)(int idx, void *user),
+                          void *user,
+                          lcd_pixel_t fg, lcd_pixel_t bg,
+                          lcd_pixel_t selector_fg);
+
+/* Adapter: turn a (const char *const *items, int idx) pair into the
+ * provider signature. */
+static const char *array_provider(int idx, void *user) {
+    const char *const *items = (const char *const *)user;
+    return items[idx];
+}
+
 void list_view_draw(const list_view_t *v,
                     const char * const *items, int count,
                     lcd_pixel_t fg, lcd_pixel_t bg, lcd_pixel_t selector_fg) {
+    draw_internal(v, count, array_provider, (void *)items,
+                  fg, bg, selector_fg);
+}
+
+/* Wrapping the bare-fn callback in a small struct sidesteps the C
+ * pedantic prohibition on converting an object pointer to a function
+ * pointer (and back). */
+typedef struct { const char *(*fn)(int); } bare_fn_holder_t;
+
+static const char *bare_provider_glue(int idx, void *user) {
+    return ((bare_fn_holder_t *)user)->fn(idx);
+}
+
+void list_view_draw_dyn(const list_view_t *v,
+                        int count,
+                        const char *(*item_at)(int idx),
+                        lcd_pixel_t fg, lcd_pixel_t bg,
+                        lcd_pixel_t selector_fg) {
+    bare_fn_holder_t holder = { .fn = item_at };
+    draw_internal(v, count, bare_provider_glue, &holder,
+                  fg, bg, selector_fg);
+}
+
+static void draw_internal(const list_view_t *v,
+                          int count,
+                          const char *(*provider)(int idx, void *user),
+                          void *user,
+                          lcd_pixel_t fg, lcd_pixel_t bg,
+                          lcd_pixel_t selector_fg) {
     /* Clear the list region. */
     chrome_fill_rect(0, LIST_TOP_Y, LCD_WIDTH, LIST_VISIBLE_ROWS * LIST_ROW_H, bg);
 
@@ -44,6 +91,7 @@ void list_view_draw(const list_view_t *v,
          * glyph vertically centered with descenders fitting. */
         int baseline = row_top + LIST_ROW_H - 8;
         bool is_sel = (i == v->selected);
+        const char *label = provider(i, user);
 
         if (is_sel) {
             /* Selector: 6 px side margin, 4 px corner radius — per
@@ -51,9 +99,9 @@ void list_view_draw(const list_view_t *v,
             chrome_rounded_rect(6, row_top,
                                 LCD_WIDTH - 12, LIST_ROW_H,
                                 4, selector_fg);
-            atlas_render(body, 14, baseline, items[i], bg);
+            atlas_render(body, 14, baseline, label, bg);
         } else {
-            atlas_render(body, 14, baseline, items[i], fg);
+            atlas_render(body, 14, baseline, label, fg);
         }
 
         /*
