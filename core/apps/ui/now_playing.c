@@ -1,5 +1,13 @@
 /*
  * core/apps/ui/now_playing.c — NP screen renderer.
+ *
+ * Layout matches Theme 1 ("Linen") in design_handoff_rockbox_theme/
+ * themes.jsx — flex row: 84x84 album art on the left, text stack on
+ * the right. Status bar carries "Now Playing" + battery glyph.
+ *
+ * The art is a diagonal-stripe placeholder until ID3 + JPEG decode
+ * lands. Title / artist / album hardcoded for the FLAC fixture
+ * pending tagcache integration.
  */
 
 #include "now_playing.h"
@@ -12,19 +20,27 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---------- Linen palette ---------------------------------------- */
+/* ---------- Linen palette (per themes.jsx Theme 1) -------------- */
 
-#define COL_INK      lcd_rgb(0x1A, 0x17, 0x14)
-#define COL_CREAM    lcd_rgb(0xF4, 0xF1, 0xEC)
-#define COL_ACCENT   lcd_rgb(0xC4, 0x5A, 0x3A)
-#define COL_FAINT    lcd_rgb(0xC8, 0xC0, 0xB4)   /* art placeholder + bar bg */
-#define COL_INK_SOFT lcd_rgb(0x60, 0x55, 0x4A)   /* artist / format text */
+#define COL_BG          lcd_rgb(0xF4, 0xF1, 0xEC)   /* paper */
+#define COL_INK         lcd_rgb(0x1A, 0x17, 0x14)   /* primary text */
+#define COL_INK_DEEP    lcd_rgb(0x5A, 0x50, 0x48)   /* artist / time */
+#define COL_INK_MUTED   lcd_rgb(0x9A, 0x8E, 0x80)   /* labels / album */
+#define COL_TRACK_FAINT lcd_rgb(0xD8, 0xD2, 0xC8)   /* progress-bar bg */
+
+/*
+ * Album art stripe: two close-luminance warm tans, per the JSX
+ * `repeating-linear-gradient(135deg, oklch(0.78 0.04 30) 0 6px,
+ *                                    oklch(0.74 0.04 30) 6px 12px)`.
+ * OKLCH(0.78, 0.04, 30) ≈ #CDB8A6, OKLCH(0.74, 0.04, 30) ≈ #C0AB99 —
+ * subtle ~5% luminance difference, not the high-contrast tans I had.
+ */
+#define COL_STRIPE_A    lcd_rgb(0xCD, 0xB8, 0xA6)
+#define COL_STRIPE_B    lcd_rgb(0xC0, 0xAB, 0x99)
 
 /* ---------- Snapshot --------------------------------------------- */
 
 void now_playing_load(now_playing_t *np, const audio_engine_t *engine) {
-    /* Hardcoded for the FLAC fixture demo. When tagcache + ID3 land,
-     * this becomes a real metadata read. */
     snprintf(np->title,  NP_TITLE_MAX,  "Test Sine 440 Hz");
     snprintf(np->artist, NP_ARTIST_MAX, "Cabinet Demo");
     snprintf(np->format, NP_FORMAT_MAX, "FLAC %u kHz",
@@ -37,12 +53,19 @@ void now_playing_load(now_playing_t *np, const audio_engine_t *engine) {
 
 /* ---------- Helpers ---------------------------------------------- */
 
-static void status_bar(const char *title) {
-    chrome_fill_rect(0, 0, LCD_WIDTH, 20, COL_INK);
-    const atlas_t *t = &NUNITO_BOLD_17;
-    int w = atlas_text_width(t, title);
-    int x = (LCD_WIDTH - w) / 2;
-    atlas_render(t, x, 16, title, COL_CREAM);
+/* Status bar specific to the NP screen — "Now Playing" left, simple
+ * battery indicator + clock text right. */
+/*
+ * NP status bar per design_handoff_rockbox_theme/themes.jsx
+ * Theme1NowPlaying (line 178+): cream background (no band), padding
+ * 8 px top + 12 px sides, "Now Playing" title-case Bold-11 ink left,
+ * battery glyph right. Shuffle/repeat icons are still TODO.
+ */
+static void np_status_bar(int battery_pct) {
+    /* Background already filled cream by the caller. */
+    atlas_render(&NUNITO_BOLD_11, 12, 17, "Now Playing", COL_INK);
+    int bat_x = LCD_WIDTH - 12 - 31;
+    chrome_battery(bat_x, 8, battery_pct, COL_INK);
 }
 
 static void format_time(uint32_t total_seconds, char *buf, size_t buflen) {
@@ -58,81 +81,84 @@ static void format_time(uint32_t total_seconds, char *buf, size_t buflen) {
     }
 }
 
-/* Center a string of the given atlas at horizontal `cx`, baseline `y`. */
-static void draw_centered(const atlas_t *a, int cx, int y_baseline,
-                          const char *s, lcd_pixel_t fg) {
-    int w = atlas_text_width(a, s);
-    atlas_render(a, cx - w / 2, y_baseline, s, fg);
-}
-
 /* ---------- Draw --------------------------------------------------- */
 
 void now_playing_draw(const now_playing_t *np, const audio_engine_t *engine) {
     /* Background. */
-    lcd_fill(COL_CREAM);
+    lcd_fill(COL_BG);
 
-    /* Status bar — title is the track name. */
-    status_bar(np->loaded ? np->title : "Now Playing");
+    /* Status bar — battery is a stub (always 87%) until power HAL lands. */
+    np_status_bar(87);
 
     /*
-     * Layout (within the 220 px below the status bar):
-     *   y =  24..123  album art (100x100, centered horizontally)
-     *   y = 132..147  artist (regular 13)
-     *   y = 152..167  album/format (regular 13, soft ink)
-     *   y = 198..200  progress bar (3 px tall, full inset)
-     *   y = 210..226  time labels (regular 13, ink)
+     * Content area below status bar (y >= 18). Padding 18 px sides;
+     * art on the left at 84x84, text stack on the right starting
+     * at art_x + art_w + gap.
      */
+    int pad_x  = 18;
+    int art_w  = 84, art_h = 84;
+    int art_x  = pad_x;
+    int art_y  = 26;
+    int gap    = 14;
+    int text_x = art_x + art_w + gap;       /* = 116 */
 
-    /* --- Album art placeholder. Centered 100x100 stub rect. --- */
-    int art_w = 100, art_h = 100;
-    int art_x = (LCD_WIDTH - art_w) / 2;
-    int art_y = 28;
-    chrome_rounded_rect(art_x, art_y, art_w, art_h, 6, COL_FAINT);
-    /* Inset accent bar in the center to make it obvious this is a
-     * placeholder, not real art. */
-    chrome_fill_rect(art_x + 36, art_y + 46, 28, 8, COL_ACCENT);
+    /* Album art placeholder: rounded diagonal stripes. */
+    chrome_diagonal_stripes(art_x, art_y, art_w, art_h,
+                            6, 4, COL_STRIPE_A, COL_STRIPE_B);
+    /* Thin inset border to crisp the edge. */
+    chrome_fill_rect(art_x + 1, art_y + 1,         art_w - 2, 1,
+                     lcd_rgb(0xA0, 0x88, 0x70));
 
-    /* --- Artist (the title is in the status bar; make sense to put
-     * artist + album/format here so we don't repeat). --- */
+    /*
+     * Text stack:
+     *   "TRACK 1 OF 1" — Bold-9 muted (track counter)  baseline ~38
+     *   Title          — Bold-17 ink                   baseline ~58
+     *   Artist         — Regular-13 ink-deep           baseline ~78
+     *   Album          — Regular-11 ink-muted          baseline ~94
+     */
     if (np->loaded) {
-        draw_centered(&NUNITO_REGULAR_13, LCD_WIDTH / 2, 142,
-                      np->artist, COL_INK);
-        draw_centered(&NUNITO_REGULAR_13, LCD_WIDTH / 2, 158,
-                      np->format, COL_INK_SOFT);
+        atlas_render(&NUNITO_BOLD_9,    text_x, 38,
+                     "TRACK 1 OF 1",   COL_INK_MUTED);
+        atlas_render(&NUNITO_BOLD_17,   text_x, 60,
+                     np->title,        COL_INK);
+        atlas_render(&NUNITO_REGULAR_13, text_x, 80,
+                     np->artist,       COL_INK_DEEP);
+        atlas_render(&NUNITO_REGULAR_11, text_x, 96,
+                     np->format,       COL_INK_MUTED);
     }
 
-    /* --- Progress bar + time labels. --- */
-    uint32_t played = (uint32_t)engine->read_idx;
-    uint32_t total  = np->total_frames;
+    /* ---- Progress bar + time labels (bottom band). ---- */
+
+    uint32_t played   = (uint32_t)engine->read_idx;
+    uint32_t total    = np->total_frames;
     uint32_t played_s = (np->sample_rate > 0) ? played / np->sample_rate : 0;
-    uint32_t total_s  = (np->sample_rate > 0 && total > 0)
-                        ? total / np->sample_rate : 0;
+    uint32_t remain_s = (total > played && np->sample_rate > 0)
+                        ? (total - played) / np->sample_rate : 0;
 
-    /* Bar geometry: full-width with 24 px side margins, 3 px tall. */
-    int bar_x = 24, bar_y = 198, bar_w = LCD_WIDTH - 48, bar_h = 3;
-    chrome_fill_rect(bar_x, bar_y, bar_w, bar_h, COL_FAINT);
-
-    int fill_w = 0;
+    /* Bar: full-width minus 18 px sides, 3 px tall; ink fill on faint track. */
+    int bar_x = pad_x, bar_y = 222;
+    int bar_w = LCD_WIDTH - 2 * pad_x;
+    int bar_h = 3;
+    chrome_fill_rect(bar_x, bar_y, bar_w, bar_h, COL_TRACK_FAINT);
     if (total > 0 && played > 0) {
         if (played > total) played = total;
-        /* Avoid uint overflow on huge tracks. */
-        fill_w = (int)((uint64_t)played * (uint64_t)bar_w / (uint64_t)total);
-    }
-    if (fill_w > 0) {
-        chrome_fill_rect(bar_x, bar_y, fill_w, bar_h, COL_ACCENT);
+        int fill_w = (int)((uint64_t)played * (uint64_t)bar_w / (uint64_t)total);
+        chrome_fill_rect(bar_x, bar_y, fill_w, bar_h, COL_INK);
     }
 
-    /* Time labels — elapsed left, total right. */
+    /* Time labels above the bar — current left, remaining right
+     * (with leading "-" per the design spec). */
     char left[16], right[16];
     format_time(played_s, left, sizeof(left));
     if (total > 0) {
-        format_time(total_s, right, sizeof(right));
+        char tmp[16];
+        format_time(remain_s, tmp, sizeof(tmp));
+        snprintf(right, sizeof(right), "-%s", tmp);
     } else {
         snprintf(right, sizeof(right), "--:--");
     }
-    int label_y = 220;
-    atlas_render(&NUNITO_REGULAR_13, bar_x, label_y, left, COL_INK);
-    int rw = atlas_text_width(&NUNITO_REGULAR_13, right);
-    atlas_render(&NUNITO_REGULAR_13,
-                 bar_x + bar_w - rw, label_y, right, COL_INK);
+    int label_y = 215;
+    atlas_render(&NUNITO_BOLD_9, bar_x, label_y, left, COL_INK_DEEP);
+    int rw = atlas_text_width(&NUNITO_BOLD_9, right);
+    atlas_render(&NUNITO_BOLD_9, bar_x + bar_w - rw, label_y, right, COL_INK_DEEP);
 }

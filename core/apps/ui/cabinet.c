@@ -129,12 +129,20 @@ static void store_view(cabinet_t *c, const list_view_t *v) {
     c->list_state[c->depth - 1].scroll_offset = v->scroll_offset;
 }
 
+/*
+ * Menu status bar per themes.jsx MainMenu (line 467+):
+ *   padding "9px 14px 8px" + borderBottom 1px rgba(26,23,20,0.08)
+ *   "iPod" Bold-13 ink upper-left; Battery upper-right.
+ */
 static void draw_status_bar(const char *title) {
-    chrome_fill_rect(0, 0, LCD_WIDTH, 20, COL_INK);
-    const atlas_t *t = &NUNITO_BOLD_17;
-    int w = atlas_text_width(t, title);
-    int x = (LCD_WIDTH - w) / 2;
-    atlas_render(t, x, 16, title, COL_CREAM);
+    /* Title left, Bold-13 ink. Baseline at y=22 (9 padding + ~13 ascender). */
+    atlas_render(&NUNITO_BOLD_13, 14, 22, title, COL_INK);
+    /* Battery right. Vertically aligned with the title's cap height. */
+    int bat_x = LCD_WIDTH - 14 - 31;
+    chrome_battery(bat_x, 12, 78, COL_INK);
+    /* Border line at y=30 — pre-composited 8% ink on cream. */
+    chrome_fill_rect(0, 30, LCD_WIDTH, 1,
+                     lcd_rgb(0xE2, 0xDE, 0xDA));
 }
 
 static void push_menu(cabinet_t *c, int menu_id) {
@@ -183,7 +191,10 @@ void cabinet_draw(cabinet_t *c) {
     draw_status_bar(m->title);
 
     list_view_t v = current_view(c);
-    list_view_draw(&v, m->items, m->count, COL_INK, COL_CREAM, COL_ACCENT);
+    /* Per themes.jsx:464 (Theme 1 light), selBg = ink, selFg = cream.
+     * Terracotta (COL_ACCENT) is reserved for progress / play indicators,
+     * NOT the menu selector. */
+    list_view_draw(&v, m->items, m->count, COL_INK, COL_CREAM, COL_INK);
 }
 
 void cabinet_handle_button(cabinet_t *c, button_t btn) {

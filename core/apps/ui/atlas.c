@@ -18,7 +18,12 @@
  *   - const atlas_t <SYM>
  * So including them here makes the `<SYM>` consts available to the
  * rest of the firmware via extern in atlas.h. */
+#include "atlas/nunito_regular_9.h"
+#include "atlas/nunito_regular_11.h"
 #include "atlas/nunito_regular_13.h"
+#include "atlas/nunito_bold_9.h"
+#include "atlas/nunito_bold_11.h"
+#include "atlas/nunito_bold_13.h"
 #include "atlas/nunito_bold_17.h"
 
 /* ---------- Measurement -------------------------------------------- */

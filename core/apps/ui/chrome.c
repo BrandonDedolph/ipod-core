@@ -3,6 +3,7 @@
  */
 
 #include "chrome.h"
+#include "atlas.h"
 #include "../../hal/hal.h"
 
 #include <stdint.h>
@@ -123,24 +124,148 @@ void chrome_rounded_rect(int x, int y, int w, int h, int radius,
     }
 }
 
+void chrome_diagonal_stripes(int x, int y, int w, int h,
+                             int stripe_w, int radius,
+                             lcd_pixel_t color_a, lcd_pixel_t color_b) {
+    if (stripe_w < 1) stripe_w = 1;
+    int r2 = radius * radius;
+
+    for (int j = 0; j < h; j++) {
+        int py = y + j;
+        if (py < 0 || py >= LCD_HEIGHT) continue;
+        for (int i = 0; i < w; i++) {
+            int px = x + i;
+            if (px < 0 || px >= LCD_WIDTH) continue;
+
+            /* Corner cull for rounded rects. */
+            if (radius > 0) {
+                int dx = 0, dy = 0;
+                if (i < radius) dx = radius - i - 1;
+                else if (i >= w - radius) dx = i - (w - radius);
+                if (j < radius) dy = radius - j - 1;
+                else if (j >= h - radius) dy = j - (h - radius);
+                if (dx > 0 && dy > 0 && dx * dx + dy * dy >= r2) continue;
+            }
+
+            /* Diagonal lines: (i + j) // stripe_w alternates. */
+            int band = (i + j) / stripe_w;
+            lcd_pixel_t color = (band & 1) ? color_b : color_a;
+            lcd_framebuffer()[py * LCD_WIDTH + px] = color;
+        }
+    }
+}
+
+/*
+ * Alpha-blend a rectangle of `color` into the framebuffer at `alpha`
+ * (0..255). Used by chrome_battery for the soft-fill band.
+ * Clipping handled.
+ */
+static void chrome_alpha_rect(int x, int y, int w, int h,
+                              lcd_pixel_t color, uint8_t alpha) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > LCD_WIDTH)  w = LCD_WIDTH  - x;
+    if (y + h > LCD_HEIGHT) h = LCD_HEIGHT - y;
+    if (w <= 0 || h <= 0) return;
+    for (int row = y; row < y + h; row++) {
+        for (int col = x; col < x + w; col++) {
+            put_pixel(col, row, color, alpha);
+        }
+    }
+}
+
+void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color) {
+    /*
+     * 32x11 body + 2x5 nub at right. Matches the SVG in
+     * design_handoff_rockbox_theme/themes.jsx Battery() — viewBox
+     * 0..32, body rect 0.5..28.5 / 0.5..10.5 with rx=1.5, nub at
+     * x=29 y=3 size 2x5, inner soft fill rect at x=2 y=2 width
+     * 25*level height 7 opacity 0.18, "NN%" text centered at x=15.
+     */
+
+    if (level_pct < 0)   level_pct = 0;
+    if (level_pct > 100) level_pct = 100;
+
+    /* Soft inner fill band, ~18% alpha = 46/255. Drawn first so the
+     * outline strokes over it cleanly. Width scales with level: design
+     * formula is 25 * level, where level is 0..1. */
+    int fill_w = (level_pct * 25) / 100;
+    if (fill_w > 0) {
+        chrome_alpha_rect(x + 2, y + 2, fill_w, 7, color, 46);
+    }
+
+    /*
+     * Outline (1 px stroke) with rounded corners matching the design's
+     * rx=1.5. We drop the corner squares entirely and fade the two
+     * adjacent edge pixels at each corner with ~80% alpha — that gives
+     * about 1.5 px of visible rounding, equivalent to the SVG.
+     */
+    chrome_fill_rect(x + 2, y,      25, 1, color);    /* top */
+    chrome_fill_rect(x + 2, y + 10, 25, 1, color);    /* bottom */
+    chrome_fill_rect(x,     y + 2,  1,  7, color);    /* left */
+    chrome_fill_rect(x + 28,y + 2,  1,  7, color);    /* right */
+    /* Corner softening — partial alpha on the pixel adjacent to each
+     * inset edge. The actual corner pixel stays empty (no drawing). */
+    put_pixel(x + 1,  y,       color, 200);
+    put_pixel(x,      y + 1,   color, 200);
+    put_pixel(x + 27, y,       color, 200);
+    put_pixel(x + 28, y + 1,   color, 200);
+    put_pixel(x + 1,  y + 10,  color, 200);
+    put_pixel(x,      y + 9,   color, 200);
+    put_pixel(x + 27, y + 10,  color, 200);
+    put_pixel(x + 28, y + 9,   color, 200);
+
+    /* Nub: 2x5 solid rect. */
+    chrome_fill_rect(x + 29, y + 3, 2, 5, color);
+
+    /* Percent text inside the body, centered horizontally at x=15
+     * within the 28-wide body. Bold-9 is the closest atlas to the
+     * design's 7px tabular bold. */
+    char buf[8];
+    int n = level_pct;
+    if (n >= 100) { buf[0]='1'; buf[1]='0'; buf[2]='0'; buf[3]='%'; buf[4]=0; }
+    else if (n >= 10) { buf[0]='0'+(n/10); buf[1]='0'+(n%10); buf[2]='%'; buf[3]=0; }
+    else { buf[0]='0'+n; buf[1]='%'; buf[2]=0; }
+
+    int tw = atlas_text_width(&NUNITO_BOLD_9, buf);
+    int tx = x + (28 - tw) / 2 + 1;   /* +1 to center on the visual midline */
+    int baseline = y + 9;
+    atlas_render(&NUNITO_BOLD_9, tx, baseline, buf, color);
+}
+
 void chrome_chevron(int x, int y, int size, lcd_pixel_t color) {
     /*
-     * Right-pointing triangle from (x, y) to (x+size, y+size).
-     * Apex on the right edge at vertical center; base on the left.
-     * Per-row width:  row r in [0..size-1] -> width = size - 2*|r - size/2|
-     * Anti-aliased on the slanting edges via fractional coverage.
+     * Thin right-pointing angle bracket (›) — two 1-px diagonals
+     * meeting at a point on the right. Matches the Unicode ›
+     * (U+203A) used in the design, NOT a filled triangle.
+     *
+     * `size` is the height. Width is computed as (size/2 + 1) so the
+     * shape stays narrower than tall — matching how Nunito renders ›
+     * at small font sizes.
+     *
+     * For size=7, w=4:
+     *     X...     row 0: col 0
+     *     .X..     row 1: col 1
+     *     ..X.     row 2: col 2
+     *     ...X     row 3: col 3 (apex, at y_mid)
+     *     ..X.     row 4: col 2
+     *     .X..     row 5: col 1
+     *     X...     row 6: col 0
      */
-    int half = size / 2;
-    for (int r = 0; r < size; r++) {
-        int dist_from_mid = (r >= half) ? (r - half) : (half - 1 - r);
-        int row_w = size - 2 * dist_from_mid;
-        if (row_w <= 0) continue;
-        for (int c = 0; c < row_w; c++) {
-            put_pixel(x + c, y + r, color, 255);
-        }
-        /* AA: one pixel beyond the edge gets ~50% coverage to soften. */
-        if (row_w < size) {
-            put_pixel(x + row_w, y + r, color, 128);
+    if (size < 4) size = 4;
+    int h   = size;
+    int w   = h / 2 + 1;
+    int mid = h / 2;
+
+    for (int r = 0; r < h; r++) {
+        int dist_from_mid = (r >= mid) ? (r - mid) : (mid - r);
+        int col = (w - 1) - dist_from_mid;
+        if (col < 0) continue;
+        put_pixel(x + col, y + r, color, 255);
+        /* Light AA — partial-alpha pixel one column toward the apex
+         * to soften the staircase between rows. */
+        if (col + 1 < w && r != mid) {
+            put_pixel(x + col + 1, y + r, color, 90);
         }
     }
 }

@@ -19,11 +19,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Geometry: 13px Nunito + 9 px vertical padding = 22 px per row.
- * 220 px tall (LCD_HEIGHT 240 - 20 status bar) / 22 = 10 visible rows. */
-#define LIST_ROW_H        22
-#define LIST_VISIBLE_ROWS 10
-#define LIST_TOP_Y        20
+/* Geometry per themes.jsx MainMenu (line 467+):
+ *   Header: padding 9/14/8 + 13 px font + 1 px border = 31 px tall
+ *   List padding: 6 px top
+ *   Row: padding 7px top/bottom + 13 px font = 27 px each
+ *
+ * 7 visible rows × 27 = 189 px. Plus header 31 + list padding 6 + 6 =
+ * 232 px. Leaves 8 px below — same proportion as the mockup. */
+#define LIST_ROW_H        27
+#define LIST_VISIBLE_ROWS 7
+#define LIST_TOP_Y        37    /* header(31) + list-padding(6) */
 
 typedef struct list_view {
     int selected;        /* 0..count-1; the highlighted row */

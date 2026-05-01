@@ -16,6 +16,14 @@ void list_view_init(list_view_t *v) {
     v->scroll_offset = 0;
 }
 
+/*
+ * Chevron colors (faint, on each row's bg). Hardcoded approximations
+ * of design's `opacity: sel ? 0.7 : 0.4` against the row bg.
+ * Pre-composited so atlas_render's alpha blender doesn't have to know.
+ */
+#define CHEV_UNSEL  lcd_rgb(0xB0, 0xA8, 0x9E)   /* 0.4 ink on cream */
+#define CHEV_SEL    lcd_rgb(0xA0, 0x9C, 0x97)   /* 0.7 cream on ink */
+
 void list_view_draw(const list_view_t *v,
                     const char * const *items, int count,
                     lcd_pixel_t fg, lcd_pixel_t bg, lcd_pixel_t selector_fg) {
@@ -26,26 +34,40 @@ void list_view_draw(const list_view_t *v,
     int last  = first + LIST_VISIBLE_ROWS;
     if (last > count) last = count;
 
-    /* Use Nunito Regular 13px for body text. Baseline ~3 px above the
-     * row bottom so descenders fit. */
     const atlas_t *body = &NUNITO_REGULAR_13;
 
     for (int i = first; i < last; i++) {
         int row_idx = i - first;
         int row_top = LIST_TOP_Y + row_idx * LIST_ROW_H;
-        int baseline = row_top + LIST_ROW_H - 6;
+        /* Baseline near row bottom; for 27 px rows with 13 px font,
+         * baseline at row_top + LIST_ROW_H - 8 = top+19 keeps the
+         * glyph vertically centered with descenders fitting. */
+        int baseline = row_top + LIST_ROW_H - 8;
         bool is_sel = (i == v->selected);
 
         if (is_sel) {
-            /* Soft-rounded terracotta selector inset 4 px from each
-             * side; text rendered in the cream "bg" color on top. */
-            chrome_rounded_rect(4, row_top + 1,
-                                LCD_WIDTH - 8, LIST_ROW_H - 2,
+            /* Selector: 6 px side margin, 4 px corner radius — per
+             * the design's `margin: "0 6px"; borderRadius: 4`. */
+            chrome_rounded_rect(6, row_top,
+                                LCD_WIDTH - 12, LIST_ROW_H,
                                 4, selector_fg);
-            atlas_render(body, 12, baseline, items[i], bg);
+            atlas_render(body, 14, baseline, items[i], bg);
         } else {
-            atlas_render(body, 12, baseline, items[i], fg);
+            atlas_render(body, 14, baseline, items[i], fg);
         }
+
+        /*
+         * Trailing chevron at right edge — thin angle bracket (›).
+         * 7 px tall × 4 px wide; right-aligned with 14 px padding
+         * matching the design's `padding: '7px 14px'`. Vertically
+         * centered against the text x-height.
+         */
+        int chev_h = 7;
+        int chev_w = chev_h / 2 + 1;
+        int chev_x = LCD_WIDTH - 14 - chev_w;
+        int chev_y = row_top + (LIST_ROW_H - chev_h) / 2;
+        chrome_chevron(chev_x, chev_y, chev_h,
+                       is_sel ? CHEV_SEL : CHEV_UNSEL);
     }
 }
 

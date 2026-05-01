@@ -39,4 +39,27 @@ void chrome_rounded_rect(int x, int y, int w, int h, int radius,
  */
 void chrome_chevron(int x, int y, int size, lcd_pixel_t color);
 
+/*
+ * Diagonal-stripe pattern fill — used as the album-art placeholder
+ * when no real image is loaded. Fills the rect (x, y, w, h) with
+ * stripes alternating between `color_a` and `color_b`, each
+ * `stripe_w` pixels wide, running at 45 degrees.
+ *
+ * Optionally rounds the rect's corners (radius > 0). Caller-managed
+ * border (use chrome_rounded_rect or similar with a thin outline if
+ * needed).
+ */
+void chrome_diagonal_stripes(int x, int y, int w, int h,
+                             int stripe_w, int radius,
+                             lcd_pixel_t color_a, lcd_pixel_t color_b);
+
+/*
+ * Battery glyph matching the Linen design: 32×11 outline + 2×5 nub
+ * on the right, soft inner fill (~18% opacity) scaled to level_pct,
+ * and a "NN%" label rendered inside in tabular bold-9 numerals.
+ *
+ * Drawn at (x, y) = top-left of the 32×11 box.
+ */
+void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color);
+
 #endif /* CORE_APPS_UI_CHROME_H */

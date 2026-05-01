@@ -55,7 +55,12 @@ typedef struct {
 
 /* The atlases we ship (declared here, defined in generated .h files
  * pulled in by atlas.c). */
+extern const atlas_t NUNITO_REGULAR_9;
+extern const atlas_t NUNITO_REGULAR_11;
 extern const atlas_t NUNITO_REGULAR_13;
+extern const atlas_t NUNITO_BOLD_9;
+extern const atlas_t NUNITO_BOLD_11;
+extern const atlas_t NUNITO_BOLD_13;
 extern const atlas_t NUNITO_BOLD_17;
 
 /*
