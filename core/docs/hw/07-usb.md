@@ -73,9 +73,7 @@ Standard Bulk-Only Mass Storage allocation:
 - **EP1** — bulk-IN (device → host).
 - **EP2** — bulk-OUT (host → device).
 
-```c
-// Source: firmware/usbstack/usb_storage.c lines 325–328
-```
+(Source: `firmware/usbstack/usb_storage.c` lines 325–328.)
 
 ## Queue heads and transfer descriptors
 

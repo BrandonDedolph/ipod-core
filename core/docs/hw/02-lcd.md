@@ -54,16 +54,22 @@ Source: `firmware/target/arm/ipod/video/lcd-video.c` lines 40–57.
 
 ## Internal BCM addresses
 
-The BCM has its own SDRAM. Two regions matter to us:
+The BCM has its own SDRAM. Three absolute addresses (all in BCM-internal
+memory, addressed via `bcm_write_addr` / `bcm_write32`) matter to us:
 
-| Address (BCM-internal) | Purpose |
-|------------------------|---------|
-| `0xE0000`              | Framebuffer base (320×240×2 = 153,600 bytes) |
-| `0xE00000`             | Command parameter region (for `LCD_UPDATERECT` etc.) |
-| `0x1F8` from `BCMA_CMDPARAM` | `BCMA_COMMAND` — command code register |
+| Symbol           | Absolute addr | Purpose |
+|------------------|---------------|---------|
+| `BCMA_CMDPARAM`  | `0xE0000`     | Command parameter region — also serves as the framebuffer for `LCD_UPDATE` (full-frame writes start here; partial-rect writes use the same address with rect params elsewhere) |
+| `BCMA_COMMAND`   | `0x1F8`       | Command-code register — write the `BCM_CMD(...)` encoded value here, then strobe `BCM_CONTROL = 0x31` to execute |
+| (parameter alt)  | `0xE00000`    | Higher-up command parameter region used by `LCD_UPDATERECT` (Rockbox doesn't drive this) |
 
 Pixel `(x, y)` in the framebuffer is at offset `(LCD_WIDTH * 2) * y +
 (x * 2)` from `0xE0000`, RGB565 little-endian.
+
+The framebuffer-as-parameter-region overlap is intentional: for the
+full-frame `LCD_UPDATE` command the BCM expects the full 153,600 bytes
+of pixel data starting at `BCMA_CMDPARAM`, then the command itself is
+written to `BCMA_COMMAND` (a separate register, not an offset).
 
 ## Commands
 

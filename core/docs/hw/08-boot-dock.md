@@ -105,27 +105,33 @@ UART debug interface, line-level audio out, accessory ID, and a few
 control lines. Not all of this is in the Rockbox source — much of
 the pinout is reverse-engineered iPodLinux work.
 
-| Pin   | Function (5G)                |
-|-------|------------------------------|
-| 1, 2  | GND                          |
-| 3, 4  | Audio L/R out (line level)   |
-| 5     | Audio GND                    |
-| 8, 9  | Video out                    |
-| 11    | Serial GND                   |
-| 13    | UART TX (`SER0_THR` from SoC) |
-| 14    | UART RX (`SER0_RBR` to SoC)   |
-| 15, 19, 20 | Reserved / accessory power |
-| 16    | USB GND                      |
-| 23    | USB +5 V                     |
-| 25    | USB D−                       |
-| 27    | USB D+                       |
-| 21    | Accessory ID (resistor divider) |
-| 25–30 | FireWire data + power (ignored if USB is the cable in use) |
+| Pin   | Function (5G)                                   |
+|-------|-------------------------------------------------|
+| 1, 2  | GND                                             |
+| 3, 4  | Audio L / R out (line level)                    |
+| 5     | Audio GND                                       |
+| 8, 9  | Video out                                       |
+| 11    | Serial GND                                      |
+| 13    | UART TX (`SER0_THR` from SoC)                   |
+| 14    | UART RX (`SER0_RBR` to SoC)                     |
+| 15    | Reserved                                        |
+| 16    | USB GND                                         |
+| 19, 20| Accessory power                                 |
+| 21    | Accessory ID (resistor divider)                 |
+| 23    | USB +5 V                                        |
+| 25    | USB D−                                          |
+| 27    | USB D+                                          |
+| 26, 28, 29, 30 | FireWire data + power (only used when FireWire is the carrier; idle when over USB) |
 
 > Pin assignments differ between iPod models and across some
 > revisions. The 5G/5.5G layout above is what's documented in the
 > iPodLinux pinout pages and what Rockbox's `serial-ipod-pp.c`
 > assumes when it routes UART.
+>
+> Note: pin 25 carries USB D− on the iPod Video. Earlier docs
+> sometimes describe pins 25–30 collectively as the "FireWire region"
+> because on a FireWire-only iPod the same physical pins are
+> repurposed; on the 5G the assignments above are exclusive.
 
 ## UART debug
 

@@ -5,7 +5,9 @@ an integrated PMIC (PMU + RTC + ADC + charge controller interface) —
 plus a separate **LTC4066** charger IC that the firmware controls
 through GPIO current-limit signals.
 
-The PCF50605 talks to the SoC over I²C at address `0x08`. It owns:
+The PCF50605 sits on I²C at bus address `0x08` (the *device* address;
+unrelated to its internal register `OOCC1` further down which also
+happens to be at offset `0x08` — easy to confuse). It owns:
 
 - DCDC converters (1.2 V core, 3.0 V I/O).
 - ADC (battery voltage, charge state, temperature on a channel we don't use).
