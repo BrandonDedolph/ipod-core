@@ -12,8 +12,7 @@
 #include <stdlib.h>
 
 /* Linen palette colors (subset). Hex codes from the original mockups. */
-static const lcd_pixel_t COLOR_INK     = 0;          /* set in main */
-static lcd_pixel_t       g_ink, g_cream, g_accent;
+static lcd_pixel_t g_ink, g_cream, g_accent;
 
 static void draw_test_pattern(uint32_t frame) {
     lcd_pixel_t *fb = lcd_framebuffer();
@@ -59,7 +58,6 @@ int main(int argc, char **argv) {
     g_ink    = lcd_rgb(0x1A, 0x17, 0x14);   /* near-black ink */
     g_cream  = lcd_rgb(0xF4, 0xF1, 0xEC);   /* warm cream */
     g_accent = lcd_rgb(0xC4, 0x5A, 0x3A);   /* terracotta */
-    (void)COLOR_INK;
 
     log_printf("core-sim starting; press q or Esc to exit");
 

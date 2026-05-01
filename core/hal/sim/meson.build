@@ -1,6 +1,6 @@
 # SDL2-backed HAL implementation for host builds.
 hal_lib = static_library(
-  'hal',
+  'core_hal_sim',
   sources: ['sim_hal.c'],
   dependencies: [sdl2_dep],
   include_directories: include_directories('..'),

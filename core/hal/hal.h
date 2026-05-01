@@ -75,9 +75,15 @@ void lcd_fill(lcd_pixel_t color);
 
 /*
  * Button bitmap. Multiple bits can be set (e.g. SELECT held while
- * SCROLL_FWD).  The values match the iPod's wheel-packet button bits
- * (see core/docs/hw/03-clickwheel.md) so the hw backend can pass them
- * through unchanged.
+ * SCROLL_FWD).
+ *
+ * These are *logical* button identifiers, NOT the iPod's wheel-packet
+ * bit positions (which live at bits 8–12 per
+ * core/docs/hw/03-clickwheel.md). The hw backend translates between
+ * the two; sim and any future test fixtures emit logical bits
+ * directly. We diverge from the wheel-packet layout deliberately so
+ * we can fit BUTTON_HOLD / BUTTON_QUIT / future synthetic events into
+ * the same bitmap without colliding with the wheel-packet wire format.
  */
 typedef enum {
     BUTTON_NONE        = 0,

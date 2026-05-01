@@ -7,5 +7,8 @@ if target == 'sim'
   subdir('sim')
 elif target == 'hw'
   # subdir('hw')   # lands in PR introducing register-touching drivers
-  message('hal/hw not yet populated — hw target produces no library')
+  message('hal/hw not yet populated — declaring stub hal_dep so subdirs can link')
+  hal_dep = declare_dependency(
+    include_directories: include_directories('.'),
+  )
 endif
