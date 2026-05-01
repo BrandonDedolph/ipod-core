@@ -235,22 +235,37 @@ void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color) {
 
 void chrome_chevron(int x, int y, int size, lcd_pixel_t color) {
     /*
-     * Right-pointing triangle from (x, y) to (x+size, y+size).
-     * Apex on the right edge at vertical center; base on the left.
-     * Per-row width:  row r in [0..size-1] -> width = size - 2*|r - size/2|
-     * Anti-aliased on the slanting edges via fractional coverage.
+     * Thin right-pointing angle bracket (›) — two 1-px diagonals
+     * meeting at a point on the right. Matches the Unicode ›
+     * (U+203A) used in the design, NOT a filled triangle.
+     *
+     * `size` is the height. Width is computed as (size/2 + 1) so the
+     * shape stays narrower than tall — matching how Nunito renders ›
+     * at small font sizes.
+     *
+     * For size=7, w=4:
+     *     X...     row 0: col 0
+     *     .X..     row 1: col 1
+     *     ..X.     row 2: col 2
+     *     ...X     row 3: col 3 (apex, at y_mid)
+     *     ..X.     row 4: col 2
+     *     .X..     row 5: col 1
+     *     X...     row 6: col 0
      */
-    int half = size / 2;
-    for (int r = 0; r < size; r++) {
-        int dist_from_mid = (r >= half) ? (r - half) : (half - 1 - r);
-        int row_w = size - 2 * dist_from_mid;
-        if (row_w <= 0) continue;
-        for (int c = 0; c < row_w; c++) {
-            put_pixel(x + c, y + r, color, 255);
-        }
-        /* AA: one pixel beyond the edge gets ~50% coverage to soften. */
-        if (row_w < size) {
-            put_pixel(x + row_w, y + r, color, 128);
+    if (size < 4) size = 4;
+    int h   = size;
+    int w   = h / 2 + 1;
+    int mid = h / 2;
+
+    for (int r = 0; r < h; r++) {
+        int dist_from_mid = (r >= mid) ? (r - mid) : (mid - r);
+        int col = (w - 1) - dist_from_mid;
+        if (col < 0) continue;
+        put_pixel(x + col, y + r, color, 255);
+        /* Light AA — partial-alpha pixel one column toward the apex
+         * to soften the staircase between rows. */
+        if (col + 1 < w && r != mid) {
+            put_pixel(x + col + 1, y + r, color, 90);
         }
     }
 }

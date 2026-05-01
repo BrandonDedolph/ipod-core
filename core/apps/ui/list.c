@@ -56,12 +56,17 @@ void list_view_draw(const list_view_t *v,
             atlas_render(body, 14, baseline, items[i], fg);
         }
 
-        /* Trailing chevron at right edge. Sized ~6 px square,
-         * vertically centered against the text x-height. */
-        int chev_size = 6;
-        int chev_x    = LCD_WIDTH - 14 - chev_size;
-        int chev_y    = baseline - 9;   /* roughly centered with text */
-        chrome_chevron(chev_x, chev_y, chev_size,
+        /*
+         * Trailing chevron at right edge — thin angle bracket (›).
+         * 7 px tall × 4 px wide; right-aligned with 14 px padding
+         * matching the design's `padding: '7px 14px'`. Vertically
+         * centered against the text x-height.
+         */
+        int chev_h = 7;
+        int chev_w = chev_h / 2 + 1;
+        int chev_x = LCD_WIDTH - 14 - chev_w;
+        int chev_y = row_top + (LIST_ROW_H - chev_h) / 2;
+        chrome_chevron(chev_x, chev_y, chev_h,
                        is_sel ? CHEV_SEL : CHEV_UNSEL);
     }
 }
