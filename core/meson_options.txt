@@ -12,3 +12,6 @@ option(
   value: false,
   description: 'Compile out debug logging (printf, dbg() macro)',
 )
+# TODO(release): wire this through to a -DRELEASE define in the C build
+# once the kernel logging layer lands (PR introducing apps/ui or kernel/).
+# Until then this option is parsed but inert.

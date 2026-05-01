@@ -31,11 +31,21 @@ core/
 └── scripts/     build helpers
 ```
 
+## Prerequisites
+
+Run `../tools/install_deps.sh` from the repo root to install everything
+in one shot (asdf-managed Go + system packages via your distro's
+package manager). Specifically you need:
+
+- `meson` ≥ 0.62, `ninja`, `pkg-config`
+- `libsdl2-dev` / `sdl2` (for `make sim`)
+- `arm-none-eabi-gcc` 13+ with `binutils` and `newlib` (for `make hw`)
+
 ## Quick start
 
 ```bash
-make sim    # builds the simulator (host)
-make hw     # builds the firmware image (ARM)
+make sim    # builds the simulator (host) — requires SDL2 dev headers
+make hw     # builds the firmware image (ARM cross-toolchain)
 make help   # see all targets
 ```
 

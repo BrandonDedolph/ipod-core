@@ -25,10 +25,12 @@ endian     = 'little'
 [built-in options]
 c_args = [
   '-mcpu=arm7tdmi',
-  '-mthumb-interwork',
   '-ffreestanding',
 ]
 c_link_args = [
   '-nostdlib',
   '-nostartfiles',
 ]
+# Note: -mthumb-interwork was removed — it's a no-op on arm-none-eabi-gcc
+# 5+ (which has handled ARM/Thumb interworking automatically since then).
+# Add -mthumb explicitly per-file if/when we want Thumb code.

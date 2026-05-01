@@ -14,7 +14,7 @@ project(
   'core',
   'c',
   version: '0.0.1',
-  license: 'GPL-2.0-or-later',
+  license: 'Apache-2.0',
   default_options: [
     'c_std=gnu11',
     'warning_level=3',
@@ -41,18 +41,13 @@ common_link_args = [
 ]
 
 if target == 'hw'
-  # ARM cross-build. Cross file pins the toolchain (see cross/arm-none-eabi.txt).
+  # ARM cross-build. Toolchain + ARM-specific flags live in
+  # cross/arm-none-eabi.txt under [built-in options]; we add only the
+  # freestanding-correctness flags that don't belong in the cross file.
   common_c_args += [
-    '-mcpu=arm7tdmi',
-    '-mthumb-interwork',
-    '-ffreestanding',
     '-fno-builtin',
     '-fno-common',
     '-fno-stack-protector',
-  ]
-  common_link_args += [
-    '-nostdlib',
-    '-nostartfiles',
   ]
   add_project_arguments(common_c_args, language: 'c')
   add_project_link_arguments(common_link_args, language: 'c')
