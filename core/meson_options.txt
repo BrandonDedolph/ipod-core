@@ -1,0 +1,14 @@
+option(
+  'target',
+  type: 'combo',
+  choices: ['hw', 'sim'],
+  value: 'sim',
+  description: 'Build target: hw (iPod ARM) or sim (host with SDL2)',
+)
+
+option(
+  'release',
+  type: 'boolean',
+  value: false,
+  description: 'Compile out debug logging (printf, dbg() macro)',
+)

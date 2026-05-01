@@ -1,0 +1,15 @@
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 2, June 1991
+
+ Copyright (C) 1989, 1991 Free Software Foundation, Inc.,
+ 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+The original firmware code in this directory is licensed under the GNU
+General Public License version 2 or later, matching Rockbox (which we
+use as a reference, not a dependency). Vendored third-party codec
+libraries retain their own licenses — see the LICENSE file inside each
+codecs/<name>/ subdirectory.
+
+For the full GPL-2.0 text, see https://www.gnu.org/licenses/gpl-2.0.txt
