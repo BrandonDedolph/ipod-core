@@ -155,43 +155,75 @@ void chrome_diagonal_stripes(int x, int y, int w, int h,
     }
 }
 
+/*
+ * Alpha-blend a rectangle of `color` into the framebuffer at `alpha`
+ * (0..255). Used by chrome_battery for the soft-fill band.
+ * Clipping handled.
+ */
+static void chrome_alpha_rect(int x, int y, int w, int h,
+                              lcd_pixel_t color, uint8_t alpha) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > LCD_WIDTH)  w = LCD_WIDTH  - x;
+    if (y + h > LCD_HEIGHT) h = LCD_HEIGHT - y;
+    if (w <= 0 || h <= 0) return;
+    for (int row = y; row < y + h; row++) {
+        for (int col = x; col < x + w; col++) {
+            put_pixel(col, row, color, alpha);
+        }
+    }
+}
+
 void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color) {
     /*
      * 32x11 body + 2x5 nub at right. Matches the SVG in
      * design_handoff_rockbox_theme/themes.jsx Battery() — viewBox
-     * 0..32, body rect 0.5..28.5 / 0.5..10.5, nub at x=29 y=3 size 2x5,
-     * inner soft fill rect at x=2 y=2 width 25*level height 7 opacity 0.18.
-     *
-     * Inner fill rendered as ~20% blend toward the rectangle color so
-     * we don't need true alpha framebuffer ops; chrome_fill_rect
-     * over-writes, so we approximate by skipping the fill rect and
-     * relying on the percentage text being readable on the page bg.
-     * Good enough for the placeholder; revisit when a proper "tinted
-     * fill" primitive lands.
+     * 0..32, body rect 0.5..28.5 / 0.5..10.5 with rx=1.5, nub at
+     * x=29 y=3 size 2x5, inner soft fill rect at x=2 y=2 width
+     * 25*level height 7 opacity 0.18, "NN%" text centered at x=15.
      */
 
-    /* Outline (1 px stroke). */
-    chrome_fill_rect(x,         y,      29, 1,  color);    /* top */
-    chrome_fill_rect(x,         y + 10, 29, 1,  color);    /* bottom */
-    chrome_fill_rect(x,         y,      1,  11, color);    /* left */
-    chrome_fill_rect(x + 28,    y,      1,  11, color);    /* right */
-    /* Nub. */
-    chrome_fill_rect(x + 29,    y + 3,  2,  5,  color);
-
-    /* Percent text inside the body, centered horizontally. The design
-     * uses 7 px tabular bold; we use Bold-9 (closest atlas) and tuck
-     * the baseline so it fits inside the 11 px body. */
     if (level_pct < 0)   level_pct = 0;
     if (level_pct > 100) level_pct = 100;
+
+    /* Soft inner fill band, ~18% alpha = 46/255. Drawn first so the
+     * outline strokes over it cleanly. Width scales with level: design
+     * formula is 25 * level, where level is 0..1. */
+    int fill_w = (level_pct * 25) / 100;
+    if (fill_w > 0) {
+        chrome_alpha_rect(x + 2, y + 2, fill_w, 7, color, 46);
+    }
+
+    /*
+     * Outline (1 px stroke) with soft corners. The design's rx=1.5
+     * rounding at this resolution is essentially "skip the four
+     * absolute-corner pixels" — that's enough to read as rounded
+     * without doing real AA curves at 11 px tall.
+     */
+    chrome_fill_rect(x + 1, y,      27, 1,  color);    /* top */
+    chrome_fill_rect(x + 1, y + 10, 27, 1,  color);    /* bottom */
+    chrome_fill_rect(x,     y + 1,  1,  9,  color);    /* left */
+    chrome_fill_rect(x + 28,y + 1,  1,  9,  color);    /* right */
+    /* Half-pixel softening at each corner via low-alpha pixel. */
+    put_pixel(x,      y,      color, 128);
+    put_pixel(x + 28, y,      color, 128);
+    put_pixel(x,      y + 10, color, 128);
+    put_pixel(x + 28, y + 10, color, 128);
+
+    /* Nub: 2x5 solid rect. */
+    chrome_fill_rect(x + 29, y + 3, 2, 5, color);
+
+    /* Percent text inside the body, centered horizontally at x=15
+     * within the 28-wide body. Bold-9 is the closest atlas to the
+     * design's 7px tabular bold. */
     char buf[8];
     int n = level_pct;
-    /* Hand-format "NN%" without snprintf (cheap, no <stdio> dep). */
     if (n >= 100) { buf[0]='1'; buf[1]='0'; buf[2]='0'; buf[3]='%'; buf[4]=0; }
     else if (n >= 10) { buf[0]='0'+(n/10); buf[1]='0'+(n%10); buf[2]='%'; buf[3]=0; }
     else { buf[0]='0'+n; buf[1]='%'; buf[2]=0; }
 
     int tw = atlas_text_width(&NUNITO_BOLD_9, buf);
-    int tx = x + (28 - tw) / 2;
+    int tx = x + (28 - tw) / 2 + 1;   /* +1 to center on the visual midline */
     int baseline = y + 9;
     atlas_render(&NUNITO_BOLD_9, tx, baseline, buf, color);
 }
