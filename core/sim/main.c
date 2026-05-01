@@ -1,11 +1,15 @@
 /*
  * core/sim/main.c — entry point for the host simulator (core-sim).
  *
- * Boots the HAL, initializes the audio engine, hands the main loop
- * to the Cabinet shell. Cabinet draws menus, handles button events,
- * triggers playback through the engine on Now Playing → SELECT.
+ * Interactive mode: HAL + audio engine + Cabinet UI run a normal
+ * event loop until the user closes the window or hits q/Esc.
  *
- * Press Q or Esc (or close the window) to exit.
+ * Headless capture mode (`--shot <path>`): run a fixed sequence,
+ * capture the framebuffer to BMP, exit. Optional `--press <keys>`
+ * fires synthetic button events before the loop starts (each char
+ * is one event: D=down, U=up, L=left, R=right, E=enter/select,
+ * M=menu, P=play). Optional `--frames N` runs N frames after the
+ * presses to let layout settle / scrubber advance.
  */
 
 #include "../apps/audio/engine.h"
@@ -15,13 +19,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+static button_t key_to_button(char k) {
+    switch (k) {
+        case 'D': return BUTTON_SCROLL_FWD;
+        case 'U': return BUTTON_SCROLL_BACK;
+        case 'L': return BUTTON_LEFT;
+        case 'R': return BUTTON_RIGHT;
+        case 'E': return BUTTON_SELECT;
+        case 'M': return BUTTON_MENU;
+        case 'P': return BUTTON_PLAY;
+        default:  return BUTTON_NONE;
+    }
+}
+
 int main(int argc, char **argv) {
-    /* --shot <path>: render a few frames to settle layout, dump a
-     * BMP, exit. Used for headless visual capture. */
     const char *shot_path = NULL;
+    const char *press_seq = NULL;
+    int shot_frames = 4;
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shot_path = argv[++i];
+        } else if (strcmp(argv[i], "--press") == 0 && i + 1 < argc) {
+            press_seq = argv[++i];
+        } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+            shot_frames = atoi(argv[++i]);
+            if (shot_frames < 1) shot_frames = 1;
         }
     }
 
@@ -37,14 +60,24 @@ int main(int argc, char **argv) {
                shot_path ? " (--shot mode)" : "");
 
     if (shot_path) {
-        /* Run a handful of frames so the first lcd_present has flushed,
-         * then capture and exit. No event loop, no audio. */
-        for (int i = 0; i < 4; i++) {
+        /* Pre-fire any synthetic key presses. */
+        if (press_seq) {
+            for (const char *k = press_seq; *k; k++) {
+                button_t b = key_to_button(*k);
+                if (b != BUTTON_NONE) cabinet_handle_button(&cabinet, b);
+            }
+        }
+        /* Run the configured number of frames, pumping audio so the
+         * scrubber advances if a track is playing. */
+        for (int i = 0; i < shot_frames; i++) {
+            audio_engine_pump(&engine);
             cabinet_draw(&cabinet);
             lcd_present();
+            sleep_ms(16);   /* let the audio thread make progress */
         }
         int rc = lcd_screenshot_bmp(shot_path);
         log_printf("screenshot %s -> %s", shot_path, rc == 0 ? "ok" : "FAIL");
+        audio_engine_close(&engine);
         hal_shutdown();
         return rc == 0 ? 0 : 1;
     }
@@ -52,9 +85,8 @@ int main(int argc, char **argv) {
     bool running = true;
     while (running) {
         audio_engine_pump(&engine);
-        if (audio_engine_eos(&engine)) {
-            audio_engine_stop(&engine);
-        }
+        /* No auto-stop on EOS — the Now Playing screen keeps showing
+         * the track at 100% until the user manually MENUs back. */
 
         cabinet_draw(&cabinet);
         lcd_present();

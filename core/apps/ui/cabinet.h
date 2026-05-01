@@ -21,6 +21,7 @@
 
 #include "../../hal/hal.h"
 #include "../audio/engine.h"
+#include "now_playing.h"
 
 #include <stdbool.h>
 
@@ -45,22 +46,33 @@ void cabinet_draw(cabinet_t *c);
  */
 void cabinet_handle_button(cabinet_t *c, button_t btn);
 
+/*
+ * Frame kind — what's on each level of the nav stack. Most frames
+ * are list-view menus; the Now Playing screen is a different shape
+ * so it gets its own kind.
+ */
+typedef enum {
+    FRAME_MENU = 0,
+    FRAME_NOW_PLAYING,
+} frame_kind_t;
+
 /* Forward decl + storage size — exposed so callers can statically
  * allocate one. Definition is in cabinet.c. */
 struct cabinet {
-    /* Frame stack. Each frame is an index into a static menu table
-     * defined in cabinet.c. We don't dynamically alloc anything. */
-    int            stack[8];
-    int            depth;          /* number of frames on the stack */
+    /* Frame stack. Each frame has a kind + per-kind state. */
+    frame_kind_t   stack_kind[8];
+    int            stack_menu[8];     /* FRAME_MENU: menu id */
+    int            depth;             /* number of frames on the stack */
 
-    /* Current list view state, one per stack level (so pop restores
-     * scroll/selection). */
+    /* List view state per stack level, only meaningful for FRAME_MENU
+     * frames. Pop restores scroll/selection. */
     struct {
         int selected;
         int scroll_offset;
     } list_state[8];
 
-    audio_engine_t *engine;        /* for triggering playback */
+    audio_engine_t *engine;           /* for triggering playback */
+    now_playing_t   np;               /* current NP snapshot, if any */
 
     /* The bytes of the FLAC fixture, loaded once at init for the
      * Now Playing demo. NULL if not loaded. */

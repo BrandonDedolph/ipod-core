@@ -10,6 +10,7 @@ ui_lib = static_library(
     'atlas.c',
     'chrome.c',
     'list.c',
+    'now_playing.c',
     'cabinet.c',
   ],
   dependencies: [hal_dep, audio_engine_dep, flac_dep],
