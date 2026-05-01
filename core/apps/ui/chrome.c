@@ -195,20 +195,25 @@ void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color) {
     }
 
     /*
-     * Outline (1 px stroke) with soft corners. The design's rx=1.5
-     * rounding at this resolution is essentially "skip the four
-     * absolute-corner pixels" — that's enough to read as rounded
-     * without doing real AA curves at 11 px tall.
+     * Outline (1 px stroke) with rounded corners matching the design's
+     * rx=1.5. We drop the corner squares entirely and fade the two
+     * adjacent edge pixels at each corner with ~80% alpha — that gives
+     * about 1.5 px of visible rounding, equivalent to the SVG.
      */
-    chrome_fill_rect(x + 1, y,      27, 1,  color);    /* top */
-    chrome_fill_rect(x + 1, y + 10, 27, 1,  color);    /* bottom */
-    chrome_fill_rect(x,     y + 1,  1,  9,  color);    /* left */
-    chrome_fill_rect(x + 28,y + 1,  1,  9,  color);    /* right */
-    /* Half-pixel softening at each corner via low-alpha pixel. */
-    put_pixel(x,      y,      color, 128);
-    put_pixel(x + 28, y,      color, 128);
-    put_pixel(x,      y + 10, color, 128);
-    put_pixel(x + 28, y + 10, color, 128);
+    chrome_fill_rect(x + 2, y,      25, 1, color);    /* top */
+    chrome_fill_rect(x + 2, y + 10, 25, 1, color);    /* bottom */
+    chrome_fill_rect(x,     y + 2,  1,  7, color);    /* left */
+    chrome_fill_rect(x + 28,y + 2,  1,  7, color);    /* right */
+    /* Corner softening — partial alpha on the pixel adjacent to each
+     * inset edge. The actual corner pixel stays empty (no drawing). */
+    put_pixel(x + 1,  y,       color, 200);
+    put_pixel(x,      y + 1,   color, 200);
+    put_pixel(x + 27, y,       color, 200);
+    put_pixel(x + 28, y + 1,   color, 200);
+    put_pixel(x + 1,  y + 10,  color, 200);
+    put_pixel(x,      y + 9,   color, 200);
+    put_pixel(x + 27, y + 10,  color, 200);
+    put_pixel(x + 28, y + 9,   color, 200);
 
     /* Nub: 2x5 solid rect. */
     chrome_fill_rect(x + 29, y + 3, 2, 5, color);
