@@ -65,10 +65,12 @@ else
 endif
 
 subdir('hal')         # hardware abstraction layer (sim or hw backend)
+subdir('codecs')      # vendored audio decoders (currently FLAC only)
 
-# Sim target also gets the simulator entry point.
+# Sim target also gets the simulator entry point + the test harness.
 if target == 'sim'
   subdir('sim')
+  subdir('tests')
 endif
 
 # Future subsystems land here as they're written:
@@ -76,7 +78,6 @@ endif
 # subdir('boot')        # crt0, linker, image header (hw only)
 # subdir('kernel')      # tasks, IPC, IRQs
 # subdir('fs')          # FAT32
-# subdir('codecs')      # vendored decoders
 # subdir('apps/audio')  # audio engine
 # subdir('apps/db')     # tagcache
 # subdir('apps/ui')     # Cabinet shell
