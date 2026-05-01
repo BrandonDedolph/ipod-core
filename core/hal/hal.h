@@ -126,6 +126,91 @@ uint32_t clock_us(void);
  */
 void sleep_ms(uint32_t ms);
 
+/* ---------- Audio --------------------------------------------------- */
+
+/*
+ * Audio output uses a pull/callback model. The HAL clocks samples
+ * out at the rate set in hal_audio_init(); when its internal buffer
+ * empties, it calls the registered audio_source_fn to refill.
+ *
+ * Sim:  SDL2 audio callback runs on SDL's audio thread.
+ * Hw:   I²S DMA-empty IRQ schedules a callback on the audio task.
+ *
+ * The callback model maps cleanly to both ends. The audio engine
+ * later sits between decoder_t (pull from a codec) and the HAL
+ * (push to this fill function); see core/apps/audio/.
+ *
+ * Output format is fixed at 16-bit signed interleaved PCM. Only the
+ * sample rate and channel count are configurable per stream.
+ */
+
+/*
+ * audio_source_fn — invoked by the HAL when it needs samples.
+ *
+ * Fill `buf` with up to `frames` frames of interleaved s16 PCM.
+ * Return the number of frames actually written. If you write fewer
+ * than `frames`, the HAL pads the remainder with silence and assumes
+ * the source is starved (sim) / underrun (hw).
+ *
+ * Runs in a real-time context (SDL audio thread on sim; IRQ-driven
+ * task on hw). Don't block, don't malloc, don't call back into the
+ * HAL. Pull from a lock-free ring buffer.
+ *
+ * `userdata` is the pointer registered in hal_audio_set_source.
+ */
+typedef int (*audio_source_fn)(void *userdata, int16_t *buf, int frames);
+
+/*
+ * hal_audio_init configures the output device.
+ *
+ * sample_rate is in Hz (typical: 44100, 48000). channels must be 1 or 2.
+ * Returns 0 on success, negative on failure.
+ *
+ * Strict on the device's capabilities: if the underlying audio system
+ * cannot give us *exactly* the requested rate and channel count, we
+ * return failure rather than silently resampling — wrong-pitch audio
+ * would be a worse failure mode than "device unavailable, fall back."
+ * Callers (the audio engine) are expected to retry with a different
+ * rate if the first try fails.
+ *
+ * Idempotent — calling twice with the same parameters is a no-op;
+ * calling with different parameters tears down and re-opens.
+ *
+ * After init, no audio plays until hal_audio_set_source + hal_audio_start.
+ */
+int hal_audio_init(uint32_t sample_rate, uint16_t channels);
+
+/*
+ * Register the source callback. Safe to call from any thread, at any
+ * time after hal_audio_init.
+ *
+ * Quiescence guarantee: when this function returns, the previously
+ * registered fn/userdata are no longer in flight in any callback.
+ * It is therefore safe to free `userdata` immediately after
+ * set_source returns with a different fn (or NULL).
+ *
+ * Pass fn = NULL to clear (silence on next pull).
+ */
+void hal_audio_set_source(audio_source_fn fn, void *userdata);
+
+/*
+ * hal_audio_start unpauses the output. The HAL begins pulling from the
+ * source. Safe to call repeatedly.
+ */
+void hal_audio_start(void);
+
+/*
+ * hal_audio_stop pauses output. The internal buffer is not cleared —
+ * a subsequent hal_audio_start resumes from where we left off.
+ */
+void hal_audio_stop(void);
+
+/*
+ * hal_audio_close releases the output device. After this hal_audio_init
+ * must be called again before further audio is possible.
+ */
+void hal_audio_close(void);
+
 /* ---------- Log ----------------------------------------------------- */
 
 /*
