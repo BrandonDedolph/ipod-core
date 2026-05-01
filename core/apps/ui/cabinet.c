@@ -13,6 +13,7 @@
 #include "list.h"
 #include "now_playing.h"
 #include "../audio/engine.h"
+#include "../db/tagcache.h"
 #include "../../codecs/dr_flac/flac.h"
 #include "../../hal/hal.h"
 
@@ -60,33 +61,68 @@ static const int music_actions[] = {
     M_MUSIC_ARTISTS, M_MUSIC_ALBUMS, M_MUSIC_SONGS, M_MUSIC_GENRES, ACT_NOOP, ACT_NOOP
 };
 
-static const char *const stub_three[] = {
-    "(no library indexed)", "Run: core release tagcache <dir>", "(stub)"
-};
-static const int stub_three_actions[] = { ACT_NOOP, ACT_NOOP, ACT_NOOP };
-
 static const char *const empty_items[] = {"(empty)"};
 static const int empty_actions[] = { ACT_NOOP };
 
+/*
+ * A menu either has static items (const arrays + count) OR a dynamic
+ * provider (count_fn + item_fn from the tagcache). Selecting any
+ * dynamic-menu row is a no-op for now; album/song drilldown lands
+ * with playlist routing in a later PR.
+ */
 typedef struct {
     const char         *title;
-    const char *const  *items;
+    const char *const  *items;          /* NULL for dynamic menus */
     const int          *actions;
     int                 count;
+    int               (*count_fn)(void);
+    const char       *(*item_fn)(int idx);
 } menu_t;
 
 static const menu_t MENUS[M_COUNT] = {
-    [M_MAIN]            = {"iPod",       main_items,    main_actions,    6},
-    [M_MUSIC]           = {"Music",      music_items,   music_actions,   6},
-    [M_MUSIC_ARTISTS]   = {"Artists",    stub_three,    stub_three_actions, 3},
-    [M_MUSIC_ALBUMS]    = {"Albums",     stub_three,    stub_three_actions, 3},
-    [M_MUSIC_SONGS]     = {"Songs",      stub_three,    stub_three_actions, 3},
-    [M_MUSIC_GENRES]    = {"Genres",     stub_three,    stub_three_actions, 3},
-    [M_PLAYLISTS]       = {"Playlists",  empty_items,   empty_actions,   1},
-    [M_PODCASTS]        = {"Podcasts",   empty_items,   empty_actions,   1},
-    [M_AUDIOBOOKS]      = {"Audiobooks", empty_items,   empty_actions,   1},
-    [M_SETTINGS]        = {"Settings",   empty_items,   empty_actions,   1},
+    [M_MAIN]   = {"iPod",  main_items,  main_actions,  6},
+    [M_MUSIC]  = {"Music", music_items, music_actions, 6},
+
+    /* Tagcache-backed flat lists. */
+    [M_MUSIC_ARTISTS] = {
+        .title = "Artists",
+        .count_fn = tagcache_artist_count,
+        .item_fn  = tagcache_artist_name,
+    },
+    [M_MUSIC_ALBUMS] = {
+        .title = "Albums",
+        .count_fn = tagcache_album_count,
+        .item_fn  = tagcache_album_name,
+    },
+    [M_MUSIC_SONGS] = {
+        .title = "Songs",
+        .count_fn = tagcache_song_count,
+        .item_fn  = tagcache_song_title,
+    },
+    [M_MUSIC_GENRES] = {
+        .title = "Genres",
+        .count_fn = tagcache_genre_count,
+        .item_fn  = tagcache_genre_name,
+    },
+
+    [M_PLAYLISTS]  = {"Playlists",  empty_items, empty_actions, 1},
+    [M_PODCASTS]   = {"Podcasts",   empty_items, empty_actions, 1},
+    [M_AUDIOBOOKS] = {"Audiobooks", empty_items, empty_actions, 1},
+    [M_SETTINGS]   = {"Settings",   empty_items, empty_actions, 1},
 };
+
+/* Helpers that paper over the static-vs-dynamic distinction. */
+static int menu_count(const menu_t *m) {
+    return m->items ? m->count : m->count_fn();
+}
+static const char *menu_item(const menu_t *m, int idx) {
+    if (m->items) return m->items[idx];
+    return m->item_fn(idx);
+}
+static int menu_action(const menu_t *m, int idx) {
+    if (m->actions) return m->actions[idx];
+    return ACT_NOOP;
+}
 
 /* ---------- Internal helpers -------------------------------------- */
 
@@ -191,10 +227,16 @@ void cabinet_draw(cabinet_t *c) {
     draw_status_bar(m->title);
 
     list_view_t v = current_view(c);
-    /* Per themes.jsx:464 (Theme 1 light), selBg = ink, selFg = cream.
-     * Terracotta (COL_ACCENT) is reserved for progress / play indicators,
-     * NOT the menu selector. */
-    list_view_draw(&v, m->items, m->count, COL_INK, COL_CREAM, COL_INK);
+    /* Per themes.jsx:464, selBg = ink, selFg = cream.
+     * Terracotta (COL_ACCENT) is reserved for progress / play
+     * indicators, NOT the menu selector. */
+    if (m->items) {
+        list_view_draw(&v, m->items, m->count,
+                       COL_INK, COL_CREAM, COL_INK);
+    } else {
+        list_view_draw_dyn(&v, m->count_fn(), m->item_fn,
+                           COL_INK, COL_CREAM, COL_INK);
+    }
 }
 
 void cabinet_handle_button(cabinet_t *c, button_t btn) {
@@ -231,20 +273,21 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
     /* Menu frame: list-view scroll first, then SELECT for action. */
     int mid = current_menu(c);
     const menu_t *m = &MENUS[mid];
+    int count = menu_count(m);
 
     list_view_t v = current_view(c);
-    if (list_view_handle_button(&v, btn, m->count)) {
+    if (list_view_handle_button(&v, btn, count)) {
         store_view(c, &v);
         return;
     }
 
     if (btn == BUTTON_SELECT) {
         int idx = c->list_state[c->depth - 1].selected;
-        if (idx < 0 || idx >= m->count) return;
-        int act = m->actions[idx];
+        if (idx < 0 || idx >= count) return;
+        int act = menu_action(m, idx);
         if (act == ACT_NOOP) {
             log_printf("cabinet: %s -> %s (stub)",
-                       m->title, m->items[idx]);
+                       m->title, menu_item(m, idx));
         } else if (act == ACT_PLAY) {
             if (c->fixture_bytes && c->fixture_len > 0) {
                 int rc = audio_engine_play(c->engine, flac_decoder_ops(),

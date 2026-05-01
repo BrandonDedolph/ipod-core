@@ -52,6 +52,16 @@ void list_view_draw(const list_view_t *v,
                     lcd_pixel_t fg, lcd_pixel_t bg, lcd_pixel_t selector_fg);
 
 /*
+ * Same as list_view_draw, but pulls items from a callback instead
+ * of a const array. Used for dynamic content (e.g. tagcache-backed
+ * Artists/Albums/Songs lists).
+ */
+void list_view_draw_dyn(const list_view_t *v,
+                        int count,
+                        const char *(*item_at)(int idx),
+                        lcd_pixel_t fg, lcd_pixel_t bg, lcd_pixel_t selector_fg);
+
+/*
  * Feed a button press. Returns true if the input was consumed (i.e.,
  * scroll up/down). SELECT/MENU pass through unconsumed for the caller
  * to act on.
