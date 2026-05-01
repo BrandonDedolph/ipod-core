@@ -217,10 +217,14 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
         return;
     }
 
-    /* Now Playing frame: only PLAY/MENU are meaningful. Wheel and
-     * SELECT are no-ops here for now (next-track / scrub will land
+    /* Now Playing frame: SELECT cycles the info pages; wheel and
+     * LEFT/RIGHT are no-ops for now (prev/next-track + scrub land
      * with proper playlists). */
     if (current_kind(c) == FRAME_NOW_PLAYING) {
+        if (btn == BUTTON_SELECT) {
+            now_playing_advance_page(&c->np);
+            log_printf("cabinet: NP page -> %d", c->np.page);
+        }
         return;
     }
 
