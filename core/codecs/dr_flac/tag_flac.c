@@ -52,7 +52,7 @@ static const char *match_key(const char *comment, drflac_uint32 comment_len,
 }
 
 static void on_meta(void *user, drflac_metadata *m) {
-    flac_tags_t *tags = (flac_tags_t *)user;
+    audio_tags_t *tags = (audio_tags_t *)user;
     if (m->type != DRFLAC_METADATA_BLOCK_TYPE_VORBIS_COMMENT) return;
 
     drflac_vorbis_comment_iterator it;
@@ -78,7 +78,7 @@ static void on_meta(void *user, drflac_metadata *m) {
     }
 }
 
-int tag_flac_read(const void *bytes, size_t len, flac_tags_t *out) {
+int tag_flac_read(const void *bytes, size_t len, audio_tags_t *out) {
     if (!bytes || len == 0 || !out) return -1;
     memset(out, 0, sizeof(*out));
 

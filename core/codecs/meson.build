@@ -36,7 +36,7 @@ flac_dep = declare_dependency(
 
 mp3_lib = static_library(
   'core_codec_mp3',
-  sources: ['dr_mp3/mp3.c'],
+  sources: ['dr_mp3/mp3.c', 'dr_mp3/tag_mp3.c'],
   include_directories: include_directories('.', 'dr_mp3'),
   c_args: vendored_codec_warning_suppress + [
     # dr_mp3 has additional warnings under -Wall + -Werror that

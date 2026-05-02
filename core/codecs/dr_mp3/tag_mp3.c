@@ -1,0 +1,185 @@
+/*
+ * core/codecs/dr_mp3/tag_mp3.c — minimal ID3v2 parser.
+ *
+ * Layout:
+ *   [10-byte header]
+ *     "ID3", v[2], v[1] = 0,
+ *     flags (1 byte; we ignore),
+ *     size (4 bytes synchsafe — total frame-data size, excluding header)
+ *   [optional extended header, if flags bit 6 set; we skip via its own size]
+ *   [frames]
+ *     id   = 4 ASCII bytes
+ *     size = 4 bytes (v2.3 = regular BE; v2.4 = synchsafe)
+ *     flags = 2 bytes
+ *     content = `size` bytes
+ *
+ * We extract three frames:
+ *   TIT2 → title
+ *   TPE1 → artist
+ *   TALB → album
+ *
+ * Text frames are encoded with a 1-byte prefix:
+ *   0 = ISO-8859-1, 1 = UTF-16 with BOM, 2 = UTF-16BE, 3 = UTF-8 (v2.4)
+ *
+ * UTF-16 is downconverted by dropping the high byte of each code unit
+ * (good for ASCII-in-UTF-16, returns '?' for code points >= 0x80) —
+ * see header for rationale.
+ *
+ * Robustness contract: any malformed header or out-of-bounds size is
+ * treated as "no tags found", not as an error. The audio stream is
+ * usually still playable; we just won't show metadata for it.
+ */
+
+#include "tag_mp3.h"
+
+#include <stdint.h>
+#include <string.h>
+
+/* ---------- helpers ---------------------------------------------------- */
+
+/* Synchsafe 32-bit integer: each byte contributes 7 bits. */
+static uint32_t read_synchsafe(const uint8_t *p) {
+    return ((uint32_t)(p[0] & 0x7f) << 21) |
+           ((uint32_t)(p[1] & 0x7f) << 14) |
+           ((uint32_t)(p[2] & 0x7f) <<  7) |
+           ((uint32_t)(p[3] & 0x7f));
+}
+
+/* Plain big-endian 32-bit integer (used for frame sizes in v2.3). */
+static uint32_t read_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
+}
+
+/*
+ * Convert a text frame's content to UTF-8 in `dst` (null-terminated,
+ * truncated at dst_size-1 bytes). `body` points to the text-encoding
+ * byte; `body_len` covers the encoding byte plus the text payload.
+ */
+static void copy_text_frame(char *dst, size_t dst_size,
+                            const uint8_t *body, size_t body_len) {
+    if (dst_size == 0) return;
+    dst[0] = 0;
+    if (body_len < 1) return;
+
+    uint8_t enc = body[0];
+    const uint8_t *text = body + 1;
+    size_t text_len = body_len - 1;
+
+    if (enc == 0 || enc == 3) {
+        /* ISO-8859-1 (treat bytes < 0x80 as ASCII; bytes >= 0x80
+         * passed through as Latin-1, which renders incorrectly for
+         * the BMP-plane atlas but harmless) OR UTF-8 (already
+         * UTF-8). Same code path; differ only in semantics. */
+        size_t copy = text_len < dst_size - 1 ? text_len : dst_size - 1;
+        size_t out = 0;
+        for (size_t i = 0; i < copy; i++) {
+            if (text[i] == 0) break;          /* tag end */
+            dst[out++] = (char)text[i];
+        }
+        dst[out] = 0;
+    } else if (enc == 1 || enc == 2) {
+        /* UTF-16. enc==1 has a BOM at the start; enc==2 is UTF-16BE
+         * with no BOM. Detect endianness from BOM if present, else
+         * assume BE. Downconvert by dropping the high byte; non-ASCII
+         * code points become '?' to avoid garbage. */
+        size_t off = 0;
+        int big_endian = (enc == 2);
+        if (enc == 1 && text_len >= 2) {
+            if (text[0] == 0xff && text[1] == 0xfe) { big_endian = 0; off = 2; }
+            else if (text[0] == 0xfe && text[1] == 0xff) { big_endian = 1; off = 2; }
+            /* No BOM: leave big_endian default (BE), don't consume any. */
+        }
+        size_t out = 0;
+        while (off + 1 < text_len && out < dst_size - 1) {
+            uint8_t hi = big_endian ? text[off]     : text[off + 1];
+            uint8_t lo = big_endian ? text[off + 1] : text[off];
+            uint16_t cu = ((uint16_t)hi << 8) | lo;
+            if (cu == 0) break;               /* tag end */
+            dst[out++] = (cu < 0x80) ? (char)cu : '?';
+            off += 2;
+        }
+        dst[out] = 0;
+    } else {
+        /* Unknown encoding — leave dst empty. */
+    }
+}
+
+/* ---------- frame iteration ------------------------------------------- */
+
+static int matches(const uint8_t *id4, const char *want4) {
+    return id4[0] == (uint8_t)want4[0] &&
+           id4[1] == (uint8_t)want4[1] &&
+           id4[2] == (uint8_t)want4[2] &&
+           id4[3] == (uint8_t)want4[3];
+}
+
+int tag_mp3_read(const void *bytes, size_t len, audio_tags_t *out) {
+    if (!bytes || len == 0 || !out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    const uint8_t *p = (const uint8_t *)bytes;
+
+    /* Need at least the 10-byte header. */
+    if (len < 10) return 0;
+    if (p[0] != 'I' || p[1] != 'D' || p[2] != '3') return 0;
+
+    uint8_t major = p[3];
+    /* uint8_t minor = p[4]; — unused, but versions 0/0xff are reserved/invalid. */
+    uint8_t flags = p[5];
+    uint32_t tag_size = read_synchsafe(&p[6]);
+
+    /* The header itself is 10 bytes; tag_size is the size of the body
+     * (extended header + frames + padding) that follows it. */
+    if ((uint64_t)10 + tag_size > len) return 0;     /* truncated */
+
+    /* Only versions 2.3 and 2.4 are common. v2.2 had 3-byte frame
+     * IDs and is rare; treat as no tags rather than mis-parse. */
+    if (major != 3 && major != 4) return 0;
+
+    const uint8_t *body     = p + 10;
+    const uint8_t *body_end = body + tag_size;
+
+    /* Skip extended header if flags bit 6 set. Layout differs slightly
+     * between v2.3 and v2.4, but in both the first 4 bytes of the
+     * extended header are its own size field — synchsafe in v2.4,
+     * regular BE in v2.3. */
+    if ((flags & 0x40) && body + 4 <= body_end) {
+        uint32_t ext_size = (major == 4) ? read_synchsafe(body) : read_be32(body);
+        /* In v2.3 the ext_size excludes its own 4 bytes; in v2.4 it
+         * includes them. Both interpretations leave us pointing at
+         * the first frame after this advance. */
+        size_t skip = (major == 4) ? ext_size : (4 + ext_size);
+        if (skip > (size_t)(body_end - body)) return 0;
+        body += skip;
+    }
+
+    /* Iterate frames. */
+    while (body + 10 <= body_end) {
+        const uint8_t *id     = body;
+        uint32_t       fsize  = (major == 4) ? read_synchsafe(body + 4)
+                                             : read_be32(body + 4);
+        /* uint16_t fflags = (body[8] << 8) | body[9]; — unused */
+        const uint8_t *fbody  = body + 10;
+
+        /* A zero ID byte signals padding — we're done. */
+        if (id[0] == 0) break;
+
+        /* Frame must fit in the remaining body. */
+        if (fbody + fsize > body_end) break;
+
+        if (matches(id, "TIT2") && !out->found_title) {
+            copy_text_frame(out->title, sizeof(out->title), fbody, fsize);
+            out->found_title = (out->title[0] != 0);
+        } else if (matches(id, "TPE1") && !out->found_artist) {
+            copy_text_frame(out->artist, sizeof(out->artist), fbody, fsize);
+            out->found_artist = (out->artist[0] != 0);
+        } else if (matches(id, "TALB") && !out->found_album) {
+            copy_text_frame(out->album, sizeof(out->album), fbody, fsize);
+            out->found_album = (out->album[0] != 0);
+        }
+
+        body = fbody + fsize;
+    }
+    return 0;
+}
