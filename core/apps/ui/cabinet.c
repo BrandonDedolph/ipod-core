@@ -15,6 +15,7 @@
 #include "../audio/engine.h"
 #include "../db/tagcache.h"
 #include "../../codecs/dr_flac/flac.h"
+#include "../../codecs/dr_flac/tag_flac.h"
 #include "../../codecs/dr_mp3/mp3.h"
 #include "../../hal/hal.h"
 
@@ -331,6 +332,17 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
                     log_printf("cabinet: read failed %s", path);
                     return;
                 }
+
+                /* Read tags first while we still hold the bytes. We do
+                 * this for FLAC today (Vorbis comments via dr_flac);
+                 * MP3 ID3v2 lands in a follow-up PR — until then MP3
+                 * NP rows fall back to filename. */
+                flac_tags_t tags = (flac_tags_t){0};
+                int have_tags = 0;
+                if (ops == flac_decoder_ops()) {
+                    have_tags = (tag_flac_read(bytes, (size_t)len, &tags) == 0);
+                }
+
                 int rc = audio_engine_play(c->engine, ops, bytes, (size_t)len);
                 free(bytes);    /* engine took its own copy */
                 if (rc != 0) {
@@ -338,11 +350,25 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
                     return;
                 }
                 now_playing_load(&c->np, c->engine);
-                /* Override the fixture-default title/format with the
-                 * real song's filename + codec. ID3-driven metadata
-                 * lands when the binary tagcache + tag parser do. */
-                snprintf(c->np.title, NP_TITLE_MAX, "%s",
-                         tagcache_song_title(idx));
+                /* Title: tag if present, else filename. Artist/album:
+                 * tag if present, else clear (NP draws empty rows
+                 * cleanly rather than leaving the fixture defaults). */
+                if (have_tags && tags.found_title) {
+                    snprintf(c->np.title, NP_TITLE_MAX, "%s", tags.title);
+                } else {
+                    snprintf(c->np.title, NP_TITLE_MAX, "%s",
+                             tagcache_song_title(idx));
+                }
+                if (have_tags && tags.found_artist) {
+                    snprintf(c->np.artist, NP_ARTIST_MAX, "%s", tags.artist);
+                } else {
+                    c->np.artist[0] = 0;
+                }
+                if (have_tags && tags.found_album) {
+                    snprintf(c->np.album, NP_TITLE_MAX, "%s", tags.album);
+                } else {
+                    c->np.album[0] = 0;
+                }
                 snprintf(c->np.format, NP_FORMAT_MAX, "%s", label);
                 snprintf(c->np.format_detail, NP_FORMAT_MAX, "%u kHz",
                          c->engine->sample_rate / 1000);
