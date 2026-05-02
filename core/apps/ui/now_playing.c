@@ -16,6 +16,7 @@
 #include "atlas.h"
 #include "chrome.h"
 #include "../audio/engine.h"
+#include "../../codecs/stb_image/image.h"
 #include "../../hal/hal.h"
 
 #include <stdint.h>
@@ -53,6 +54,21 @@ void now_playing_load(now_playing_t *np, const audio_engine_t *engine) {
     np->total_frames = (uint32_t)engine->decoder.total_frames;
     np->sample_rate  = engine->sample_rate;
     np->loaded       = true;
+    np->art_loaded   = false;   /* caller will set art via now_playing_set_art_jpeg */
+}
+
+int now_playing_set_art_jpeg(now_playing_t *np,
+                             const void *jpeg_bytes, size_t jpeg_len) {
+    if (!np) return -1;
+    if (!jpeg_bytes || jpeg_len == 0) {
+        np->art_loaded = false;
+        return -1;
+    }
+    int rc = image_jpeg_decode_rgb565(jpeg_bytes, jpeg_len,
+                                      NP_ART_W, NP_ART_H,
+                                      np->art_pixels);
+    np->art_loaded = (rc == 0);
+    return rc;
 }
 
 void now_playing_advance_page(now_playing_t *np) {
@@ -174,11 +190,23 @@ static void draw_default(const now_playing_t *np, const audio_engine_t *engine) 
     int art_y  = 30;
     int text_x = art_x + art_w + 14;   /* 116 */
 
-    /* Album art placeholder. */
-    chrome_diagonal_stripes(art_x, art_y, art_w, art_h,
-                            6, 4, COL_STRIPE_A, COL_STRIPE_B);
-    chrome_fill_rect(art_x + 1, art_y + 1, art_w - 2, 1,
-                     lcd_rgb(0xA0, 0x88, 0x70));
+    /* Album art: real if decoded, diagonal-stripe placeholder if not. */
+    if (np->art_loaded) {
+        /* Direct framebuffer blit — art_pixels is already in RGB565
+         * matching lcd_pixel_t. NP_ART_W/H matches the layout. */
+        lcd_pixel_t *fb = lcd_framebuffer();
+        for (int y = 0; y < art_h; y++) {
+            for (int x = 0; x < art_w; x++) {
+                fb[(art_y + y) * LCD_WIDTH + (art_x + x)] =
+                    np->art_pixels[y * NP_ART_W + x];
+            }
+        }
+    } else {
+        chrome_diagonal_stripes(art_x, art_y, art_w, art_h,
+                                6, 4, COL_STRIPE_A, COL_STRIPE_B);
+        chrome_fill_rect(art_x + 1, art_y + 1, art_w - 2, 1,
+                         lcd_rgb(0xA0, 0x88, 0x70));
+    }
 
     /*
      * Text stack:

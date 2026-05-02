@@ -141,10 +141,12 @@ static const char *const COMPOSERS[] = {
  * reverting to the example data.
  */
 typedef struct {
-    char **titles;       /* tag TITLE if present, else basename-without-ext */
-    char **paths;        /* full filesystem path */
-    char **artists;      /* tag ARTIST or NULL if missing */
-    char **albums;       /* tag ALBUM  or NULL if missing */
+    char    **titles;       /* tag TITLE if present, else basename-without-ext */
+    char    **paths;        /* full filesystem path */
+    char    **artists;      /* tag ARTIST or NULL if missing */
+    char    **albums;       /* tag ALBUM  or NULL if missing */
+    void    **art_bytes;    /* heap-owned JPEG bytes, or NULL if no embedded art */
+    size_t   *art_lens;     /* parallel array: byte counts (0 if no art) */
     int    count;
     int    cap;
     int    loaded;
@@ -178,7 +180,7 @@ typedef struct {
     int   *album_song_counts;
 } library_t;
 
-static library_t LIBRARY = { NULL, NULL, NULL, NULL, 0, 0, 0,
+static library_t LIBRARY = { NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0,
                              NULL, 0, NULL, 0,
                              NULL, NULL,
                              NULL, NULL, NULL, NULL };
@@ -189,11 +191,14 @@ static void library_clear(void) {
         free(LIBRARY.paths[i]);
         free(LIBRARY.artists[i]);
         free(LIBRARY.albums[i]);
+        free(LIBRARY.art_bytes[i]);
     }
     free(LIBRARY.titles);
     free(LIBRARY.paths);
     free(LIBRARY.artists);
     free(LIBRARY.albums);
+    free(LIBRARY.art_bytes);
+    free(LIBRARY.art_lens);
 
     for (int i = 0; i < LIBRARY.uniq_artist_count; i++) free(LIBRARY.uniq_artists[i]);
     for (int i = 0; i < LIBRARY.uniq_album_count;  i++) free(LIBRARY.uniq_albums [i]);
@@ -218,6 +223,8 @@ static void library_clear(void) {
     LIBRARY.paths              = NULL;
     LIBRARY.artists            = NULL;
     LIBRARY.albums             = NULL;
+    LIBRARY.art_bytes          = NULL;
+    LIBRARY.art_lens           = NULL;
     LIBRARY.count              = 0;
     LIBRARY.cap                = 0;
     LIBRARY.loaded             = 0;
@@ -244,11 +251,14 @@ static void library_free_contents(library_t *lib) {
         free(lib->paths[i]);
         free(lib->artists[i]);
         free(lib->albums[i]);
+        free(lib->art_bytes[i]);
     }
     free(lib->titles);
     free(lib->paths);
     free(lib->artists);
     free(lib->albums);
+    free(lib->art_bytes);
+    free(lib->art_lens);
     for (int i = 0; i < lib->uniq_artist_count; i++) free(lib->uniq_artists[i]);
     for (int i = 0; i < lib->uniq_album_count;  i++) free(lib->uniq_albums [i]);
     free(lib->uniq_artists);
@@ -275,23 +285,33 @@ static void library_free_contents(library_t *lib) {
  */
 static int library_reserve(library_t *lib, int min_cap) {
     if (lib->cap >= min_cap) return 0;
-    size_t sz = (size_t)min_cap * sizeof(char *);
+    size_t sz_p  = (size_t)min_cap * sizeof(char *);
+    size_t sz_v  = (size_t)min_cap * sizeof(void *);
+    size_t sz_sz = (size_t)min_cap * sizeof(size_t);
 
-    char **t = (char **)realloc(lib->titles, sz);
+    char **t = (char **)realloc(lib->titles, sz_p);
     if (!t) return -1;
     lib->titles = t;
 
-    char **p = (char **)realloc(lib->paths, sz);
+    char **p = (char **)realloc(lib->paths, sz_p);
     if (!p) return -1;
     lib->paths = p;
 
-    char **ar = (char **)realloc(lib->artists, sz);
+    char **ar = (char **)realloc(lib->artists, sz_p);
     if (!ar) return -1;
     lib->artists = ar;
 
-    char **al = (char **)realloc(lib->albums, sz);
+    char **al = (char **)realloc(lib->albums, sz_p);
     if (!al) return -1;
     lib->albums = al;
+
+    void **ab = (void **)realloc(lib->art_bytes, sz_v);
+    if (!ab) return -1;
+    lib->art_bytes = ab;
+
+    size_t *aln = (size_t *)realloc(lib->art_lens, sz_sz);
+    if (!aln) return -1;
+    lib->art_lens = aln;
 
     lib->cap = min_cap;
     return 0;
@@ -552,7 +572,7 @@ int tagcache_library_load(const char *dir) {
 
     /* Scan into a fresh staging buffer so a partial failure leaves
      * the previous LIBRARY untouched. */
-    library_t staging = { NULL, NULL, NULL, NULL, 0, 0, 0,
+    library_t staging = { NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0,
                           NULL, 0, NULL, 0,
                           NULL, NULL,
                           NULL, NULL, NULL, NULL };
@@ -615,11 +635,23 @@ int tagcache_library_load(const char *dir) {
         char *artist = tags.found_artist ? strdup(tags.artist) : NULL;
         char *album  = tags.found_album  ? strdup(tags.album)  : NULL;
 
-        staging.titles [staging.count] = title;
-        staging.paths  [staging.count] = path;
-        staging.artists[staging.count] = artist;
-        staging.albums [staging.count] = album;
+        /* art: transfer ownership of the heap copy that the tag
+         * reader produced. Set tags.art_bytes = NULL so audio_tags_free
+         * (called below) doesn't double-free. */
+        void   *art_bytes = tags.art_bytes;
+        size_t  art_len   = tags.art_len;
+        tags.art_bytes = NULL;
+        tags.art_len   = 0;
+
+        staging.titles   [staging.count] = title;
+        staging.paths    [staging.count] = path;
+        staging.artists  [staging.count] = artist;
+        staging.albums   [staging.count] = album;
+        staging.art_bytes[staging.count] = art_bytes;
+        staging.art_lens [staging.count] = art_len;
         staging.count++;
+
+        audio_tags_free(&tags);   /* releases nothing (art moved out) */
     }
     closedir(d);
 
@@ -633,31 +665,44 @@ int tagcache_library_load(const char *dir) {
             CMP_TITLES = staging.titles;
             qsort(idx, (size_t)staging.count, sizeof(int), qsort_cmp_idx);
 
-            size_t sz = (size_t)staging.count * sizeof(char *);
-            char **sorted_titles  = (char **)malloc(sz);
-            char **sorted_paths   = (char **)malloc(sz);
-            char **sorted_artists = (char **)malloc(sz);
-            char **sorted_albums  = (char **)malloc(sz);
-            if (sorted_titles && sorted_paths && sorted_artists && sorted_albums) {
+            size_t sz_p  = (size_t)staging.count * sizeof(char *);
+            size_t sz_v  = (size_t)staging.count * sizeof(void *);
+            size_t sz_sz = (size_t)staging.count * sizeof(size_t);
+            char    **sorted_titles    = (char **)malloc(sz_p);
+            char    **sorted_paths     = (char **)malloc(sz_p);
+            char    **sorted_artists   = (char **)malloc(sz_p);
+            char    **sorted_albums    = (char **)malloc(sz_p);
+            void    **sorted_art_bytes = (void **)malloc(sz_v);
+            size_t   *sorted_art_lens  = (size_t *)malloc(sz_sz);
+            if (sorted_titles && sorted_paths && sorted_artists &&
+                sorted_albums && sorted_art_bytes && sorted_art_lens) {
                 for (int i = 0; i < staging.count; i++) {
-                    sorted_titles [i] = staging.titles [idx[i]];
-                    sorted_paths  [i] = staging.paths  [idx[i]];
-                    sorted_artists[i] = staging.artists[idx[i]];
-                    sorted_albums [i] = staging.albums [idx[i]];
+                    sorted_titles    [i] = staging.titles    [idx[i]];
+                    sorted_paths     [i] = staging.paths     [idx[i]];
+                    sorted_artists   [i] = staging.artists   [idx[i]];
+                    sorted_albums    [i] = staging.albums    [idx[i]];
+                    sorted_art_bytes [i] = staging.art_bytes [idx[i]];
+                    sorted_art_lens  [i] = staging.art_lens  [idx[i]];
                 }
                 free(staging.titles);
                 free(staging.paths);
                 free(staging.artists);
                 free(staging.albums);
-                staging.titles  = sorted_titles;
-                staging.paths   = sorted_paths;
-                staging.artists = sorted_artists;
-                staging.albums  = sorted_albums;
+                free(staging.art_bytes);
+                free(staging.art_lens);
+                staging.titles    = sorted_titles;
+                staging.paths     = sorted_paths;
+                staging.artists   = sorted_artists;
+                staging.albums    = sorted_albums;
+                staging.art_bytes = sorted_art_bytes;
+                staging.art_lens  = sorted_art_lens;
             } else {
                 free(sorted_titles);
                 free(sorted_paths);
                 free(sorted_artists);
                 free(sorted_albums);
+                free(sorted_art_bytes);
+                free(sorted_art_lens);
             }
             free(idx);
         }
@@ -685,6 +730,8 @@ int tagcache_library_load(const char *dir) {
     LIBRARY.paths              = staging.paths;
     LIBRARY.artists            = staging.artists;
     LIBRARY.albums             = staging.albums;
+    LIBRARY.art_bytes          = staging.art_bytes;
+    LIBRARY.art_lens           = staging.art_lens;
     LIBRARY.count              = staging.count;
     LIBRARY.cap                = staging.cap;
     LIBRARY.loaded             = 1;
@@ -721,6 +768,17 @@ const char *tagcache_song_album(int idx) {
     if (!LIBRARY.loaded) return NULL;
     if (idx < 0 || idx >= LIBRARY.count) return NULL;
     return LIBRARY.albums[idx];    /* may be NULL if no ALBUM tag */
+}
+
+const void *tagcache_song_art_bytes(int idx, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!LIBRARY.loaded) return NULL;
+    if (idx < 0 || idx >= LIBRARY.count) return NULL;
+    if (!LIBRARY.art_bytes) return NULL;
+    void *bytes = LIBRARY.art_bytes[idx];
+    if (!bytes) return NULL;
+    if (out_len) *out_len = LIBRARY.art_lens[idx];
+    return bytes;
 }
 
 /* ---------- Filtered queries ---------------------------------------- */

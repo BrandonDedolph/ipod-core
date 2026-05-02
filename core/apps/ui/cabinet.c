@@ -331,6 +331,13 @@ static void play_global_song(cabinet_t *c, int global_idx) {
     snprintf(c->np.format, NP_FORMAT_MAX, "%s", label);
     snprintf(c->np.format_detail, NP_FORMAT_MAX, "%u kHz",
              c->engine->sample_rate / 1000);
+    /* Embedded album art (FLAC PICTURE today; MP3 APIC follows). On
+     * decode failure we silently fall back to the stripe placeholder. */
+    size_t art_len = 0;
+    const void *art_bytes = tagcache_song_art_bytes(global_idx, &art_len);
+    if (art_bytes) {
+        (void)now_playing_set_art_jpeg(&c->np, art_bytes, art_len);
+    }
     push_now_playing(c);
     log_printf("cabinet: now playing %s", path);
 }

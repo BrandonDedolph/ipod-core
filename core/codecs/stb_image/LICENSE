@@ -1,0 +1,26 @@
+stb_image is dual-licensed under MIT and public domain. We distribute
+it under the public domain option.
+
+The full license text is at the bottom of stb_image.h. The relevant
+public-domain dedication:
+
+    This is free and unencumbered software released into the public
+    domain.
+
+    Anyone is free to copy, modify, publish, use, compile, sell, or
+    distribute this software, either in source code form or as a
+    compiled binary, for any purpose, commercial or non-commercial,
+    and by any means.
+
+    [...]
+
+    For more information, please refer to <http://unlicense.org/>
+
+Source: https://github.com/nothings/stb
+
+Vendored version: 2.30 (single header at master HEAD on 2026-05-02).
+Built JPEG-only — STBI_NO_PNG / _BMP / _PSD / _TGA / _GIF / _PIC /
+_PNM / _HDR are all defined in image.c, so the binary doesn't carry
+the other format decoders.
+
+To update: re-run core/codecs/stb_image/vendor.sh.
