@@ -20,6 +20,7 @@
 #ifndef CORE_APPS_DB_TAGCACHE_H
 #define CORE_APPS_DB_TAGCACHE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* ---------- Library counts --------------------------------------- */
@@ -98,6 +99,20 @@ const char *tagcache_song_path(int idx);
  */
 const char *tagcache_song_artist(int idx);
 const char *tagcache_song_album(int idx);
+
+/*
+ * Embedded album-art bytes (raw JPEG) for the song at `idx`. Returns
+ * NULL when:
+ *   - no library has been loaded, or
+ *   - idx is out of range, or
+ *   - the file had no embedded picture, or
+ *   - the codec's tag reader doesn't yet support picture extraction
+ *     (only FLAC today; MP3 ID3v2 APIC lands in a follow-up).
+ *
+ * On success, *out_len is the byte count. The pointer is owned by
+ * tagcache; caller must not free.
+ */
+const void *tagcache_song_art_bytes(int idx, size_t *out_len);
 
 /* ---------- Filtered queries (drilldown) ------------------------- */
 

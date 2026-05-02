@@ -57,6 +57,15 @@ typedef enum {
     NP_PAGE_COUNT       = 4,
 } np_page_t;
 
+/*
+ * Album-art buffer for the default page. 84 × 84 RGB565 = 14 112 bytes,
+ * lives inline in the now_playing_t (no heap). When a song's tag block
+ * has an embedded picture, now_playing_load decodes it into this
+ * buffer; otherwise the page draws the diagonal-stripe placeholder.
+ */
+#define NP_ART_W 84
+#define NP_ART_H 84
+
 typedef struct {
     char     title[NP_TITLE_MAX];
     char     artist[NP_ARTIST_MAX];
@@ -69,6 +78,12 @@ typedef struct {
     uint32_t sample_rate;
     bool     loaded;
     np_page_t page;
+
+    /* Decoded album art for the default page. art_loaded tracks
+     * whether art_pixels holds a valid image (vs a stale/empty
+     * buffer); the renderer falls back to stripes when false. */
+    uint16_t art_pixels[NP_ART_W * NP_ART_H];
+    bool     art_loaded;
 } now_playing_t;
 
 /*
@@ -82,9 +97,25 @@ void now_playing_advance_page(now_playing_t *np);
  * hardcoded for now (the FLAC fixture has no ID3); future PRs that
  * land tagcache + ID3 parsing will fill these from real metadata.
  *
+ * Also clears the album-art buffer (art_loaded = false). Caller
+ * follows up with now_playing_set_art_jpeg if the song has embedded
+ * art.
+ *
  * Call right after audio_engine_play() returns success.
  */
 void now_playing_load(now_playing_t *np, const audio_engine_t *engine);
+
+/*
+ * Decode `jpeg_bytes` into the NP album-art buffer (NP_ART_W ×
+ * NP_ART_H RGB565). Sets art_loaded=true on success; on failure
+ * leaves art_loaded as-is (the caller's pre-set value, typically
+ * false from now_playing_load) and returns -1.
+ *
+ * Pass NULL to clear the buffer (art_loaded = false). The default
+ * page falls back to the diagonal-stripe placeholder when not loaded.
+ */
+int now_playing_set_art_jpeg(now_playing_t *np,
+                             const void *jpeg_bytes, size_t jpeg_len);
 
 /*
  * Render the NP screen into the LCD framebuffer. `engine` is read

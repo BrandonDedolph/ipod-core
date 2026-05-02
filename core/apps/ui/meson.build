@@ -13,12 +13,12 @@ ui_lib = static_library(
     'now_playing.c',
     'cabinet.c',
   ],
-  dependencies: [hal_dep, audio_engine_dep, flac_dep, tagcache_dep],
+  dependencies: [hal_dep, audio_engine_dep, flac_dep, image_dep, tagcache_dep],
   include_directories: include_directories('.'),
 )
 
 ui_dep = declare_dependency(
   link_with: ui_lib,
   include_directories: include_directories('.'),
-  dependencies: [hal_dep, audio_engine_dep, flac_dep, tagcache_dep],
+  dependencies: [hal_dep, audio_engine_dep, flac_dep, image_dep, tagcache_dep],
 )

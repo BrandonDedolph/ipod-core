@@ -51,9 +51,30 @@ mp3_dep = declare_dependency(
   include_directories: include_directories('.', 'dr_mp3'),
 )
 
+# ---------- stb_image (JPEG, album art) -------------------------------
+
+image_lib = static_library(
+  'core_codec_image',
+  sources: ['stb_image/image.c'],
+  include_directories: include_directories('.', 'stb_image'),
+  c_args: vendored_codec_warning_suppress + [
+    # stb_image trips a few additional warnings under -Wall + -Werror
+    # (sign comparisons, type limits in the JPEG IDCT, etc) that are
+    # cosmetic. Suppress them here; our wrapper code is small and
+    # easy to keep clean.
+    '-Wno-sign-compare',
+    '-Wno-type-limits',
+  ],
+)
+
+image_dep = declare_dependency(
+  link_with: image_lib,
+  include_directories: include_directories('.', 'stb_image'),
+)
+
 # ---------- aggregate -------------------------------------------------
 
 codecs_dep = declare_dependency(
-  dependencies: [flac_dep, mp3_dep],
+  dependencies: [flac_dep, mp3_dep, image_dep],
   include_directories: include_directories('.'),
 )
