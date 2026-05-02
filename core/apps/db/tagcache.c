@@ -436,7 +436,11 @@ static void build_filter_indexes(library_t *lib) {
      *
      * Two passes per group: count first, then fill. Allocation
      * failure leaves the per-group entry NULL; downstream queries
-     * return 0 for that artist. */
+     * return 0 for that artist.
+     *
+     * Asymmetric-NULL between artist_songs and artist_song_counts
+     * (one calloc'd, the other NULL) is intentionally tolerated —
+     * the accessors below explicitly NULL-check both before use. */
     if (lib->uniq_artist_count > 0) {
         lib->artist_songs       = (int **)calloc((size_t)lib->uniq_artist_count,
                                                  sizeof(int *));
