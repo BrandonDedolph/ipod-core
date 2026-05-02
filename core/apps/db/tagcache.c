@@ -681,18 +681,28 @@ int tagcache_library_load(const char *dir) {
 
     /* Commit: drop any previous library, install staging. */
     library_clear();
-    LIBRARY.titles            = staging.titles;
-    LIBRARY.paths             = staging.paths;
-    LIBRARY.artists           = staging.artists;
-    LIBRARY.albums            = staging.albums;
-    LIBRARY.count             = staging.count;
-    LIBRARY.cap               = staging.cap;
-    LIBRARY.loaded            = 1;
-    LIBRARY.uniq_artists      = staging.uniq_artists;
-    LIBRARY.uniq_artist_count = staging.uniq_artist_count;
-    LIBRARY.uniq_albums       = staging.uniq_albums;
-    LIBRARY.uniq_album_count  = staging.uniq_album_count;
+    LIBRARY.titles             = staging.titles;
+    LIBRARY.paths              = staging.paths;
+    LIBRARY.artists            = staging.artists;
+    LIBRARY.albums             = staging.albums;
+    LIBRARY.count              = staging.count;
+    LIBRARY.cap                = staging.cap;
+    LIBRARY.loaded             = 1;
+    LIBRARY.uniq_artists       = staging.uniq_artists;
+    LIBRARY.uniq_artist_count  = staging.uniq_artist_count;
+    LIBRARY.uniq_albums        = staging.uniq_albums;
+    LIBRARY.uniq_album_count   = staging.uniq_album_count;
+    LIBRARY.song_artist_idx    = staging.song_artist_idx;
+    LIBRARY.song_album_idx     = staging.song_album_idx;
+    LIBRARY.artist_songs       = staging.artist_songs;
+    LIBRARY.artist_song_counts = staging.artist_song_counts;
+    LIBRARY.album_songs        = staging.album_songs;
+    LIBRARY.album_song_counts  = staging.album_song_counts;
     return LIBRARY.count;
+}
+
+int tagcache_library_loaded(void) {
+    return LIBRARY.loaded;
 }
 
 const char *tagcache_song_path(int idx) {
@@ -773,6 +783,13 @@ const char *tagcache_song_title_for_album(int album_idx, int n) {
 const char *tagcache_song_path_for_album(int album_idx, int n) {
     int s = song_idx_in_album(album_idx, n);
     return (s < 0) ? NULL : LIBRARY.paths[s];
+}
+
+int tagcache_song_index_for_artist(int artist_idx, int n) {
+    return song_idx_in_artist(artist_idx, n);
+}
+int tagcache_song_index_for_album(int album_idx, int n) {
+    return song_idx_in_album(album_idx, n);
 }
 
 /* ---------- API impl --------------------------------------------- */
