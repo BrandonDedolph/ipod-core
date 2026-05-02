@@ -161,6 +161,40 @@ static void library_clear(void) {
 }
 
 /*
+ * Free the heap contents of a (staging or live) library_t. Used during
+ * scan teardown on partial-failure paths. Doesn't reset the bookkeeping
+ * — the struct is about to be discarded.
+ */
+static void library_free_contents(library_t *lib) {
+    for (int i = 0; i < lib->count; i++) {
+        free(lib->titles[i]);
+        free(lib->paths[i]);
+    }
+    free(lib->titles);
+    free(lib->paths);
+}
+
+/*
+ * Grow `lib`'s capacity to at least `min_cap`. Each realloc is
+ * committed back to lib before the next is attempted, so a failure
+ * never leaves a freed-old + orphaned-new pair behind. Returns 0 on
+ * success, -1 on allocation failure (lib is unchanged on first
+ * failure; partially grown on second — caller's library_free_contents
+ * is correct in either case).
+ */
+static int library_reserve(library_t *lib, int min_cap) {
+    if (lib->cap >= min_cap) return 0;
+    char **t = (char **)realloc(lib->titles, (size_t)min_cap * sizeof(char *));
+    if (!t) return -1;
+    lib->titles = t;
+    char **p = (char **)realloc(lib->paths, (size_t)min_cap * sizeof(char *));
+    if (!p) return -1;
+    lib->paths = p;
+    lib->cap   = min_cap;
+    return 0;
+}
+
+/*
  * Returns true if `name` ends with a recognized audio extension
  * (case-insensitive). Sets *out_title_len to the length of the basename
  * minus the extension so the caller can build a title without it.
@@ -205,29 +239,22 @@ int tagcache_library_load(const char *dir) {
         size_t title_len;
         if (!has_audio_ext(ent->d_name, &title_len)) continue;
 
-        /* Grow staging in place. */
         if (staging.cap <= staging.count) {
             int new_cap = staging.cap ? staging.cap * 2 : 32;
-            char **t = (char **)realloc(staging.titles, (size_t)new_cap * sizeof(char *));
-            char **p = (char **)realloc(staging.paths,  (size_t)new_cap * sizeof(char *));
-            if (!t || !p) {
-                free(t); free(p);
-                /* Drop everything in staging. */
-                for (int i = 0; i < staging.count; i++) {
-                    free(staging.titles[i]); free(staging.paths[i]);
-                }
-                free(staging.titles); free(staging.paths);
+            if (library_reserve(&staging, new_cap) != 0) {
+                library_free_contents(&staging);
                 closedir(d);
                 return -1;
             }
-            staging.titles = t;
-            staging.paths  = p;
-            staging.cap    = new_cap;
         }
 
         /* title = basename without extension */
         char *title = (char *)malloc(title_len + 1);
-        if (!title) break;
+        if (!title) {
+            library_free_contents(&staging);
+            closedir(d);
+            return -1;
+        }
         memcpy(title, ent->d_name, title_len);
         title[title_len] = 0;
 
@@ -236,7 +263,12 @@ int tagcache_library_load(const char *dir) {
         size_t name_len = strlen(ent->d_name);
         size_t need     = dir_len + 1 + name_len + 1;
         char *path = (char *)malloc(need);
-        if (!path) { free(title); break; }
+        if (!path) {
+            free(title);
+            library_free_contents(&staging);
+            closedir(d);
+            return -1;
+        }
         int strip_slash = (dir_len > 0 && dir[dir_len - 1] == '/') ? 1 : 0;
         snprintf(path, need, "%s%s%s",
                  dir,

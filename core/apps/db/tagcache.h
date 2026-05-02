@@ -57,8 +57,15 @@ const char *tagcache_composer_name(int idx);
  * for the corresponding row.
  *
  * Returns the number of songs loaded (>= 0), or -1 on error
- * (directory not readable, etc). On error, the previous library
- * state is preserved.
+ * (directory not readable, OOM mid-scan, etc). On error, the previous
+ * library state is preserved.
+ *
+ * **Call once, at startup.** The strings returned by
+ * tagcache_song_title / tagcache_song_path point into heap memory
+ * that is freed if library_load is called a second time. If a
+ * "rescan" feature is added later, it must invalidate every UI cached
+ * pointer first (or this function must be reworked to atomically swap
+ * in a new library while keeping the old one alive until quiescence).
  */
 int tagcache_library_load(const char *dir);
 
@@ -68,8 +75,9 @@ int tagcache_library_load(const char *dir);
  *   - no library has been loaded (synthetic data is in use), or
  *   - idx is out of range.
  *
- * The pointer is owned by the tagcache and is stable for the lifetime
- * of the loaded library.
+ * The pointer is owned by the tagcache and is stable until the next
+ * tagcache_library_load call (which is "never" in the current
+ * single-load contract).
  */
 const char *tagcache_song_path(int idx);
 
