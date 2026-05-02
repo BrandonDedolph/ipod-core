@@ -69,6 +69,11 @@ const char *tagcache_composer_name(int idx);
  */
 int tagcache_library_load(const char *dir);
 
+/* True iff a library has been loaded (even an empty one). When this
+ * is false, tagcache_artist/album/song accessors fall back to the
+ * synthetic example data and the *_for_* drilldown queries return 0. */
+int tagcache_library_loaded(void);
+
 /*
  * Filesystem path for the song at `idx` if a library has been loaded
  * via tagcache_library_load. Returns NULL when:
@@ -108,6 +113,15 @@ const char *tagcache_song_album(int idx);
 int          tagcache_song_count_for_artist(int artist_idx);
 const char  *tagcache_song_title_for_artist(int artist_idx, int n);
 const char  *tagcache_song_path_for_artist (int artist_idx, int n);
+
+/*
+ * Resolve (group, n) back into the global song index. Returns -1 when
+ * out of range / no library loaded. Drilldown UI uses this to call
+ * tagcache_song_artist/album/title against the same global index that
+ * the playback path uses.
+ */
+int          tagcache_song_index_for_artist(int artist_idx, int n);
+int          tagcache_song_index_for_album (int album_idx, int n);
 
 /*
  * Same shape for the per-album view.

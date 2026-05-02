@@ -58,10 +58,13 @@ typedef enum {
 
 /* Forward decl + storage size — exposed so callers can statically
  * allocate one. Definition is in cabinet.c. */
+#define CABINET_MAX_DEPTH      8
+#define CABINET_FRAME_TITLE_MAX 64
+
 struct cabinet {
     /* Frame stack. Each frame has a kind + per-kind state. */
-    frame_kind_t   stack_kind[8];
-    int            stack_menu[8];     /* FRAME_MENU: menu id */
+    frame_kind_t   stack_kind[CABINET_MAX_DEPTH];
+    int            stack_menu[CABINET_MAX_DEPTH];     /* FRAME_MENU: menu id */
     int            depth;             /* number of frames on the stack */
 
     /* List view state per stack level, only meaningful for FRAME_MENU
@@ -69,7 +72,14 @@ struct cabinet {
     struct {
         int selected;
         int scroll_offset;
-    } list_state[8];
+    } list_state[CABINET_MAX_DEPTH];
+
+    /* For filtered drilldown frames: the artist_idx or album_idx to
+     * filter by; -1 for unfiltered frames. The dynamic title (e.g.
+     * the artist's name) is stored alongside so the status bar shows
+     * "Aphex Twin" rather than the menu's static label. */
+    int            frame_filter[CABINET_MAX_DEPTH];
+    char           frame_title [CABINET_MAX_DEPTH][CABINET_FRAME_TITLE_MAX];
 
     audio_engine_t *engine;           /* for triggering playback */
     now_playing_t   np;               /* current NP snapshot, if any */

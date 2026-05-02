@@ -42,12 +42,32 @@ enum menu_id {
     M_MUSIC_ALBUMS,
     M_MUSIC_SONGS,
     M_MUSIC_GENRES,
+    M_MUSIC_ARTIST_SONGS,    /* drilldown: songs by one artist */
+    M_MUSIC_ALBUM_SONGS,     /* drilldown: songs on one album */
     M_PLAYLISTS,
     M_PODCASTS,
     M_AUDIOBOOKS,
     M_SETTINGS,
     M_COUNT
 };
+
+/*
+ * Filter context for the drilldown menus. cabinet_draw and
+ * cabinet_handle_button set this to the current frame's frame_filter
+ * before any menu_count / menu_item call, so the filtered count_fn /
+ * item_fn wrappers below pull the right artist or album.
+ *
+ * Single-threaded, single-cabinet — no contention. If cabinet ever
+ * goes multi-instance, promote this to a per-cabinet field and pass
+ * the cabinet through the wrappers (which would need a user-data arg
+ * on list_view_draw_dyn).
+ */
+static int g_filter = -1;
+
+static int         filtered_artist_song_count(void)        { return tagcache_song_count_for_artist(g_filter); }
+static const char *filtered_artist_song_title(int idx)     { return tagcache_song_title_for_artist(g_filter, idx); }
+static int         filtered_album_song_count(void)         { return tagcache_song_count_for_album(g_filter); }
+static const char *filtered_album_song_title(int idx)      { return tagcache_song_title_for_album(g_filter, idx); }
 
 static const char *const main_items[] = {
     "Music", "Playlists", "Podcasts", "Audiobooks", "Settings", "Now Playing"
@@ -105,6 +125,19 @@ static const menu_t MENUS[M_COUNT] = {
         .title = "Genres",
         .count_fn = tagcache_genre_count,
         .item_fn  = tagcache_genre_name,
+    },
+
+    /* Drilldown menus — title is overridden per-frame with the
+     * artist or album name; the .title here is the fallback. */
+    [M_MUSIC_ARTIST_SONGS] = {
+        .title    = "Artist",
+        .count_fn = filtered_artist_song_count,
+        .item_fn  = filtered_artist_song_title,
+    },
+    [M_MUSIC_ALBUM_SONGS] = {
+        .title    = "Album",
+        .count_fn = filtered_album_song_count,
+        .item_fn  = filtered_album_song_title,
     },
 
     [M_PLAYLISTS]  = {"Playlists",  empty_items, empty_actions, 1},
@@ -210,23 +243,96 @@ static void draw_status_bar(const char *title) {
 }
 
 static void push_menu(cabinet_t *c, int menu_id) {
-    if (c->depth >= 8) return;
+    if (c->depth >= CABINET_MAX_DEPTH) return;
     c->stack_kind[c->depth] = FRAME_MENU;
     c->stack_menu[c->depth] = menu_id;
     c->list_state[c->depth].selected = 0;
     c->list_state[c->depth].scroll_offset = 0;
+    c->frame_filter[c->depth] = -1;
+    c->frame_title[c->depth][0] = 0;
+    c->depth++;
+}
+
+/*
+ * Push a filtered menu (drilldown). `filter` is the artist or album
+ * uniq-index that the menu's count_fn / item_fn read via g_filter at
+ * draw / button-handle time. `title` is shown in the status bar
+ * instead of the menu's static label (so the user sees "Aphex Twin"
+ * not "Artist").
+ */
+static void push_filtered_menu(cabinet_t *c, int menu_id, int filter,
+                               const char *title) {
+    if (c->depth >= CABINET_MAX_DEPTH) return;
+    c->stack_kind[c->depth] = FRAME_MENU;
+    c->stack_menu[c->depth] = menu_id;
+    c->list_state[c->depth].selected = 0;
+    c->list_state[c->depth].scroll_offset = 0;
+    c->frame_filter[c->depth] = filter;
+    snprintf(c->frame_title[c->depth], CABINET_FRAME_TITLE_MAX, "%s",
+             title ? title : "");
     c->depth++;
 }
 
 static void push_now_playing(cabinet_t *c) {
-    if (c->depth >= 8) return;
+    if (c->depth >= CABINET_MAX_DEPTH) return;
     c->stack_kind[c->depth] = FRAME_NOW_PLAYING;
     c->stack_menu[c->depth] = -1;
+    c->frame_filter[c->depth] = -1;
+    c->frame_title[c->depth][0] = 0;
     c->depth++;
 }
 
 static void pop_frame(cabinet_t *c) {
     if (c->depth > 1) c->depth--;
+}
+
+/*
+ * Play the song at the given global library index. Used by all three
+ * SELECT-on-song branches (top-level Songs, Artist→Songs, Album→Songs).
+ * Caller has already checked that the index is in-range.
+ *
+ * On any failure (no path, unknown format, read error, audio engine
+ * refusal) the cabinet stays on the current menu and a log line is
+ * emitted; nothing the user can do about it from the UI.
+ */
+static void play_global_song(cabinet_t *c, int global_idx) {
+    const char *path = tagcache_song_path(global_idx);
+    if (!path) {
+        log_printf("cabinet: no path for song idx %d", global_idx);
+        return;
+    }
+    const char *label = NULL;
+    const decoder_ops_t *ops = decoder_for_path(path, &label);
+    if (!ops) {
+        log_printf("cabinet: %s — unknown format", path);
+        return;
+    }
+    void *bytes = NULL;
+    long len = load_file(path, &bytes);
+    if (len <= 0) {
+        log_printf("cabinet: read failed %s", path);
+        return;
+    }
+    int rc = audio_engine_play(c->engine, ops, bytes, (size_t)len);
+    free(bytes);    /* engine took its own copy */
+    if (rc != 0) {
+        log_printf("cabinet: play failed %s rc=%d", path, rc);
+        return;
+    }
+    now_playing_load(&c->np, c->engine);
+    snprintf(c->np.title, NP_TITLE_MAX, "%s",
+             tagcache_song_title(global_idx));
+    const char *artist = tagcache_song_artist(global_idx);
+    const char *album  = tagcache_song_album(global_idx);
+    if (artist) snprintf(c->np.artist, NP_ARTIST_MAX, "%s", artist);
+    else c->np.artist[0] = 0;
+    if (album)  snprintf(c->np.album,  NP_TITLE_MAX,  "%s", album);
+    else c->np.album[0]  = 0;
+    snprintf(c->np.format, NP_FORMAT_MAX, "%s", label);
+    snprintf(c->np.format_detail, NP_FORMAT_MAX, "%u kHz",
+             c->engine->sample_rate / 1000);
+    push_now_playing(c);
+    log_printf("cabinet: now playing %s", path);
 }
 
 /* ---------- Public API -------------------------------------------- */
@@ -237,6 +343,11 @@ void cabinet_init(cabinet_t *c, audio_engine_t *engine) {
     c->stack_kind[0] = FRAME_MENU;
     c->stack_menu[0] = M_MAIN;
     c->depth = 1;
+    /* memset zeros frame_filter[i] to 0, but we want -1 ("unfiltered")
+     * as the explicit sentinel so g_filter never accidentally matches a
+     * real artist_idx of 0 on a frame that wasn't pushed via the
+     * filtered helper. */
+    for (int i = 0; i < CABINET_MAX_DEPTH; i++) c->frame_filter[i] = -1;
 
     long n = load_file(FIXTURE_PATH, &c->fixture_bytes);
     if (n > 0) c->fixture_len = (size_t)n;
@@ -248,11 +359,21 @@ void cabinet_draw(cabinet_t *c) {
         return;
     }
 
+    /* Publish the current frame's filter for the drilldown wrappers
+     * BEFORE we call menu_count / menu_item. */
+    g_filter = c->frame_filter[c->depth - 1];
+
     int mid = current_menu(c);
     const menu_t *m = &MENUS[mid];
 
+    /* Filtered frames use the dynamic title (artist or album name);
+     * everything else uses the menu's static label. */
+    const char *title = c->frame_title[c->depth - 1][0]
+                        ? c->frame_title[c->depth - 1]
+                        : m->title;
+
     lcd_fill(COL_CREAM);
-    draw_status_bar(m->title);
+    draw_status_bar(title);
 
     list_view_t v = current_view(c);
     /* Per themes.jsx:464, selBg = ink, selFg = cream.
@@ -298,6 +419,10 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
         return;
     }
 
+    /* Publish current filter so the drilldown menus' count_fn /
+     * item_fn read the correct artist or album. */
+    g_filter = c->frame_filter[c->depth - 1];
+
     /* Menu frame: list-view scroll first, then SELECT for action. */
     int mid = current_menu(c);
     const menu_t *m = &MENUS[mid];
@@ -313,52 +438,41 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
         int idx = c->list_state[c->depth - 1].selected;
         if (idx < 0 || idx >= count) return;
 
-        /* Songs menu: if a library is loaded and this row maps to a
-         * real file, play it. Otherwise fall through to the generic
-         * action dispatch (which logs a stub). */
+        /* Top-level Songs: row idx IS the global song idx. */
         if (mid == M_MUSIC_SONGS) {
-            const char *path = tagcache_song_path(idx);
-            if (path) {
-                const char *label = NULL;
-                const decoder_ops_t *ops = decoder_for_path(path, &label);
-                if (!ops) {
-                    log_printf("cabinet: %s — unknown format", path);
-                    return;
-                }
-                void *bytes = NULL;
-                long len = load_file(path, &bytes);
-                if (len <= 0) {
-                    log_printf("cabinet: read failed %s", path);
-                    return;
-                }
-                int rc = audio_engine_play(c->engine, ops, bytes, (size_t)len);
-                free(bytes);    /* engine took its own copy */
-                if (rc != 0) {
-                    log_printf("cabinet: play failed %s rc=%d", path, rc);
-                    return;
-                }
-                now_playing_load(&c->np, c->engine);
-                /* Pull title/artist/album from the tagcache (already
-                 * parsed during library_load). tagcache_song_title
-                 * always returns a non-NULL string (TITLE tag or
-                 * filename fallback); artist/album may be NULL when
-                 * the file had no such tag. */
-                snprintf(c->np.title, NP_TITLE_MAX, "%s",
-                         tagcache_song_title(idx));
-                const char *artist = tagcache_song_artist(idx);
-                const char *album  = tagcache_song_album(idx);
-                if (artist) snprintf(c->np.artist, NP_ARTIST_MAX, "%s", artist);
-                else c->np.artist[0] = 0;
-                if (album)  snprintf(c->np.album,  NP_TITLE_MAX,  "%s", album);
-                else c->np.album[0]  = 0;
-                snprintf(c->np.format, NP_FORMAT_MAX, "%s", label);
-                snprintf(c->np.format_detail, NP_FORMAT_MAX, "%u kHz",
-                         c->engine->sample_rate / 1000);
-                push_now_playing(c);
-                log_printf("cabinet: now playing %s", path);
+            if (tagcache_song_path(idx)) {
+                play_global_song(c, idx);
                 return;
             }
-            /* No path mapping: fall through to the stub log. */
+            /* No path mapping (synthetic data): fall through to stub log. */
+        }
+
+        /* Artists list: drill into songs by that artist. Only when
+         * a real library is loaded — synthetic data has no songs to
+         * drill into. */
+        if (mid == M_MUSIC_ARTISTS && tagcache_library_loaded()) {
+            push_filtered_menu(c, M_MUSIC_ARTIST_SONGS, idx,
+                               tagcache_artist_name(idx));
+            return;
+        }
+
+        /* Albums list: drill into songs on that album. */
+        if (mid == M_MUSIC_ALBUMS && tagcache_library_loaded()) {
+            push_filtered_menu(c, M_MUSIC_ALBUM_SONGS, idx,
+                               tagcache_album_name(idx));
+            return;
+        }
+
+        /* Drilldown leaf: row resolves to a global song idx. */
+        if (mid == M_MUSIC_ARTIST_SONGS) {
+            int global = tagcache_song_index_for_artist(g_filter, idx);
+            if (global >= 0) play_global_song(c, global);
+            return;
+        }
+        if (mid == M_MUSIC_ALBUM_SONGS) {
+            int global = tagcache_song_index_for_album(g_filter, idx);
+            if (global >= 0) play_global_song(c, global);
+            return;
         }
 
         int act = menu_action(m, idx);
