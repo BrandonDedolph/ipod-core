@@ -1,78 +1,93 @@
 # Status — picked up where we left off
 
-Last working session ended 2026-05-01 with **16 PRs merged on main**.
+Last working session ended **2026-05-01** with **23 PRs merged on
+main** (16 from the prior session, 7 from this one).
 
 ## What works end-to-end today
 
-Run `make sim` from `core/`, then `./build-sim/sim/core-sim`. The
-sim opens an SDL window at 320×240 (×2 scaled) with a real Linen UI:
+Run `make sim` from `core/`, then `./build-sim/sim/core-sim
+--music ~/Music` (any directory of `.flac` / `.mp3` files). The sim
+opens an SDL window at 320×240 (×2 scaled) with a real Linen UI.
 
-- **Main menu** — "iPod" upper-left, 78% battery upper-right, separator
-  line, six menu items (Music / Playlists / Podcasts / Audiobooks /
-  Settings / Now Playing) with the trailing chevron and ink-bg selector.
-- **Music sub-menu** — drills into Music → Artists / Albums / Songs /
-  Genres / Composers, each rendering ~25 real names from the synthetic
-  tagcache (Aphex Twin, Drukqs, Avril 14th, etc).
-- **Now Playing** — SELECT on the main menu's Now Playing plays the
-  FLAC fixture and pushes the NP frame:
-  - Page 1 (default): striped art, title, artist, album, 4-star rating,
-    "FLAC 44 kHz" badge, "UP NEXT" row, scrubber, time labels.
-  - Page 2 (big art): dark backdrop, 180×180 art, title overlay.
-  - Page 3 (peak meter): two animated channel columns with
-    amber/red zones, dB labels.
-  - Page 4 (track info): key/value rows.
-  - SELECT cycles, MENU pops back to the main menu (track keeps
-    playing in the background).
-- **Pause / resume** — SPACE on any frame.
-- **Headless capture** — `core-sim --shot path.bmp [--press CHARS] [--frames N]`
-  writes a 24-bit BMP screenshot. Used through the session for visual
-  verification.
+### Without `--music` (synthetic data)
 
-Plus underneath the UI:
+- **Main menu** — "iPod" header, 78% battery, six items (Music,
+  Playlists, Podcasts, Audiobooks, Settings, Now Playing).
+- **Music sub-menu** — drills into Artists / Albums / Songs / Genres /
+  Composers populated from a synthetic tagcache (~26 real-looking
+  artist names: Aphex Twin, Beach House, Boards of Canada, etc).
+  Selecting any leaf row logs a stub.
+- **Now Playing** — SELECT on the main-menu "Now Playing" item plays
+  the FLAC fixture, pushes the NP frame with four cycle-able pages
+  (default / big art / peak meter / track info). SELECT cycles,
+  MENU pops, SPACE pauses.
 
-- **FLAC + MP3 decoders** (dr_flac + dr_mp3) wrapped under a unified
+### With `--music <dir>` (real library)
+
+Same UI, but:
+- **Songs list** shows the discovered files sorted by TITLE tag (or
+  filename for untagged files).
+- **Artists / Albums menus** show only the unique values present in
+  the loaded library (sorted, NULL tags skipped).
+- **Drilldown**: SELECT on an Artist row → that artist's songs;
+  SELECT on an Album row → that album's songs. SELECT on any leaf
+  song row plays it through the audio engine, populating NP with
+  real title / artist / album from the file's tags.
+- **Tag readers** ship for FLAC (Vorbis comments via dr_flac's
+  metadata API) and MP3 (custom ID3v2.3/2.4 parser at
+  `core/codecs/dr_mp3/tag_mp3.c`). UTF-16 ID3v2 frames are
+  best-effort downconverted to ASCII.
+
+### Underneath the UI
+
+- **FLAC + MP3 decoders** (dr_flac + dr_mp3) under a unified
   `decoder_t` ABI. Both bit-exact via the codec KAT (`meson test`).
 - **Audio engine** — SPSC ring buffer between decoder and HAL audio,
   `__atomic_*` release/acquire ordering for dual-core PP5022 safety.
-- **HAL** — LCD framebuffer, click wheel via keyboard, monotonic clock,
-  audio out via SDL2, log to stdout.
-- **Phase-0 hardware reference doc** at `core/docs/hw/` — 8 subsystems,
-  ~2,500 lines, reverse-engineered from Rockbox source.
+- **HAL** — LCD framebuffer, click wheel via keyboard, monotonic
+  clock, audio out via SDL2.
+- **Phase-0 hardware reference doc** at `core/docs/hw/` — 8
+  subsystems, ~2,500 lines.
+- **Headless capture** — `core-sim --shot path.bmp` runs SDL with
+  `SDL_VIDEODRIVER=dummy` so screenshots don't pop a window or play
+  audio. Used heavily for visual verification.
 
-## What's NOT wired (pick up tomorrow)
+## What's NOT done (pick up next)
 
-The sim **can play one specific track** (the synthetic 1 s sine FLAC at
-`core/tests/codec-vectors/sine_440hz_1s_44k_s16_stereo.flac`) via the
-"Now Playing" main-menu item. **It cannot yet play music from the
-library** — selecting a song in Music → Songs is a no-op.
+The music browser is feature-complete for sim use. Remaining items
+from the original PLAN.md:
 
-To make it actually play library music, three things are needed
-(easiest first):
+1. **Album-art JPEG decode** — replace the diagonal-stripe placeholder
+   with the actual cover art. Vendor `dr_jpg` (or similar single-
+   header JPEG decoder), call it from the FLAC PICTURE block /
+   ID3v2 APIC frame, render into the NP screen. Probably 200-300
+   lines.
 
-1. **`core-sim --music <dir>` flag.** Scan a directory for `.flac` /
-   `.mp3` files at startup, populate the Songs list with their
-   filenames, wire SELECT-on-song to `audio_engine_play(...)` with
-   that file's bytes. ~150 lines in `core/sim/main.c` +
-   `core/apps/db/tagcache.c`. **This is the ~30-min next move.**
-2. **Path-mapped tagcache.** Current `tagcache.c` only stores names;
-   needs to store filesystem paths alongside so SELECT can find the
-   actual bytes. Tiny refactor.
-3. **Drill-down Music → Artist → Album → Song.** Cabinet's frame
-   stack needs per-frame parent-context (which artist's albums are we
-   listing?). Bigger but bounded.
+2. **Go-side `core release tagcache <music-dir>` indexer** — scan a
+   real music directory, parse tags via `github.com/dhowden/tag`,
+   emit a binary tagcache file. The C reader replaces the in-memory
+   scan-at-startup path with mmap'd binary. Needed before this
+   firmware ships on real hardware (scan-at-startup over USB-disk
+   speeds is too slow).
 
-After those, the natural next moves are the bigger pending items:
+3. **Genres / Composers drilldown** — same shape as Artists/Albums,
+   trivial extension once the patterns are in.
 
-4. **Go-side `core release tagcache <music-dir>` indexer** — scan a
-   real music directory, parse ID3v2 / Vorbis / MP4 tags via
-   `github.com/dhowden/tag`, emit a binary tagcache file. The C
-   reader replaces `apps/db/tagcache.c`'s synthetic data.
-5. **Real ID3 metadata in the NP screen** — title/artist/album come
-   from the played file's tags, not hardcoded "Test Sine 440 Hz".
-6. **Album-art JPEG decode** — use `dr_jpg` or similar, replace the
-   striped placeholder with actual cover art.
-7. **Phase 1+: bootable ARM skeleton** — needs hardware in the loop.
-   See `PLAN.md`.
+4. **Phase 1: bootable ARM skeleton** — needs hardware in the loop.
+   See `PLAN.md`. Major chunk.
+
+5. **Search / on-screen keyboard** — iPod-style alphabetical jump
+   into long lists.
+
+## Recent PRs (this session)
+
+- #17 `Library playback: --music dir scans + SELECT-on-song plays`
+- #18 `NP metadata: real FLAC Vorbis tags in Now Playing`
+- #19 `NP metadata: ID3v2 reader for MP3 + shared audio_tags_t`
+- #20 `Tagcache: parse tags during library_load, real titles in Songs`
+- #21 `Tagcache: derive unique-artist + unique-album indexes`
+- #22 `Tagcache: per-song filter indexes + drilldown query APIs`
+- #23 `Cabinet drilldown: Music → Artists/Albums → Songs → play`
 
 ## Repo layout reminder
 
@@ -86,15 +101,16 @@ core/
 │   ├── hw/       (empty — needs hardware)
 │   └── sim/      SDL2-backed implementation
 ├── codecs/
-│   ├── dr_flac/  vendored single-header FLAC
-│   └── dr_mp3/   vendored single-header MP3
+│   ├── tags.h           shared audio_tags_t
+│   ├── dr_flac/         vendored single-header FLAC + tag_flac
+│   └── dr_mp3/          vendored single-header MP3 + tag_mp3 (ID3v2)
 ├── apps/
-│   ├── audio/    decoder → ring → hal_audio engine
-│   ├── db/       tagcache (synthetic data today)
-│   └── ui/       Cabinet shell, list view, NP, Linen chrome
-├── cli/          Go CLI scaffold (10 subcommands, mostly stubs)
-├── sim/          core-sim entry point
-└── tests/        codec KAT, fixtures, codec-vectors
+│   ├── audio/           decoder → ring → hal_audio engine
+│   ├── db/              tagcache: scan, parse tags, build indexes
+│   └── ui/              Cabinet shell, list view, NP, Linen chrome
+├── cli/                 Go CLI scaffold (10 subcommands, mostly stubs)
+├── sim/                 core-sim entry point
+└── tests/               codec KAT, fixtures, codec-vectors
 
 tools/
 ├── atlas_gen.{py,sh}      Pillow-based glyph atlas generator
@@ -107,11 +123,12 @@ tools/
 - `cd core && meson test -C build-sim` — codec KATs (FLAC + MP3,
   bit-exact). Should always pass.
 - `cd core && ./build-sim/sim/core-sim --shot /tmp/x.bmp` — quick
-  visual smoke test; produces a BMP of the main menu.
+  visual smoke test; produces a BMP of the main menu (headless, no
+  window pop-up).
 
 ## Repository links
 
 GitHub: https://github.com/BrandonDedolph/ipod_theme
 
-All 16 PRs are squash-merged into `main`; commit history is linear
-(`git log --oneline -16`).
+All 23 PRs are squash-merged into `main`; commit history is linear
+(`git log --oneline -23`).
