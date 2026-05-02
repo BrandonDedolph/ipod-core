@@ -336,11 +336,11 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
                 /* Read tags first while we still hold the bytes. We do
                  * this for FLAC today (Vorbis comments via dr_flac);
                  * MP3 ID3v2 lands in a follow-up PR — until then MP3
-                 * NP rows fall back to filename. */
+                 * NP rows fall back to filename. The zero-init means
+                 * the MP3 path lands here with all found_* flags = 0. */
                 flac_tags_t tags = (flac_tags_t){0};
-                int have_tags = 0;
                 if (ops == flac_decoder_ops()) {
-                    have_tags = (tag_flac_read(bytes, (size_t)len, &tags) == 0);
+                    (void)tag_flac_read(bytes, (size_t)len, &tags);
                 }
 
                 int rc = audio_engine_play(c->engine, ops, bytes, (size_t)len);
@@ -353,18 +353,18 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
                 /* Title: tag if present, else filename. Artist/album:
                  * tag if present, else clear (NP draws empty rows
                  * cleanly rather than leaving the fixture defaults). */
-                if (have_tags && tags.found_title) {
+                if (tags.found_title) {
                     snprintf(c->np.title, NP_TITLE_MAX, "%s", tags.title);
                 } else {
                     snprintf(c->np.title, NP_TITLE_MAX, "%s",
                              tagcache_song_title(idx));
                 }
-                if (have_tags && tags.found_artist) {
+                if (tags.found_artist) {
                     snprintf(c->np.artist, NP_ARTIST_MAX, "%s", tags.artist);
                 } else {
                     c->np.artist[0] = 0;
                 }
-                if (have_tags && tags.found_album) {
+                if (tags.found_album) {
                     snprintf(c->np.album, NP_TITLE_MAX, "%s", tags.album);
                 } else {
                     c->np.album[0] = 0;
