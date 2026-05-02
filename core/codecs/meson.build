@@ -22,7 +22,7 @@ vendored_codec_warning_suppress = [
 
 flac_lib = static_library(
   'core_codec_flac',
-  sources: ['dr_flac/flac.c'],
+  sources: ['dr_flac/flac.c', 'dr_flac/tag_flac.c'],
   include_directories: include_directories('.', 'dr_flac'),
   c_args: vendored_codec_warning_suppress,
 )
