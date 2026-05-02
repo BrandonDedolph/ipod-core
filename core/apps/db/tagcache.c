@@ -191,7 +191,7 @@ static void library_clear(void) {
         free(LIBRARY.paths[i]);
         free(LIBRARY.artists[i]);
         free(LIBRARY.albums[i]);
-        if (LIBRARY.art_bytes) free(LIBRARY.art_bytes[i]);
+        free(LIBRARY.art_bytes[i]);
     }
     free(LIBRARY.titles);
     free(LIBRARY.paths);
@@ -251,7 +251,7 @@ static void library_free_contents(library_t *lib) {
         free(lib->paths[i]);
         free(lib->artists[i]);
         free(lib->albums[i]);
-        if (lib->art_bytes) free(lib->art_bytes[i]);
+        free(lib->art_bytes[i]);
     }
     free(lib->titles);
     free(lib->paths);
