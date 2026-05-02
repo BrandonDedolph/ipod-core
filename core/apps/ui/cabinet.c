@@ -15,8 +15,10 @@
 #include "../audio/engine.h"
 #include "../db/tagcache.h"
 #include "../../codecs/dr_flac/flac.h"
+#include "../../codecs/dr_mp3/mp3.h"
 #include "../../hal/hal.h"
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,12 +130,13 @@ static int menu_action(const menu_t *m, int idx) {
 
 #define FIXTURE_PATH "tests/codec-vectors/sine_440hz_1s_44k_s16_stereo.flac"
 
-static long load_fixture(const char *path, void **out_buf) {
+static long load_file(const char *path, void **out_buf) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return -1;
     fseek(fp, 0, SEEK_END);
     long n = ftell(fp);
     fseek(fp, 0, SEEK_SET);
+    if (n <= 0) { fclose(fp); return -1; }
     void *buf = malloc((size_t)n);
     if (!buf) { fclose(fp); return -1; }
     if (fread(buf, 1, (size_t)n, fp) != (size_t)n) {
@@ -142,6 +145,31 @@ static long load_fixture(const char *path, void **out_buf) {
     fclose(fp);
     *out_buf = buf;
     return n;
+}
+
+/*
+ * Pick a decoder by file extension. Returns NULL for unknown formats.
+ * `format_label` (e.g. "FLAC", "MP3") is written into `*out_label` for
+ * the NP screen badge.
+ */
+static const decoder_ops_t *decoder_for_path(const char *path,
+                                             const char **out_label) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return NULL;
+    char ext[8];
+    size_t ext_len = strlen(dot + 1);
+    if (ext_len >= sizeof(ext)) return NULL;
+    for (size_t i = 0; i < ext_len; i++) ext[i] = (char)tolower((unsigned char)dot[1 + i]);
+    ext[ext_len] = 0;
+    if (strcmp(ext, "flac") == 0) {
+        if (out_label) *out_label = "FLAC";
+        return flac_decoder_ops();
+    }
+    if (strcmp(ext, "mp3") == 0) {
+        if (out_label) *out_label = "MP3";
+        return mp3_decoder_ops();
+    }
+    return NULL;
 }
 
 static frame_kind_t current_kind(const cabinet_t *c) {
@@ -210,7 +238,7 @@ void cabinet_init(cabinet_t *c, audio_engine_t *engine) {
     c->stack_menu[0] = M_MAIN;
     c->depth = 1;
 
-    long n = load_fixture(FIXTURE_PATH, &c->fixture_bytes);
+    long n = load_file(FIXTURE_PATH, &c->fixture_bytes);
     if (n > 0) c->fixture_len = (size_t)n;
 }
 
@@ -284,6 +312,47 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
     if (btn == BUTTON_SELECT) {
         int idx = c->list_state[c->depth - 1].selected;
         if (idx < 0 || idx >= count) return;
+
+        /* Songs menu: if a library is loaded and this row maps to a
+         * real file, play it. Otherwise fall through to the generic
+         * action dispatch (which logs a stub). */
+        if (mid == M_MUSIC_SONGS) {
+            const char *path = tagcache_song_path(idx);
+            if (path) {
+                const char *label = NULL;
+                const decoder_ops_t *ops = decoder_for_path(path, &label);
+                if (!ops) {
+                    log_printf("cabinet: %s — unknown format", path);
+                    return;
+                }
+                void *bytes = NULL;
+                long len = load_file(path, &bytes);
+                if (len <= 0) {
+                    log_printf("cabinet: read failed %s", path);
+                    return;
+                }
+                int rc = audio_engine_play(c->engine, ops, bytes, (size_t)len);
+                free(bytes);    /* engine took its own copy */
+                if (rc != 0) {
+                    log_printf("cabinet: play failed %s rc=%d", path, rc);
+                    return;
+                }
+                now_playing_load(&c->np, c->engine);
+                /* Override the fixture-default title/format with the
+                 * real song's filename + codec. ID3-driven metadata
+                 * lands when the binary tagcache + tag parser do. */
+                snprintf(c->np.title, NP_TITLE_MAX, "%s",
+                         tagcache_song_title(idx));
+                snprintf(c->np.format, NP_FORMAT_MAX, "%s", label);
+                snprintf(c->np.format_detail, NP_FORMAT_MAX, "%u kHz",
+                         c->engine->sample_rate / 1000);
+                push_now_playing(c);
+                log_printf("cabinet: now playing %s", path);
+                return;
+            }
+            /* No path mapping: fall through to the stub log. */
+        }
+
         int act = menu_action(m, idx);
         if (act == ACT_NOOP) {
             log_printf("cabinet: %s -> %s (stub)",
