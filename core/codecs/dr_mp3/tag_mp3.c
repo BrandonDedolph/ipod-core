@@ -142,6 +142,14 @@ static size_t skip_byte_terminated(const uint8_t *body, size_t off, size_t body_
     return 0;
 }
 
+/*
+ * Limitation: v2.4 frame-flag bits for compression / encryption /
+ * data-length-indicator are not handled. The parser sees the raw body
+ * after our generic header read; if the frame is compressed it will
+ * misparse silently (no crash because every read stays within fsize).
+ * Same posture as the text-frame path. Few real-world MP3s use these
+ * flags on APIC; revisit when one shows up.
+ */
 static void stash_picture_apic(audio_tags_t *tags,
                                const uint8_t *fbody, size_t fsize) {
     if (fsize < 3) return;            /* enc + at least one MIME byte + null */
