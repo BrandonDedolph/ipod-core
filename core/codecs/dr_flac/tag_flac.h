@@ -17,20 +17,9 @@
 #ifndef CORE_CODECS_DR_FLAC_TAG_FLAC_H
 #define CORE_CODECS_DR_FLAC_TAG_FLAC_H
 
+#include "../tags.h"
+
 #include <stddef.h>
-
-/* Match NP_TITLE_MAX / NP_ARTIST_MAX in apps/ui/now_playing.h so the
- * NP screen can copy without a second-stage truncation. */
-#define TAG_FLAC_FIELD_MAX 64
-
-typedef struct {
-    char title [TAG_FLAC_FIELD_MAX];
-    char artist[TAG_FLAC_FIELD_MAX];
-    char album [TAG_FLAC_FIELD_MAX];
-    int  found_title;
-    int  found_artist;
-    int  found_album;
-} flac_tags_t;
 
 /*
  * Read Vorbis comments from `bytes` (a complete FLAC file in memory)
@@ -40,11 +29,7 @@ typedef struct {
  * Returns:
  *    0 on success (even if no tags found — check the found_* flags).
  *   -1 if dr_flac couldn't open the input (truncated, malformed, etc).
- *
- * UTF-8 strings longer than TAG_FLAC_FIELD_MAX-1 bytes are truncated
- * at the byte boundary; we don't parse code points. Callers that need
- * full strings should bump TAG_FLAC_FIELD_MAX.
  */
-int tag_flac_read(const void *bytes, size_t len, flac_tags_t *out);
+int tag_flac_read(const void *bytes, size_t len, audio_tags_t *out);
 
 #endif /* CORE_CODECS_DR_FLAC_TAG_FLAC_H */

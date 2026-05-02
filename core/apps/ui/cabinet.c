@@ -17,6 +17,7 @@
 #include "../../codecs/dr_flac/flac.h"
 #include "../../codecs/dr_flac/tag_flac.h"
 #include "../../codecs/dr_mp3/mp3.h"
+#include "../../codecs/dr_mp3/tag_mp3.h"
 #include "../../hal/hal.h"
 
 #include <ctype.h>
@@ -333,14 +334,14 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
                     return;
                 }
 
-                /* Read tags first while we still hold the bytes. We do
-                 * this for FLAC today (Vorbis comments via dr_flac);
-                 * MP3 ID3v2 lands in a follow-up PR — until then MP3
-                 * NP rows fall back to filename. The zero-init means
-                 * the MP3 path lands here with all found_* flags = 0. */
-                flac_tags_t tags = (flac_tags_t){0};
+                /* Read tags first while we still hold the bytes. FLAC
+                 * uses Vorbis comments via dr_flac; MP3 uses our own
+                 * ID3v2 parser. Both populate the same audio_tags_t. */
+                audio_tags_t tags = (audio_tags_t){0};
                 if (ops == flac_decoder_ops()) {
                     (void)tag_flac_read(bytes, (size_t)len, &tags);
+                } else if (ops == mp3_decoder_ops()) {
+                    (void)tag_mp3_read(bytes, (size_t)len, &tags);
                 }
 
                 int rc = audio_engine_play(c->engine, ops, bytes, (size_t)len);
