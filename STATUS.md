@@ -1,7 +1,8 @@
 # Status — picked up where we left off
 
-Last working session ended **2026-05-01** with **23 PRs merged on
-main** (16 from the prior session, 7 from this one).
+Last working session ended **2026-05-02** with **26 PRs merged on
+main**: 16 from the original arc, 7 from the library/drilldown push,
+3 more for album art (FLAC + MP3 APIC + big-art page).
 
 ## What works end-to-end today
 
@@ -37,6 +38,10 @@ Same UI, but:
   metadata API) and MP3 (custom ID3v2.3/2.4 parser at
   `core/codecs/dr_mp3/tag_mp3.c`). UTF-16 ID3v2 frames are
   best-effort downconverted to ASCII.
+- **Album art** — embedded JPEG cover art (FLAC PICTURE block /
+  ID3v2 APIC frame) is decoded via stb_image (JPEG-only build) and
+  rendered on both the default page (84×84) and big-art page
+  (180×180). Untagged tracks fall back to diagonal-stripe placeholder.
 
 ### Underneath the UI
 
@@ -54,27 +59,32 @@ Same UI, but:
 
 ## What's NOT done (pick up next)
 
-The music browser is feature-complete for sim use. Remaining items
-from the original PLAN.md:
+The music browser feels real end-to-end in sim — load, browse, drill,
+play, with real metadata and cover art on the NP pages. Remaining
+items, roughly in order of payoff vs. effort:
 
-1. **Album-art JPEG decode** — replace the diagonal-stripe placeholder
-   with the actual cover art. Vendor `dr_jpg` (or similar single-
-   header JPEG decoder), call it from the FLAC PICTURE block /
-   ID3v2 APIC frame, render into the NP screen. Probably 200-300
-   lines.
+1. **Genres / Composers drilldown** — needs tag readers extended with
+   GENRE / TCON and COMPOSER / TCOM, then the same indexing + filter-
+   menu pattern as Artists/Albums. Medium PR (~200 lines), high
+   visibility (more iconic-iPod browse paths).
 
 2. **Go-side `core release tagcache <music-dir>` indexer** — scan a
    real music directory, parse tags via `github.com/dhowden/tag`,
    emit a binary tagcache file. The C reader replaces the in-memory
    scan-at-startup path with mmap'd binary. Needed before this
    firmware ships on real hardware (scan-at-startup over USB-disk
-   speeds is too slow).
+   speeds is too slow). Medium-large PR, mostly Go-side.
 
-3. **Genres / Composers drilldown** — same shape as Artists/Albums,
-   trivial extension once the patterns are in.
+3. **Phase 1: bootable ARM skeleton** — needs hardware in the loop.
+   See `PLAN.md`. Major chunk; not trivially mockable in sim.
 
-4. **Phase 1: bootable ARM skeleton** — needs hardware in the loop.
-   See `PLAN.md`. Major chunk.
+4. **Search / on-screen keyboard** — iPod-style alphabetical jump
+   into long lists.
+
+5. **Polish odds & ends** — UI quirks (silent UTF-8 truncation
+   mid-codepoint in tag fields; v2.4 compressed APIC frames misparse
+   silently); compressed-art format support if a real-world MP3 ever
+   embeds PNG via APIC.
 
 5. **Search / on-screen keyboard** — iPod-style alphabetical jump
    into long lists.
@@ -88,6 +98,9 @@ from the original PLAN.md:
 - #21 `Tagcache: derive unique-artist + unique-album indexes`
 - #22 `Tagcache: per-song filter indexes + drilldown query APIs`
 - #23 `Cabinet drilldown: Music → Artists/Albums → Songs → play`
+- #24 `Album art: FLAC PICTURE → JPEG decode → render in NP`
+- #25 `MP3 album art: ID3v2 APIC extraction in tag_mp3`
+- #26 `NP big-art page: render real album art at 180×180`
 
 ## Repo layout reminder
 
@@ -101,9 +114,10 @@ core/
 │   ├── hw/       (empty — needs hardware)
 │   └── sim/      SDL2-backed implementation
 ├── codecs/
-│   ├── tags.h           shared audio_tags_t
+│   ├── tags.h           shared audio_tags_t (incl. owned art bytes)
 │   ├── dr_flac/         vendored single-header FLAC + tag_flac
-│   └── dr_mp3/          vendored single-header MP3 + tag_mp3 (ID3v2)
+│   ├── dr_mp3/          vendored single-header MP3 + tag_mp3 (ID3v2)
+│   └── stb_image/       JPEG-only build for embedded album art
 ├── apps/
 │   ├── audio/           decoder → ring → hal_audio engine
 │   ├── db/              tagcache: scan, parse tags, build indexes
@@ -130,5 +144,5 @@ tools/
 
 GitHub: https://github.com/BrandonDedolph/ipod_theme
 
-All 23 PRs are squash-merged into `main`; commit history is linear
-(`git log --oneline -23`).
+All 26 PRs are squash-merged into `main`; commit history is linear
+(`git log --oneline -26`).
