@@ -81,4 +81,17 @@ int tagcache_library_load(const char *dir);
  */
 const char *tagcache_song_path(int idx);
 
+/*
+ * Per-song artist / album as parsed from the file's tags during
+ * library_load. Returns NULL when:
+ *   - no library has been loaded, or
+ *   - idx is out of range, or
+ *   - the file had no ARTIST / ALBUM tag (untagged file or unsupported
+ *     codec).
+ *
+ * Future drilldown UI uses these to group songs by artist/album.
+ */
+const char *tagcache_song_artist(int idx);
+const char *tagcache_song_album(int idx);
+
 #endif /* CORE_APPS_DB_TAGCACHE_H */

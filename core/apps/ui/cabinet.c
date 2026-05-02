@@ -15,9 +15,7 @@
 #include "../audio/engine.h"
 #include "../db/tagcache.h"
 #include "../../codecs/dr_flac/flac.h"
-#include "../../codecs/dr_flac/tag_flac.h"
 #include "../../codecs/dr_mp3/mp3.h"
-#include "../../codecs/dr_mp3/tag_mp3.h"
 #include "../../hal/hal.h"
 
 #include <ctype.h>
@@ -333,17 +331,6 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
                     log_printf("cabinet: read failed %s", path);
                     return;
                 }
-
-                /* Read tags first while we still hold the bytes. FLAC
-                 * uses Vorbis comments via dr_flac; MP3 uses our own
-                 * ID3v2 parser. Both populate the same audio_tags_t. */
-                audio_tags_t tags = (audio_tags_t){0};
-                if (ops == flac_decoder_ops()) {
-                    (void)tag_flac_read(bytes, (size_t)len, &tags);
-                } else if (ops == mp3_decoder_ops()) {
-                    (void)tag_mp3_read(bytes, (size_t)len, &tags);
-                }
-
                 int rc = audio_engine_play(c->engine, ops, bytes, (size_t)len);
                 free(bytes);    /* engine took its own copy */
                 if (rc != 0) {
@@ -351,25 +338,19 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
                     return;
                 }
                 now_playing_load(&c->np, c->engine);
-                /* Title: tag if present, else filename. Artist/album:
-                 * tag if present, else clear (NP draws empty rows
-                 * cleanly rather than leaving the fixture defaults). */
-                if (tags.found_title) {
-                    snprintf(c->np.title, NP_TITLE_MAX, "%s", tags.title);
-                } else {
-                    snprintf(c->np.title, NP_TITLE_MAX, "%s",
-                             tagcache_song_title(idx));
-                }
-                if (tags.found_artist) {
-                    snprintf(c->np.artist, NP_ARTIST_MAX, "%s", tags.artist);
-                } else {
-                    c->np.artist[0] = 0;
-                }
-                if (tags.found_album) {
-                    snprintf(c->np.album, NP_TITLE_MAX, "%s", tags.album);
-                } else {
-                    c->np.album[0] = 0;
-                }
+                /* Pull title/artist/album from the tagcache (already
+                 * parsed during library_load). tagcache_song_title
+                 * always returns a non-NULL string (TITLE tag or
+                 * filename fallback); artist/album may be NULL when
+                 * the file had no such tag. */
+                snprintf(c->np.title, NP_TITLE_MAX, "%s",
+                         tagcache_song_title(idx));
+                const char *artist = tagcache_song_artist(idx);
+                const char *album  = tagcache_song_album(idx);
+                if (artist) snprintf(c->np.artist, NP_ARTIST_MAX, "%s", artist);
+                else c->np.artist[0] = 0;
+                if (album)  snprintf(c->np.album,  NP_TITLE_MAX,  "%s", album);
+                else c->np.album[0]  = 0;
                 snprintf(c->np.format, NP_FORMAT_MAX, "%s", label);
                 snprintf(c->np.format_detail, NP_FORMAT_MAX, "%u kHz",
                          c->engine->sample_rate / 1000);
