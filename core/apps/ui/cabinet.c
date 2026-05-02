@@ -57,7 +57,10 @@ enum menu_id {
  * before any menu_count / menu_item call, so the filtered count_fn /
  * item_fn wrappers below pull the right artist or album.
  *
- * Single-threaded, single-cabinet — no contention.
+ * Single-threaded, single-cabinet — no contention. If cabinet ever
+ * goes multi-instance, promote this to a per-cabinet field and pass
+ * the cabinet through the wrappers (which would need a user-data arg
+ * on list_view_draw_dyn).
  */
 static int g_filter = -1;
 
@@ -288,32 +291,33 @@ static void pop_frame(cabinet_t *c) {
  * SELECT-on-song branches (top-level Songs, Artist→Songs, Album→Songs).
  * Caller has already checked that the index is in-range.
  *
- * Returns true on success (NP frame pushed); false on any failure
- * (logged). On failure the cabinet stays on the current menu.
+ * On any failure (no path, unknown format, read error, audio engine
+ * refusal) the cabinet stays on the current menu and a log line is
+ * emitted; nothing the user can do about it from the UI.
  */
-static bool play_global_song(cabinet_t *c, int global_idx) {
+static void play_global_song(cabinet_t *c, int global_idx) {
     const char *path = tagcache_song_path(global_idx);
     if (!path) {
         log_printf("cabinet: no path for song idx %d", global_idx);
-        return false;
+        return;
     }
     const char *label = NULL;
     const decoder_ops_t *ops = decoder_for_path(path, &label);
     if (!ops) {
         log_printf("cabinet: %s — unknown format", path);
-        return false;
+        return;
     }
     void *bytes = NULL;
     long len = load_file(path, &bytes);
     if (len <= 0) {
         log_printf("cabinet: read failed %s", path);
-        return false;
+        return;
     }
     int rc = audio_engine_play(c->engine, ops, bytes, (size_t)len);
     free(bytes);    /* engine took its own copy */
     if (rc != 0) {
         log_printf("cabinet: play failed %s rc=%d", path, rc);
-        return false;
+        return;
     }
     now_playing_load(&c->np, c->engine);
     snprintf(c->np.title, NP_TITLE_MAX, "%s",
@@ -329,7 +333,6 @@ static bool play_global_song(cabinet_t *c, int global_idx) {
              c->engine->sample_rate / 1000);
     push_now_playing(c);
     log_printf("cabinet: now playing %s", path);
-    return true;
 }
 
 /* ---------- Public API -------------------------------------------- */
