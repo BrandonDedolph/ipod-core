@@ -13,10 +13,11 @@
  *     flags = 2 bytes
  *     content = `size` bytes
  *
- * We extract three frames:
+ * We extract three text frames + one picture frame:
  *   TIT2 → title
  *   TPE1 → artist
  *   TALB → album
+ *   APIC → embedded picture (album art)
  *
  * Text frames are encoded with a 1-byte prefix:
  *   0 = ISO-8859-1, 1 = UTF-16 with BOM, 2 = UTF-16BE, 3 = UTF-8 (v2.4)
@@ -24,6 +25,13 @@
  * UTF-16 is downconverted by dropping the high byte of each code unit
  * (good for ASCII-in-UTF-16, returns '?' for code points >= 0x80) —
  * see header for rationale.
+ *
+ * APIC body layout:
+ *   1 byte  text-encoding (for description)
+ *   N bytes MIME type, null-terminated ASCII (e.g. "image/jpeg")
+ *   1 byte  picture type (0x03 = front cover)
+ *   N bytes description, null-terminated (encoding above)
+ *   ...    picture data, runs to end of frame
  *
  * Robustness contract: any malformed header or out-of-bounds size is
  * treated as "no tags found", not as an error. The audio stream is
@@ -33,6 +41,7 @@
 #include "tag_mp3.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---------- helpers ---------------------------------------------------- */
@@ -103,6 +112,88 @@ static void copy_text_frame(char *dst, size_t dst_size,
     } else {
         /* Unknown encoding — leave dst empty. */
     }
+}
+
+/* ---------- APIC (album art) ------------------------------------------ */
+
+/* ID3v2 picture type for "Cover (front)". */
+#define APIC_TYPE_FRONT_COVER 0x03
+
+/*
+ * Walk a UTF-16 null-terminated string starting at body[off..body_len).
+ * Returns the offset just past the trailing 0x0000 code unit, or 0 if
+ * no terminator was found. Used to skip the APIC description field
+ * when it's UTF-16-encoded.
+ */
+static size_t skip_utf16_terminated(const uint8_t *body, size_t off, size_t body_len) {
+    while (off + 1 < body_len) {
+        if (body[off] == 0 && body[off + 1] == 0) return off + 2;
+        off += 2;
+    }
+    return 0;
+}
+
+/* Same for null-terminated single-byte strings (Latin-1 / UTF-8). */
+static size_t skip_byte_terminated(const uint8_t *body, size_t off, size_t body_len) {
+    while (off < body_len) {
+        if (body[off] == 0) return off + 1;
+        off++;
+    }
+    return 0;
+}
+
+/*
+ * Limitation: v2.4 frame-flag bits for compression / encryption /
+ * data-length-indicator are not handled. The parser sees the raw body
+ * after our generic header read; if the frame is compressed it will
+ * misparse silently (no crash because every read stays within fsize).
+ * Same posture as the text-frame path. Few real-world MP3s use these
+ * flags on APIC; revisit when one shows up.
+ */
+static void stash_picture_apic(audio_tags_t *tags,
+                               const uint8_t *fbody, size_t fsize) {
+    if (fsize < 3) return;            /* enc + at least one MIME byte + null */
+
+    uint8_t enc = fbody[0];
+    /* Description is encoded per `enc`; MIME is always Latin-1 per spec. */
+
+    /* MIME type — null-terminated single-byte string starting at off=1. */
+    size_t off = skip_byte_terminated(fbody, 1, fsize);
+    if (off == 0 || off >= fsize) return;
+
+    /* Picture type. */
+    uint8_t pic_type = fbody[off];
+    off++;
+    if (off >= fsize) return;
+
+    /* Description (size depends on enc). UTF-16 needs a 0x0000 unit
+     * terminator; Latin-1/UTF-8 just a 0x00 byte. */
+    if (enc == 1 || enc == 2) {
+        off = skip_utf16_terminated(fbody, off, fsize);
+    } else {
+        off = skip_byte_terminated(fbody, off, fsize);
+    }
+    if (off == 0 || off > fsize) return;
+
+    /* Picture data: from `off` to end of frame. */
+    size_t pic_len = fsize - off;
+    if (pic_len == 0) return;
+
+    /* Same front-cover-preferred logic as tag_flac.c:
+     *   found_art == 0 → nothing stashed (take any)
+     *   found_art == 1 → non-front stashed (override only with front)
+     *   found_art == 2 → front stashed (don't override) */
+    if (tags->found_art == 2) return;
+    if (tags->found_art == 1 && pic_type != APIC_TYPE_FRONT_COVER) return;
+
+    void *copy = malloc(pic_len);
+    if (!copy) return;
+    memcpy(copy, fbody + off, pic_len);
+
+    free(tags->art_bytes);
+    tags->art_bytes = copy;
+    tags->art_len   = pic_len;
+    tags->found_art = (pic_type == APIC_TYPE_FRONT_COVER) ? 2 : 1;
 }
 
 /* ---------- frame iteration ------------------------------------------- */
@@ -179,6 +270,8 @@ int tag_mp3_read(const void *bytes, size_t len, audio_tags_t *out) {
         } else if (matches(id, "TALB") && !out->found_album) {
             copy_text_frame(out->album, sizeof(out->album), fbody, fsize);
             out->found_album = (out->album[0] != 0);
+        } else if (matches(id, "APIC")) {
+            stash_picture_apic(out, fbody, fsize);
         }
 
         body = fbody + fsize;
