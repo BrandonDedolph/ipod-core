@@ -10,7 +10,7 @@
  *      (commentCount, pComments) tuple via an iterator.
  *   2. Each comment is "KEY=VALUE" without a null terminator. We
  *      uppercase the key and match against TITLE / ARTIST / ALBUM.
- *   3. Truncate the value at TAG_FLAC_FIELD_MAX-1 bytes (UTF-8 byte
+ *   3. Truncate the value at TAG_FIELD_MAX-1 bytes (UTF-8 byte
  *      boundary; not code-point aware).
  *   4. Close the decoder; throw away the audio path.
  */

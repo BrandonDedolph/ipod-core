@@ -165,8 +165,10 @@ int tag_mp3_read(const void *bytes, size_t len, audio_tags_t *out) {
         /* A zero ID byte signals padding — we're done. */
         if (id[0] == 0) break;
 
-        /* Frame must fit in the remaining body. */
-        if (fbody + fsize > body_end) break;
+        /* Frame must fit in the remaining body. Compare via the
+         * size_t form rather than `fbody + fsize > body_end` so a
+         * 32-bit target can't wrap on a maliciously huge fsize. */
+        if (fsize > (size_t)(body_end - fbody)) break;
 
         if (matches(id, "TIT2") && !out->found_title) {
             copy_text_frame(out->title, sizeof(out->title), fbody, fsize);
