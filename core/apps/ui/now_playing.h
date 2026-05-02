@@ -58,13 +58,21 @@ typedef enum {
 } np_page_t;
 
 /*
- * Album-art buffer for the default page. 84 × 84 RGB565 = 14 112 bytes,
- * lives inline in the now_playing_t (no heap). When a song's tag block
- * has an embedded picture, now_playing_load decodes it into this
- * buffer; otherwise the page draws the diagonal-stripe placeholder.
+ * Album-art buffers. Two sizes lined up with the two pages that show
+ * art:
+ *   - default page (NP_PAGE_DEFAULT): 84 × 84 in the inline art rect
+ *   - big-art page (NP_PAGE_BIG_ART): 180 × 180 centered on dark bg
+ *
+ * Both live inline in now_playing_t (no heap). 14 112 + 64 800 =
+ * 78 912 bytes total — fits comfortably in the static cabinet_t. When
+ * a song has embedded art we decode + nearest-neighbor scale into both
+ * buffers at load time; if neither decode succeeds the renderers fall
+ * back to their respective stripe placeholders.
  */
-#define NP_ART_W 84
-#define NP_ART_H 84
+#define NP_ART_W      84
+#define NP_ART_H      84
+#define NP_ART_BIG_W  180
+#define NP_ART_BIG_H  180
 
 typedef struct {
     char     title[NP_TITLE_MAX];
@@ -79,10 +87,11 @@ typedef struct {
     bool     loaded;
     np_page_t page;
 
-    /* Decoded album art for the default page. art_loaded tracks
-     * whether art_pixels holds a valid image (vs a stale/empty
-     * buffer); the renderer falls back to stripes when false. */
-    uint16_t art_pixels[NP_ART_W * NP_ART_H];
+    /* Decoded album art for the default + big-art pages. art_loaded
+     * is set true after a successful decode of *both* buffers; if
+     * either fails, both pages fall back to stripes. */
+    uint16_t art_pixels    [NP_ART_W     * NP_ART_H];
+    uint16_t art_pixels_big[NP_ART_BIG_W * NP_ART_BIG_H];
     bool     art_loaded;
 } now_playing_t;
 

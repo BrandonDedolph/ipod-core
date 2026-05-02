@@ -64,11 +64,19 @@ int now_playing_set_art_jpeg(now_playing_t *np,
         np->art_loaded = false;
         return -1;
     }
-    int rc = image_jpeg_decode_rgb565(jpeg_bytes, jpeg_len,
-                                      NP_ART_W, NP_ART_H,
-                                      np->art_pixels);
-    np->art_loaded = (rc == 0);
-    return rc;
+    /* Decode twice — once at each target size — rather than upscaling
+     * the small buffer. Two passes through stb_image_resize-equivalent
+     * (our nearest-neighbor scaler) is roughly the same cost as one,
+     * since most of the time is in the JPEG decode itself. Either
+     * decode failing falls back to stripes for both pages. */
+    int rc1 = image_jpeg_decode_rgb565(jpeg_bytes, jpeg_len,
+                                       NP_ART_W, NP_ART_H,
+                                       np->art_pixels);
+    int rc2 = image_jpeg_decode_rgb565(jpeg_bytes, jpeg_len,
+                                       NP_ART_BIG_W, NP_ART_BIG_H,
+                                       np->art_pixels_big);
+    np->art_loaded = (rc1 == 0 && rc2 == 0);
+    return np->art_loaded ? 0 : -1;
 }
 
 void now_playing_advance_page(now_playing_t *np) {
@@ -294,15 +302,24 @@ static void draw_big_art(const now_playing_t *np, const audio_engine_t *engine) 
     chrome_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, COL_DARK_BG);
 
     /*
-     * 180x180 art centered, per design — ((320-180)/2, (240-180)/2) =
-     * (70, 30). Slightly different stripe colors so the art still
-     * reads as warm-tan against the near-black bg.
+     * 180×180 art centered, per design — ((320-180)/2, (240-180)/2) =
+     * (70, 30). Real if decoded, slightly-darker-tan stripes if not.
      */
-    int art_w = 180, art_h = 180;
+    int art_w = NP_ART_BIG_W, art_h = NP_ART_BIG_H;
     int art_x = (LCD_WIDTH  - art_w) / 2;
     int art_y = (LCD_HEIGHT - art_h) / 2;
-    chrome_diagonal_stripes(art_x, art_y, art_w, art_h,
-                            10, 6, COL_BIG_STRIPE_A, COL_BIG_STRIPE_B);
+    if (np->art_loaded) {
+        lcd_pixel_t *fb = lcd_framebuffer();
+        for (int y = 0; y < art_h; y++) {
+            for (int x = 0; x < art_w; x++) {
+                fb[(art_y + y) * LCD_WIDTH + (art_x + x)] =
+                    np->art_pixels_big[y * NP_ART_BIG_W + x];
+            }
+        }
+    } else {
+        chrome_diagonal_stripes(art_x, art_y, art_w, art_h,
+                                10, 6, COL_BIG_STRIPE_A, COL_BIG_STRIPE_B);
+    }
 
     /*
      * Top status row: "1 OF 3" left, battery right, both in cream
