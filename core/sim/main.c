@@ -10,9 +10,15 @@
  * is one event: D=down, U=up, L=left, R=right, E=enter/select,
  * M=menu, P=play). Optional `--frames N` runs N frames after the
  * presses to let layout settle / scrubber advance.
+ *
+ * `--music <dir>` scans `dir` (non-recursively) for .flac/.mp3 files
+ * and uses them to populate Music → Songs at startup. SELECT on a
+ * song row then plays that file through the audio engine. Without
+ * the flag, the Songs list shows the synthetic example data.
  */
 
 #include "../apps/audio/engine.h"
+#include "../apps/db/tagcache.h"
 #include "../apps/ui/cabinet.h"
 #include "../hal/hal.h"
 
@@ -35,6 +41,7 @@ static button_t key_to_button(char k) {
 int main(int argc, char **argv) {
     const char *shot_path = NULL;
     const char *press_seq = NULL;
+    const char *music_dir = NULL;
     int shot_frames = 4;
 
     for (int i = 1; i < argc; i++) {
@@ -45,10 +52,22 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             shot_frames = atoi(argv[++i]);
             if (shot_frames < 1) shot_frames = 1;
+        } else if (strcmp(argv[i], "--music") == 0 && i + 1 < argc) {
+            music_dir = argv[++i];
         }
     }
 
     if (hal_init() != 0) return EXIT_FAILURE;
+
+    if (music_dir) {
+        int n = tagcache_library_load(music_dir);
+        if (n < 0) {
+            log_printf("--music %s: failed to scan", music_dir);
+        } else {
+            log_printf("--music %s: %d song%s loaded",
+                       music_dir, n, n == 1 ? "" : "s");
+        }
+    }
 
     static audio_engine_t engine;
     audio_engine_init(&engine);
