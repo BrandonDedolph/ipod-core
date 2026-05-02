@@ -148,9 +148,20 @@ typedef struct {
     int    count;
     int    cap;
     int    loaded;
+
+    /* Derived indexes built after the scan: sorted unique sets of
+     * the artists and albums seen in the songs list. Used by the
+     * Artists / Albums menus when a library is loaded. Songs without
+     * a given tag are skipped (a song with no ARTIST tag doesn't
+     * contribute a "(?)" entry to the artist list). */
+    char **uniq_artists;
+    int    uniq_artist_count;
+    char **uniq_albums;
+    int    uniq_album_count;
 } library_t;
 
-static library_t LIBRARY = { NULL, NULL, NULL, NULL, 0, 0, 0 };
+static library_t LIBRARY = { NULL, NULL, NULL, NULL, 0, 0, 0,
+                             NULL, 0, NULL, 0 };
 
 static void library_clear(void) {
     for (int i = 0; i < LIBRARY.count; i++) {
@@ -163,13 +174,23 @@ static void library_clear(void) {
     free(LIBRARY.paths);
     free(LIBRARY.artists);
     free(LIBRARY.albums);
-    LIBRARY.titles  = NULL;
-    LIBRARY.paths   = NULL;
-    LIBRARY.artists = NULL;
-    LIBRARY.albums  = NULL;
-    LIBRARY.count   = 0;
-    LIBRARY.cap     = 0;
-    LIBRARY.loaded  = 0;
+
+    for (int i = 0; i < LIBRARY.uniq_artist_count; i++) free(LIBRARY.uniq_artists[i]);
+    for (int i = 0; i < LIBRARY.uniq_album_count;  i++) free(LIBRARY.uniq_albums [i]);
+    free(LIBRARY.uniq_artists);
+    free(LIBRARY.uniq_albums);
+
+    LIBRARY.titles            = NULL;
+    LIBRARY.paths             = NULL;
+    LIBRARY.artists           = NULL;
+    LIBRARY.albums            = NULL;
+    LIBRARY.count             = 0;
+    LIBRARY.cap               = 0;
+    LIBRARY.loaded            = 0;
+    LIBRARY.uniq_artists      = NULL;
+    LIBRARY.uniq_artist_count = 0;
+    LIBRARY.uniq_albums       = NULL;
+    LIBRARY.uniq_album_count  = 0;
 }
 
 /*
@@ -188,6 +209,10 @@ static void library_free_contents(library_t *lib) {
     free(lib->paths);
     free(lib->artists);
     free(lib->albums);
+    for (int i = 0; i < lib->uniq_artist_count; i++) free(lib->uniq_artists[i]);
+    for (int i = 0; i < lib->uniq_album_count;  i++) free(lib->uniq_albums [i]);
+    free(lib->uniq_artists);
+    free(lib->uniq_albums);
 }
 
 /*
@@ -249,6 +274,69 @@ static int qsort_cmp_idx(const void *a, const void *b) {
     int ia = *(const int *)a;
     int ib = *(const int *)b;
     return strcasecmp(CMP_TITLES[ia], CMP_TITLES[ib]);
+}
+
+/* qsort comparator for char ** arrays sorted alphabetically (case-
+ * insensitive). Used for the unique-artist / unique-album indexes. */
+static int qsort_cmp_strcase(const void *a, const void *b) {
+    const char *const *sa = (const char *const *)a;
+    const char *const *sb = (const char *const *)b;
+    return strcasecmp(*sa, *sb);
+}
+
+/*
+ * Build a sorted, unique, NULL-skipping copy of `values[0..count)`.
+ *
+ * Allocates a new char** array (caller owns) and strdup's each unique
+ * value. Returns the array via *out_arr and the count via *out_count.
+ * On allocation failure, *out_arr is NULL and *out_count is 0 (degraded
+ * but not fatal — the caller treats it as "no derived index").
+ *
+ * O(n log n) — sort dominates; dedup is a single linear pass. Result
+ * array is sized at the upper bound (`n` slots) and may be slightly
+ * over-allocated when there are duplicates; for library sizes reachable
+ * on a 5G iPod (~10K songs) the slack is negligible.
+ */
+static void build_unique_index(char **values, int count,
+                               char ***out_arr, int *out_count) {
+    *out_arr = NULL;
+    *out_count = 0;
+
+    if (count <= 0) return;
+
+    /* Copy non-NULL values into a working buffer. */
+    char **work = (char **)malloc((size_t)count * sizeof(char *));
+    if (!work) return;
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        if (values[i]) work[n++] = values[i];   /* shallow copy */
+    }
+    if (n == 0) { free(work); return; }
+
+    qsort(work, (size_t)n, sizeof(char *), qsort_cmp_strcase);
+
+    /* Result is sized at n (upper bound). Acceptable slack — see
+     * the function header on library-size assumptions. */
+    char **uniq = (char **)malloc((size_t)n * sizeof(char *));
+    if (!uniq) { free(work); return; }
+    int u = 0;
+    for (int i = 0; i < n; i++) {
+        if (i == 0 || strcasecmp(work[i], work[i - 1]) != 0) {
+            char *dup = strdup(work[i]);
+            if (!dup) {
+                /* Free what we have and bail. */
+                for (int k = 0; k < u; k++) free(uniq[k]);
+                free(uniq);
+                free(work);
+                return;
+            }
+            uniq[u++] = dup;
+        }
+    }
+    free(work);
+
+    *out_arr = uniq;
+    *out_count = u;
 }
 
 /*
@@ -316,7 +404,8 @@ int tagcache_library_load(const char *dir) {
 
     /* Scan into a fresh staging buffer so a partial failure leaves
      * the previous LIBRARY untouched. */
-    library_t staging = { NULL, NULL, NULL, NULL, 0, 0, 0 };
+    library_t staging = { NULL, NULL, NULL, NULL, 0, 0, 0,
+                          NULL, 0, NULL, 0 };
 
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
@@ -424,15 +513,28 @@ int tagcache_library_load(const char *dir) {
         }
     }
 
+    /* Build the derived indexes (sorted unique artists / albums).
+     * Failures here are non-fatal — we just commit the library
+     * without the index, and the Artists / Albums menus fall back to
+     * synthetic data. */
+    build_unique_index(staging.artists, staging.count,
+                       &staging.uniq_artists, &staging.uniq_artist_count);
+    build_unique_index(staging.albums, staging.count,
+                       &staging.uniq_albums, &staging.uniq_album_count);
+
     /* Commit: drop any previous library, install staging. */
     library_clear();
-    LIBRARY.titles  = staging.titles;
-    LIBRARY.paths   = staging.paths;
-    LIBRARY.artists = staging.artists;
-    LIBRARY.albums  = staging.albums;
-    LIBRARY.count   = staging.count;
-    LIBRARY.cap     = staging.cap;
-    LIBRARY.loaded  = 1;
+    LIBRARY.titles            = staging.titles;
+    LIBRARY.paths             = staging.paths;
+    LIBRARY.artists           = staging.artists;
+    LIBRARY.albums            = staging.albums;
+    LIBRARY.count             = staging.count;
+    LIBRARY.cap               = staging.cap;
+    LIBRARY.loaded            = 1;
+    LIBRARY.uniq_artists      = staging.uniq_artists;
+    LIBRARY.uniq_artist_count = staging.uniq_artist_count;
+    LIBRARY.uniq_albums       = staging.uniq_albums;
+    LIBRARY.uniq_album_count  = staging.uniq_album_count;
     return LIBRARY.count;
 }
 
@@ -458,8 +560,12 @@ const char *tagcache_song_album(int idx) {
 
 #define ARRAY_LEN(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
-int tagcache_artist_count(void)   { return ARRAY_LEN(ARTISTS); }
-int tagcache_album_count(void)    { return ARRAY_LEN(ALBUMS); }
+int tagcache_artist_count(void) {
+    return LIBRARY.loaded ? LIBRARY.uniq_artist_count : ARRAY_LEN(ARTISTS);
+}
+int tagcache_album_count(void) {
+    return LIBRARY.loaded ? LIBRARY.uniq_album_count : ARRAY_LEN(ALBUMS);
+}
 int tagcache_song_count(void) {
     return LIBRARY.loaded ? LIBRARY.count : ARRAY_LEN(SONGS);
 }
@@ -472,9 +578,17 @@ static const char *bounded(const char *const *table, int count, int idx) {
 }
 
 const char *tagcache_artist_name(int idx) {
+    if (LIBRARY.loaded) {
+        if (idx < 0 || idx >= LIBRARY.uniq_artist_count) return "(?)";
+        return LIBRARY.uniq_artists[idx];
+    }
     return bounded(ARTISTS, ARRAY_LEN(ARTISTS), idx);
 }
 const char *tagcache_album_name(int idx) {
+    if (LIBRARY.loaded) {
+        if (idx < 0 || idx >= LIBRARY.uniq_album_count) return "(?)";
+        return LIBRARY.uniq_albums[idx];
+    }
     return bounded(ALBUMS, ARRAY_LEN(ALBUMS), idx);
 }
 const char *tagcache_song_title(int idx) {
