@@ -57,6 +57,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Headless capture mode: tell SDL to use the dummy video/audio
+     * drivers so no window pops up and no real audio device is opened.
+     * Lets `--shot` runs work in the background without stealing focus
+     * or making a sound. The interactive path leaves these unset and
+     * gets the normal SDL backends. */
+    if (shot_path) {
+        setenv("SDL_VIDEODRIVER", "dummy", 0);
+        setenv("SDL_AUDIODRIVER", "dummy", 0);
+    }
+
     if (hal_init() != 0) return EXIT_FAILURE;
 
     if (music_dir) {
