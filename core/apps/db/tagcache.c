@@ -21,6 +21,10 @@
 
 #include "tagcache.h"
 
+#include "../../codecs/dr_flac/tag_flac.h"
+#include "../../codecs/dr_mp3/tag_mp3.h"
+#include "../../codecs/tags.h"
+
 #include <ctype.h>
 #include <dirent.h>
 #include <stddef.h>
@@ -137,27 +141,35 @@ static const char *const COMPOSERS[] = {
  * reverting to the example data.
  */
 typedef struct {
-    char **titles;       /* basename without extension */
+    char **titles;       /* tag TITLE if present, else basename-without-ext */
     char **paths;        /* full filesystem path */
+    char **artists;      /* tag ARTIST or NULL if missing */
+    char **albums;       /* tag ALBUM  or NULL if missing */
     int    count;
     int    cap;
     int    loaded;
 } library_t;
 
-static library_t LIBRARY = { NULL, NULL, 0, 0, 0 };
+static library_t LIBRARY = { NULL, NULL, NULL, NULL, 0, 0, 0 };
 
 static void library_clear(void) {
     for (int i = 0; i < LIBRARY.count; i++) {
         free(LIBRARY.titles[i]);
         free(LIBRARY.paths[i]);
+        free(LIBRARY.artists[i]);
+        free(LIBRARY.albums[i]);
     }
     free(LIBRARY.titles);
     free(LIBRARY.paths);
-    LIBRARY.titles = NULL;
-    LIBRARY.paths  = NULL;
-    LIBRARY.count  = 0;
-    LIBRARY.cap    = 0;
-    LIBRARY.loaded = 0;
+    free(LIBRARY.artists);
+    free(LIBRARY.albums);
+    LIBRARY.titles  = NULL;
+    LIBRARY.paths   = NULL;
+    LIBRARY.artists = NULL;
+    LIBRARY.albums  = NULL;
+    LIBRARY.count   = 0;
+    LIBRARY.cap     = 0;
+    LIBRARY.loaded  = 0;
 }
 
 /*
@@ -169,28 +181,42 @@ static void library_free_contents(library_t *lib) {
     for (int i = 0; i < lib->count; i++) {
         free(lib->titles[i]);
         free(lib->paths[i]);
+        free(lib->artists[i]);
+        free(lib->albums[i]);
     }
     free(lib->titles);
     free(lib->paths);
+    free(lib->artists);
+    free(lib->albums);
 }
 
 /*
  * Grow `lib`'s capacity to at least `min_cap`. Each realloc is
  * committed back to lib before the next is attempted, so a failure
  * never leaves a freed-old + orphaned-new pair behind. Returns 0 on
- * success, -1 on allocation failure (lib is unchanged on first
- * failure; partially grown on second — caller's library_free_contents
- * is correct in either case).
+ * success, -1 on allocation failure.
  */
 static int library_reserve(library_t *lib, int min_cap) {
     if (lib->cap >= min_cap) return 0;
-    char **t = (char **)realloc(lib->titles, (size_t)min_cap * sizeof(char *));
+    size_t sz = (size_t)min_cap * sizeof(char *);
+
+    char **t = (char **)realloc(lib->titles, sz);
     if (!t) return -1;
     lib->titles = t;
-    char **p = (char **)realloc(lib->paths, (size_t)min_cap * sizeof(char *));
+
+    char **p = (char **)realloc(lib->paths, sz);
     if (!p) return -1;
     lib->paths = p;
-    lib->cap   = min_cap;
+
+    char **ar = (char **)realloc(lib->artists, sz);
+    if (!ar) return -1;
+    lib->artists = ar;
+
+    char **al = (char **)realloc(lib->albums, sz);
+    if (!al) return -1;
+    lib->albums = al;
+
+    lib->cap = min_cap;
     return 0;
 }
 
@@ -225,6 +251,64 @@ static int qsort_cmp_idx(const void *a, const void *b) {
     return strcasecmp(CMP_TITLES[ia], CMP_TITLES[ib]);
 }
 
+/*
+ * Read `path` into a freshly malloc'd buffer. *out_buf and *out_len
+ * are written on success. Returns 0 on success, -1 on any I/O error
+ * or if the file exceeds SLURP_MAX (caller treats either as "no tags"
+ * and continues).
+ *
+ * The cap defends against a user accidentally pointing --music at a
+ * directory containing huge non-audio files (a disk image, a video).
+ * Real audio files top out under a few hundred MB even for hi-res
+ * FLAC; 64 MiB is well past that for the codecs we ship.
+ */
+#define SLURP_MAX (64u * 1024u * 1024u)
+
+static int slurp(const char *path, void **out_buf, size_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return -1; }
+    long n = ftell(fp);
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return -1; }
+    if (n <= 0 || (size_t)n > SLURP_MAX) { fclose(fp); return -1; }
+    void *buf = malloc((size_t)n);
+    if (!buf) { fclose(fp); return -1; }
+    if (fread(buf, 1, (size_t)n, fp) != (size_t)n) {
+        free(buf); fclose(fp); return -1;
+    }
+    fclose(fp);
+    *out_buf = buf;
+    *out_len = (size_t)n;
+    return 0;
+}
+
+/*
+ * Determine codec from extension and call the matching tag reader.
+ * On success populates *out (zero-initialized first by the readers
+ * themselves). Caller passes a NULL-or-empty *out for "no tags found".
+ */
+static void read_tags_for(const char *path, audio_tags_t *out) {
+    memset(out, 0, sizeof(*out));
+
+    void *bytes = NULL;
+    size_t len = 0;
+    if (slurp(path, &bytes, &len) != 0) return;
+
+    const char *dot = strrchr(path, '.');
+    if (dot) {
+        char ext[8];
+        size_t ext_len = strlen(dot + 1);
+        if (ext_len < sizeof(ext)) {
+            for (size_t i = 0; i < ext_len; i++)
+                ext[i] = (char)tolower((unsigned char)dot[1 + i]);
+            ext[ext_len] = 0;
+            if (strcmp(ext, "flac") == 0)      (void)tag_flac_read(bytes, len, out);
+            else if (strcmp(ext, "mp3") == 0)  (void)tag_mp3_read(bytes, len, out);
+        }
+    }
+    free(bytes);
+}
+
 int tagcache_library_load(const char *dir) {
     if (!dir) return -1;
     DIR *d = opendir(dir);
@@ -232,12 +316,12 @@ int tagcache_library_load(const char *dir) {
 
     /* Scan into a fresh staging buffer so a partial failure leaves
      * the previous LIBRARY untouched. */
-    library_t staging = { NULL, NULL, 0, 0, 0 };
+    library_t staging = { NULL, NULL, NULL, NULL, 0, 0, 0 };
 
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        size_t title_len;
-        if (!has_audio_ext(ent->d_name, &title_len)) continue;
+        size_t basename_title_len;
+        if (!has_audio_ext(ent->d_name, &basename_title_len)) continue;
 
         if (staging.cap <= staging.count) {
             int new_cap = staging.cap ? staging.cap * 2 : 32;
@@ -248,23 +332,12 @@ int tagcache_library_load(const char *dir) {
             }
         }
 
-        /* title = basename without extension */
-        char *title = (char *)malloc(title_len + 1);
-        if (!title) {
-            library_free_contents(&staging);
-            closedir(d);
-            return -1;
-        }
-        memcpy(title, ent->d_name, title_len);
-        title[title_len] = 0;
-
-        /* path = dir + '/' + name */
+        /* path = dir + '/' + name (built first so we can read tags). */
         size_t dir_len  = strlen(dir);
         size_t name_len = strlen(ent->d_name);
         size_t need     = dir_len + 1 + name_len + 1;
         char *path = (char *)malloc(need);
         if (!path) {
-            free(title);
             library_free_contents(&staging);
             closedir(d);
             return -1;
@@ -275,14 +348,45 @@ int tagcache_library_load(const char *dir) {
                  strip_slash ? "" : "/",
                  ent->d_name);
 
-        staging.titles[staging.count] = title;
-        staging.paths [staging.count] = path;
+        /* Read tags. Failure is silent — we just fall back to filename
+         * for the title and leave artist/album NULL. */
+        audio_tags_t tags;
+        read_tags_for(path, &tags);
+
+        /* title = TITLE tag if present, else basename-without-ext. */
+        char *title;
+        if (tags.found_title) {
+            title = strdup(tags.title);
+        } else {
+            title = (char *)malloc(basename_title_len + 1);
+            if (title) {
+                memcpy(title, ent->d_name, basename_title_len);
+                title[basename_title_len] = 0;
+            }
+        }
+        if (!title) {
+            free(path);
+            library_free_contents(&staging);
+            closedir(d);
+            return -1;
+        }
+
+        /* artist / album: strdup if present, NULL if not. NULL doesn't
+         * count as an OOM failure since the tag itself is optional. */
+        char *artist = tags.found_artist ? strdup(tags.artist) : NULL;
+        char *album  = tags.found_album  ? strdup(tags.album)  : NULL;
+
+        staging.titles [staging.count] = title;
+        staging.paths  [staging.count] = path;
+        staging.artists[staging.count] = artist;
+        staging.albums [staging.count] = album;
         staging.count++;
     }
     closedir(d);
 
     /* Sort by title (case-insensitive). Build an index permutation
-     * to keep titles[] / paths[] aligned. */
+     * and apply it to all four parallel arrays. If any sort allocation
+     * fails we keep the unsorted order — degraded but correct. */
     if (staging.count > 1) {
         int *idx = (int *)malloc((size_t)staging.count * sizeof(int));
         if (idx) {
@@ -290,20 +394,31 @@ int tagcache_library_load(const char *dir) {
             CMP_TITLES = staging.titles;
             qsort(idx, (size_t)staging.count, sizeof(int), qsort_cmp_idx);
 
-            char **sorted_titles = (char **)malloc((size_t)staging.count * sizeof(char *));
-            char **sorted_paths  = (char **)malloc((size_t)staging.count * sizeof(char *));
-            if (sorted_titles && sorted_paths) {
+            size_t sz = (size_t)staging.count * sizeof(char *);
+            char **sorted_titles  = (char **)malloc(sz);
+            char **sorted_paths   = (char **)malloc(sz);
+            char **sorted_artists = (char **)malloc(sz);
+            char **sorted_albums  = (char **)malloc(sz);
+            if (sorted_titles && sorted_paths && sorted_artists && sorted_albums) {
                 for (int i = 0; i < staging.count; i++) {
-                    sorted_titles[i] = staging.titles[idx[i]];
-                    sorted_paths [i] = staging.paths [idx[i]];
+                    sorted_titles [i] = staging.titles [idx[i]];
+                    sorted_paths  [i] = staging.paths  [idx[i]];
+                    sorted_artists[i] = staging.artists[idx[i]];
+                    sorted_albums [i] = staging.albums [idx[i]];
                 }
                 free(staging.titles);
                 free(staging.paths);
-                staging.titles = sorted_titles;
-                staging.paths  = sorted_paths;
+                free(staging.artists);
+                free(staging.albums);
+                staging.titles  = sorted_titles;
+                staging.paths   = sorted_paths;
+                staging.artists = sorted_artists;
+                staging.albums  = sorted_albums;
             } else {
                 free(sorted_titles);
                 free(sorted_paths);
+                free(sorted_artists);
+                free(sorted_albums);
             }
             free(idx);
         }
@@ -311,11 +426,13 @@ int tagcache_library_load(const char *dir) {
 
     /* Commit: drop any previous library, install staging. */
     library_clear();
-    LIBRARY.titles = staging.titles;
-    LIBRARY.paths  = staging.paths;
-    LIBRARY.count  = staging.count;
-    LIBRARY.cap    = staging.cap;
-    LIBRARY.loaded = 1;
+    LIBRARY.titles  = staging.titles;
+    LIBRARY.paths   = staging.paths;
+    LIBRARY.artists = staging.artists;
+    LIBRARY.albums  = staging.albums;
+    LIBRARY.count   = staging.count;
+    LIBRARY.cap     = staging.cap;
+    LIBRARY.loaded  = 1;
     return LIBRARY.count;
 }
 
@@ -323,6 +440,18 @@ const char *tagcache_song_path(int idx) {
     if (!LIBRARY.loaded) return NULL;
     if (idx < 0 || idx >= LIBRARY.count) return NULL;
     return LIBRARY.paths[idx];
+}
+
+const char *tagcache_song_artist(int idx) {
+    if (!LIBRARY.loaded) return NULL;
+    if (idx < 0 || idx >= LIBRARY.count) return NULL;
+    return LIBRARY.artists[idx];   /* may be NULL if no ARTIST tag */
+}
+
+const char *tagcache_song_album(int idx) {
+    if (!LIBRARY.loaded) return NULL;
+    if (idx < 0 || idx >= LIBRARY.count) return NULL;
+    return LIBRARY.albums[idx];    /* may be NULL if no ALBUM tag */
 }
 
 /* ---------- API impl --------------------------------------------- */
