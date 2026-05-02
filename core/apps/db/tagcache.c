@@ -292,10 +292,10 @@ static int qsort_cmp_strcase(const void *a, const void *b) {
  * On allocation failure, *out_arr is NULL and *out_count is 0 (degraded
  * but not fatal — the caller treats it as "no derived index").
  *
- * O(n log n + n²) worst case (one strdup per row + a linear unique
- * scan). For library sizes reachable on a 5G iPod (~10K songs) the
- * n² term is the bottleneck but still finishes well under a second.
- * If that becomes the limit, swap for a hash-set.
+ * O(n log n) — sort dominates; dedup is a single linear pass. Result
+ * array is sized at the upper bound (`n` slots) and may be slightly
+ * over-allocated when there are duplicates; for library sizes reachable
+ * on a 5G iPod (~10K songs) the slack is negligible.
  */
 static void build_unique_index(char **values, int count,
                                char ***out_arr, int *out_count) {
@@ -315,7 +315,8 @@ static void build_unique_index(char **values, int count,
 
     qsort(work, (size_t)n, sizeof(char *), qsort_cmp_strcase);
 
-    /* Allocate the result; we'll reallocate to exact size after dedup. */
+    /* Result is sized at n (upper bound). Acceptable slack — see
+     * the function header on library-size assumptions. */
     char **uniq = (char **)malloc((size_t)n * sizeof(char *));
     if (!uniq) { free(work); return; }
     int u = 0;
