@@ -254,15 +254,23 @@ static int qsort_cmp_idx(const void *a, const void *b) {
 /*
  * Read `path` into a freshly malloc'd buffer. *out_buf and *out_len
  * are written on success. Returns 0 on success, -1 on any I/O error
- * (caller treats this as "no tags" and continues).
+ * or if the file exceeds SLURP_MAX (caller treats either as "no tags"
+ * and continues).
+ *
+ * The cap defends against a user accidentally pointing --music at a
+ * directory containing huge non-audio files (a disk image, a video).
+ * Real audio files top out under a few hundred MB even for hi-res
+ * FLAC; 64 MiB is well past that for the codecs we ship.
  */
+#define SLURP_MAX (64u * 1024u * 1024u)
+
 static int slurp(const char *path, void **out_buf, size_t *out_len) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return -1;
-    fseek(fp, 0, SEEK_END);
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return -1; }
     long n = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (n <= 0) { fclose(fp); return -1; }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return -1; }
+    if (n <= 0 || (size_t)n > SLURP_MAX) { fclose(fp); return -1; }
     void *buf = malloc((size_t)n);
     if (!buf) { fclose(fp); return -1; }
     if (fread(buf, 1, (size_t)n, fp) != (size_t)n) {
