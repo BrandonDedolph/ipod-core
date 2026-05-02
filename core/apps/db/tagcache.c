@@ -158,10 +158,30 @@ typedef struct {
     int    uniq_artist_count;
     char **uniq_albums;
     int    uniq_album_count;
+
+    /* Per-song lookup: which uniq_artist / uniq_album does song i
+     * belong to? -1 means the song had no ARTIST/ALBUM tag, and so
+     * doesn't appear in any artist's or album's drilldown list. */
+    int   *song_artist_idx;
+    int   *song_album_idx;
+
+    /* Filtered song lists, precomputed at library_load. For artist a,
+     * `artist_songs[a]` is a heap array of song indices whose ARTIST
+     * matches uniq_artists[a], in the same alphabetical-by-title order
+     * as the global library. Same shape for albums.
+     *
+     * Two parallel arrays per group (the int* per-group array + a
+     * count). NULL/0 if a given group is empty (no songs match). */
+    int  **artist_songs;
+    int   *artist_song_counts;
+    int  **album_songs;
+    int   *album_song_counts;
 } library_t;
 
 static library_t LIBRARY = { NULL, NULL, NULL, NULL, 0, 0, 0,
-                             NULL, 0, NULL, 0 };
+                             NULL, 0, NULL, 0,
+                             NULL, NULL,
+                             NULL, NULL, NULL, NULL };
 
 static void library_clear(void) {
     for (int i = 0; i < LIBRARY.count; i++) {
@@ -180,17 +200,37 @@ static void library_clear(void) {
     free(LIBRARY.uniq_artists);
     free(LIBRARY.uniq_albums);
 
-    LIBRARY.titles            = NULL;
-    LIBRARY.paths             = NULL;
-    LIBRARY.artists           = NULL;
-    LIBRARY.albums            = NULL;
-    LIBRARY.count             = 0;
-    LIBRARY.cap               = 0;
-    LIBRARY.loaded            = 0;
-    LIBRARY.uniq_artists      = NULL;
-    LIBRARY.uniq_artist_count = 0;
-    LIBRARY.uniq_albums       = NULL;
-    LIBRARY.uniq_album_count  = 0;
+    free(LIBRARY.song_artist_idx);
+    free(LIBRARY.song_album_idx);
+
+    if (LIBRARY.artist_songs) {
+        for (int i = 0; i < LIBRARY.uniq_artist_count; i++) free(LIBRARY.artist_songs[i]);
+        free(LIBRARY.artist_songs);
+    }
+    free(LIBRARY.artist_song_counts);
+    if (LIBRARY.album_songs) {
+        for (int i = 0; i < LIBRARY.uniq_album_count; i++) free(LIBRARY.album_songs[i]);
+        free(LIBRARY.album_songs);
+    }
+    free(LIBRARY.album_song_counts);
+
+    LIBRARY.titles             = NULL;
+    LIBRARY.paths              = NULL;
+    LIBRARY.artists            = NULL;
+    LIBRARY.albums             = NULL;
+    LIBRARY.count              = 0;
+    LIBRARY.cap                = 0;
+    LIBRARY.loaded             = 0;
+    LIBRARY.uniq_artists       = NULL;
+    LIBRARY.uniq_artist_count  = 0;
+    LIBRARY.uniq_albums        = NULL;
+    LIBRARY.uniq_album_count   = 0;
+    LIBRARY.song_artist_idx    = NULL;
+    LIBRARY.song_album_idx     = NULL;
+    LIBRARY.artist_songs       = NULL;
+    LIBRARY.artist_song_counts = NULL;
+    LIBRARY.album_songs        = NULL;
+    LIBRARY.album_song_counts  = NULL;
 }
 
 /*
@@ -213,6 +253,18 @@ static void library_free_contents(library_t *lib) {
     for (int i = 0; i < lib->uniq_album_count;  i++) free(lib->uniq_albums [i]);
     free(lib->uniq_artists);
     free(lib->uniq_albums);
+    free(lib->song_artist_idx);
+    free(lib->song_album_idx);
+    if (lib->artist_songs) {
+        for (int i = 0; i < lib->uniq_artist_count; i++) free(lib->artist_songs[i]);
+        free(lib->artist_songs);
+    }
+    free(lib->artist_song_counts);
+    if (lib->album_songs) {
+        for (int i = 0; i < lib->uniq_album_count; i++) free(lib->album_songs[i]);
+        free(lib->album_songs);
+    }
+    free(lib->album_song_counts);
 }
 
 /*
@@ -340,6 +392,98 @@ static void build_unique_index(char **values, int count,
 }
 
 /*
+ * Find `needle` in `hay[0..n)` (case-insensitive). Returns the index,
+ * or -1 if not present. Linear — small n (artist/album counts are tens
+ * to a few thousand even on full libraries; binary search wouldn't pay
+ * for the extra code).
+ */
+static int find_in_uniq(char **hay, int n, const char *needle) {
+    if (!needle) return -1;
+    for (int i = 0; i < n; i++) {
+        if (strcasecmp(hay[i], needle) == 0) return i;
+    }
+    return -1;
+}
+
+/*
+ * Build the per-song uniq-idx tables and per-group song lists. Any
+ * allocation failure leaves the affected structure NULL — caller
+ * commits regardless. See library_t comments for the data layout.
+ */
+static void build_filter_indexes(library_t *lib) {
+    if (lib->count <= 0) return;
+
+    /* Per-song -> uniq lookup. */
+    lib->song_artist_idx = (int *)malloc((size_t)lib->count * sizeof(int));
+    lib->song_album_idx  = (int *)malloc((size_t)lib->count * sizeof(int));
+    if (!lib->song_artist_idx || !lib->song_album_idx) {
+        free(lib->song_artist_idx); free(lib->song_album_idx);
+        lib->song_artist_idx = NULL;
+        lib->song_album_idx  = NULL;
+        return;
+    }
+    for (int s = 0; s < lib->count; s++) {
+        lib->song_artist_idx[s] = find_in_uniq(lib->uniq_artists,
+                                               lib->uniq_artist_count,
+                                               lib->artists[s]);
+        lib->song_album_idx [s] = find_in_uniq(lib->uniq_albums,
+                                               lib->uniq_album_count,
+                                               lib->albums[s]);
+    }
+
+    /* artist_songs[a]: song indices where song_artist_idx == a, in
+     * the song-array's existing alphabetical-by-title order.
+     *
+     * Two passes per group: count first, then fill. Allocation
+     * failure leaves the per-group entry NULL; downstream queries
+     * return 0 for that artist. */
+    if (lib->uniq_artist_count > 0) {
+        lib->artist_songs       = (int **)calloc((size_t)lib->uniq_artist_count,
+                                                 sizeof(int *));
+        lib->artist_song_counts = (int  *)calloc((size_t)lib->uniq_artist_count,
+                                                 sizeof(int));
+        if (lib->artist_songs && lib->artist_song_counts) {
+            for (int a = 0; a < lib->uniq_artist_count; a++) {
+                int n = 0;
+                for (int s = 0; s < lib->count; s++)
+                    if (lib->song_artist_idx[s] == a) n++;
+                if (n == 0) continue;
+                int *list = (int *)malloc((size_t)n * sizeof(int));
+                if (!list) continue;
+                int j = 0;
+                for (int s = 0; s < lib->count; s++)
+                    if (lib->song_artist_idx[s] == a) list[j++] = s;
+                lib->artist_songs[a]       = list;
+                lib->artist_song_counts[a] = n;
+            }
+        }
+    }
+
+    /* album_songs[a]: same shape for the album dimension. */
+    if (lib->uniq_album_count > 0) {
+        lib->album_songs       = (int **)calloc((size_t)lib->uniq_album_count,
+                                                sizeof(int *));
+        lib->album_song_counts = (int  *)calloc((size_t)lib->uniq_album_count,
+                                                sizeof(int));
+        if (lib->album_songs && lib->album_song_counts) {
+            for (int a = 0; a < lib->uniq_album_count; a++) {
+                int n = 0;
+                for (int s = 0; s < lib->count; s++)
+                    if (lib->song_album_idx[s] == a) n++;
+                if (n == 0) continue;
+                int *list = (int *)malloc((size_t)n * sizeof(int));
+                if (!list) continue;
+                int j = 0;
+                for (int s = 0; s < lib->count; s++)
+                    if (lib->song_album_idx[s] == a) list[j++] = s;
+                lib->album_songs[a]       = list;
+                lib->album_song_counts[a] = n;
+            }
+        }
+    }
+}
+
+/*
  * Read `path` into a freshly malloc'd buffer. *out_buf and *out_len
  * are written on success. Returns 0 on success, -1 on any I/O error
  * or if the file exceeds SLURP_MAX (caller treats either as "no tags"
@@ -405,7 +549,9 @@ int tagcache_library_load(const char *dir) {
     /* Scan into a fresh staging buffer so a partial failure leaves
      * the previous LIBRARY untouched. */
     library_t staging = { NULL, NULL, NULL, NULL, 0, 0, 0,
-                          NULL, 0, NULL, 0 };
+                          NULL, 0, NULL, 0,
+                          NULL, NULL,
+                          NULL, NULL, NULL, NULL };
 
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
@@ -522,6 +668,13 @@ int tagcache_library_load(const char *dir) {
     build_unique_index(staging.albums, staging.count,
                        &staging.uniq_albums, &staging.uniq_album_count);
 
+    /* Build the per-song lookup tables and the per-group song lists.
+     * All optional — any malloc failure here just leaves the affected
+     * structure NULL, and the corresponding drilldown query returns 0
+     * rows. The library still commits, the user just doesn't get
+     * drilldown for that group. */
+    build_filter_indexes(&staging);
+
     /* Commit: drop any previous library, install staging. */
     library_clear();
     LIBRARY.titles            = staging.titles;
@@ -554,6 +707,68 @@ const char *tagcache_song_album(int idx) {
     if (!LIBRARY.loaded) return NULL;
     if (idx < 0 || idx >= LIBRARY.count) return NULL;
     return LIBRARY.albums[idx];    /* may be NULL if no ALBUM tag */
+}
+
+/* ---------- Filtered queries ---------------------------------------- */
+
+/*
+ * Resolve the (group_idx, n) pair into a global song index. Returns
+ * -1 when no library is loaded, the group is out of range, the
+ * filter table never built, or n is out of range. Centralizes the
+ * bounds checks that all six accessors below would otherwise repeat.
+ */
+static int song_idx_in_artist(int artist_idx, int n) {
+    if (!LIBRARY.loaded) return -1;
+    if (artist_idx < 0 || artist_idx >= LIBRARY.uniq_artist_count) return -1;
+    if (!LIBRARY.artist_songs) return -1;
+    if (n < 0 || n >= LIBRARY.artist_song_counts[artist_idx]) return -1;
+    int *list = LIBRARY.artist_songs[artist_idx];
+    if (!list) return -1;
+    return list[n];
+}
+
+static int song_idx_in_album(int album_idx, int n) {
+    if (!LIBRARY.loaded) return -1;
+    if (album_idx < 0 || album_idx >= LIBRARY.uniq_album_count) return -1;
+    if (!LIBRARY.album_songs) return -1;
+    if (n < 0 || n >= LIBRARY.album_song_counts[album_idx]) return -1;
+    int *list = LIBRARY.album_songs[album_idx];
+    if (!list) return -1;
+    return list[n];
+}
+
+int tagcache_song_count_for_artist(int artist_idx) {
+    if (!LIBRARY.loaded) return 0;
+    if (artist_idx < 0 || artist_idx >= LIBRARY.uniq_artist_count) return 0;
+    if (!LIBRARY.artist_song_counts) return 0;
+    return LIBRARY.artist_song_counts[artist_idx];
+}
+
+const char *tagcache_song_title_for_artist(int artist_idx, int n) {
+    int s = song_idx_in_artist(artist_idx, n);
+    return (s < 0) ? "(?)" : LIBRARY.titles[s];
+}
+
+const char *tagcache_song_path_for_artist(int artist_idx, int n) {
+    int s = song_idx_in_artist(artist_idx, n);
+    return (s < 0) ? NULL : LIBRARY.paths[s];
+}
+
+int tagcache_song_count_for_album(int album_idx) {
+    if (!LIBRARY.loaded) return 0;
+    if (album_idx < 0 || album_idx >= LIBRARY.uniq_album_count) return 0;
+    if (!LIBRARY.album_song_counts) return 0;
+    return LIBRARY.album_song_counts[album_idx];
+}
+
+const char *tagcache_song_title_for_album(int album_idx, int n) {
+    int s = song_idx_in_album(album_idx, n);
+    return (s < 0) ? "(?)" : LIBRARY.titles[s];
+}
+
+const char *tagcache_song_path_for_album(int album_idx, int n) {
+    int s = song_idx_in_album(album_idx, n);
+    return (s < 0) ? NULL : LIBRARY.paths[s];
 }
 
 /* ---------- API impl --------------------------------------------- */

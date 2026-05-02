@@ -94,4 +94,26 @@ const char *tagcache_song_path(int idx);
 const char *tagcache_song_artist(int idx);
 const char *tagcache_song_album(int idx);
 
+/* ---------- Filtered queries (drilldown) ------------------------- */
+
+/*
+ * Songs whose ARTIST tag matches the unique-artist at
+ * tagcache_artist_name(artist_idx). Returns 0 when no library is
+ * loaded or artist_idx is out of range. Songs are presented in the
+ * same alphabetical-by-title order as the global Songs list.
+ *
+ * `n` is the per-artist row index (0..count-1); the corresponding
+ * accessors return the song's title and absolute path.
+ */
+int          tagcache_song_count_for_artist(int artist_idx);
+const char  *tagcache_song_title_for_artist(int artist_idx, int n);
+const char  *tagcache_song_path_for_artist (int artist_idx, int n);
+
+/*
+ * Same shape for the per-album view.
+ */
+int          tagcache_song_count_for_album(int album_idx);
+const char  *tagcache_song_title_for_album(int album_idx, int n);
+const char  *tagcache_song_path_for_album (int album_idx, int n);
+
 #endif /* CORE_APPS_DB_TAGCACHE_H */
