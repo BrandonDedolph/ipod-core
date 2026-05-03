@@ -30,6 +30,7 @@
 #include "../apps/ui/cabinet.h"
 #include "../hal/hal.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -79,6 +80,14 @@ int main(int argc, char **argv) {
      * Used by the playback meson test. Override mode (1) wins over the
      * default dummy-audio setenv since both branches use setenv flag 0
      * (don't override). */
+    if (capture_audio && !shot_path) {
+        /* Without --shot the program enters the interactive loop and
+         * never closes the audio device, so the disk file would grow
+         * unbounded and never flush cleanly. The header docstring
+         * already says capture-audio "implies --shot" — enforce it. */
+        fprintf(stderr, "core-sim: --capture-audio requires --shot\n");
+        return EXIT_FAILURE;
+    }
     if (capture_audio) {
         setenv("SDL_AUDIODRIVER", "disk", 1);
         setenv("SDL_DISKAUDIOFILE", capture_audio, 1);

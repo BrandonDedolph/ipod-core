@@ -42,10 +42,11 @@
 
 #define REFERENCE_PCM_NAME "sine_440hz_1s_44k_s16_stereo.pcm"
 
-/* Frames the sim runs after the press sequence. Each frame sleeps 16ms,
- * so 200 frames ≈ 3.2 s of wall time — enough for the SDL audio thread
- * to drain the full 1 s reference plus margin. */
-#define SIM_FRAMES "200"
+/* Frames the sim runs after the press sequence. Each frame's
+ * sleep_ms(16) is a *minimum* — slow CI hosts can stretch it. 400
+ * gives ≈ 6.4 s of wall time for the SDL audio thread to drain a 1 s
+ * reference, well under the meson test timeout (30 s). */
+#define SIM_FRAMES "400"
 
 /* Press sequence to navigate from the main menu (Music idx=0) to Songs
  * (Music sub-menu idx=2) and play the first row.
@@ -198,10 +199,15 @@ int main(int argc, char **argv) {
     free(cap_buf);
 
     /* Clean up the temp dir on success — leave it intact on failure
-     * so the user can inspect captured.raw + shot.bmp. */
+     * so the user can inspect captured.raw + shot.bmp. If the child
+     * dropped any other file (future logspew, core dump), `rmdir`
+     * will fail; surface that as a warning so the leak is visible. */
     (void)unlink(capture_path);
     (void)unlink(shot_path);
-    (void)rmdir(out_dir);
+    if (rmdir(out_dir) != 0) {
+        fprintf(stderr, "warn: temp dir %s left behind (extra files?)\n",
+                out_dir);
+    }
 
     fprintf(stdout, "ok: %ld bytes of audio matched (capture started at byte %ld)\n",
             ref_len, start);
