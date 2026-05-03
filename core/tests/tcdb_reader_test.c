@@ -372,17 +372,47 @@ static int test_truncated_header(void) {
     return 0;
 }
 
+/*
+ * Adversarial group block: the first artist's song-list points at
+ * song_idx 99, which is way past song_count (3). The parser must
+ * reject this rather than commit a library where the drilldown
+ * accessors OOB-read LIBRARY.titles[99] at draw time.
+ */
+static int test_invalid_group_song_index(void) {
+    buf_t buf = {0};
+    if (build_happy_fixture(&buf) != 0) FAIL("build fixture");
+    /* The artist groups block starts at uniq_end (composer_idx_off
+     * + n_composers*4) — recompute from the header. */
+    uint64_t artist_groups_off = 0;
+    artist_groups_off |= (uint64_t)buf.data[TCDB_OFF_ARTIST_GROUPS_OFF + 0];
+    artist_groups_off |= (uint64_t)buf.data[TCDB_OFF_ARTIST_GROUPS_OFF + 1] << 8;
+    artist_groups_off |= (uint64_t)buf.data[TCDB_OFF_ARTIST_GROUPS_OFF + 2] << 16;
+    artist_groups_off |= (uint64_t)buf.data[TCDB_OFF_ARTIST_GROUPS_OFF + 3] << 24;
+    /* Block layout: [u32 off_X, u32 off_Y, u32 count_X=1, u32 idx_X,
+     * u32 count_Y=1, u32 idx_Y]. We corrupt idx_X (offset
+     * artist_groups_off + 8 [past offsets table] + 4 [past count]). */
+    uint64_t idx_x_at = artist_groups_off + 8 + 4;
+    put_u32(buf.data + idx_x_at, 99);   /* song_count is 3 */
+
+    char *path = write_temp_file(&buf);
+    int rc = tagcache_library_load_tcdb(path);
+    EXPECT_EQ(rc, -1);
+    unlink(path); free(path); free(buf.data);
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
-    if (test_happy()             != 0) failures++;
-    if (test_bad_magic()         != 0) failures++;
-    if (test_bad_version()       != 0) failures++;
-    if (test_truncated_header()  != 0) failures++;
+    if (test_happy()                    != 0) failures++;
+    if (test_bad_magic()                != 0) failures++;
+    if (test_bad_version()              != 0) failures++;
+    if (test_truncated_header()         != 0) failures++;
+    if (test_invalid_group_song_index() != 0) failures++;
     if (failures > 0) {
         fprintf(stderr, "tcdb_reader_test: %d case%s failed\n",
                 failures, failures == 1 ? "" : "s");
         return 1;
     }
-    fprintf(stdout, "ok: tcdb reader passed all 4 cases\n");
+    fprintf(stdout, "ok: tcdb reader passed all 5 cases\n");
     return 0;
 }

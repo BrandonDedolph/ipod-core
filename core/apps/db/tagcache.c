@@ -964,8 +964,26 @@ static int tcdb_parse(const void *bytes, size_t len, library_t *staging) {
 
     const uint8_t *strings = p + strings_off;
 
-    /* Reserve the per-song parallel arrays. */
-    if (song_count > 0 && library_reserve(staging, (int)song_count) != 0) return -1;
+    /* Reserve the per-song parallel arrays. library_reserve uses
+     * realloc, so the new slots come back uninitialized. We MUST
+     * zero them before setting staging->count, because any later
+     * allocation failure in this function bubbles up via
+     * library_free_contents which walks [0..count) and free()s
+     * every per-song pointer — undefined behavior on uninitialized
+     * memory. The 8 parallel arrays are: titles, paths, artists,
+     * albums, genres, composers, art_bytes, art_lens. */
+    if (song_count > 0) {
+        if (library_reserve(staging, (int)song_count) != 0) return -1;
+        size_t pn = (size_t)song_count;
+        memset(staging->titles,    0, pn * sizeof(char *));
+        memset(staging->paths,     0, pn * sizeof(char *));
+        memset(staging->artists,   0, pn * sizeof(char *));
+        memset(staging->albums,    0, pn * sizeof(char *));
+        memset(staging->genres,    0, pn * sizeof(char *));
+        memset(staging->composers, 0, pn * sizeof(char *));
+        memset(staging->art_bytes, 0, pn * sizeof(void *));
+        memset(staging->art_lens,  0, pn * sizeof(size_t));
+    }
     staging->count = (int)song_count;
 
     /* Read uniq tables. We need them up-front so we can populate the
@@ -1072,22 +1090,25 @@ static int tcdb_parse(const void *bytes, size_t len, library_t *staging) {
         staging->song_genre_idx   [i] = (genre_idx    >= 0 && genre_idx    < (int)n_genres)    ? genre_idx    : -1;
         staging->song_composer_idx[i] = (composer_idx >= 0 && composer_idx < (int)n_composers) ? composer_idx : -1;
 
-        /* Art: rec_art_off is relative to header.art_off. The parallel
-         * arrays come back from library_reserve via realloc — NOT
-         * zero-initialized — so we must explicitly NULL out the slots
-         * for tracks without art to match the scan-path contract that
-         * tagcache_song_art_bytes uses (NULL pointer => no art). */
+        /* Art: rec_art_off is relative to header.art_off. We bounds-
+         * check against the art section's stated length (not the
+         * whole file) so an adversarial header with rec_art_off
+         * pointing outside the art region — but inside the file —
+         * is rejected. The art section itself was already validated
+         * to be in-file; verifying inside-art is sufficient. The
+         * compound check uses subtraction (`rec_art_off > art_len -
+         * rec_art_len`) instead of addition so we never compute a
+         * sum that could wrap u64. */
         if (rec_art_len > 0) {
-            if (!tcdb_section_in_bounds(art_off + rec_art_off, rec_art_len, len)) return -1;
+            if (rec_art_len > art_len) return -1;
+            if (rec_art_off > art_len - rec_art_len) return -1;
             void *copy = malloc((size_t)rec_art_len);
             if (!copy) return -1;
             memcpy(copy, p + art_off + rec_art_off, (size_t)rec_art_len);
             staging->art_bytes[i] = copy;
             staging->art_lens [i] = (size_t)rec_art_len;
-        } else {
-            staging->art_bytes[i] = NULL;
-            staging->art_lens [i] = 0;
         }
+        /* else: art_bytes/art_lens already zeroed via memset above. */
     }
 
     /* Per-group song lists. Each block starts with N u32 offsets
@@ -1124,7 +1145,13 @@ static int tcdb_parse(const void *bytes, size_t len, library_t *staging) {
             int *idx = (int *)malloc((size_t)count * sizeof(int));
             if (!idx) return -1;
             for (uint32_t k = 0; k < count; k++) {
-                idx[k] = (int)tcdb_le32(p + body_off + 4 + (uint64_t)k * 4);
+                uint32_t s = tcdb_le32(p + body_off + 4 + (uint64_t)k * 4);
+                /* Reject group song-indices that escape the song
+                 * array. The drilldown accessors trust list[n] and
+                 * dereference LIBRARY.titles[s] without re-bounding,
+                 * so an invalid s here would OOB-read at draw time. */
+                if (s >= song_count) { free(idx); return -1; }
+                idx[k] = (int)s;
             }
             lists[g]  = idx;
             counts[g] = (int)count;
