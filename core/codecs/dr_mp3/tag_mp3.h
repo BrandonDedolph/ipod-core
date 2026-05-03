@@ -27,8 +27,8 @@
 
 /*
  * Read ID3v2 tags from `bytes` (a complete MP3 file in memory) into
- * `*out`. Zeroes `*out` first, then fills any of TIT2 / TPE1 / TALB
- * that are present.
+ * `*out`. Zeroes `*out` first, then fills any of TIT2 / TPE1 / TALB /
+ * TCON / TCOM / APIC that are present.
  *
  * Returns:
  *    0 on success or if no ID3v2 header is present (the file is just

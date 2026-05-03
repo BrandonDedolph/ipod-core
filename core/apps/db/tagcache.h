@@ -139,10 +139,20 @@ int          tagcache_song_index_for_artist(int artist_idx, int n);
 int          tagcache_song_index_for_album (int album_idx, int n);
 
 /*
- * Same shape for the per-album view.
+ * Same shape for the per-album / per-genre / per-composer views.
  */
 int          tagcache_song_count_for_album(int album_idx);
 const char  *tagcache_song_title_for_album(int album_idx, int n);
 const char  *tagcache_song_path_for_album (int album_idx, int n);
+
+int          tagcache_song_count_for_genre(int genre_idx);
+const char  *tagcache_song_title_for_genre(int genre_idx, int n);
+const char  *tagcache_song_path_for_genre (int genre_idx, int n);
+int          tagcache_song_index_for_genre(int genre_idx, int n);
+
+int          tagcache_song_count_for_composer(int composer_idx);
+const char  *tagcache_song_title_for_composer(int composer_idx, int n);
+const char  *tagcache_song_path_for_composer (int composer_idx, int n);
+int          tagcache_song_index_for_composer(int composer_idx, int n);
 
 #endif /* CORE_APPS_DB_TAGCACHE_H */

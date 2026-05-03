@@ -114,6 +114,12 @@ static void on_meta(void *user, drflac_metadata *m) {
             } else if ((v = match_key(comment, comment_len, "ALBUM", &vlen)) && !tags->found_album) {
                 copy_value(tags->album, sizeof(tags->album), v, vlen);
                 tags->found_album = 1;
+            } else if ((v = match_key(comment, comment_len, "GENRE", &vlen)) && !tags->found_genre) {
+                copy_value(tags->genre, sizeof(tags->genre), v, vlen);
+                tags->found_genre = 1;
+            } else if ((v = match_key(comment, comment_len, "COMPOSER", &vlen)) && !tags->found_composer) {
+                copy_value(tags->composer, sizeof(tags->composer), v, vlen);
+                tags->found_composer = 1;
             }
         }
         break;

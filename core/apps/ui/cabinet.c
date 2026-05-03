@@ -42,8 +42,11 @@ enum menu_id {
     M_MUSIC_ALBUMS,
     M_MUSIC_SONGS,
     M_MUSIC_GENRES,
+    M_MUSIC_COMPOSERS,
     M_MUSIC_ARTIST_SONGS,    /* drilldown: songs by one artist */
     M_MUSIC_ALBUM_SONGS,     /* drilldown: songs on one album */
+    M_MUSIC_GENRE_SONGS,     /* drilldown: songs in one genre */
+    M_MUSIC_COMPOSER_SONGS,  /* drilldown: songs by one composer */
     M_PLAYLISTS,
     M_PODCASTS,
     M_AUDIOBOOKS,
@@ -68,6 +71,10 @@ static int         filtered_artist_song_count(void)        { return tagcache_son
 static const char *filtered_artist_song_title(int idx)     { return tagcache_song_title_for_artist(g_filter, idx); }
 static int         filtered_album_song_count(void)         { return tagcache_song_count_for_album(g_filter); }
 static const char *filtered_album_song_title(int idx)      { return tagcache_song_title_for_album(g_filter, idx); }
+static int         filtered_genre_song_count(void)         { return tagcache_song_count_for_genre(g_filter); }
+static const char *filtered_genre_song_title(int idx)      { return tagcache_song_title_for_genre(g_filter, idx); }
+static int         filtered_composer_song_count(void)      { return tagcache_song_count_for_composer(g_filter); }
+static const char *filtered_composer_song_title(int idx)   { return tagcache_song_title_for_composer(g_filter, idx); }
 
 static const char *const main_items[] = {
     "Music", "Playlists", "Podcasts", "Audiobooks", "Settings", "Now Playing"
@@ -80,7 +87,8 @@ static const char *const music_items[] = {
     "Artists", "Albums", "Songs", "Genres", "Composers", "Audiobooks"
 };
 static const int music_actions[] = {
-    M_MUSIC_ARTISTS, M_MUSIC_ALBUMS, M_MUSIC_SONGS, M_MUSIC_GENRES, ACT_NOOP, ACT_NOOP
+    M_MUSIC_ARTISTS, M_MUSIC_ALBUMS, M_MUSIC_SONGS,
+    M_MUSIC_GENRES, M_MUSIC_COMPOSERS, ACT_NOOP
 };
 
 static const char *const empty_items[] = {"(empty)"};
@@ -126,9 +134,15 @@ static const menu_t MENUS[M_COUNT] = {
         .count_fn = tagcache_genre_count,
         .item_fn  = tagcache_genre_name,
     },
+    [M_MUSIC_COMPOSERS] = {
+        .title = "Composers",
+        .count_fn = tagcache_composer_count,
+        .item_fn  = tagcache_composer_name,
+    },
 
-    /* Drilldown menus — title is overridden per-frame with the
-     * artist or album name; the .title here is the fallback. */
+    /* Drilldown menus — title is overridden per-frame with the group
+     * name (artist / album / genre / composer); the .title here is
+     * the fallback used only when the frame title is empty. */
     [M_MUSIC_ARTIST_SONGS] = {
         .title    = "Artist",
         .count_fn = filtered_artist_song_count,
@@ -138,6 +152,16 @@ static const menu_t MENUS[M_COUNT] = {
         .title    = "Album",
         .count_fn = filtered_album_song_count,
         .item_fn  = filtered_album_song_title,
+    },
+    [M_MUSIC_GENRE_SONGS] = {
+        .title    = "Genre",
+        .count_fn = filtered_genre_song_count,
+        .item_fn  = filtered_genre_song_title,
+    },
+    [M_MUSIC_COMPOSER_SONGS] = {
+        .title    = "Composer",
+        .count_fn = filtered_composer_song_count,
+        .item_fn  = filtered_composer_song_title,
     },
 
     [M_PLAYLISTS]  = {"Playlists",  empty_items, empty_actions, 1},
@@ -470,6 +494,20 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
             return;
         }
 
+        /* Genres list: drill into songs in that genre. */
+        if (mid == M_MUSIC_GENRES && tagcache_library_loaded()) {
+            push_filtered_menu(c, M_MUSIC_GENRE_SONGS, idx,
+                               tagcache_genre_name(idx));
+            return;
+        }
+
+        /* Composers list: drill into songs by that composer. */
+        if (mid == M_MUSIC_COMPOSERS && tagcache_library_loaded()) {
+            push_filtered_menu(c, M_MUSIC_COMPOSER_SONGS, idx,
+                               tagcache_composer_name(idx));
+            return;
+        }
+
         /* Drilldown leaf: row resolves to a global song idx. */
         if (mid == M_MUSIC_ARTIST_SONGS) {
             int global = tagcache_song_index_for_artist(g_filter, idx);
@@ -478,6 +516,16 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
         }
         if (mid == M_MUSIC_ALBUM_SONGS) {
             int global = tagcache_song_index_for_album(g_filter, idx);
+            if (global >= 0) play_global_song(c, global);
+            return;
+        }
+        if (mid == M_MUSIC_GENRE_SONGS) {
+            int global = tagcache_song_index_for_genre(g_filter, idx);
+            if (global >= 0) play_global_song(c, global);
+            return;
+        }
+        if (mid == M_MUSIC_COMPOSER_SONGS) {
+            int global = tagcache_song_index_for_composer(g_filter, idx);
             if (global >= 0) play_global_song(c, global);
             return;
         }

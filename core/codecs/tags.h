@@ -30,12 +30,16 @@
 #define TAG_FIELD_MAX 64
 
 typedef struct {
-    char title [TAG_FIELD_MAX];
-    char artist[TAG_FIELD_MAX];
-    char album [TAG_FIELD_MAX];
+    char title    [TAG_FIELD_MAX];
+    char artist   [TAG_FIELD_MAX];
+    char album    [TAG_FIELD_MAX];
+    char genre    [TAG_FIELD_MAX];
+    char composer [TAG_FIELD_MAX];
     int  found_title;
     int  found_artist;
     int  found_album;
+    int  found_genre;
+    int  found_composer;
 
     /* Embedded picture (album art) — owned heap allocation; NULL when
      * the file has no embedded art. art_len is meaningless when
