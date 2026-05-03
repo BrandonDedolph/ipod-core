@@ -65,7 +65,8 @@ func newTagcacheDumpCmd() *cobra.Command {
 
 func newTagcacheBuildCmd() *cobra.Command {
 	var (
-		out string
+		out   string
+		force bool
 	)
 	cmd := &cobra.Command{
 		Use:   "build <music-dir>",
@@ -82,8 +83,19 @@ func newTagcacheBuildCmd() *cobra.Command {
 			}
 			model := tagcache.Build(songs)
 
-			f, err := os.Create(out)
+			// Refuse to overwrite an existing file unless --force.
+			// O_EXCL gives us the atomic check; the user gets a clear
+			// error rather than silently losing a stale tagcache they
+			// might still want.
+			flag := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+			if !force {
+				flag = os.O_WRONLY | os.O_CREATE | os.O_EXCL
+			}
+			f, err := os.OpenFile(out, flag, 0o644)
 			if err != nil {
+				if os.IsExist(err) {
+					return fmt.Errorf("%s already exists; pass --force to overwrite", out)
+				}
 				return fmt.Errorf("create %s: %w", out, err)
 			}
 			defer f.Close()
@@ -106,6 +118,8 @@ func newTagcacheBuildCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&out, "out", "o", "",
 		"Output file path (default: <music-dir>/tagcache.tcdb)")
+	cmd.Flags().BoolVarP(&force, "force", "f", false,
+		"Overwrite the output file if it already exists")
 	return cmd
 }
 

@@ -15,8 +15,21 @@ import (
 //
 // Tag values that compare case-insensitively equal share a uniq slot
 // (e.g. "Aphex Twin" and "aphex twin" collapse to one artist). The
-// canonical spelling is the first one encountered in the song scan.
+// canonical spelling is deterministic: after sorting songs by title,
+// the first spelling encountered in title order wins. This differs
+// from the firmware's `tagcache.c::build_unique_index`, where the
+// surviving spelling depends on the C qsort's (unstable) ordering —
+// the asymmetry vanishes in normal use because the C reader will
+// consume uniq strings from the .tcdb verbatim instead of re-deriving
+// them.
 func Build(songs []SongInfo) *Model {
+	// Sort by title (case-insensitive) up front. The format docstring
+	// promises the on-disk song array is title-sorted; doing it here
+	// (instead of trusting the caller) keeps direct callers and the
+	// round-trip test from accidentally violating the contract.
+	sort.SliceStable(songs, func(i, j int) bool {
+		return strings.ToLower(songs[i].Title) < strings.ToLower(songs[j].Title)
+	})
 	m := &Model{
 		Songs: songs,
 	}

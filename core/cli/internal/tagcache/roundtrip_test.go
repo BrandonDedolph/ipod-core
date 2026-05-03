@@ -86,3 +86,66 @@ func TestRoundTrip(t *testing.T) {
 		t.Errorf("art blob len: want %d (deduped) got %d", wantArtLen, hdr.ArtLen)
 	}
 }
+
+// TestCaseCollision locks the case-folding-dedup contract: two artist
+// strings differing only by case must collapse to a single uniq slot,
+// and the canonical spelling is the first one in title-sort order.
+func TestCaseCollision(t *testing.T) {
+	in := []SongInfo{
+		// "Apple" sorts before "Banana", so the first-encountered
+		// spelling of the case-folded artist is "Aphex Twin".
+		{Path: "/a.flac", Title: "Apple",  Artist: "Aphex Twin"},
+		{Path: "/b.flac", Title: "Banana", Artist: "aphex twin"},
+	}
+	m := Build(in)
+	if len(m.UniqArtists) != 1 || m.UniqArtists[0] != "Aphex Twin" {
+		t.Fatalf("uniq artists: want [Aphex Twin] got %v", m.UniqArtists)
+	}
+	if m.SongArtistIdx[0] != 0 || m.SongArtistIdx[1] != 0 {
+		t.Errorf("both songs should map to artist 0; got %v", m.SongArtistIdx)
+	}
+	if !reflect.DeepEqual(m.ArtistGroups[0], []uint32{0, 1}) {
+		t.Errorf("artist 0 group: want [0 1] got %v", m.ArtistGroups[0])
+	}
+}
+
+// TestEmpty exercises the zero-song path. Encoder must produce a
+// well-formed file and decoder must accept it without error.
+func TestEmpty(t *testing.T) {
+	m := Build(nil)
+	var buf bytes.Buffer
+	if err := m.Write(&buf); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := Read(buf.Bytes())
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got.Songs) != 0 || len(got.UniqArtists) != 0 {
+		t.Errorf("expected empty model, got %d songs / %d artists",
+			len(got.Songs), len(got.UniqArtists))
+	}
+}
+
+// TestNoArt covers the no-embedded-art path on every track. The art
+// blob should be zero-length but still validly addressed.
+func TestNoArt(t *testing.T) {
+	in := []SongInfo{
+		{Path: "/a.flac", Title: "A", Artist: "X", Album: "Y"},
+		{Path: "/b.flac", Title: "B", Artist: "X", Album: "Y"},
+	}
+	m := Build(in)
+	var buf bytes.Buffer
+	if err := m.Write(&buf); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := Read(buf.Bytes())
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	for i, s := range got.Songs {
+		if len(s.ArtBytes) != 0 {
+			t.Errorf("song[%d] expected no art, got %d bytes", i, len(s.ArtBytes))
+		}
+	}
+}

@@ -24,8 +24,46 @@ func Read(data []byte) (*Model, error) {
 	if hdr.Version != Version {
 		return nil, fmt.Errorf("tagcache: unsupported version %d (want %d)", hdr.Version, Version)
 	}
-	if uint64(len(data)) < hdr.ArtOff+hdr.ArtLen {
-		return nil, fmt.Errorf("tagcache: file truncated (have %d, need %d)", len(data), hdr.ArtOff+hdr.ArtLen)
+	// Bounds-check every advertised section against file length. The
+	// firmware's C reader will be doing pointer arithmetic on mmap'd
+	// bytes — we want a malformed/truncated file to surface here in
+	// the build pipeline rather than as a SEGV at boot. Width sums
+	// are u64 to defend against overflow on a malicious header.
+	end := uint64(len(data))
+	checks := []struct {
+		off, length uint64
+		name        string
+	}{
+		{hdr.SongsOff,          uint64(hdr.SongCount)  * SongRecordSize, "songs"},
+		{hdr.ArtistIdxOff,      uint64(hdr.NArtists)   * 4,              "artist_idx"},
+		{hdr.AlbumIdxOff,       uint64(hdr.NAlbums)    * 4,              "album_idx"},
+		{hdr.GenreIdxOff,       uint64(hdr.NGenres)    * 4,              "genre_idx"},
+		{hdr.ComposerIdxOff,    uint64(hdr.NComposers) * 4,              "composer_idx"},
+		{hdr.StringsOff,        hdr.StringsLen,                          "strings"},
+		{hdr.ArtOff,            hdr.ArtLen,                              "art"},
+	}
+	for _, c := range checks {
+		if c.off+c.length < c.off /* overflow */ || c.off+c.length > end {
+			return nil, fmt.Errorf("tagcache: section %s out of bounds (off=%d len=%d file=%d)",
+				c.name, c.off, c.length, end)
+		}
+	}
+	// Per-group blocks have a fixed header (n*4 offsets) but the body
+	// extent depends on per-group counts read at decode time; the
+	// section-end check is enforced in readGroups instead.
+	for _, c := range []struct {
+		off uint64
+		n   uint32
+		name string
+	}{
+		{hdr.ArtistGroupsOff,   hdr.NArtists,   "artist_groups"},
+		{hdr.AlbumGroupsOff,    hdr.NAlbums,    "album_groups"},
+		{hdr.GenreGroupsOff,    hdr.NGenres,    "genre_groups"},
+		{hdr.ComposerGroupsOff, hdr.NComposers, "composer_groups"},
+	} {
+		if c.off+uint64(c.n)*4 < c.off || c.off+uint64(c.n)*4 > end {
+			return nil, fmt.Errorf("tagcache: section %s offset table out of bounds", c.name)
+		}
 	}
 
 	strings := func(off uint32) string {

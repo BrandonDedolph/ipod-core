@@ -9,7 +9,7 @@
 //
 // File layout (all integers little-endian, the iPod ARM is LE):
 //
-//	+-------- Header (104 bytes) --------+
+//	+-------- Header (132 bytes) --------+
 //	|  magic[4]      = "TCDB"             |
 //	|  version u32   = 1                  |
 //	|  song_count u32                     |
@@ -54,6 +54,12 @@
 // tables are sorted alphabetically. Per-group song-list orders match
 // the global song order, so the firmware can present the same drilldown
 // rows whether it reads from the binary cache or scan-at-startup.
+//
+// Case-insensitive ordering is ASCII-only — we use strings.ToLower /
+// strcasecmp on the C side, NOT a Unicode collator. Two strings that
+// differ only by Unicode-case (e.g. Turkish dotless i) are treated as
+// distinct. For an iPod-class music library this hasn't surfaced, but
+// don't promise Unicode-correct collation here.
 //
 // Versioning: bump `Version` whenever the binary layout changes in a
 // non-additive way. Readers must reject mismatched versions rather than
