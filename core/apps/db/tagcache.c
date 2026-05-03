@@ -723,6 +723,10 @@ int tagcache_library_load(const char *dir) {
             }
         }
         if (!title) {
+            /* Half-row in flight: `path` has been malloc'd but not
+             * stored in staging yet (staging.count not bumped until
+             * the row is fully built below). Free it explicitly,
+             * then library_free_contents drops the rest. */
             free(path);
             library_free_contents(&staging);
             closedir(d);
