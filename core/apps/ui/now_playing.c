@@ -496,7 +496,7 @@ static void draw_track_info(const now_playing_t *np, const audio_engine_t *engin
     const char *vals[] = {
         np->title, np->artist, np->album, track, format_full,
         rate, length,
-        "tests/codec-vectors/sine_440hz_1s_44k_s16_stereo.flac",
+        np->path[0] ? np->path : "(unknown)",
     };
     int n = (int)(sizeof(KEYS) / sizeof(KEYS[0]));
 

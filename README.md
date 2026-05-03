@@ -1,178 +1,170 @@
-# Cabinet · Linen
+# core — custom firmware for iPod Video 5G/5.5G
 
-A custom UI for [Rockbox](https://rockbox.org) on the iPod Video (5G).
-**Linen** is a warm-light theme; **Cabinet** is a plugin that replaces
-Rockbox's hardcoded main menu with a curated, design-driven interface.
+A from-scratch firmware that ships **Cabinet** as the shell and **Linen**
+as the only theme. Replaces Rockbox entirely on the device.
 
-Together they ship as a drop-in zip for any iPod Video already running
-Rockbox.
+The simulator runs the real C firmware against an SDL2 host backend, so
+every screen below is rendered by the same code that will run on the
+iPod.
+
+![Main menu](docs/img/01-main.png) ![Now Playing](docs/img/09-np-default.png) ![Big art](docs/img/10-np-bigart.png)
 
 ---
 
-![Main menu](docs/img/p6-cabinet-main.png) ![Now Playing](docs/img/p11-wps.png)
+## Status
 
-## What's in this repo
+The music browser is feature-complete in sim — load, browse all four
+iconic groupings (Artists / Albums / Genres / Composers), drill down,
+play. Now Playing shows real metadata + embedded album art.
 
+| Working today (sim) | Pending |
+|---|---|
+| FLAC + MP3 decoders (bit-exact via codec KAT) | Bootable ARM image (Phase 1) |
+| Audio engine — SPSC ring + SDL2 HAL | On-device USB / disk / battery |
+| Library scan + tag parse (Vorbis, ID3v2.3/2.4) | Search / on-screen keyboard |
+| Drilldown: Artists → songs, Albums → songs, Genres → songs, Composers → songs | Playlists, podcasts, audiobooks |
+| Embedded album art (FLAC PICTURE, MP3 APIC → JPEG → 84² + 180²) | Per-track gain (replaygain) |
+| Binary tagcache (`.tcdb`) — Go-side encoder + C-side reader | Settings UI |
+| End-to-end audio playback test (captures real PCM, bit-compares to reference) |  |
+
+30 PRs squash-merged on `main`. See [`STATUS.md`](STATUS.md) for the
+running list.
+
+---
+
+## Quick start (sim)
+
+Requires `meson`, `ninja`, `pkg-config`, `libsdl2-dev`, and a C11
+compiler. Run `tools/install_deps.sh` for a one-shot setup.
+
+```bash
+cd core
+make sim                                  # builds build-sim/sim/core-sim
+./build-sim/sim/core-sim                  # synthetic data — empty library
+./build-sim/sim/core-sim --music ~/Music  # scan a real directory at startup
+meson test -C build-sim                   # codec KAT + .tcdb parser + audio playback
 ```
-design_handoff_rockbox_theme/  Original design files (JSX components + HTML)
-theme/                         The Linen theme: .cfg, .wps, .sbs, fonts, bitmaps
-plugin/                        The Cabinet plugin source (C, single file)
-tools/                         Build helpers + headless test harness
-docs/img/                      Screenshots from the headless sim test runs
-build/                         Output zips ready to deploy
-```
 
-## Highlights
+Wheel = scroll, center = SELECT, MENU = back, SPACE = pause/resume.
 
-- **Theme:** Linen — warm cream `#F4F1EC`, ink `#1A1714`, terracotta accent.
-  Custom Nunito font in 5 weights/sizes (9, 11, 13, 13-bold, 17-bold px),
-  per-viewport colors, soft-rounded selector with anti-aliased corners,
-  3-px progress bar, custom status bar.
-- **Plugin:** Cabinet replaces the Rockbox main menu with the design's
-  curated list (Music / Playlists / Podcasts / Audiobooks / Settings /
-  Now Playing). Music browse chain (Artists → Albums → Songs) goes
-  through Rockbox's tagcache via the `add_filter` API for correct
-  filtering. Playback handoff routes through a fully custom 3-page
-  Now Playing screen.
+---
 
 ## Screenshots
 
-### Cabinet — main menu
-![Main menu](docs/img/p6-cabinet-main.png)
+All captured headlessly via `core-sim --shot <path.bmp>` against a
+six-track tagged library; the same code path runs in interactive mode.
 
-### Music sub-menu
-![Music](docs/img/p7-cabinet-music.png)
+### Cabinet shell — main menu and Music sub-menu
+![Main menu](docs/img/01-main.png) ![Music sub-menu](docs/img/02-music.png)
 
-### Artists list (live tagcache)
-![Artists](docs/img/p8-cabinet-artists.png)
+### Library views (all backed by the tagcache)
+![Songs](docs/img/03-songs.png) ![Artists](docs/img/04-artists.png)
 
-### Albums for artist (real album-art thumb on selected row)
-![Albums](docs/img/p9-cabinet-albums.png)
+### Genres / Composers — same shape as Artists/Albums
+![Genres](docs/img/05-genres.png) ![Composers](docs/img/06-composers.png)
 
-### Album detail — hero header + tracklist (matches design's `AlbumDetail`)
-![Album detail](docs/img/p10-cabinet-songs.png)
+### Drilldowns — pick a row, see its songs
+![Aphex Twin → songs](docs/img/07-aphex-songs.png) ![Genre IDM → songs](docs/img/08-genre-idm.png)
 
-### Now Playing — page 1 (Linen layout: art, title, artist, album, format badge, stars, up next, progress)
-![NP default](docs/img/p11-wps.png)
+### Now Playing — four cycle-able pages
+The iconic iPod NP screen. Embedded album art renders at 84² on the
+default page and 180² on the big-art page; SELECT cycles pages, MENU
+pops.
 
-### Now Playing — page 2 (big art on dark backdrop)
-![NP big art](docs/img/p12-wps-bigart.png)
-
-### Now Playing — page 3 (track info)
-![NP track info](docs/img/p13-wps-trackinfo.png)
-
-### Volume overlay (transient, on wheel scroll during playback)
-![Volume overlay](docs/img/p15-wps-volume.png)
-
-## Install
-
-Pre-built zip: **`build/cabinet-linen-ipodvideo.zip`** (~50 KB).
-
-1. Make sure your iPod Video already runs Rockbox
-   ([install guide](https://www.rockbox.org/wiki/IpodVideo)).
-2. Mount the iPod and copy the contents of the zip to its root. The
-   `.rockbox` folder will merge with your existing one.
-3. On the device:
-   - **Settings → Theme Settings → Browse Theme Files → linen**
-   - **Database → Initialize Now** (one-time scan)
-   - **Plugins → Applications → cabinet** to launch the UI
-
-Optional: make Cabinet the auto-launching start screen so the iPod boots
-straight into our UI:
-
-> Settings → General Settings → System → Start Screen → Custom →
-> `/.rockbox/rocks/apps/cabinet.rock`
-
-## Controls (in Cabinet)
-
-| Action | Mapping |
+| Default | Big art |
 |---|---|
-| Scroll list / Volume on Now Playing | Wheel up/down |
-| Prev/Next track on Now Playing | Left / Right |
-| Drill in / Cycle NP info pages | Center (Select) |
-| Pause / Resume | Play |
-| Back | Menu |
+| ![NP default](docs/img/09-np-default.png) | ![NP big art](docs/img/10-np-bigart.png) |
 
-Holding the wheel triggers fast-scroll (8-item jump) for browsing long
-artist lists.
+| Peak meter (synthesized) | Track info |
+|---|---|
+| ![NP peak meter](docs/img/12-np-peakmeter.png) | ![NP track info](docs/img/11-np-trackinfo.png) |
 
-## Building from source
+---
 
-The plugin needs to be compiled against the Rockbox source tree.
+## Binary tagcache
 
-```bash
-# 1. Clone Rockbox
-git clone https://git.rockbox.org/cgit/rockbox.git ~/rockbox
-
-# 2. Drop our plugin into apps/plugins/ and add to SOURCES
-cp plugin/cabinet.c ~/rockbox/apps/plugins/
-
-# Add `cabinet.c` to ~/rockbox/apps/plugins/SOURCES (alphabetical, near `cab*`).
-
-# 3. Get the cross-toolchain (for hardware) — interactive
-~/rockbox/tools/rockboxdev.sh
-
-# 4. Configure for the iPod Video target + build
-mkdir -p ~/rockbox/build-ipodvideo && cd ~/rockbox/build-ipodvideo
-../tools/configure         # pick `ipodvideo`, Normal build
-make -j$(nproc) zip        # produces rockbox.zip with cabinet.rock inside
-```
-
-For sim testing on Linux:
+Real iPod hardware can't afford a scan-at-startup pass — even a small
+library on a USB-disk takes seconds-to-minutes to walk and re-parse
+every tag. The `core` host CLI builds a precomputed binary index the
+firmware mmaps at boot.
 
 ```bash
-mkdir -p ~/rockbox/build-ipodsim && cd ~/rockbox/build-ipodsim
-echo "ipodvideo
-S
-N" | ../tools/configure
-make -j$(nproc)
-make fullinstall           # installs runtime to simdisk/
-./rockboxui                # SDL window opens
+cd core/cli
+go build -o /tmp/core ./cmd/core
+/tmp/core tagcache build ~/Music
+# ~/Music/tagcache.tcdb: 1834 songs, 142 artists, 218 albums, 17 genres, 89 composers (412 KB)
+
+cd ..
+./build-sim/sim/core-sim --tagcache ~/Music/tagcache.tcdb
 ```
 
-A small headless test harness (Xvfb + xdotool + ffmpeg) is in
-`tools/test_plugin.sh` — drives the sim through the menu/play flow and
-captures PNGs into `build/headless/` so visual diffs can be reviewed via
-the auto-refreshing index page (`tools/render_index.py`).
+Format spec: [`core/apps/db/tagcache_format.h`](core/apps/db/tagcache_format.h)
+(C side) and [`core/cli/internal/tagcache/format.go`](core/cli/internal/tagcache/format.go)
+(Go side). Both sides have round-trip tests; a layout drift fails both
+simultaneously.
 
-### Patches required for the Rockbox source
+---
 
-To build under glibc 2.38+ / gcc 15, two upstream files need `#undef`s
-added (the build wraps `rb->memchr` etc. as struct-pointer calls that
-collide with newer glibc's `_Generic` macros). See the README of the
-Rockbox source tree, or the patch fragments below:
+## Repo layout
 
-- `apps/plugin.h` — add `#undef strrchr / strstr / memchr` near the top
-- `lib/rbcodec/codecs/lib/codeclib.c` — add the same `#undef`s before
-  the redefinitions of `memchr / memmove / memcmp / memset / memcpy`
+```
+core/                     C firmware + simulator
+├── boot/                 (empty — Phase 1)
+├── kernel/               (empty — Phase 1)
+├── hal/
+│   ├── hal.h             contract
+│   ├── hw/               (empty — needs hardware)
+│   └── sim/              SDL2-backed implementation
+├── codecs/
+│   ├── tags.h            shared audio_tags_t (incl. owned art bytes)
+│   ├── decoder.h         unified decoder ABI
+│   ├── dr_flac/          vendored single-header FLAC + Vorbis comments
+│   ├── dr_mp3/           vendored single-header MP3 + custom ID3v2 parser
+│   └── stb_image/        JPEG-only build for embedded album art
+├── apps/
+│   ├── audio/            decoder → SPSC ring → hal_audio engine
+│   ├── db/               tagcache: scan, parse, build indexes, .tcdb reader
+│   └── ui/               Cabinet shell, list view, Now Playing, Linen chrome
+├── cli/                  Go host CLI (build / install / update / tagcache build)
+├── sim/                  core-sim entry point
+├── docs/hw/              Phase-0 hardware reference (8 subsystems, ~2,500 lines)
+└── tests/                codec KAT + .tcdb reader + end-to-end audio playback
 
-These don't affect older toolchains (the macros simply don't exist on
-arm-elf-eabi gcc 9, which is what `rockboxdev.sh` installs).
+design_handoff_rockbox_theme/  Original design files (JSX + HTML)
+docs/img/                       Sim screenshots (this README)
+tools/                          Build helpers (atlas generator, deps installer)
+```
 
-## Design source
+See [`core/README.md`](core/README.md) for the firmware-side build details
+and [`PLAN.md`](PLAN.md) for the phased roadmap.
 
-The design ships in `design_handoff_rockbox_theme/` as React/JSX
-components — open `Rockbox Theme.html` in a browser (or run `python3 -m
-http.server 8000` and navigate to it) to see the design at native 320×240
-scale. The plugin and theme are pixel-tightened to match.
+---
 
-## What's intentionally not implemented
+## Verifying audio actually plays
 
-- **Peak-meter NP info page** — the Rockbox plugin API doesn't expose
-  audio sample data; would need a core firmware change.
-- **Charging / Locked-screen system overlays / Boot splash** — these
-  are firmware-level, outside theme + plugin reach.
-- **Podcasts, Audiobooks** as distinct types — Rockbox doesn't natively
-  distinguish them; would need a folder convention.
+The `sim-audio-playback` integration test spawns `core-sim` with the
+SDL2 `disk` audio driver, drives Music → Songs → SELECT, and bit-
+compares the captured S16LE samples against the codec KAT reference.
+This catches regressions anywhere in the chain — tagcache, cabinet's
+play path, audio engine, ring buffer, or HAL audio source callback.
+
+```bash
+cd core
+meson test -C build-sim --suite integration
+# 2/2 integration - core:sim-audio-playback OK     6.74s
+# stdout: ok: 176400 bytes of audio matched (capture started at byte 0)
+```
+
+To listen interactively, drop `--shot` and use `--music`:
+
+```bash
+./build-sim/sim/core-sim --music ~/Music
+```
+
+---
 
 ## License
 
-- Theme files (`*.cfg`, `*.wps`, `*.sbs`, `*.bmp`) and the Cabinet
-  plugin: GPL-2.0-or-later, matching Rockbox.
-- Nunito font: SIL Open Font License 1.1 (see `theme/OFL.txt`).
-- Design files: original work, free to adapt.
-
-## Credits
-
-Designed and authored from scratch — no proprietary Apple or
-Rockbox-stock assets used.
+Apache-2.0 first-party; vendored codecs (`dr_flac`, `dr_mp3`,
+`stb_image`) keep their upstream licenses (zlib / public domain / MIT).
+Nunito font: SIL Open Font License 1.1 (`tools/fonts-src/`).

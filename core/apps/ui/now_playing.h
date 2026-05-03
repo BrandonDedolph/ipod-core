@@ -41,6 +41,11 @@
 
 #define NP_NEXT_MAX   80
 
+/* Path field is wider than title/artist because filesystem paths
+ * (esp. nested album folders) often blow past 64 chars; the track-
+ * info page truncates with an ellipsis past this. */
+#define NP_PATH_MAX   192
+
 /*
  * The four NP pages, cycled through with center button (SELECT) per
  * the design (system-screens.jsx). Order matches the JSX:
@@ -80,6 +85,7 @@ typedef struct {
     char     album[NP_TITLE_MAX];          /* the album text under artist */
     char     format[NP_FORMAT_MAX];        /* "FLAC" / "MP3" / etc — short */
     char     format_detail[NP_FORMAT_MAX]; /* "44.1 kHz" / "192 kbps" / etc */
+    char     path[NP_PATH_MAX];            /* filesystem path, for track-info page */
     char     up_next[NP_NEXT_MAX];         /* next-track title */
     int      stars;                        /* 0..5 */
     uint32_t total_frames;     /* 0 if unknown */
