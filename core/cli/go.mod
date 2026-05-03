@@ -2,7 +2,10 @@ module github.com/BrandonDedolph/ipod_theme/core/cli
 
 go 1.22
 
-require github.com/spf13/cobra v1.8.1
+require (
+	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
+	github.com/spf13/cobra v1.8.1
+)
 
 require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
