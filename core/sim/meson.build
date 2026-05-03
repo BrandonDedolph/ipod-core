@@ -6,7 +6,7 @@
 cc = meson.get_compiler('c')
 m_dep = cc.find_library('m', required: false)
 
-executable(
+core_sim_target = executable(
   'core-sim',
   sources: ['main.c'],
   dependencies: [hal_dep, audio_engine_dep, flac_dep, ui_dep, m_dep],
