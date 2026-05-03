@@ -23,6 +23,19 @@ if target == 'sim'
        args: [vectors_dir],
        suite: 'unit')
 
+  # tcdb-reader: hand-rolls a minimal .tcdb byte string in memory
+  # (using the same constants the parser reads) and verifies the
+  # parser populates the public tagcache_* accessors correctly.
+  # Independent from the Go encoder — both sides implement the
+  # spec separately, so a layout drift fails this AND the Go
+  # round-trip test simultaneously.
+  tcdb_reader_test = executable(
+    'tcdb_reader_test',
+    sources: ['tcdb_reader_test.c'],
+    dependencies: [tagcache_dep],
+  )
+  test('tcdb-reader', tcdb_reader_test, suite: 'unit')
+
   # End-to-end audio-playback test: spawns core-sim with the SDL2
   # disk audio driver, plays the FLAC fixture, then bit-compares
   # the captured PCM to the codec_kat reference. Exercises the

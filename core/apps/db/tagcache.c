@@ -20,6 +20,7 @@
  */
 
 #include "tagcache.h"
+#include "tagcache_format.h"
 
 #include "../../codecs/dr_flac/tag_flac.h"
 #include "../../codecs/dr_mp3/tag_mp3.h"
@@ -28,6 +29,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -852,6 +854,325 @@ int tagcache_library_load(const char *dir) {
     /* Commit: drop any previous library, install staging. Wholesale
      * struct copy (instead of field-by-field) so adding a new field
      * to library_t doesn't require remembering to add a line here. */
+    library_clear();
+    LIBRARY = staging;
+    LIBRARY.loaded = 1;
+    return LIBRARY.count;
+}
+
+/* ---------- Binary tagcache (.tcdb) parser ----------------------- */
+
+/* Little-endian readers. The on-disk format is LE; iPod ARM is also
+ * LE, but we go byte-wise so the same code works on any host endian
+ * (the meson host build runs on whatever the dev box is). */
+static uint32_t tcdb_le32(const uint8_t *p) {
+    return (uint32_t)p[0]        | ((uint32_t)p[1] <<  8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static int32_t tcdb_le32s(const uint8_t *p) {
+    return (int32_t)tcdb_le32(p);
+}
+static uint64_t tcdb_le64(const uint8_t *p) {
+    return (uint64_t)tcdb_le32(p) | ((uint64_t)tcdb_le32(p + 4) << 32);
+}
+
+/*
+ * Resolve string at `off` (byte offset within the strings section)
+ * into a freshly malloc'd null-terminated copy. Returns NULL on OOM
+ * or when off is out of bounds. The caller owns the returned pointer.
+ */
+static char *tcdb_strdup_at(const uint8_t *strings, uint64_t strings_len,
+                            uint32_t off) {
+    if ((uint64_t)off >= strings_len) return NULL;
+    /* The strings section is null-terminated UTF-8; find the end
+     * within the section bounds (a malformed file with a missing
+     * terminator would otherwise read past). */
+    size_t end = off;
+    while (end < strings_len && strings[end] != 0) end++;
+    size_t len = end - off;
+    char *dup = (char *)malloc(len + 1);
+    if (!dup) return NULL;
+    memcpy(dup, strings + off, len);
+    dup[len] = 0;
+    return dup;
+}
+
+/*
+ * Validate that section [off, off+length) lies entirely within
+ * [0, file_len). Defends against an adversarial header where
+ * off+length wraps around the u64 range.
+ */
+static int tcdb_section_in_bounds(uint64_t off, uint64_t length, uint64_t file_len) {
+    uint64_t end = off + length;
+    if (end < off) return 0;          /* overflow */
+    if (end > file_len) return 0;
+    return 1;
+}
+
+/*
+ * Parse a .tcdb buffer into `staging`. Returns 0 on success. On
+ * failure, `staging` may be partially populated; the caller MUST
+ * call library_free_contents(staging) and discard.
+ */
+static int tcdb_parse(const void *bytes, size_t len, library_t *staging) {
+    if (!bytes || len < TCDB_HEADER_SIZE) return -1;
+    const uint8_t *p = (const uint8_t *)bytes;
+
+    /* Magic + version. */
+    if (p[TCDB_OFF_MAGIC + 0] != TCDB_MAGIC0 ||
+        p[TCDB_OFF_MAGIC + 1] != TCDB_MAGIC1 ||
+        p[TCDB_OFF_MAGIC + 2] != TCDB_MAGIC2 ||
+        p[TCDB_OFF_MAGIC + 3] != TCDB_MAGIC3) return -1;
+    if (tcdb_le32(p + TCDB_OFF_VERSION) != TCDB_VERSION) return -1;
+
+    uint32_t song_count  = tcdb_le32(p + TCDB_OFF_SONG_COUNT);
+    uint32_t n_artists   = tcdb_le32(p + TCDB_OFF_N_ARTISTS);
+    uint32_t n_albums    = tcdb_le32(p + TCDB_OFF_N_ALBUMS);
+    uint32_t n_genres    = tcdb_le32(p + TCDB_OFF_N_GENRES);
+    uint32_t n_composers = tcdb_le32(p + TCDB_OFF_N_COMPOSERS);
+
+    uint64_t songs_off          = tcdb_le64(p + TCDB_OFF_SONGS_OFF);
+    uint64_t artist_idx_off     = tcdb_le64(p + TCDB_OFF_ARTIST_IDX_OFF);
+    uint64_t album_idx_off      = tcdb_le64(p + TCDB_OFF_ALBUM_IDX_OFF);
+    uint64_t genre_idx_off      = tcdb_le64(p + TCDB_OFF_GENRE_IDX_OFF);
+    uint64_t composer_idx_off   = tcdb_le64(p + TCDB_OFF_COMPOSER_IDX_OFF);
+    uint64_t artist_groups_off  = tcdb_le64(p + TCDB_OFF_ARTIST_GROUPS_OFF);
+    uint64_t album_groups_off   = tcdb_le64(p + TCDB_OFF_ALBUM_GROUPS_OFF);
+    uint64_t genre_groups_off   = tcdb_le64(p + TCDB_OFF_GENRE_GROUPS_OFF);
+    uint64_t composer_groups_off= tcdb_le64(p + TCDB_OFF_COMPOSER_GROUPS_OFF);
+    uint64_t strings_off        = tcdb_le64(p + TCDB_OFF_STRINGS_OFF);
+    uint64_t strings_len        = tcdb_le64(p + TCDB_OFF_STRINGS_LEN);
+    uint64_t art_off            = tcdb_le64(p + TCDB_OFF_ART_OFF);
+    uint64_t art_len            = tcdb_le64(p + TCDB_OFF_ART_LEN);
+
+    /* Bounds-check every fixed-size section against file length. The
+     * group blocks have variable bodies; we only check their offset
+     * tables here and verify body extents during the read. */
+    if (!tcdb_section_in_bounds(songs_off,        (uint64_t)song_count * TCDB_SONG_RECORD_SIZE, len) ||
+        !tcdb_section_in_bounds(artist_idx_off,   (uint64_t)n_artists   * 4, len) ||
+        !tcdb_section_in_bounds(album_idx_off,    (uint64_t)n_albums    * 4, len) ||
+        !tcdb_section_in_bounds(genre_idx_off,    (uint64_t)n_genres    * 4, len) ||
+        !tcdb_section_in_bounds(composer_idx_off, (uint64_t)n_composers * 4, len) ||
+        !tcdb_section_in_bounds(artist_groups_off,   (uint64_t)n_artists   * 4, len) ||
+        !tcdb_section_in_bounds(album_groups_off,    (uint64_t)n_albums    * 4, len) ||
+        !tcdb_section_in_bounds(genre_groups_off,    (uint64_t)n_genres    * 4, len) ||
+        !tcdb_section_in_bounds(composer_groups_off, (uint64_t)n_composers * 4, len) ||
+        !tcdb_section_in_bounds(strings_off, strings_len, len) ||
+        !tcdb_section_in_bounds(art_off,     art_len,     len)) {
+        return -1;
+    }
+
+    const uint8_t *strings = p + strings_off;
+
+    /* Reserve the per-song parallel arrays. */
+    if (song_count > 0 && library_reserve(staging, (int)song_count) != 0) return -1;
+    staging->count = (int)song_count;
+
+    /* Read uniq tables. We need them up-front so we can populate the
+     * per-song artist/album/genre/composer string fields by indexing. */
+    char **uniq_artists   = NULL;
+    char **uniq_albums    = NULL;
+    char **uniq_genres    = NULL;
+    char **uniq_composers = NULL;
+    if (n_artists > 0) {
+        uniq_artists = (char **)calloc(n_artists, sizeof(char *));
+        if (!uniq_artists) return -1;
+        for (uint32_t i = 0; i < n_artists; i++) {
+            uint32_t off = tcdb_le32(p + artist_idx_off + (uint64_t)i * 4);
+            uniq_artists[i] = tcdb_strdup_at(strings, strings_len, off);
+            if (!uniq_artists[i]) { staging->uniq_artists = uniq_artists;
+                                    staging->uniq_artist_count = (int)i; return -1; }
+        }
+    }
+    staging->uniq_artists = uniq_artists;
+    staging->uniq_artist_count = (int)n_artists;
+
+    if (n_albums > 0) {
+        uniq_albums = (char **)calloc(n_albums, sizeof(char *));
+        if (!uniq_albums) return -1;
+        for (uint32_t i = 0; i < n_albums; i++) {
+            uint32_t off = tcdb_le32(p + album_idx_off + (uint64_t)i * 4);
+            uniq_albums[i] = tcdb_strdup_at(strings, strings_len, off);
+            if (!uniq_albums[i]) { staging->uniq_albums = uniq_albums;
+                                   staging->uniq_album_count = (int)i; return -1; }
+        }
+    }
+    staging->uniq_albums = uniq_albums;
+    staging->uniq_album_count = (int)n_albums;
+
+    if (n_genres > 0) {
+        uniq_genres = (char **)calloc(n_genres, sizeof(char *));
+        if (!uniq_genres) return -1;
+        for (uint32_t i = 0; i < n_genres; i++) {
+            uint32_t off = tcdb_le32(p + genre_idx_off + (uint64_t)i * 4);
+            uniq_genres[i] = tcdb_strdup_at(strings, strings_len, off);
+            if (!uniq_genres[i]) { staging->uniq_genres = uniq_genres;
+                                   staging->uniq_genre_count = (int)i; return -1; }
+        }
+    }
+    staging->uniq_genres = uniq_genres;
+    staging->uniq_genre_count = (int)n_genres;
+
+    if (n_composers > 0) {
+        uniq_composers = (char **)calloc(n_composers, sizeof(char *));
+        if (!uniq_composers) return -1;
+        for (uint32_t i = 0; i < n_composers; i++) {
+            uint32_t off = tcdb_le32(p + composer_idx_off + (uint64_t)i * 4);
+            uniq_composers[i] = tcdb_strdup_at(strings, strings_len, off);
+            if (!uniq_composers[i]) { staging->uniq_composers = uniq_composers;
+                                      staging->uniq_composer_count = (int)i; return -1; }
+        }
+    }
+    staging->uniq_composers = uniq_composers;
+    staging->uniq_composer_count = (int)n_composers;
+
+    /* Per-song lookup arrays. Allocate up front so the read loop
+     * below can fill them; partial-allocation failure leaves them
+     * NULL and library_free_contents handles cleanup. */
+    if (song_count > 0) {
+        staging->song_artist_idx   = (int *)malloc((size_t)song_count * sizeof(int));
+        staging->song_album_idx    = (int *)malloc((size_t)song_count * sizeof(int));
+        staging->song_genre_idx    = (int *)malloc((size_t)song_count * sizeof(int));
+        staging->song_composer_idx = (int *)malloc((size_t)song_count * sizeof(int));
+        if (!staging->song_artist_idx || !staging->song_album_idx ||
+            !staging->song_genre_idx  || !staging->song_composer_idx) return -1;
+    }
+
+    /* Read song records. */
+    for (uint32_t i = 0; i < song_count; i++) {
+        const uint8_t *rec = p + songs_off + (uint64_t)i * TCDB_SONG_RECORD_SIZE;
+        uint32_t title_off    = tcdb_le32 (rec + TCDB_REC_TITLE_OFF);
+        uint32_t path_off     = tcdb_le32 (rec + TCDB_REC_PATH_OFF);
+        int32_t  artist_idx   = tcdb_le32s(rec + TCDB_REC_ARTIST_IDX);
+        int32_t  album_idx    = tcdb_le32s(rec + TCDB_REC_ALBUM_IDX);
+        int32_t  genre_idx    = tcdb_le32s(rec + TCDB_REC_GENRE_IDX);
+        int32_t  composer_idx = tcdb_le32s(rec + TCDB_REC_COMPOSER_IDX);
+        uint64_t rec_art_off  = tcdb_le64 (rec + TCDB_REC_ART_OFF);
+        uint64_t rec_art_len  = tcdb_le64 (rec + TCDB_REC_ART_LEN);
+
+        staging->titles[i] = tcdb_strdup_at(strings, strings_len, title_off);
+        staging->paths [i] = tcdb_strdup_at(strings, strings_len, path_off);
+        if (!staging->titles[i] || !staging->paths[i]) return -1;
+
+        /* artist/album/genre/composer: derive from uniq tables when
+         * the per-song idx is non-negative; NULL when missing. We
+         * dup the uniq entry rather than alias it so library_clear's
+         * per-song free() doesn't double-free the uniq table. */
+        staging->artists  [i] = (artist_idx   >= 0 && artist_idx   < (int)n_artists)
+                                ? strdup(uniq_artists  [artist_idx])   : NULL;
+        staging->albums   [i] = (album_idx    >= 0 && album_idx    < (int)n_albums)
+                                ? strdup(uniq_albums   [album_idx])    : NULL;
+        staging->genres   [i] = (genre_idx    >= 0 && genre_idx    < (int)n_genres)
+                                ? strdup(uniq_genres   [genre_idx])    : NULL;
+        staging->composers[i] = (composer_idx >= 0 && composer_idx < (int)n_composers)
+                                ? strdup(uniq_composers[composer_idx]) : NULL;
+
+        staging->song_artist_idx  [i] = (artist_idx   >= 0 && artist_idx   < (int)n_artists)   ? artist_idx   : -1;
+        staging->song_album_idx   [i] = (album_idx    >= 0 && album_idx    < (int)n_albums)    ? album_idx    : -1;
+        staging->song_genre_idx   [i] = (genre_idx    >= 0 && genre_idx    < (int)n_genres)    ? genre_idx    : -1;
+        staging->song_composer_idx[i] = (composer_idx >= 0 && composer_idx < (int)n_composers) ? composer_idx : -1;
+
+        /* Art: rec_art_off is relative to header.art_off. The parallel
+         * arrays come back from library_reserve via realloc — NOT
+         * zero-initialized — so we must explicitly NULL out the slots
+         * for tracks without art to match the scan-path contract that
+         * tagcache_song_art_bytes uses (NULL pointer => no art). */
+        if (rec_art_len > 0) {
+            if (!tcdb_section_in_bounds(art_off + rec_art_off, rec_art_len, len)) return -1;
+            void *copy = malloc((size_t)rec_art_len);
+            if (!copy) return -1;
+            memcpy(copy, p + art_off + rec_art_off, (size_t)rec_art_len);
+            staging->art_bytes[i] = copy;
+            staging->art_lens [i] = (size_t)rec_art_len;
+        } else {
+            staging->art_bytes[i] = NULL;
+            staging->art_lens [i] = 0;
+        }
+    }
+
+    /* Per-group song lists. Each block starts with N u32 offsets
+     * (relative to the block's start), then [u32 count, count u32
+     * indices] tuples. Layout matches Go's tagcache.encodeGroups. */
+    struct group_dim {
+        uint64_t block_off;
+        uint32_t n;
+        int    ***out_lists;     /* &staging->artist_songs etc */
+        int    **out_counts;     /* &staging->artist_song_counts */
+    };
+    struct group_dim dims[4] = {
+        { artist_groups_off,   n_artists,   &staging->artist_songs,   &staging->artist_song_counts   },
+        { album_groups_off,    n_albums,    &staging->album_songs,    &staging->album_song_counts    },
+        { genre_groups_off,    n_genres,    &staging->genre_songs,    &staging->genre_song_counts    },
+        { composer_groups_off, n_composers, &staging->composer_songs, &staging->composer_song_counts },
+    };
+    for (int d = 0; d < 4; d++) {
+        if (dims[d].n == 0) continue;
+        int **lists  = (int **)calloc(dims[d].n, sizeof(int *));
+        int  *counts = (int  *)calloc(dims[d].n, sizeof(int));
+        if (!lists || !counts) { free(lists); free(counts); return -1; }
+        *dims[d].out_lists  = lists;
+        *dims[d].out_counts = counts;
+
+        for (uint32_t g = 0; g < dims[d].n; g++) {
+            uint32_t group_off = tcdb_le32(p + dims[d].block_off + (uint64_t)g * 4);
+            uint64_t body_off  = dims[d].block_off + group_off;
+            /* Each group body is: u32 count + count*u32 indices. */
+            if (!tcdb_section_in_bounds(body_off, 4, len)) return -1;
+            uint32_t count = tcdb_le32(p + body_off);
+            if (!tcdb_section_in_bounds(body_off + 4, (uint64_t)count * 4, len)) return -1;
+            if (count == 0) continue;
+            int *idx = (int *)malloc((size_t)count * sizeof(int));
+            if (!idx) return -1;
+            for (uint32_t k = 0; k < count; k++) {
+                idx[k] = (int)tcdb_le32(p + body_off + 4 + (uint64_t)k * 4);
+            }
+            lists[g]  = idx;
+            counts[g] = (int)count;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Slurp `path` into a malloc'd buffer. Returns 0 on success and
+ * writes *out_buf + *out_len; -1 on any error (open, seek, OOM,
+ * short read). Caller frees *out_buf on success.
+ */
+static int tcdb_slurp(const char *path, void **out_buf, size_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return -1; }
+    long n = ftell(fp);
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return -1; }
+    if (n <= 0) { fclose(fp); return -1; }
+    void *buf = malloc((size_t)n);
+    if (!buf) { fclose(fp); return -1; }
+    if (fread(buf, 1, (size_t)n, fp) != (size_t)n) {
+        free(buf); fclose(fp); return -1;
+    }
+    fclose(fp);
+    *out_buf = buf;
+    *out_len = (size_t)n;
+    return 0;
+}
+
+int tagcache_library_load_tcdb(const char *path) {
+    if (!path) return -1;
+
+    void *bytes = NULL;
+    size_t len = 0;
+    if (tcdb_slurp(path, &bytes, &len) != 0) return -1;
+
+    library_t staging = { 0 };
+    int rc = tcdb_parse(bytes, len, &staging);
+    free(bytes);   /* strings + art are heap-copied; safe to drop the buffer */
+
+    if (rc != 0) {
+        library_free_contents(&staging);
+        return -1;
+    }
+
     library_clear();
     LIBRARY = staging;
     LIBRARY.loaded = 1;

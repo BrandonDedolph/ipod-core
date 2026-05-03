@@ -70,6 +70,26 @@ const char *tagcache_composer_name(int idx);
  */
 int tagcache_library_load(const char *dir);
 
+/*
+ * Load the binary tagcache (.tcdb) at `path` instead of scanning a
+ * music directory. Same end-state as tagcache_library_load: the
+ * Songs / Artists / Albums / Genres / Composers menus all serve
+ * data from the file, and the per-song accessors return the file's
+ * stored title / artist / album / genre / composer / art_bytes.
+ *
+ * The .tcdb is produced by `core tagcache build <music-dir>`; the
+ * format is documented in core/apps/db/tagcache_format.h. Strings
+ * and art bytes are heap-copied out of the file at load time, so
+ * the file can be unmapped immediately afterward.
+ *
+ * Returns the number of songs loaded (>= 0), or -1 on error
+ * (file unreadable, bad magic, version mismatch, malformed/truncated).
+ * On error the previous library state is preserved.
+ *
+ * Same single-load contract as tagcache_library_load.
+ */
+int tagcache_library_load_tcdb(const char *path);
+
 /* True iff a library has been loaded (even an empty one). When this
  * is false, tagcache_artist/album/song accessors fall back to the
  * synthetic example data and the *_for_* drilldown queries return 0. */
