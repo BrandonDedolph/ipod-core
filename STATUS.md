@@ -1,8 +1,9 @@
 # Status — picked up where we left off
 
-Last working session ended **2026-05-02** with **26 PRs merged on
+Last working session ended **2026-05-02** with **27 PRs merged on
 main**: 16 from the original arc, 7 from the library/drilldown push,
-3 more for album art (FLAC + MP3 APIC + big-art page).
+3 for album art (FLAC + MP3 APIC + big-art page), 1 for the
+Genres/Composers drilldown.
 
 ## What works end-to-end today
 
@@ -31,12 +32,14 @@ Same UI, but:
 - **Artists / Albums menus** show only the unique values present in
   the loaded library (sorted, NULL tags skipped).
 - **Drilldown**: SELECT on an Artist row → that artist's songs;
-  SELECT on an Album row → that album's songs. SELECT on any leaf
-  song row plays it through the audio engine, populating NP with
-  real title / artist / album from the file's tags.
+  SELECT on an Album row → that album's songs; same for Genres and
+  Composers. SELECT on any leaf song row plays it through the audio
+  engine, populating NP with real title / artist / album from the
+  file's tags.
 - **Tag readers** ship for FLAC (Vorbis comments via dr_flac's
-  metadata API) and MP3 (custom ID3v2.3/2.4 parser at
-  `core/codecs/dr_mp3/tag_mp3.c`). UTF-16 ID3v2 frames are
+  metadata API: TITLE / ARTIST / ALBUM / GENRE / COMPOSER) and MP3
+  (custom ID3v2.3/2.4 parser at `core/codecs/dr_mp3/tag_mp3.c`:
+  TIT2 / TPE1 / TALB / TCON / TCOM / APIC). UTF-16 ID3v2 frames are
   best-effort downconverted to ASCII.
 - **Album art** — embedded JPEG cover art (FLAC PICTURE block /
   ID3v2 APIC frame) is decoded via stb_image (JPEG-only build) and
@@ -59,35 +62,30 @@ Same UI, but:
 
 ## What's NOT done (pick up next)
 
-The music browser feels real end-to-end in sim — load, browse, drill,
+The music browser feels real end-to-end in sim — load, browse all
+four iconic groupings (Artists / Albums / Genres / Composers), drill,
 play, with real metadata and cover art on the NP pages. Remaining
 items, roughly in order of payoff vs. effort:
 
-1. **Genres / Composers drilldown** — needs tag readers extended with
-   GENRE / TCON and COMPOSER / TCOM, then the same indexing + filter-
-   menu pattern as Artists/Albums. Medium PR (~200 lines), high
-   visibility (more iconic-iPod browse paths).
-
-2. **Go-side `core release tagcache <music-dir>` indexer** — scan a
+1. **Go-side `core release tagcache <music-dir>` indexer** — scan a
    real music directory, parse tags via `github.com/dhowden/tag`,
    emit a binary tagcache file. The C reader replaces the in-memory
    scan-at-startup path with mmap'd binary. Needed before this
    firmware ships on real hardware (scan-at-startup over USB-disk
    speeds is too slow). Medium-large PR, mostly Go-side.
 
-3. **Phase 1: bootable ARM skeleton** — needs hardware in the loop.
+2. **Phase 1: bootable ARM skeleton** — needs hardware in the loop.
    See `PLAN.md`. Major chunk; not trivially mockable in sim.
 
-4. **Search / on-screen keyboard** — iPod-style alphabetical jump
+3. **Search / on-screen keyboard** — iPod-style alphabetical jump
    into long lists.
 
-5. **Polish odds & ends** — UI quirks (silent UTF-8 truncation
+4. **Polish odds & ends** — UI quirks (silent UTF-8 truncation
    mid-codepoint in tag fields; v2.4 compressed APIC frames misparse
-   silently); compressed-art format support if a real-world MP3 ever
-   embeds PNG via APIC.
-
-5. **Search / on-screen keyboard** — iPod-style alphabetical jump
-   into long lists.
+   silently); ID3v2 TCON `(N)` numeric → genre-name mapping;
+   compressed-art format support if a real-world MP3 ever embeds
+   PNG via APIC; refactor the four near-identical per-group blocks
+   in `tagcache.c::build_filter_indexes` into a helper.
 
 ## Recent PRs (this session)
 
@@ -101,6 +99,7 @@ items, roughly in order of payoff vs. effort:
 - #24 `Album art: FLAC PICTURE → JPEG decode → render in NP`
 - #25 `MP3 album art: ID3v2 APIC extraction in tag_mp3`
 - #26 `NP big-art page: render real album art at 180×180`
+- #27 `Genres/Composers drilldown: tag readers + tagcache + cabinet`
 
 ## Repo layout reminder
 
@@ -144,5 +143,5 @@ tools/
 
 GitHub: https://github.com/BrandonDedolph/ipod_theme
 
-All 26 PRs are squash-merged into `main`; commit history is linear
-(`git log --oneline -26`).
+All 27 PRs are squash-merged into `main`; commit history is linear
+(`git log --oneline -27`).
