@@ -13,10 +13,12 @@
  *     flags = 2 bytes
  *     content = `size` bytes
  *
- * We extract three text frames + one picture frame:
+ * We extract five text frames + one picture frame:
  *   TIT2 → title
  *   TPE1 → artist
  *   TALB → album
+ *   TCON → genre
+ *   TCOM → composer
  *   APIC → embedded picture (album art)
  *
  * Text frames are encoded with a 1-byte prefix:
@@ -270,6 +272,17 @@ int tag_mp3_read(const void *bytes, size_t len, audio_tags_t *out) {
         } else if (matches(id, "TALB") && !out->found_album) {
             copy_text_frame(out->album, sizeof(out->album), fbody, fsize);
             out->found_album = (out->album[0] != 0);
+        } else if (matches(id, "TCON") && !out->found_genre) {
+            /* TCON often arrives as a parenthesized numeric ID3v1
+             * genre code ("(17)") rather than a name; we pass it
+             * through verbatim. Mapping the numeric form to the
+             * canonical genre name is a polish item — most modern
+             * taggers write the name directly. */
+            copy_text_frame(out->genre, sizeof(out->genre), fbody, fsize);
+            out->found_genre = (out->genre[0] != 0);
+        } else if (matches(id, "TCOM") && !out->found_composer) {
+            copy_text_frame(out->composer, sizeof(out->composer), fbody, fsize);
+            out->found_composer = (out->composer[0] != 0);
         } else if (matches(id, "APIC")) {
             stash_picture_apic(out, fbody, fsize);
         }

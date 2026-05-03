@@ -143,8 +143,10 @@ static const char *const COMPOSERS[] = {
 typedef struct {
     char    **titles;       /* tag TITLE if present, else basename-without-ext */
     char    **paths;        /* full filesystem path */
-    char    **artists;      /* tag ARTIST or NULL if missing */
-    char    **albums;       /* tag ALBUM  or NULL if missing */
+    char    **artists;      /* tag ARTIST   or NULL if missing */
+    char    **albums;       /* tag ALBUM    or NULL if missing */
+    char    **genres;       /* tag GENRE    or NULL if missing */
+    char    **composers;    /* tag COMPOSER or NULL if missing */
     void    **art_bytes;    /* heap-owned JPEG bytes, or NULL if no embedded art */
     size_t   *art_lens;     /* parallel array: byte counts (0 if no art) */
     int    count;
@@ -152,25 +154,32 @@ typedef struct {
     int    loaded;
 
     /* Derived indexes built after the scan: sorted unique sets of
-     * the artists and albums seen in the songs list. Used by the
-     * Artists / Albums menus when a library is loaded. Songs without
-     * a given tag are skipped (a song with no ARTIST tag doesn't
-     * contribute a "(?)" entry to the artist list). */
+     * the artists / albums / genres / composers seen in the songs list.
+     * Used by the Artists / Albums / Genres / Composers menus when a
+     * library is loaded. Songs without a given tag are skipped (a song
+     * with no ARTIST tag doesn't contribute a "(?)" entry to the
+     * artist list). */
     char **uniq_artists;
     int    uniq_artist_count;
     char **uniq_albums;
     int    uniq_album_count;
+    char **uniq_genres;
+    int    uniq_genre_count;
+    char **uniq_composers;
+    int    uniq_composer_count;
 
-    /* Per-song lookup: which uniq_artist / uniq_album does song i
-     * belong to? -1 means the song had no ARTIST/ALBUM tag, and so
-     * doesn't appear in any artist's or album's drilldown list. */
+    /* Per-song lookup: which uniq_* does song i belong to? -1 means
+     * the song had no tag for that dimension and doesn't appear in
+     * any group's drilldown list. */
     int   *song_artist_idx;
     int   *song_album_idx;
+    int   *song_genre_idx;
+    int   *song_composer_idx;
 
     /* Filtered song lists, precomputed at library_load. For artist a,
      * `artist_songs[a]` is a heap array of song indices whose ARTIST
      * matches uniq_artists[a], in the same alphabetical-by-title order
-     * as the global library. Same shape for albums.
+     * as the global library. Same shape for the other three dimensions.
      *
      * Two parallel arrays per group (the int* per-group array + a
      * count). NULL/0 if a given group is empty (no songs match). */
@@ -178,12 +187,14 @@ typedef struct {
     int   *artist_song_counts;
     int  **album_songs;
     int   *album_song_counts;
+    int  **genre_songs;
+    int   *genre_song_counts;
+    int  **composer_songs;
+    int   *composer_song_counts;
 } library_t;
 
-static library_t LIBRARY = { NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0,
-                             NULL, 0, NULL, 0,
-                             NULL, NULL,
-                             NULL, NULL, NULL, NULL };
+/* Designated initializer keeps this readable as the struct grows. */
+static library_t LIBRARY = { 0 };
 
 static void library_clear(void) {
     for (int i = 0; i < LIBRARY.count; i++) {
@@ -191,22 +202,32 @@ static void library_clear(void) {
         free(LIBRARY.paths[i]);
         free(LIBRARY.artists[i]);
         free(LIBRARY.albums[i]);
+        free(LIBRARY.genres[i]);
+        free(LIBRARY.composers[i]);
         free(LIBRARY.art_bytes[i]);
     }
     free(LIBRARY.titles);
     free(LIBRARY.paths);
     free(LIBRARY.artists);
     free(LIBRARY.albums);
+    free(LIBRARY.genres);
+    free(LIBRARY.composers);
     free(LIBRARY.art_bytes);
     free(LIBRARY.art_lens);
 
-    for (int i = 0; i < LIBRARY.uniq_artist_count; i++) free(LIBRARY.uniq_artists[i]);
-    for (int i = 0; i < LIBRARY.uniq_album_count;  i++) free(LIBRARY.uniq_albums [i]);
+    for (int i = 0; i < LIBRARY.uniq_artist_count;   i++) free(LIBRARY.uniq_artists  [i]);
+    for (int i = 0; i < LIBRARY.uniq_album_count;    i++) free(LIBRARY.uniq_albums   [i]);
+    for (int i = 0; i < LIBRARY.uniq_genre_count;    i++) free(LIBRARY.uniq_genres   [i]);
+    for (int i = 0; i < LIBRARY.uniq_composer_count; i++) free(LIBRARY.uniq_composers[i]);
     free(LIBRARY.uniq_artists);
     free(LIBRARY.uniq_albums);
+    free(LIBRARY.uniq_genres);
+    free(LIBRARY.uniq_composers);
 
     free(LIBRARY.song_artist_idx);
     free(LIBRARY.song_album_idx);
+    free(LIBRARY.song_genre_idx);
+    free(LIBRARY.song_composer_idx);
 
     if (LIBRARY.artist_songs) {
         for (int i = 0; i < LIBRARY.uniq_artist_count; i++) free(LIBRARY.artist_songs[i]);
@@ -218,26 +239,20 @@ static void library_clear(void) {
         free(LIBRARY.album_songs);
     }
     free(LIBRARY.album_song_counts);
+    if (LIBRARY.genre_songs) {
+        for (int i = 0; i < LIBRARY.uniq_genre_count; i++) free(LIBRARY.genre_songs[i]);
+        free(LIBRARY.genre_songs);
+    }
+    free(LIBRARY.genre_song_counts);
+    if (LIBRARY.composer_songs) {
+        for (int i = 0; i < LIBRARY.uniq_composer_count; i++) free(LIBRARY.composer_songs[i]);
+        free(LIBRARY.composer_songs);
+    }
+    free(LIBRARY.composer_song_counts);
 
-    LIBRARY.titles             = NULL;
-    LIBRARY.paths              = NULL;
-    LIBRARY.artists            = NULL;
-    LIBRARY.albums             = NULL;
-    LIBRARY.art_bytes          = NULL;
-    LIBRARY.art_lens           = NULL;
-    LIBRARY.count              = 0;
-    LIBRARY.cap                = 0;
-    LIBRARY.loaded             = 0;
-    LIBRARY.uniq_artists       = NULL;
-    LIBRARY.uniq_artist_count  = 0;
-    LIBRARY.uniq_albums        = NULL;
-    LIBRARY.uniq_album_count   = 0;
-    LIBRARY.song_artist_idx    = NULL;
-    LIBRARY.song_album_idx     = NULL;
-    LIBRARY.artist_songs       = NULL;
-    LIBRARY.artist_song_counts = NULL;
-    LIBRARY.album_songs        = NULL;
-    LIBRARY.album_song_counts  = NULL;
+    /* Re-zero everything via the same designated-initializer pattern
+     * used at static-init time, so the field list stays in one place. */
+    LIBRARY = (library_t){ 0 };
 }
 
 /*
@@ -251,20 +266,30 @@ static void library_free_contents(library_t *lib) {
         free(lib->paths[i]);
         free(lib->artists[i]);
         free(lib->albums[i]);
+        free(lib->genres[i]);
+        free(lib->composers[i]);
         free(lib->art_bytes[i]);
     }
     free(lib->titles);
     free(lib->paths);
     free(lib->artists);
     free(lib->albums);
+    free(lib->genres);
+    free(lib->composers);
     free(lib->art_bytes);
     free(lib->art_lens);
-    for (int i = 0; i < lib->uniq_artist_count; i++) free(lib->uniq_artists[i]);
-    for (int i = 0; i < lib->uniq_album_count;  i++) free(lib->uniq_albums [i]);
+    for (int i = 0; i < lib->uniq_artist_count;   i++) free(lib->uniq_artists  [i]);
+    for (int i = 0; i < lib->uniq_album_count;    i++) free(lib->uniq_albums   [i]);
+    for (int i = 0; i < lib->uniq_genre_count;    i++) free(lib->uniq_genres   [i]);
+    for (int i = 0; i < lib->uniq_composer_count; i++) free(lib->uniq_composers[i]);
     free(lib->uniq_artists);
     free(lib->uniq_albums);
+    free(lib->uniq_genres);
+    free(lib->uniq_composers);
     free(lib->song_artist_idx);
     free(lib->song_album_idx);
+    free(lib->song_genre_idx);
+    free(lib->song_composer_idx);
     if (lib->artist_songs) {
         for (int i = 0; i < lib->uniq_artist_count; i++) free(lib->artist_songs[i]);
         free(lib->artist_songs);
@@ -275,6 +300,16 @@ static void library_free_contents(library_t *lib) {
         free(lib->album_songs);
     }
     free(lib->album_song_counts);
+    if (lib->genre_songs) {
+        for (int i = 0; i < lib->uniq_genre_count; i++) free(lib->genre_songs[i]);
+        free(lib->genre_songs);
+    }
+    free(lib->genre_song_counts);
+    if (lib->composer_songs) {
+        for (int i = 0; i < lib->uniq_composer_count; i++) free(lib->composer_songs[i]);
+        free(lib->composer_songs);
+    }
+    free(lib->composer_song_counts);
 }
 
 /*
@@ -304,6 +339,14 @@ static int library_reserve(library_t *lib, int min_cap) {
     char **al = (char **)realloc(lib->albums, sz_p);
     if (!al) return -1;
     lib->albums = al;
+
+    char **gn = (char **)realloc(lib->genres, sz_p);
+    if (!gn) return -1;
+    lib->genres = gn;
+
+    char **cm = (char **)realloc(lib->composers, sz_p);
+    if (!cm) return -1;
+    lib->composers = cm;
 
     void **ab = (void **)realloc(lib->art_bytes, sz_v);
     if (!ab) return -1;
@@ -433,22 +476,35 @@ static int find_in_uniq(char **hay, int n, const char *needle) {
 static void build_filter_indexes(library_t *lib) {
     if (lib->count <= 0) return;
 
-    /* Per-song -> uniq lookup. */
-    lib->song_artist_idx = (int *)malloc((size_t)lib->count * sizeof(int));
-    lib->song_album_idx  = (int *)malloc((size_t)lib->count * sizeof(int));
-    if (!lib->song_artist_idx || !lib->song_album_idx) {
-        free(lib->song_artist_idx); free(lib->song_album_idx);
-        lib->song_artist_idx = NULL;
-        lib->song_album_idx  = NULL;
+    /* Per-song -> uniq lookup. All-or-nothing: if any of the four
+     * tables fail to allocate, abandon every per-song idx and let the
+     * downstream drilldown queries return 0 rows. The library still
+     * commits — the user just can't drill into it. */
+    lib->song_artist_idx   = (int *)malloc((size_t)lib->count * sizeof(int));
+    lib->song_album_idx    = (int *)malloc((size_t)lib->count * sizeof(int));
+    lib->song_genre_idx    = (int *)malloc((size_t)lib->count * sizeof(int));
+    lib->song_composer_idx = (int *)malloc((size_t)lib->count * sizeof(int));
+    if (!lib->song_artist_idx || !lib->song_album_idx ||
+        !lib->song_genre_idx  || !lib->song_composer_idx) {
+        free(lib->song_artist_idx);   lib->song_artist_idx   = NULL;
+        free(lib->song_album_idx);    lib->song_album_idx    = NULL;
+        free(lib->song_genre_idx);    lib->song_genre_idx    = NULL;
+        free(lib->song_composer_idx); lib->song_composer_idx = NULL;
         return;
     }
     for (int s = 0; s < lib->count; s++) {
-        lib->song_artist_idx[s] = find_in_uniq(lib->uniq_artists,
-                                               lib->uniq_artist_count,
-                                               lib->artists[s]);
-        lib->song_album_idx [s] = find_in_uniq(lib->uniq_albums,
-                                               lib->uniq_album_count,
-                                               lib->albums[s]);
+        lib->song_artist_idx  [s] = find_in_uniq(lib->uniq_artists,
+                                                 lib->uniq_artist_count,
+                                                 lib->artists[s]);
+        lib->song_album_idx   [s] = find_in_uniq(lib->uniq_albums,
+                                                 lib->uniq_album_count,
+                                                 lib->albums[s]);
+        lib->song_genre_idx   [s] = find_in_uniq(lib->uniq_genres,
+                                                 lib->uniq_genre_count,
+                                                 lib->genres[s]);
+        lib->song_composer_idx[s] = find_in_uniq(lib->uniq_composers,
+                                                 lib->uniq_composer_count,
+                                                 lib->composers[s]);
     }
 
     /* artist_songs[a]: song indices where song_artist_idx == a, in
@@ -502,6 +558,52 @@ static void build_filter_indexes(library_t *lib) {
                     if (lib->song_album_idx[s] == a) list[j++] = s;
                 lib->album_songs[a]       = list;
                 lib->album_song_counts[a] = n;
+            }
+        }
+    }
+
+    /* genre_songs[a]: same shape for the genre dimension. */
+    if (lib->uniq_genre_count > 0) {
+        lib->genre_songs       = (int **)calloc((size_t)lib->uniq_genre_count,
+                                                sizeof(int *));
+        lib->genre_song_counts = (int  *)calloc((size_t)lib->uniq_genre_count,
+                                                sizeof(int));
+        if (lib->genre_songs && lib->genre_song_counts) {
+            for (int a = 0; a < lib->uniq_genre_count; a++) {
+                int n = 0;
+                for (int s = 0; s < lib->count; s++)
+                    if (lib->song_genre_idx[s] == a) n++;
+                if (n == 0) continue;
+                int *list = (int *)malloc((size_t)n * sizeof(int));
+                if (!list) continue;
+                int j = 0;
+                for (int s = 0; s < lib->count; s++)
+                    if (lib->song_genre_idx[s] == a) list[j++] = s;
+                lib->genre_songs[a]       = list;
+                lib->genre_song_counts[a] = n;
+            }
+        }
+    }
+
+    /* composer_songs[a]: same shape for the composer dimension. */
+    if (lib->uniq_composer_count > 0) {
+        lib->composer_songs       = (int **)calloc((size_t)lib->uniq_composer_count,
+                                                   sizeof(int *));
+        lib->composer_song_counts = (int  *)calloc((size_t)lib->uniq_composer_count,
+                                                   sizeof(int));
+        if (lib->composer_songs && lib->composer_song_counts) {
+            for (int a = 0; a < lib->uniq_composer_count; a++) {
+                int n = 0;
+                for (int s = 0; s < lib->count; s++)
+                    if (lib->song_composer_idx[s] == a) n++;
+                if (n == 0) continue;
+                int *list = (int *)malloc((size_t)n * sizeof(int));
+                if (!list) continue;
+                int j = 0;
+                for (int s = 0; s < lib->count; s++)
+                    if (lib->song_composer_idx[s] == a) list[j++] = s;
+                lib->composer_songs[a]       = list;
+                lib->composer_song_counts[a] = n;
             }
         }
     }
@@ -572,10 +674,7 @@ int tagcache_library_load(const char *dir) {
 
     /* Scan into a fresh staging buffer so a partial failure leaves
      * the previous LIBRARY untouched. */
-    library_t staging = { NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0,
-                          NULL, 0, NULL, 0,
-                          NULL, NULL,
-                          NULL, NULL, NULL, NULL };
+    library_t staging = { 0 };
 
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
@@ -630,10 +729,15 @@ int tagcache_library_load(const char *dir) {
             return -1;
         }
 
-        /* artist / album: strdup if present, NULL if not. NULL doesn't
-         * count as an OOM failure since the tag itself is optional. */
-        char *artist = tags.found_artist ? strdup(tags.artist) : NULL;
-        char *album  = tags.found_album  ? strdup(tags.album)  : NULL;
+        /* artist / album / genre / composer: strdup if present, NULL
+         * if not. A NULL strdup result doesn't fail the load — a tag
+         * is optional, and silently dropping one missing field beats
+         * aborting the whole scan over an OOM on a non-essential
+         * string. */
+        char *artist   = tags.found_artist   ? strdup(tags.artist)   : NULL;
+        char *album    = tags.found_album    ? strdup(tags.album)    : NULL;
+        char *genre    = tags.found_genre    ? strdup(tags.genre)    : NULL;
+        char *composer = tags.found_composer ? strdup(tags.composer) : NULL;
 
         /* art: transfer ownership of the heap copy that the tag
          * reader produced. Set tags.art_bytes = NULL so audio_tags_free
@@ -647,6 +751,8 @@ int tagcache_library_load(const char *dir) {
         staging.paths    [staging.count] = path;
         staging.artists  [staging.count] = artist;
         staging.albums   [staging.count] = album;
+        staging.genres   [staging.count] = genre;
+        staging.composers[staging.count] = composer;
         staging.art_bytes[staging.count] = art_bytes;
         staging.art_lens [staging.count] = art_len;
         staging.count++;
@@ -672,15 +778,20 @@ int tagcache_library_load(const char *dir) {
             char    **sorted_paths     = (char **)malloc(sz_p);
             char    **sorted_artists   = (char **)malloc(sz_p);
             char    **sorted_albums    = (char **)malloc(sz_p);
+            char    **sorted_genres    = (char **)malloc(sz_p);
+            char    **sorted_composers = (char **)malloc(sz_p);
             void    **sorted_art_bytes = (void **)malloc(sz_v);
             size_t   *sorted_art_lens  = (size_t *)malloc(sz_sz);
             if (sorted_titles && sorted_paths && sorted_artists &&
-                sorted_albums && sorted_art_bytes && sorted_art_lens) {
+                sorted_albums && sorted_genres && sorted_composers &&
+                sorted_art_bytes && sorted_art_lens) {
                 for (int i = 0; i < staging.count; i++) {
                     sorted_titles    [i] = staging.titles    [idx[i]];
                     sorted_paths     [i] = staging.paths     [idx[i]];
                     sorted_artists   [i] = staging.artists   [idx[i]];
                     sorted_albums    [i] = staging.albums    [idx[i]];
+                    sorted_genres    [i] = staging.genres    [idx[i]];
+                    sorted_composers [i] = staging.composers [idx[i]];
                     sorted_art_bytes [i] = staging.art_bytes [idx[i]];
                     sorted_art_lens  [i] = staging.art_lens  [idx[i]];
                 }
@@ -688,12 +799,16 @@ int tagcache_library_load(const char *dir) {
                 free(staging.paths);
                 free(staging.artists);
                 free(staging.albums);
+                free(staging.genres);
+                free(staging.composers);
                 free(staging.art_bytes);
                 free(staging.art_lens);
                 staging.titles    = sorted_titles;
                 staging.paths     = sorted_paths;
                 staging.artists   = sorted_artists;
                 staging.albums    = sorted_albums;
+                staging.genres    = sorted_genres;
+                staging.composers = sorted_composers;
                 staging.art_bytes = sorted_art_bytes;
                 staging.art_lens  = sorted_art_lens;
             } else {
@@ -701,6 +816,8 @@ int tagcache_library_load(const char *dir) {
                 free(sorted_paths);
                 free(sorted_artists);
                 free(sorted_albums);
+                free(sorted_genres);
+                free(sorted_composers);
                 free(sorted_art_bytes);
                 free(sorted_art_lens);
             }
@@ -712,10 +829,14 @@ int tagcache_library_load(const char *dir) {
      * Failures here are non-fatal — we just commit the library
      * without the index, and the Artists / Albums menus fall back to
      * synthetic data. */
-    build_unique_index(staging.artists, staging.count,
-                       &staging.uniq_artists, &staging.uniq_artist_count);
-    build_unique_index(staging.albums, staging.count,
-                       &staging.uniq_albums, &staging.uniq_album_count);
+    build_unique_index(staging.artists,   staging.count,
+                       &staging.uniq_artists,   &staging.uniq_artist_count);
+    build_unique_index(staging.albums,    staging.count,
+                       &staging.uniq_albums,    &staging.uniq_album_count);
+    build_unique_index(staging.genres,    staging.count,
+                       &staging.uniq_genres,    &staging.uniq_genre_count);
+    build_unique_index(staging.composers, staging.count,
+                       &staging.uniq_composers, &staging.uniq_composer_count);
 
     /* Build the per-song lookup tables and the per-group song lists.
      * All optional — any malloc failure here just leaves the affected
@@ -724,27 +845,12 @@ int tagcache_library_load(const char *dir) {
      * drilldown for that group. */
     build_filter_indexes(&staging);
 
-    /* Commit: drop any previous library, install staging. */
+    /* Commit: drop any previous library, install staging. Wholesale
+     * struct copy (instead of field-by-field) so adding a new field
+     * to library_t doesn't require remembering to add a line here. */
     library_clear();
-    LIBRARY.titles             = staging.titles;
-    LIBRARY.paths              = staging.paths;
-    LIBRARY.artists            = staging.artists;
-    LIBRARY.albums             = staging.albums;
-    LIBRARY.art_bytes          = staging.art_bytes;
-    LIBRARY.art_lens           = staging.art_lens;
-    LIBRARY.count              = staging.count;
-    LIBRARY.cap                = staging.cap;
-    LIBRARY.loaded             = 1;
-    LIBRARY.uniq_artists       = staging.uniq_artists;
-    LIBRARY.uniq_artist_count  = staging.uniq_artist_count;
-    LIBRARY.uniq_albums        = staging.uniq_albums;
-    LIBRARY.uniq_album_count   = staging.uniq_album_count;
-    LIBRARY.song_artist_idx    = staging.song_artist_idx;
-    LIBRARY.song_album_idx     = staging.song_album_idx;
-    LIBRARY.artist_songs       = staging.artist_songs;
-    LIBRARY.artist_song_counts = staging.artist_song_counts;
-    LIBRARY.album_songs        = staging.album_songs;
-    LIBRARY.album_song_counts  = staging.album_song_counts;
+    LIBRARY = staging;
+    LIBRARY.loaded = 1;
     return LIBRARY.count;
 }
 
@@ -850,6 +956,63 @@ int tagcache_song_index_for_album(int album_idx, int n) {
     return song_idx_in_album(album_idx, n);
 }
 
+/* Genre / composer drilldown — same shape as the artist/album helpers. */
+static int song_idx_in_genre(int genre_idx, int n) {
+    if (!LIBRARY.loaded) return -1;
+    if (genre_idx < 0 || genre_idx >= LIBRARY.uniq_genre_count) return -1;
+    if (!LIBRARY.genre_songs) return -1;
+    if (n < 0 || n >= LIBRARY.genre_song_counts[genre_idx]) return -1;
+    int *list = LIBRARY.genre_songs[genre_idx];
+    if (!list) return -1;
+    return list[n];
+}
+
+static int song_idx_in_composer(int composer_idx, int n) {
+    if (!LIBRARY.loaded) return -1;
+    if (composer_idx < 0 || composer_idx >= LIBRARY.uniq_composer_count) return -1;
+    if (!LIBRARY.composer_songs) return -1;
+    if (n < 0 || n >= LIBRARY.composer_song_counts[composer_idx]) return -1;
+    int *list = LIBRARY.composer_songs[composer_idx];
+    if (!list) return -1;
+    return list[n];
+}
+
+int tagcache_song_count_for_genre(int genre_idx) {
+    if (!LIBRARY.loaded) return 0;
+    if (genre_idx < 0 || genre_idx >= LIBRARY.uniq_genre_count) return 0;
+    if (!LIBRARY.genre_song_counts) return 0;
+    return LIBRARY.genre_song_counts[genre_idx];
+}
+const char *tagcache_song_title_for_genre(int genre_idx, int n) {
+    int s = song_idx_in_genre(genre_idx, n);
+    return (s < 0) ? "(?)" : LIBRARY.titles[s];
+}
+const char *tagcache_song_path_for_genre(int genre_idx, int n) {
+    int s = song_idx_in_genre(genre_idx, n);
+    return (s < 0) ? NULL : LIBRARY.paths[s];
+}
+int tagcache_song_index_for_genre(int genre_idx, int n) {
+    return song_idx_in_genre(genre_idx, n);
+}
+
+int tagcache_song_count_for_composer(int composer_idx) {
+    if (!LIBRARY.loaded) return 0;
+    if (composer_idx < 0 || composer_idx >= LIBRARY.uniq_composer_count) return 0;
+    if (!LIBRARY.composer_song_counts) return 0;
+    return LIBRARY.composer_song_counts[composer_idx];
+}
+const char *tagcache_song_title_for_composer(int composer_idx, int n) {
+    int s = song_idx_in_composer(composer_idx, n);
+    return (s < 0) ? "(?)" : LIBRARY.titles[s];
+}
+const char *tagcache_song_path_for_composer(int composer_idx, int n) {
+    int s = song_idx_in_composer(composer_idx, n);
+    return (s < 0) ? NULL : LIBRARY.paths[s];
+}
+int tagcache_song_index_for_composer(int composer_idx, int n) {
+    return song_idx_in_composer(composer_idx, n);
+}
+
 /* ---------- API impl --------------------------------------------- */
 
 #define ARRAY_LEN(a) ((int)(sizeof(a) / sizeof((a)[0])))
@@ -863,8 +1026,12 @@ int tagcache_album_count(void) {
 int tagcache_song_count(void) {
     return LIBRARY.loaded ? LIBRARY.count : ARRAY_LEN(SONGS);
 }
-int tagcache_genre_count(void)    { return ARRAY_LEN(GENRES); }
-int tagcache_composer_count(void) { return ARRAY_LEN(COMPOSERS); }
+int tagcache_genre_count(void) {
+    return LIBRARY.loaded ? LIBRARY.uniq_genre_count : ARRAY_LEN(GENRES);
+}
+int tagcache_composer_count(void) {
+    return LIBRARY.loaded ? LIBRARY.uniq_composer_count : ARRAY_LEN(COMPOSERS);
+}
 
 static const char *bounded(const char *const *table, int count, int idx) {
     if (idx < 0 || idx >= count) return "(?)";
@@ -893,8 +1060,16 @@ const char *tagcache_song_title(int idx) {
     return bounded(SONGS, ARRAY_LEN(SONGS), idx);
 }
 const char *tagcache_genre_name(int idx) {
+    if (LIBRARY.loaded) {
+        if (idx < 0 || idx >= LIBRARY.uniq_genre_count) return "(?)";
+        return LIBRARY.uniq_genres[idx];
+    }
     return bounded(GENRES, ARRAY_LEN(GENRES), idx);
 }
 const char *tagcache_composer_name(int idx) {
+    if (LIBRARY.loaded) {
+        if (idx < 0 || idx >= LIBRARY.uniq_composer_count) return "(?)";
+        return LIBRARY.uniq_composers[idx];
+    }
     return bounded(COMPOSERS, ARRAY_LEN(COMPOSERS), idx);
 }
