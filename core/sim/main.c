@@ -16,6 +16,12 @@
  * song row then plays that file through the audio engine. Without
  * the flag, the Songs list shows the synthetic example data.
  *
+ * `--tagcache <file.tcdb>` loads a precomputed binary tagcache
+ * (built by `core tagcache build <music-dir>`) instead of scanning.
+ * Same UI end-state as `--music`, but the strings/art come from the
+ * binary file rather than re-parsing tags on every startup. Only one
+ * of `--music` / `--tagcache` may be set per invocation.
+ *
  * `--capture-audio <path>` switches the SDL2 audio backend to its
  * built-in `disk` driver, which writes the raw S16LE stereo samples
  * the audio callback would have sent to the speakers into <path>.
@@ -51,6 +57,7 @@ int main(int argc, char **argv) {
     const char *shot_path     = NULL;
     const char *press_seq     = NULL;
     const char *music_dir     = NULL;
+    const char *tagcache_file = NULL;
     const char *capture_audio = NULL;
     int shot_frames = 4;
 
@@ -64,9 +71,15 @@ int main(int argc, char **argv) {
             if (shot_frames < 1) shot_frames = 1;
         } else if (strcmp(argv[i], "--music") == 0 && i + 1 < argc) {
             music_dir = argv[++i];
+        } else if (strcmp(argv[i], "--tagcache") == 0 && i + 1 < argc) {
+            tagcache_file = argv[++i];
         } else if (strcmp(argv[i], "--capture-audio") == 0 && i + 1 < argc) {
             capture_audio = argv[++i];
         }
+    }
+    if (music_dir && tagcache_file) {
+        fprintf(stderr, "core-sim: --music and --tagcache are mutually exclusive\n");
+        return EXIT_FAILURE;
     }
 
     /* Headless capture mode: tell SDL to use the dummy video/audio
@@ -106,6 +119,14 @@ int main(int argc, char **argv) {
         } else {
             log_printf("--music %s: %d song%s loaded",
                        music_dir, n, n == 1 ? "" : "s");
+        }
+    } else if (tagcache_file) {
+        int n = tagcache_library_load_tcdb(tagcache_file);
+        if (n < 0) {
+            log_printf("--tagcache %s: failed to load", tagcache_file);
+        } else {
+            log_printf("--tagcache %s: %d song%s loaded",
+                       tagcache_file, n, n == 1 ? "" : "s");
         }
     }
 
