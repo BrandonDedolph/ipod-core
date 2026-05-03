@@ -1,9 +1,9 @@
 # Status — picked up where we left off
 
-Last working session ended **2026-05-02** with **27 PRs merged on
-main**: 16 from the original arc, 7 from the library/drilldown push,
-3 for album art (FLAC + MP3 APIC + big-art page), 1 for the
-Genres/Composers drilldown.
+Last working session ended **2026-05-03** with **31 PRs merged on
+main**: 16 from the original arc, 7 library/drilldown, 3 album art,
+1 Genres/Composers, 1 Go-side `.tcdb` encoder, 1 sim audio-playback
+test, 1 C-side `.tcdb` reader, 1 README + screenshots refresh.
 
 ## What works end-to-end today
 
@@ -46,6 +46,21 @@ Same UI, but:
   rendered on both the default page (84×84) and big-art page
   (180×180). Untagged tracks fall back to diagonal-stripe placeholder.
 
+### With `--tagcache <file.tcdb>` (precomputed binary index)
+
+Same UI end-state as `--music`, but loads from a precomputed binary
+file instead of scanning + reparsing tags:
+
+- **Build the file** with the host CLI:
+  `core tagcache build ~/Music --out ~/Music/tagcache.tcdb`
+- **Load it** with `core-sim --tagcache ~/Music/tagcache.tcdb`.
+- This is what the firmware will use on real hardware (scan-at-startup
+  over USB-disk speeds is too slow). The Go encoder
+  (`core/cli/internal/tagcache/`) and C reader
+  (`core/apps/db/tagcache.c::tcdb_parse`) share their format spec via
+  parallel headers (`format.go` ↔ `tagcache_format.h`); both round-
+  trip themselves and cross-validate via the audio-playback test.
+
 ### Underneath the UI
 
 - **FLAC + MP3 decoders** (dr_flac + dr_mp3) under a unified
@@ -59,28 +74,37 @@ Same UI, but:
 - **Headless capture** — `core-sim --shot path.bmp` runs SDL with
   `SDL_VIDEODRIVER=dummy` so screenshots don't pop a window or play
   audio. Used heavily for visual verification.
+- **Audio capture for tests** — `core-sim --shot ... --capture-audio
+  out.raw` switches the SDL audio backend to its disk driver, writing
+  the engine's raw S16LE samples to a file. The `sim-audio-playback`
+  meson test uses this to bit-compare engine output against the codec
+  KAT reference end-to-end (catches regressions in tagcache → cabinet
+  → engine → ring → HAL audio source callback that the codec KAT
+  alone wouldn't see).
 
 ## What's NOT done (pick up next)
 
 The music browser feels real end-to-end in sim — load, browse all
-four iconic groupings (Artists / Albums / Genres / Composers), drill,
-play, with real metadata and cover art on the NP pages. Remaining
-items, roughly in order of payoff vs. effort:
+four iconic groupings, drill, play. Both the in-memory scan path
+and the binary `.tcdb` path produce bit-identical audio output
+(verified by the integration test). Remaining items, roughly in
+order of payoff vs. effort:
 
-1. **Go-side `core release tagcache <music-dir>` indexer** — scan a
-   real music directory, parse tags via `github.com/dhowden/tag`,
-   emit a binary tagcache file. The C reader replaces the in-memory
-   scan-at-startup path with mmap'd binary. Needed before this
-   firmware ships on real hardware (scan-at-startup over USB-disk
-   speeds is too slow). Medium-large PR, mostly Go-side.
-
-2. **Phase 1: bootable ARM skeleton** — needs hardware in the loop.
+1. **Phase 1: bootable ARM skeleton** — needs hardware in the loop.
    See `PLAN.md`. Major chunk; not trivially mockable in sim.
+
+2. **mmap path for `.tcdb`** — the C reader currently slurps the
+   file with fread+heap-copy of strings/art. On real hardware we'd
+   mmap and let pointers reference into the mapped region. The
+   `tcdb_parse` shape already takes `(bytes, len)`; just the slurp
+   wrapper changes. Small PR, but needs hardware to actually exercise.
 
 3. **Search / on-screen keyboard** — iPod-style alphabetical jump
    into long lists.
 
-4. **Polish odds & ends** — UI quirks (silent UTF-8 truncation
+4. **Settings UI** — currently a stub leaf menu.
+
+5. **Polish odds & ends** — UI quirks (silent UTF-8 truncation
    mid-codepoint in tag fields; v2.4 compressed APIC frames misparse
    silently); ID3v2 TCON `(N)` numeric → genre-name mapping;
    compressed-art format support if a real-world MP3 ever embeds
@@ -100,6 +124,10 @@ items, roughly in order of payoff vs. effort:
 - #25 `MP3 album art: ID3v2 APIC extraction in tag_mp3`
 - #26 `NP big-art page: render real album art at 180×180`
 - #27 `Genres/Composers drilldown: tag readers + tagcache + cabinet`
+- #28 `core tagcache build: Go-side .tcdb binary index`
+- #29 `sim: --capture-audio + end-to-end audio-playback test`
+- #30 `core: C-side .tcdb reader (mmap-style binary tagcache loader)`
+- #31 `docs: rewrite README + refresh screenshots, fix NP track-info path`
 
 ## Repo layout reminder
 
@@ -119,11 +147,16 @@ core/
 │   └── stb_image/       JPEG-only build for embedded album art
 ├── apps/
 │   ├── audio/           decoder → ring → hal_audio engine
-│   ├── db/              tagcache: scan, parse tags, build indexes
+│   ├── db/              tagcache: scan/parse + .tcdb binary reader
+│   │                     (tagcache_format.h is the C-side layout spec)
 │   └── ui/              Cabinet shell, list view, NP, Linen chrome
-├── cli/                 Go CLI scaffold (10 subcommands, mostly stubs)
-├── sim/                 core-sim entry point
-└── tests/               codec KAT, fixtures, codec-vectors
+├── cli/                 Go CLI — `tagcache build/dump` works; the
+│                         other 10 subcommands are stubs
+│   └── internal/tagcache/  Go-side encoder + decoder for the .tcdb
+│                            (format.go is the Go-side layout spec)
+├── sim/                 core-sim entry point (--shot, --music,
+│                         --tagcache, --capture-audio)
+└── tests/               codec KAT + .tcdb parser + audio playback
 
 tools/
 ├── atlas_gen.{py,sh}      Pillow-based glyph atlas generator
@@ -133,8 +166,16 @@ tools/
 
 ## Test gates
 
-- `cd core && meson test -C build-sim` — codec KATs (FLAC + MP3,
-  bit-exact). Should always pass.
+- `cd core && meson test -C build-sim` runs all three suites and
+  should always be green:
+  - **codec-kat** (unit) — FLAC + MP3 decoders bit-exact against
+    reference PCM.
+  - **tcdb-reader** (unit) — C-side parser exercised against a
+    hand-rolled in-memory `.tcdb` (5 cases: happy, bad magic, bad
+    version, truncated header, invalid group song-idx).
+  - **sim-audio-playback** (integration) — spawns `core-sim` with
+    SDL's disk audio driver, plays the FLAC fixture, bit-compares
+    176 400 captured bytes against the codec KAT reference.
 - `cd core && ./build-sim/sim/core-sim --shot /tmp/x.bmp` — quick
   visual smoke test; produces a BMP of the main menu (headless, no
   window pop-up).
@@ -143,5 +184,5 @@ tools/
 
 GitHub: https://github.com/BrandonDedolph/ipod_theme
 
-All 27 PRs are squash-merged into `main`; commit history is linear
-(`git log --oneline -27`).
+All 31 PRs are squash-merged into `main`; commit history is linear
+(`git log --oneline -31`).
