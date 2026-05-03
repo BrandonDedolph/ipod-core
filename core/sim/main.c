@@ -15,6 +15,14 @@
  * and uses them to populate Music → Songs at startup. SELECT on a
  * song row then plays that file through the audio engine. Without
  * the flag, the Songs list shows the synthetic example data.
+ *
+ * `--capture-audio <path>` switches the SDL2 audio backend to its
+ * built-in `disk` driver, which writes the raw S16LE stereo samples
+ * the audio callback would have sent to the speakers into <path>.
+ * Used by the audio-playback meson test to verify the full
+ * decoder → engine → ring → HAL audio path end-to-end. Implies the
+ * sim runs to its configured frame budget; only meaningful in
+ * `--shot` mode (interactive runs would never end the capture).
  */
 
 #include "../apps/audio/engine.h"
@@ -22,6 +30,7 @@
 #include "../apps/ui/cabinet.h"
 #include "../hal/hal.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,9 +48,10 @@ static button_t key_to_button(char k) {
 }
 
 int main(int argc, char **argv) {
-    const char *shot_path = NULL;
-    const char *press_seq = NULL;
-    const char *music_dir = NULL;
+    const char *shot_path     = NULL;
+    const char *press_seq     = NULL;
+    const char *music_dir     = NULL;
+    const char *capture_audio = NULL;
     int shot_frames = 4;
 
     for (int i = 1; i < argc; i++) {
@@ -54,6 +64,8 @@ int main(int argc, char **argv) {
             if (shot_frames < 1) shot_frames = 1;
         } else if (strcmp(argv[i], "--music") == 0 && i + 1 < argc) {
             music_dir = argv[++i];
+        } else if (strcmp(argv[i], "--capture-audio") == 0 && i + 1 < argc) {
+            capture_audio = argv[++i];
         }
     }
 
@@ -61,7 +73,25 @@ int main(int argc, char **argv) {
      * drivers so no window pops up and no real audio device is opened.
      * Lets `--shot` runs work in the background without stealing focus
      * or making a sound. The interactive path leaves these unset and
-     * gets the normal SDL backends. */
+     * gets the normal SDL backends.
+     *
+     * `--capture-audio` overrides the audio half: the SDL "disk" driver
+     * writes raw S16LE samples the engine produces into the named file.
+     * Used by the playback meson test. Override mode (1) wins over the
+     * default dummy-audio setenv since both branches use setenv flag 0
+     * (don't override). */
+    if (capture_audio && !shot_path) {
+        /* Without --shot the program enters the interactive loop and
+         * never closes the audio device, so the disk file would grow
+         * unbounded and never flush cleanly. The header docstring
+         * already says capture-audio "implies --shot" — enforce it. */
+        fprintf(stderr, "core-sim: --capture-audio requires --shot\n");
+        return EXIT_FAILURE;
+    }
+    if (capture_audio) {
+        setenv("SDL_AUDIODRIVER", "disk", 1);
+        setenv("SDL_DISKAUDIOFILE", capture_audio, 1);
+    }
     if (shot_path) {
         setenv("SDL_VIDEODRIVER", "dummy", 0);
         setenv("SDL_AUDIODRIVER", "dummy", 0);
