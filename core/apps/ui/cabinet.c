@@ -355,6 +355,7 @@ static void play_global_song(cabinet_t *c, int global_idx) {
     snprintf(c->np.format, NP_FORMAT_MAX, "%s", label);
     snprintf(c->np.format_detail, NP_FORMAT_MAX, "%u kHz",
              c->engine->sample_rate / 1000);
+    snprintf(c->np.path, NP_PATH_MAX, "%s", path);
     /* Embedded album art (FLAC PICTURE today; MP3 APIC follows). On
      * decode failure we silently fall back to the stripe placeholder. */
     size_t art_len = 0;
