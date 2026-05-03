@@ -31,6 +31,7 @@ func Root() *cobra.Command {
 		newDebugCmd(),
 		newTestCmd(),
 		newReleaseCmd(),
+		newTagcacheCmd(),
 	)
 
 	return root
@@ -54,6 +55,9 @@ Install and update:
 Test and release:
   core test           Run the test suite (unit / sim / hw / battery / soak)
   core release        Build, sign, and package a release zip
+
+Music index:
+  core tagcache       Build and inspect the binary music index (.tcdb)
 
 Run "core <command> --help" for command-specific options.
 `
