@@ -12,6 +12,7 @@
 #include "chrome.h"
 #include "list.h"
 #include "now_playing.h"
+#include "search.h"
 #include "../audio/engine.h"
 #include "../db/tagcache.h"
 #include "../../codecs/dr_flac/flac.h"
@@ -32,8 +33,9 @@
 
 /* ---------- Menu definitions -------------------------------------- */
 
-#define ACT_NOOP -1
-#define ACT_PLAY -2
+#define ACT_NOOP   -1
+#define ACT_PLAY   -2
+#define ACT_SEARCH -3
 
 enum menu_id {
     M_MAIN = 0,
@@ -84,9 +86,10 @@ static const int main_actions[] = {
 };
 
 static const char *const music_items[] = {
-    "Artists", "Albums", "Songs", "Genres", "Composers", "Audiobooks"
+    "Search", "Artists", "Albums", "Songs", "Genres", "Composers", "Audiobooks"
 };
 static const int music_actions[] = {
+    ACT_SEARCH,
     M_MUSIC_ARTISTS, M_MUSIC_ALBUMS, M_MUSIC_SONGS,
     M_MUSIC_GENRES, M_MUSIC_COMPOSERS, ACT_NOOP
 };
@@ -111,7 +114,7 @@ typedef struct {
 
 static const menu_t MENUS[M_COUNT] = {
     [M_MAIN]   = {"iPod",  main_items,  main_actions,  6},
-    [M_MUSIC]  = {"Music", music_items, music_actions, 6},
+    [M_MUSIC]  = {"Music", music_items, music_actions, 7},
 
     /* Tagcache-backed flat lists. */
     [M_MUSIC_ARTISTS] = {
@@ -306,6 +309,16 @@ static void push_now_playing(cabinet_t *c) {
     c->depth++;
 }
 
+static void push_search(cabinet_t *c) {
+    if (c->depth >= CABINET_MAX_DEPTH) return;
+    search_init(&c->search);
+    c->stack_kind[c->depth] = FRAME_SEARCH;
+    c->stack_menu[c->depth] = -1;
+    c->frame_filter[c->depth] = -1;
+    c->frame_title[c->depth][0] = 0;
+    c->depth++;
+}
+
 static void pop_frame(cabinet_t *c) {
     if (c->depth > 1) c->depth--;
 }
@@ -390,6 +403,12 @@ void cabinet_draw(cabinet_t *c) {
         now_playing_draw(&c->np, c->engine);
         return;
     }
+    if (current_kind(c) == FRAME_SEARCH) {
+        lcd_fill(COL_CREAM);
+        draw_status_bar("Search");
+        search_draw(&c->search);
+        return;
+    }
 
     /* Publish the current frame's filter for the drilldown wrappers
      * BEFORE we call menu_count / menu_item. */
@@ -447,6 +466,19 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
         if (btn == BUTTON_SELECT) {
             now_playing_advance_page(&c->np);
             log_printf("cabinet: NP page -> %d", c->np.page);
+        }
+        return;
+    }
+
+    /* Search frame: keyboard + results live in search_t. POP unwinds
+     * back to the parent menu; PLAY drills into NP via play_global_song. */
+    if (current_kind(c) == FRAME_SEARCH) {
+        int global_idx = -1;
+        search_action_t act = search_handle_button(&c->search, btn, &global_idx);
+        if (act == SEARCH_ACT_POP) {
+            pop_frame(c);
+        } else if (act == SEARCH_ACT_PLAY && global_idx >= 0) {
+            play_global_song(c, global_idx);
         }
         return;
     }
@@ -535,6 +567,8 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
         if (act == ACT_NOOP) {
             log_printf("cabinet: %s -> %s (stub)",
                        m->title, menu_item(m, idx));
+        } else if (act == ACT_SEARCH) {
+            push_search(c);
         } else if (act == ACT_PLAY) {
             if (c->fixture_bytes && c->fixture_len > 0) {
                 int rc = audio_engine_play(c->engine, flac_decoder_ops(),

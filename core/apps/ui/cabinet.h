@@ -22,6 +22,7 @@
 #include "../../hal/hal.h"
 #include "../audio/engine.h"
 #include "now_playing.h"
+#include "search.h"
 
 #include <stdbool.h>
 
@@ -54,6 +55,7 @@ void cabinet_handle_button(cabinet_t *c, button_t btn);
 typedef enum {
     FRAME_MENU = 0,
     FRAME_NOW_PLAYING,
+    FRAME_SEARCH,
 } frame_kind_t;
 
 /* Forward decl + storage size — exposed so callers can statically
@@ -83,6 +85,7 @@ struct cabinet {
 
     audio_engine_t *engine;           /* for triggering playback */
     now_playing_t   np;               /* current NP snapshot, if any */
+    search_t        search;           /* search frame state */
 
     /* The bytes of the FLAC fixture, loaded once at init for the
      * Now Playing demo. NULL if not loaded. */

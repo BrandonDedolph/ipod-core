@@ -49,13 +49,13 @@
 #define SIM_FRAMES "400"
 
 /* Press sequence to navigate from the main menu (Music idx=0) to Songs
- * (Music sub-menu idx=2) and play the first row.
- *   E   — main menu: enter Music
- *   D D — scroll Music sub-menu Artists -> Albums -> Songs (idx 2)
- *   E   — enter Songs
- *   E   — play the first (and only) song
+ * (Music sub-menu idx=3) and play the first row.
+ *   E     — main menu: enter Music
+ *   D D D — scroll Music sub-menu Search -> Artists -> Albums -> Songs (idx 3)
+ *   E     — enter Songs
+ *   E     — play the first (and only) song
  */
-#define PLAY_PRESSES "EDDEE"
+#define PLAY_PRESSES "EDDDEE"
 
 static long load_file(const char *path, void **out) {
     FILE *fp = fopen(path, "rb");

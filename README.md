@@ -57,6 +57,13 @@ six-track tagged library; the same code path runs in interactive mode.
 ### Cabinet shell — main menu and Music sub-menu
 ![Main menu](docs/img/01-main.png) ![Music sub-menu](docs/img/02-music.png)
 
+### Search — on-screen keyboard with live results
+Wheel cycles the highlighted key (or, with focus shifted via RIGHT,
+the result list); SELECT types / plays. Substring match,
+case-insensitive ASCII against song titles.
+
+![Search](docs/img/13-search.png)
+
 ### Library views (all backed by the tagcache)
 ![Songs](docs/img/03-songs.png) ![Artists](docs/img/04-artists.png)
 
