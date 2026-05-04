@@ -471,6 +471,39 @@ static int find_in_uniq(char **hay, int n, const char *needle) {
 }
 
 /*
+ * Build per-group song lists for one dimension (artist / album / etc).
+ * `song_count` is the global library song count, `song_group_idx` is
+ * the per-song -> uniq-idx table for this dimension, `uniq_count` is
+ * the size of the uniq table. *out_lists / *out_counts receive the
+ * group_count-sized parallel arrays (or stay NULL on alloc failure).
+ */
+static void build_group_song_lists(int song_count,
+                                   const int *song_group_idx,
+                                   int uniq_count,
+                                   int ***out_lists,
+                                   int **out_counts) {
+    if (uniq_count <= 0) return;
+    int **lists  = (int **)calloc((size_t)uniq_count, sizeof(int *));
+    int  *counts = (int  *)calloc((size_t)uniq_count, sizeof(int));
+    *out_lists  = lists;
+    *out_counts = counts;
+    if (!lists || !counts) return;
+    for (int a = 0; a < uniq_count; a++) {
+        int n = 0;
+        for (int s = 0; s < song_count; s++)
+            if (song_group_idx[s] == a) n++;
+        if (n == 0) continue;
+        int *list = (int *)malloc((size_t)n * sizeof(int));
+        if (!list) continue;
+        int j = 0;
+        for (int s = 0; s < song_count; s++)
+            if (song_group_idx[s] == a) list[j++] = s;
+        lists[a]  = list;
+        counts[a] = n;
+    }
+}
+
+/*
  * Build the per-song uniq-idx tables and per-group song lists. Any
  * allocation failure leaves the affected structure NULL — caller
  * commits regardless. See library_t comments for the data layout.
@@ -509,106 +542,26 @@ static void build_filter_indexes(library_t *lib) {
                                                  lib->composers[s]);
     }
 
-    /* artist_songs[a]: song indices where song_artist_idx == a, in
-     * the song-array's existing alphabetical-by-title order.
+    /* Per-group song lists, in the song-array's existing alphabetical-
+     * by-title order. Two passes per group inside the helper: count
+     * first, then fill. Allocation failure leaves the per-group entry
+     * NULL; downstream queries return 0 for that group.
      *
-     * Two passes per group: count first, then fill. Allocation
-     * failure leaves the per-group entry NULL; downstream queries
-     * return 0 for that artist.
-     *
-     * Asymmetric-NULL between artist_songs and artist_song_counts
-     * (one calloc'd, the other NULL) is intentionally tolerated —
-     * the accessors below explicitly NULL-check both before use. */
-    if (lib->uniq_artist_count > 0) {
-        lib->artist_songs       = (int **)calloc((size_t)lib->uniq_artist_count,
-                                                 sizeof(int *));
-        lib->artist_song_counts = (int  *)calloc((size_t)lib->uniq_artist_count,
-                                                 sizeof(int));
-        if (lib->artist_songs && lib->artist_song_counts) {
-            for (int a = 0; a < lib->uniq_artist_count; a++) {
-                int n = 0;
-                for (int s = 0; s < lib->count; s++)
-                    if (lib->song_artist_idx[s] == a) n++;
-                if (n == 0) continue;
-                int *list = (int *)malloc((size_t)n * sizeof(int));
-                if (!list) continue;
-                int j = 0;
-                for (int s = 0; s < lib->count; s++)
-                    if (lib->song_artist_idx[s] == a) list[j++] = s;
-                lib->artist_songs[a]       = list;
-                lib->artist_song_counts[a] = n;
-            }
-        }
-    }
-
-    /* album_songs[a]: same shape for the album dimension. */
-    if (lib->uniq_album_count > 0) {
-        lib->album_songs       = (int **)calloc((size_t)lib->uniq_album_count,
-                                                sizeof(int *));
-        lib->album_song_counts = (int  *)calloc((size_t)lib->uniq_album_count,
-                                                sizeof(int));
-        if (lib->album_songs && lib->album_song_counts) {
-            for (int a = 0; a < lib->uniq_album_count; a++) {
-                int n = 0;
-                for (int s = 0; s < lib->count; s++)
-                    if (lib->song_album_idx[s] == a) n++;
-                if (n == 0) continue;
-                int *list = (int *)malloc((size_t)n * sizeof(int));
-                if (!list) continue;
-                int j = 0;
-                for (int s = 0; s < lib->count; s++)
-                    if (lib->song_album_idx[s] == a) list[j++] = s;
-                lib->album_songs[a]       = list;
-                lib->album_song_counts[a] = n;
-            }
-        }
-    }
-
-    /* genre_songs[a]: same shape for the genre dimension. */
-    if (lib->uniq_genre_count > 0) {
-        lib->genre_songs       = (int **)calloc((size_t)lib->uniq_genre_count,
-                                                sizeof(int *));
-        lib->genre_song_counts = (int  *)calloc((size_t)lib->uniq_genre_count,
-                                                sizeof(int));
-        if (lib->genre_songs && lib->genre_song_counts) {
-            for (int a = 0; a < lib->uniq_genre_count; a++) {
-                int n = 0;
-                for (int s = 0; s < lib->count; s++)
-                    if (lib->song_genre_idx[s] == a) n++;
-                if (n == 0) continue;
-                int *list = (int *)malloc((size_t)n * sizeof(int));
-                if (!list) continue;
-                int j = 0;
-                for (int s = 0; s < lib->count; s++)
-                    if (lib->song_genre_idx[s] == a) list[j++] = s;
-                lib->genre_songs[a]       = list;
-                lib->genre_song_counts[a] = n;
-            }
-        }
-    }
-
-    /* composer_songs[a]: same shape for the composer dimension. */
-    if (lib->uniq_composer_count > 0) {
-        lib->composer_songs       = (int **)calloc((size_t)lib->uniq_composer_count,
-                                                   sizeof(int *));
-        lib->composer_song_counts = (int  *)calloc((size_t)lib->uniq_composer_count,
-                                                   sizeof(int));
-        if (lib->composer_songs && lib->composer_song_counts) {
-            for (int a = 0; a < lib->uniq_composer_count; a++) {
-                int n = 0;
-                for (int s = 0; s < lib->count; s++)
-                    if (lib->song_composer_idx[s] == a) n++;
-                if (n == 0) continue;
-                int *list = (int *)malloc((size_t)n * sizeof(int));
-                if (!list) continue;
-                int j = 0;
-                for (int s = 0; s < lib->count; s++)
-                    if (lib->song_composer_idx[s] == a) list[j++] = s;
-                lib->composer_songs[a]       = list;
-                lib->composer_song_counts[a] = n;
-            }
-        }
-    }
+     * Asymmetric-NULL between *_songs and *_song_counts (one calloc'd,
+     * the other NULL) is intentionally tolerated — the accessors below
+     * explicitly NULL-check both before use. */
+    build_group_song_lists(lib->count, lib->song_artist_idx,
+                           lib->uniq_artist_count,
+                           &lib->artist_songs, &lib->artist_song_counts);
+    build_group_song_lists(lib->count, lib->song_album_idx,
+                           lib->uniq_album_count,
+                           &lib->album_songs, &lib->album_song_counts);
+    build_group_song_lists(lib->count, lib->song_genre_idx,
+                           lib->uniq_genre_count,
+                           &lib->genre_songs, &lib->genre_song_counts);
+    build_group_song_lists(lib->count, lib->song_composer_idx,
+                           lib->uniq_composer_count,
+                           &lib->composer_songs, &lib->composer_song_counts);
 }
 
 /*
