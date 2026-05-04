@@ -48,6 +48,88 @@
 
 /* ---------- helpers ---------------------------------------------------- */
 
+/* ID3v1 genre table (Eric Kemp's original 0-79 + Winamp extension to 191). */
+static const char *id3v1_genres[] = {
+    "Blues", "Classic Rock", "Country", "Dance", "Disco", "Funk", "Grunge",
+    "Hip-Hop", "Jazz", "Metal", "New Age", "Oldies", "Other", "Pop", "R&B",
+    "Rap", "Reggae", "Rock", "Techno", "Industrial", "Alternative", "Ska",
+    "Death Metal", "Pranks", "Soundtrack", "Euro-Techno", "Ambient",
+    "Trip-Hop", "Vocal", "Jazz+Funk", "Fusion", "Trance", "Classical",
+    "Instrumental", "Acid", "House", "Game", "Sound Clip", "Gospel", "Noise",
+    "AlternRock", "Bass", "Soul", "Punk", "Space", "Meditative",
+    "Instrumental Pop", "Instrumental Rock", "Ethnic", "Gothic", "Darkwave",
+    "Techno-Industrial", "Electronic", "Pop-Folk", "Eurodance", "Dream",
+    "Southern Rock", "Comedy", "Cult", "Gangsta", "Top 40", "Christian Rap",
+    "Pop/Funk", "Jungle", "Native American", "Cabaret", "New Wave",
+    "Psychadelic", "Rave", "Showtunes", "Trailer", "Lo-Fi", "Tribal",
+    "Acid Punk", "Acid Jazz", "Polka", "Retro", "Musical", "Rock & Roll",
+    "Hard Rock", "Folk", "Folk-Rock", "National Folk", "Swing", "Fast Fusion",
+    "Bebob", "Latin", "Revival", "Celtic", "Bluegrass", "Avantgarde",
+    "Gothic Rock", "Progressive Rock", "Psychedelic Rock", "Symphonic Rock",
+    "Slow Rock", "Big Band", "Chorus", "Easy Listening", "Acoustic", "Humour",
+    "Speech", "Chanson", "Opera", "Chamber Music", "Sonata", "Symphony",
+    "Booty Bass", "Primus", "Porn Groove", "Satire", "Slow Jam", "Club",
+    "Tango", "Samba", "Folklore", "Ballad", "Power Ballad", "Rhythmic Soul",
+    "Freestyle", "Duet", "Punk Rock", "Drum Solo", "A Cappella", "Euro-House",
+    "Dance Hall", "Goa", "Drum & Bass", "Club-House", "Hardcore", "Terror",
+    "Indie", "BritPop", "Negerpunk", "Polsk Punk", "Beat", "Christian Gangsta",
+    "Heavy Metal", "Black Metal", "Crossover", "Contemporary Christian",
+    "Christian Rock", "Merengue", "Salsa", "Thrash Metal", "Anime", "JPop",
+    "Synthpop", "Abstract", "Art Rock", "Baroque", "Bhangra", "Big Beat",
+    "Breakbeat", "Chillout", "Downtempo", "Dub", "EBM", "Eclectic", "Electro",
+    "Electroclash", "Emo", "Experimental", "Garage", "Global", "IDM",
+    "Illbient", "Industro-Goth", "Jam Band", "Krautrock", "Leftfield",
+    "Lounge", "Math Rock", "New Romantic", "Nu-Breakz", "Post-Punk",
+    "Post-Rock", "Psytrance", "Shoegaze", "Space Rock", "Trop Rock",
+    "World Music", "Neoclassical", "Audiobook", "Audio Theatre",
+    "Neue Deutsche Welle", "Podcast", "Indie Rock", "G-Funk", "Dubstep",
+    "Garage Rock", "Psybient",
+};
+#define ID3V1_GENRE_COUNT (sizeof(id3v1_genres) / sizeof(id3v1_genres[0]))
+
+/* Resolve TCON: "(N)"/"N" -> id3v1_genres[N], "(RX)"=Remix, "(CR)"=Cover, "(N)Text" prefers Text. */
+static void resolve_tcon_genre(char *dst, size_t dst_size, const char *src) {
+    if (dst_size == 0) return;
+    dst[0] = 0;
+    if (!src || !src[0]) return;
+
+    if (src[0] == '(' && src[1] != '(') {
+        size_t i = 1;
+        if (src[i] == 'R' && src[i + 1] == 'X' && src[i + 2] == ')') {
+            const char *tail = src + i + 3;
+            if (*tail) { strncpy(dst, tail, dst_size - 1); dst[dst_size - 1] = 0; return; }
+            strncpy(dst, "Remix", dst_size - 1); dst[dst_size - 1] = 0; return;
+        }
+        if (src[i] == 'C' && src[i + 1] == 'R' && src[i + 2] == ')') {
+            const char *tail = src + i + 3;
+            if (*tail) { strncpy(dst, tail, dst_size - 1); dst[dst_size - 1] = 0; return; }
+            strncpy(dst, "Cover", dst_size - 1); dst[dst_size - 1] = 0; return;
+        }
+        unsigned n = 0;
+        int have = 0;
+        while (src[i] >= '0' && src[i] <= '9') { n = n * 10 + (unsigned)(src[i] - '0'); have = 1; i++; }
+        if (have && src[i] == ')') {
+            const char *tail = src + i + 1;
+            if (*tail) { strncpy(dst, tail, dst_size - 1); dst[dst_size - 1] = 0; return; }
+            if (n < ID3V1_GENRE_COUNT) {
+                strncpy(dst, id3v1_genres[n], dst_size - 1); dst[dst_size - 1] = 0; return;
+            }
+        }
+        strncpy(dst, src, dst_size - 1); dst[dst_size - 1] = 0; return;
+    }
+
+    {
+        size_t i = 0;
+        unsigned n = 0;
+        while (src[i] >= '0' && src[i] <= '9') { n = n * 10 + (unsigned)(src[i] - '0'); i++; }
+        if (i > 0 && src[i] == 0 && n < ID3V1_GENRE_COUNT) {
+            strncpy(dst, id3v1_genres[n], dst_size - 1); dst[dst_size - 1] = 0; return;
+        }
+    }
+
+    strncpy(dst, src, dst_size - 1); dst[dst_size - 1] = 0;
+}
+
 /* Synchsafe 32-bit integer: each byte contributes 7 bits. */
 static uint32_t read_synchsafe(const uint8_t *p) {
     return ((uint32_t)(p[0] & 0x7f) << 21) |
@@ -273,12 +355,9 @@ int tag_mp3_read(const void *bytes, size_t len, audio_tags_t *out) {
             copy_text_frame(out->album, sizeof(out->album), fbody, fsize);
             out->found_album = (out->album[0] != 0);
         } else if (matches(id, "TCON") && !out->found_genre) {
-            /* TCON often arrives as a parenthesized numeric ID3v1
-             * genre code ("(17)") rather than a name; we pass it
-             * through verbatim. Mapping the numeric form to the
-             * canonical genre name is a polish item — most modern
-             * taggers write the name directly. */
-            copy_text_frame(out->genre, sizeof(out->genre), fbody, fsize);
+            char raw[TAG_FIELD_MAX];
+            copy_text_frame(raw, sizeof(raw), fbody, fsize);
+            resolve_tcon_genre(out->genre, sizeof(out->genre), raw);
             out->found_genre = (out->genre[0] != 0);
         } else if (matches(id, "TCOM") && !out->found_composer) {
             copy_text_frame(out->composer, sizeof(out->composer), fbody, fsize);

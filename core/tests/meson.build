@@ -36,6 +36,13 @@ if target == 'sim'
   )
   test('tcdb-reader', tcdb_reader_test, suite: 'unit')
 
+  tag_mp3_test = executable(
+    'tag_mp3_test',
+    sources: ['tag_mp3_test.c'],
+    dependencies: [codecs_dep],
+  )
+  test('tag-mp3', tag_mp3_test, suite: 'unit')
+
   # End-to-end audio-playback test: spawns core-sim with the SDL2
   # disk audio driver, plays the FLAC fixture, then bit-compares
   # the captured PCM to the codec_kat reference. Exercises the
