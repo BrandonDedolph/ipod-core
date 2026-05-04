@@ -11,6 +11,7 @@ ui_lib = static_library(
     'chrome.c',
     'list.c',
     'now_playing.c',
+    'search.c',
     'cabinet.c',
   ],
   dependencies: [hal_dep, audio_engine_dep, flac_dep, image_dep, tagcache_dep],
