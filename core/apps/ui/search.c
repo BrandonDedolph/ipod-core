@@ -8,7 +8,6 @@
 #include "../db/tagcache.h"
 #include "../../hal/hal.h"
 
-#include <stdint.h>
 #include <string.h>
 
 #define COL_INK    lcd_rgb(0x1A, 0x17, 0x14)
@@ -146,6 +145,8 @@ static void draw_keyboard(const search_t *s) {
                 chrome_line(gx + 3, gy,         gx, gy + gh / 2, fg);
                 chrome_line(gx + 3, gy + gh - 1, gx, gy + gh / 2, fg);
             } else {
+                /* Space draws as '_' (more legible at 13px than a blank
+                 * cell) but apply_key inserts a real ' ' into the query. */
                 char ch[2] = { 0, 0 };
                 ch[0] = (idx == SEARCH_KEY_SPACE) ? '_' : key_char(idx);
                 int tw = atlas_text_width(&NUNITO_BOLD_13, ch);
