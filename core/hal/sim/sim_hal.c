@@ -392,6 +392,44 @@ void hal_audio_close(void) {
     }
 }
 
+/* ---------- Volume / Backlight ------------------------------------- */
+
+/*
+ * Sim holds the values + logs on change. SDL audio gain and window
+ * brightness are intentionally untouched — those would be follow-ups
+ * (audio: per-callback scale; window: an overlay tint).
+ */
+static int g_volume    = 70;
+static int g_backlight = 80;
+
+static int clamp_pct(int v) {
+    if (v < 0)   return 0;
+    if (v > 100) return 100;
+    return v;
+}
+
+void hal_volume_set(int percent) {
+    int v = clamp_pct(percent);
+    if (v == g_volume) return;
+    g_volume = v;
+    log_printf("hal/sim: volume -> %d", g_volume);
+}
+
+int hal_volume_get(void) {
+    return g_volume;
+}
+
+void hal_backlight_set(int percent) {
+    int v = clamp_pct(percent);
+    if (v == g_backlight) return;
+    g_backlight = v;
+    log_printf("hal/sim: backlight -> %d", g_backlight);
+}
+
+int hal_backlight_get(void) {
+    return g_backlight;
+}
+
 /* ---------- Log ---------------------------------------------------- */
 
 #ifndef CORE_RELEASE

@@ -219,6 +219,27 @@ void hal_audio_stop(void);
  */
 void hal_audio_close(void);
 
+/* ---------- Volume / Backlight ------------------------------------- */
+
+/*
+ * Volume: 0..100 (% of full output gain). Sim doesn't actually
+ * attenuate SDL audio — the value is held + logged on change. Hw will
+ * scale the I²S stream (or drive the codec's gain register).
+ *
+ * Out-of-range values are clamped, not rejected.
+ */
+void hal_volume_set(int percent);
+int  hal_volume_get(void);
+
+/*
+ * Backlight: 0..100. Sim logs only; hw drives the LCD backlight PWM
+ * line. 0 = off, 100 = full brightness.
+ *
+ * Out-of-range values are clamped, not rejected.
+ */
+void hal_backlight_set(int percent);
+int  hal_backlight_get(void);
+
 /* ---------- Log ----------------------------------------------------- */
 
 /*

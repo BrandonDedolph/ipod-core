@@ -38,6 +38,8 @@
 #define ACT_PLAY        -2
 #define ACT_SEARCH      -3
 #define ACT_THEME_CYCLE -4
+#define ACT_VOLUME_ADJ  -5
+#define ACT_BRIGHT_ADJ  -6
 
 enum menu_id {
     M_MAIN = 0,
@@ -100,10 +102,15 @@ static const int music_actions[] = {
 static const char *const empty_items[] = {"(empty)"};
 static const int empty_actions[] = { ACT_NOOP };
 
-/* Settings frame — Theme cycles between Light/Dark; About drills into
- * a read-only info screen. */
-static const char *const settings_items[] = { "Theme", "About" };
-static const int settings_actions[]      = { ACT_THEME_CYCLE, M_SETTINGS_ABOUT };
+/* Settings frame — Theme cycles between Light/Dark; Volume/Brightness
+ * are adjusted via LEFT/RIGHT on the row (SELECT is a no-op); About
+ * drills into a read-only info screen. */
+static const char *const settings_items[] = {
+    "Theme", "Volume", "Brightness", "About"
+};
+static const int settings_actions[] = {
+    ACT_THEME_CYCLE, ACT_VOLUME_ADJ, ACT_BRIGHT_ADJ, M_SETTINGS_ABOUT
+};
 
 static const char *settings_label_fmt(int idx) {
     static char buf[48];
@@ -111,7 +118,15 @@ static const char *settings_label_fmt(int idx) {
         snprintf(buf, sizeof buf, "Theme: %s", theme_label(theme_get()));
         return buf;
     }
-    if (idx == 1) return "About";
+    if (idx == 1) {
+        snprintf(buf, sizeof buf, "Volume: %d", hal_volume_get());
+        return buf;
+    }
+    if (idx == 2) {
+        snprintf(buf, sizeof buf, "Brightness: %d", hal_backlight_get());
+        return buf;
+    }
+    if (idx == 3) return "About";
     return "";
 }
 
@@ -210,7 +225,7 @@ static const menu_t MENUS[M_COUNT] = {
         .title       = "Settings",
         .items       = settings_items,
         .actions     = settings_actions,
-        .count       = 2,
+        .count       = 4,
         .item_fmt_fn = settings_label_fmt,
     },
     [M_SETTINGS_ABOUT] = {
@@ -550,6 +565,26 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
     if (list_view_handle_button(&v, btn, count)) {
         store_view(c, &v);
         return;
+    }
+
+    /* Settings rows that adjust a value: LEFT/RIGHT step by 10
+     * (clamped 0..100), SELECT is a no-op. Caught before the generic
+     * SELECT dispatch so ACT_VOLUME_ADJ / ACT_BRIGHT_ADJ never fall
+     * through to the stub log. */
+    if (mid == M_SETTINGS) {
+        int idx = c->list_state[c->depth - 1].selected;
+        if (idx >= 0 && idx < count) {
+            int act = menu_action(m, idx);
+            if (act == ACT_VOLUME_ADJ || act == ACT_BRIGHT_ADJ) {
+                int (*get)(void) = (act == ACT_VOLUME_ADJ)
+                                   ? hal_volume_get : hal_backlight_get;
+                void (*set)(int) = (act == ACT_VOLUME_ADJ)
+                                   ? hal_volume_set : hal_backlight_set;
+                if (btn == BUTTON_RIGHT) { set(get() + 10); return; }
+                if (btn == BUTTON_LEFT)  { set(get() - 10); return; }
+                if (btn == BUTTON_SELECT) return;   /* no-op on adjust rows */
+            }
+        }
     }
 
     if (btn == BUTTON_SELECT) {
