@@ -20,7 +20,6 @@ typedef struct {
     lcd_pixel_t track_faint;
     lcd_pixel_t star_muted;
     lcd_pixel_t stripe_a, stripe_b;
-    lcd_pixel_t big_stripe_a, big_stripe_b;
     lcd_pixel_t accent;
 } palette_t;
 
@@ -38,8 +37,6 @@ static void apply_light(void) {
     g_pal.star_muted    = lcd_rgb(0xCC, 0xC4, 0xB7);
     g_pal.stripe_a      = lcd_rgb(0xCD, 0xB8, 0xA6);
     g_pal.stripe_b      = lcd_rgb(0xC0, 0xAB, 0x99);
-    g_pal.big_stripe_a  = lcd_rgb(0xC8, 0xB2, 0x9F);
-    g_pal.big_stripe_b  = lcd_rgb(0xB6, 0xA0, 0x8C);
     g_pal.accent        = lcd_rgb(0xC4, 0x5A, 0x3A);
 }
 
@@ -60,8 +57,6 @@ static void apply_dark(void) {
     /* Stripes stay earthy but a touch dimmer so they read on near-black. */
     g_pal.stripe_a      = lcd_rgb(0x6E, 0x5C, 0x4C);
     g_pal.stripe_b      = lcd_rgb(0x82, 0x6E, 0x5A);
-    g_pal.big_stripe_a  = lcd_rgb(0x6A, 0x58, 0x48);
-    g_pal.big_stripe_b  = lcd_rgb(0x80, 0x6C, 0x58);
     g_pal.accent        = lcd_rgb(0xC4, 0x5A, 0x3A);
 }
 
@@ -94,6 +89,4 @@ lcd_pixel_t theme_track_faint(void)   { ensure_init(); return g_pal.track_faint;
 lcd_pixel_t theme_star_muted(void)    { ensure_init(); return g_pal.star_muted; }
 lcd_pixel_t theme_stripe_a(void)      { ensure_init(); return g_pal.stripe_a; }
 lcd_pixel_t theme_stripe_b(void)      { ensure_init(); return g_pal.stripe_b; }
-lcd_pixel_t theme_big_stripe_a(void)  { ensure_init(); return g_pal.big_stripe_a; }
-lcd_pixel_t theme_big_stripe_b(void)  { ensure_init(); return g_pal.big_stripe_b; }
 lcd_pixel_t theme_accent(void)        { ensure_init(); return g_pal.accent; }

@@ -42,8 +42,6 @@ lcd_pixel_t theme_track_faint(void); /* progress-bar bg, peak-meter dim */
 lcd_pixel_t theme_star_muted(void);  /* unfilled rating stars */
 lcd_pixel_t theme_stripe_a(void);    /* placeholder stripe colors — */
 lcd_pixel_t theme_stripe_b(void);    /* art-area no-art fallback */
-lcd_pixel_t theme_big_stripe_a(void);
-lcd_pixel_t theme_big_stripe_b(void);
 
 /* Accent (terracotta) is identical in both modes. */
 lcd_pixel_t theme_accent(void);
