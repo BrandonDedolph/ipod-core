@@ -15,6 +15,7 @@
 #include "now_playing.h"
 #include "atlas.h"
 #include "chrome.h"
+#include "theme.h"
 #include "../audio/engine.h"
 #include "../../codecs/stb_image/image.h"
 #include "../../hal/hal.h"
@@ -23,18 +24,16 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---------- Linen palette (per themes.jsx Theme 1) -------------- */
+/* ---------- Palette (theme-aware) ------------------------------- */
 
-#define COL_BG          lcd_rgb(0xF4, 0xF1, 0xEC)   /* paper */
-#define COL_INK         lcd_rgb(0x1A, 0x17, 0x14)   /* primary text */
-#define COL_INK_DEEP    lcd_rgb(0x5A, 0x50, 0x48)   /* artist / time */
-#define COL_INK_MUTED   lcd_rgb(0x9A, 0x8E, 0x80)   /* labels / album */
-#define COL_TRACK_FAINT lcd_rgb(0xD8, 0xD2, 0xC8)   /* progress-bar bg */
-#define COL_STAR_MUTED  lcd_rgb(0xCC, 0xC4, 0xB7)   /* unfilled stars */
-
-/* Album art stripes — subtle warm tans matching oklch(0.78/0.74). */
-#define COL_STRIPE_A    lcd_rgb(0xCD, 0xB8, 0xA6)
-#define COL_STRIPE_B    lcd_rgb(0xC0, 0xAB, 0x99)
+#define COL_BG          theme_bg()
+#define COL_INK         theme_fg()
+#define COL_INK_DEEP    theme_fg_deep()
+#define COL_INK_MUTED   theme_fg_muted()
+#define COL_TRACK_FAINT theme_track_faint()
+#define COL_STAR_MUTED  theme_star_muted()
+#define COL_STRIPE_A    theme_stripe_a()
+#define COL_STRIPE_B    theme_stripe_b()
 
 /* ---------- Snapshot --------------------------------------------- */
 
@@ -354,10 +353,13 @@ static void draw_big_art(const now_playing_t *np, const audio_engine_t *engine) 
 #define PEAK_SEG_H      4
 #define PEAK_SEG_GAP    2
 
-#define COL_PEAK_NORMAL lcd_rgb(0x1A, 0x17, 0x14)
+/* Peak segments: NORMAL follows theme (visible against bg); AMBER / RED
+ * are warning colors that stay constant. DIM (unlit cells) follows the
+ * theme's faint-track tint. */
+#define COL_PEAK_NORMAL theme_fg()
 #define COL_PEAK_AMBER  lcd_rgb(0xC0, 0x8C, 0x2A)
 #define COL_PEAK_RED    lcd_rgb(0xC4, 0x50, 0x2A)
-#define COL_PEAK_DIM    lcd_rgb(0xE6, 0xE2, 0xDB)   /* 8% ink on cream */
+#define COL_PEAK_DIM    theme_track_faint()
 
 /* Synthesize a "level" 0..1 for a channel from engine state +
  * time, so the meter looks alive even though we don't yet pull
@@ -420,7 +422,7 @@ static void draw_peak_meter(const now_playing_t *np, const audio_engine_t *engin
     const char *page_label = "PAGE 2 OF 3";
     int pw = atlas_text_width(&NUNITO_BOLD_9, page_label);
     atlas_render(&NUNITO_BOLD_9, LCD_WIDTH - 12 - pw, 16, page_label, COL_INK_MUTED);
-    chrome_fill_rect(0, 22, LCD_WIDTH, 1, lcd_rgb(0xE2, 0xDE, 0xDA));
+    chrome_fill_rect(0, 22, LCD_WIDTH, 1, theme_separator());
 
     /* Two channels, centered with 22 px gap. */
     int meter_top = 28;
@@ -463,7 +465,7 @@ static void draw_track_info(const now_playing_t *np, const audio_engine_t *engin
     const char *page_label = "PAGE 3 OF 3";
     int pw = atlas_text_width(&NUNITO_BOLD_9, page_label);
     atlas_render(&NUNITO_BOLD_9, LCD_WIDTH - 12 - pw, 16, page_label, COL_INK_MUTED);
-    chrome_fill_rect(0, 22, LCD_WIDTH, 1, lcd_rgb(0xE2, 0xDE, 0xDA));
+    chrome_fill_rect(0, 22, LCD_WIDTH, 1, theme_separator());
 
     /*
      * Key-value rows per design (line 388+). Keys uppercase tracking

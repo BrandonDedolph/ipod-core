@@ -21,13 +21,15 @@ play. Now Playing shows real metadata + embedded album art.
 |---|---|
 | FLAC + MP3 decoders (bit-exact via codec KAT) | Bootable ARM image (Phase 1) |
 | Audio engine — SPSC ring + SDL2 HAL | On-device USB / disk / battery |
-| Library scan + tag parse (Vorbis, ID3v2.3/2.4) | Search / on-screen keyboard |
-| Drilldown: Artists → songs, Albums → songs, Genres → songs, Composers → songs | Playlists, podcasts, audiobooks |
-| Embedded album art (FLAC PICTURE, MP3 APIC → JPEG → 84² + 180²) | Per-track gain (replaygain) |
-| Binary tagcache (`.tcdb`) — Go-side encoder + C-side reader | Settings UI |
+| Library scan + tag parse (Vorbis, ID3v2.3/2.4) | Playlists, podcasts, audiobooks |
+| Drilldown: Artists → songs, Albums → songs, Genres → songs, Composers → songs | Per-track gain (replaygain) |
+| Embedded album art (FLAC PICTURE, MP3 APIC → JPEG → 84² + 180²) | Volume / brightness (need HAL knobs) |
+| Binary tagcache (`.tcdb`) — Go-side encoder + C-side reader |  |
+| Search frame — on-screen keyboard, live substring filter |  |
+| Settings — light / dark theme cycle + About screen |  |
 | End-to-end audio playback test (captures real PCM, bit-compares to reference) |  |
 
-30 PRs squash-merged on `main`. See [`STATUS.md`](STATUS.md) for the
+35 PRs squash-merged on `main`. See [`STATUS.md`](STATUS.md) for the
 running list.
 
 ---
@@ -63,6 +65,18 @@ the result list); SELECT types / plays. Substring match,
 case-insensitive ASCII against song titles.
 
 ![Search](docs/img/13-search.png)
+
+### Settings — light / dark theme
+Settings → **Theme** cycles between Light and Dark; everything except
+album art flips. **About** shows firmware version + library counts.
+
+| Light | Dark |
+|---|---|
+| ![Settings light](docs/img/14-settings-light.png) | ![Settings dark](docs/img/15-settings-dark.png) |
+
+| Main menu, dark | About |
+|---|---|
+| ![Main dark](docs/img/16-main-dark.png) | ![About](docs/img/17-about.png) |
 
 ### Library views (all backed by the tagcache)
 ![Songs](docs/img/03-songs.png) ![Artists](docs/img/04-artists.png)
