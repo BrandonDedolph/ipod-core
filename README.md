@@ -62,7 +62,7 @@ six-track tagged library; the same code path runs in interactive mode.
 ### Search — on-screen keyboard with live results
 Wheel cycles the highlighted key (or, with focus shifted via RIGHT,
 the result list); SELECT types / plays. Substring match,
-case-insensitive ASCII against song titles.
+case-insensitive ASCII against song title, artist, or album.
 
 ![Search](docs/img/13-search.png)
 
