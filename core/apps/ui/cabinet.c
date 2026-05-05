@@ -13,6 +13,7 @@
 #include "list.h"
 #include "now_playing.h"
 #include "search.h"
+#include "theme.h"
 #include "../audio/engine.h"
 #include "../db/tagcache.h"
 #include "../../codecs/dr_flac/flac.h"
@@ -25,17 +26,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---------- Linen palette ----------------------------------------- */
+/* ---------- Palette (theme-aware) --------------------------------- */
 
-#define COL_INK    lcd_rgb(0x1A, 0x17, 0x14)
-#define COL_CREAM  lcd_rgb(0xF4, 0xF1, 0xEC)
-#define COL_ACCENT lcd_rgb(0xC4, 0x5A, 0x3A)
+#define COL_INK    theme_fg()
+#define COL_CREAM  theme_bg()
+#define COL_ACCENT theme_accent()
 
 /* ---------- Menu definitions -------------------------------------- */
 
-#define ACT_NOOP   -1
-#define ACT_PLAY   -2
-#define ACT_SEARCH -3
+#define ACT_NOOP        -1
+#define ACT_PLAY        -2
+#define ACT_SEARCH      -3
+#define ACT_THEME_CYCLE -4
 
 enum menu_id {
     M_MAIN = 0,
@@ -53,6 +55,7 @@ enum menu_id {
     M_PODCASTS,
     M_AUDIOBOOKS,
     M_SETTINGS,
+    M_SETTINGS_ABOUT,
     M_COUNT
 };
 
@@ -97,11 +100,43 @@ static const int music_actions[] = {
 static const char *const empty_items[] = {"(empty)"};
 static const int empty_actions[] = { ACT_NOOP };
 
+/* Settings frame — Theme cycles between Light/Dark; About drills into
+ * a read-only info screen. */
+static const char *const settings_items[] = { "Theme", "About" };
+static const int settings_actions[]      = { ACT_THEME_CYCLE, M_SETTINGS_ABOUT };
+
+static const char *settings_label_fmt(int idx) {
+    static char buf[48];
+    if (idx == 0) {
+        snprintf(buf, sizeof buf, "Theme: %s", theme_label(theme_get()));
+        return buf;
+    }
+    if (idx == 1) return "About";
+    return "";
+}
+
+/* About frame — firmware version + library counts. The list view
+ * renders one line at a time then advances, so a single static buffer
+ * across rows is safe. */
+static int about_count(void) { return 6; }
+static const char *about_line(int idx) {
+    static char buf[48];
+    switch (idx) {
+        case 0: return "core firmware 0.1";
+        case 1: snprintf(buf, sizeof buf, "Songs: %d",     tagcache_song_count());     return buf;
+        case 2: snprintf(buf, sizeof buf, "Artists: %d",   tagcache_artist_count());   return buf;
+        case 3: snprintf(buf, sizeof buf, "Albums: %d",    tagcache_album_count());    return buf;
+        case 4: snprintf(buf, sizeof buf, "Genres: %d",    tagcache_genre_count());    return buf;
+        case 5: snprintf(buf, sizeof buf, "Composers: %d", tagcache_composer_count()); return buf;
+    }
+    return "";
+}
+
 /*
  * A menu either has static items (const arrays + count) OR a dynamic
- * provider (count_fn + item_fn from the tagcache). Selecting any
- * dynamic-menu row is a no-op for now; album/song drilldown lands
- * with playlist routing in a later PR.
+ * provider (count_fn + item_fn from the tagcache). `item_fmt_fn`, when
+ * present, overrides both — it returns a pointer to a per-row formatted
+ * string (used for Settings rows that show their current value inline).
  */
 typedef struct {
     const char         *title;
@@ -110,6 +145,7 @@ typedef struct {
     int                 count;
     int               (*count_fn)(void);
     const char       *(*item_fn)(int idx);
+    const char       *(*item_fmt_fn)(int idx);
 } menu_t;
 
 static const menu_t MENUS[M_COUNT] = {
@@ -170,7 +206,18 @@ static const menu_t MENUS[M_COUNT] = {
     [M_PLAYLISTS]  = {"Playlists",  empty_items, empty_actions, 1},
     [M_PODCASTS]   = {"Podcasts",   empty_items, empty_actions, 1},
     [M_AUDIOBOOKS] = {"Audiobooks", empty_items, empty_actions, 1},
-    [M_SETTINGS]   = {"Settings",   empty_items, empty_actions, 1},
+    [M_SETTINGS]   = {
+        .title       = "Settings",
+        .items       = settings_items,
+        .actions     = settings_actions,
+        .count       = 2,
+        .item_fmt_fn = settings_label_fmt,
+    },
+    [M_SETTINGS_ABOUT] = {
+        .title    = "About",
+        .count_fn = about_count,
+        .item_fn  = about_line,
+    },
 };
 
 /* Helpers that paper over the static-vs-dynamic distinction. */
@@ -178,6 +225,7 @@ static int menu_count(const menu_t *m) {
     return m->items ? m->count : m->count_fn();
 }
 static const char *menu_item(const menu_t *m, int idx) {
+    if (m->item_fmt_fn) return m->item_fmt_fn(idx);
     if (m->items) return m->items[idx];
     return m->item_fn(idx);
 }
@@ -264,9 +312,8 @@ static void draw_status_bar(const char *title) {
     /* Battery right. Vertically aligned with the title's cap height. */
     int bat_x = LCD_WIDTH - 14 - 31;
     chrome_battery(bat_x, 12, 78, COL_INK);
-    /* Border line at y=30 — pre-composited 8% ink on cream. */
-    chrome_fill_rect(0, 30, LCD_WIDTH, 1,
-                     lcd_rgb(0xE2, 0xDE, 0xDA));
+    /* Border line at y=30 — pre-composited 8% fg on bg. */
+    chrome_fill_rect(0, 30, LCD_WIDTH, 1, theme_separator());
 }
 
 static void push_menu(cabinet_t *c, int menu_id) {
@@ -429,8 +476,15 @@ void cabinet_draw(cabinet_t *c) {
     list_view_t v = current_view(c);
     /* Per themes.jsx:464, selBg = ink, selFg = cream.
      * Terracotta (COL_ACCENT) is reserved for progress / play
-     * indicators, NOT the menu selector. */
-    if (m->items) {
+     * indicators, NOT the menu selector.
+     *
+     * item_fmt_fn takes priority (Settings-style rows that fold the
+     * current value into the label). Otherwise: static items array, or
+     * dynamic item_fn from tagcache. */
+    if (m->item_fmt_fn) {
+        list_view_draw_dyn(&v, menu_count(m), m->item_fmt_fn,
+                           COL_INK, COL_CREAM, COL_INK);
+    } else if (m->items) {
         list_view_draw(&v, m->items, m->count,
                        COL_INK, COL_CREAM, COL_INK);
     } else {
@@ -569,6 +623,10 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
                        m->title, menu_item(m, idx));
         } else if (act == ACT_SEARCH) {
             push_search(c);
+        } else if (act == ACT_THEME_CYCLE) {
+            theme_set(theme_get() == THEME_LIGHT ? THEME_DARK : THEME_LIGHT);
+            log_printf("cabinet: theme -> %s",
+                       theme_label(theme_get()));
         } else if (act == ACT_PLAY) {
             if (c->fixture_bytes && c->fixture_len > 0) {
                 int rc = audio_engine_play(c->engine, flac_decoder_ops(),

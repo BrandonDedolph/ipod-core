@@ -10,6 +10,7 @@ ui_lib = static_library(
     'atlas.c',
     'chrome.c',
     'list.c',
+    'theme.c',
     'now_playing.c',
     'search.c',
     'cabinet.c',

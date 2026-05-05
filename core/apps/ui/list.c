@@ -9,6 +9,7 @@
 #include "list.h"
 #include "atlas.h"
 #include "chrome.h"
+#include "theme.h"
 #include "../../hal/hal.h"
 
 #include <stdint.h>
@@ -19,12 +20,11 @@ void list_view_init(list_view_t *v) {
 }
 
 /*
- * Chevron colors (faint, on each row's bg). Hardcoded approximations
- * of design's `opacity: sel ? 0.7 : 0.4` against the row bg.
- * Pre-composited so atlas_render's alpha blender doesn't have to know.
+ * Chevron colors (faint, on each row's bg). Pre-composited approximations
+ * of design's `opacity: sel ? 0.7 : 0.4` against the row bg, theme-aware.
  */
-#define CHEV_UNSEL  lcd_rgb(0xB0, 0xA8, 0x9E)   /* 0.4 ink on cream */
-#define CHEV_SEL    lcd_rgb(0xA0, 0x9C, 0x97)   /* 0.7 cream on ink */
+#define CHEV_UNSEL  theme_chev_unsel()
+#define CHEV_SEL    theme_chev_sel()
 
 /* Internal: shared draw routine. `provider` returns the i'th item
  * string. Both list_view_draw and list_view_draw_dyn delegate here. */

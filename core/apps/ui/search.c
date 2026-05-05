@@ -5,14 +5,15 @@
 #include "search.h"
 #include "atlas.h"
 #include "chrome.h"
+#include "theme.h"
 #include "../db/tagcache.h"
 #include "../../hal/hal.h"
 
 #include <string.h>
 
-#define COL_INK    lcd_rgb(0x1A, 0x17, 0x14)
-#define COL_CREAM  lcd_rgb(0xF4, 0xF1, 0xEC)
-#define COL_FAINT  lcd_rgb(0xE2, 0xDE, 0xDA)   /* cream-on-cream divider */
+#define COL_INK    theme_fg()
+#define COL_CREAM  theme_bg()
+#define COL_FAINT  theme_separator()
 
 /* Layout constants. The status bar (y=0..30) is owned by the caller;
  * everything below is search-frame territory. */
