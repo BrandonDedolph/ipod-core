@@ -56,18 +56,20 @@ static int substr_ci(const char *haystack, const char *needle) {
 }
 
 /* Walk every song in the loaded library; collect the first
- * SEARCH_RESULT_MAX whose title contains the query (case-insensitive
- * ASCII). When the library is empty this leaves result_count = 0
- * and the screen shows no results — matching the "no library loaded"
- * state. */
+ * SEARCH_RESULT_MAX whose title, artist, or album contains the query
+ * (case-insensitive ASCII). Matching across all three fields is the
+ * iPod-canonical behavior — typing "aphex" finds songs by Aphex Twin
+ * even when none of the song titles contain the artist's name.
+ * When the library is empty this leaves result_count = 0. */
 static void rebuild_results(search_t *s) {
     s->result_count = 0;
     s->result_selected = 0;
     s->result_scroll = 0;
     int total = tagcache_song_count();
     for (int i = 0; i < total && s->result_count < SEARCH_RESULT_MAX; i++) {
-        const char *title = tagcache_song_title(i);
-        if (substr_ci(title, s->query)) {
+        if (substr_ci(tagcache_song_title(i),  s->query) ||
+            substr_ci(tagcache_song_artist(i), s->query) ||
+            substr_ci(tagcache_song_album(i),  s->query)) {
             s->results[s->result_count++] = i;
         }
     }
