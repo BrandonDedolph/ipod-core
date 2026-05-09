@@ -26,8 +26,8 @@
 #define KB_CELL_H        (KB_H / SEARCH_KB_ROWS)
 #define RESULTS_TOP      (KB_TOP + KB_H)         /* 130 */
 #define RESULTS_H        (LCD_HEIGHT - RESULTS_TOP)
-#define RESULT_ROW_H     22
-#define RESULTS_VISIBLE  ((LCD_HEIGHT - RESULTS_TOP - 4) / RESULT_ROW_H)
+#define RESULT_ROW_H     18
+#define RESULT_HDR_H     11
 
 static char key_char(int idx) {
     if (idx < 0 || idx >= SEARCH_KB_COUNT) return 0;
@@ -55,24 +55,62 @@ static int substr_ci(const char *haystack, const char *needle) {
     return 0;
 }
 
-/* Walk every song in the loaded library; collect the first
- * SEARCH_RESULT_MAX whose title, artist, or album contains the query
- * (case-insensitive ASCII). Matching across all three fields is the
- * iPod-canonical behavior — typing "aphex" finds songs by Aphex Twin
- * even when none of the song titles contain the artist's name.
- * When the library is empty this leaves result_count = 0. */
+/* Append one result; bail silently if the flat array is full. */
+static void push_result(search_t *s, search_result_type_t type, int idx) {
+    int cap = (int)(sizeof(s->results) / sizeof(s->results[0]));
+    if (s->result_count >= cap) return;
+    s->results[s->result_count].type = type;
+    s->results[s->result_count].idx  = idx;
+    s->result_count++;
+}
+
+/* Three-pass scan: songs first, then albums, then artists. The flat
+ * `results` array is grouped by type so the renderer can emit section
+ * headers each time the type changes, and the user lands in Songs
+ * (the largest section) when they hit RIGHT to focus the result list.
+ *
+ * Songs match on title, artist, OR album so typing "aphex" surfaces
+ * the artist's tracks even when no title contains the word. Albums
+ * and artists match only on their own canonical name — matching
+ * artists by song title would create noise (every artist whose
+ * catalog mentions "love" would show up for query "love"). */
 static void rebuild_results(search_t *s) {
-    s->result_count = 0;
+    s->result_count    = 0;
     s->result_selected = 0;
-    s->result_scroll = 0;
-    int total = tagcache_song_count();
-    for (int i = 0; i < total && s->result_count < SEARCH_RESULT_MAX; i++) {
+    s->result_scroll   = 0;
+
+    /* Songs. */
+    int song_added = 0;
+    int n_songs = tagcache_song_count();
+    for (int i = 0; i < n_songs && song_added < SEARCH_MAX_SONGS; i++) {
         if (substr_ci(tagcache_song_title(i),  s->query) ||
             substr_ci(tagcache_song_artist(i), s->query) ||
             substr_ci(tagcache_song_album(i),  s->query)) {
-            s->results[s->result_count++] = i;
+            push_result(s, SEARCH_RESULT_SONG, i);
+            song_added++;
         }
     }
+
+    /* Albums. */
+    int album_added = 0;
+    int n_albums = tagcache_album_count();
+    for (int i = 0; i < n_albums && album_added < SEARCH_MAX_ALBUMS; i++) {
+        if (substr_ci(tagcache_album_name(i), s->query)) {
+            push_result(s, SEARCH_RESULT_ALBUM, i);
+            album_added++;
+        }
+    }
+
+    /* Artists. */
+    int artist_added = 0;
+    int n_artists = tagcache_artist_count();
+    for (int i = 0; i < n_artists && artist_added < SEARCH_MAX_ARTISTS; i++) {
+        if (substr_ci(tagcache_artist_name(i), s->query)) {
+            push_result(s, SEARCH_RESULT_ARTIST, i);
+            artist_added++;
+        }
+    }
+
     if (s->focus == SEARCH_FOCUS_RESULTS && s->result_count == 0) {
         s->focus = SEARCH_FOCUS_KB;
     }
@@ -160,6 +198,28 @@ static void draw_keyboard(const search_t *s) {
     }
 }
 
+/* The label printed in the section header for a given result type.
+ * Caps so the rows below visually settle as the body content. */
+static const char *type_label(search_result_type_t t) {
+    switch (t) {
+        case SEARCH_RESULT_SONG:   return "SONGS";
+        case SEARCH_RESULT_ALBUM:  return "ALBUMS";
+        case SEARCH_RESULT_ARTIST: return "ARTISTS";
+    }
+    return "";
+}
+
+/* Look up a result's display string. Songs render their title;
+ * albums and artists render their canonical name. */
+static const char *result_label(const search_result_t *r) {
+    switch (r->type) {
+        case SEARCH_RESULT_SONG:   return tagcache_song_title (r->idx);
+        case SEARCH_RESULT_ALBUM:  return tagcache_album_name (r->idx);
+        case SEARCH_RESULT_ARTIST: return tagcache_artist_name(r->idx);
+    }
+    return "";
+}
+
 static void draw_results(const search_t *s) {
     chrome_fill_rect(0, RESULTS_TOP, LCD_WIDTH, RESULTS_H, COL_CREAM);
     /* Top divider. */
@@ -172,24 +232,38 @@ static void draw_results(const search_t *s) {
     }
 
     bool res_focused = (s->focus == SEARCH_FOCUS_RESULTS);
-    int first = s->result_scroll;
-    int last  = first + RESULTS_VISIBLE;
-    if (last > s->result_count) last = s->result_count;
+    int panel_bottom = RESULTS_TOP + RESULTS_H;
+    int y = RESULTS_TOP + 2;
 
-    for (int i = first; i < last; i++) {
-        int row_idx = i - first;
-        int row_top = RESULTS_TOP + 2 + row_idx * RESULT_ROW_H;
+    /* Walk items starting at scroll. Emit a section header before the
+     * first item of each type — including the first emitted item, so
+     * the user always sees what category they're scrolled into. Stop
+     * when we'd exceed the panel. */
+    search_result_type_t prev_type = (search_result_type_t)-1;
+    for (int i = s->result_scroll; i < s->result_count; i++) {
+        const search_result_t *r = &s->results[i];
+
+        if (r->type != prev_type) {
+            if (y + RESULT_HDR_H > panel_bottom) break;
+            atlas_render(&NUNITO_BOLD_9, 12, y + RESULT_HDR_H - 2,
+                         type_label(r->type), COL_FAINT);
+            y += RESULT_HDR_H;
+            prev_type = r->type;
+        }
+
+        if (y + RESULT_ROW_H > panel_bottom) break;
         bool sel = (i == s->result_selected);
-        const char *title = tagcache_song_title(s->results[i]);
-        int baseline = row_top + RESULT_ROW_H - 7;
+        int baseline = y + RESULT_ROW_H - 5;
+        const char *label = result_label(r);
 
         if (sel && res_focused) {
-            chrome_rounded_rect(6, row_top, LCD_WIDTH - 12, RESULT_ROW_H,
+            chrome_rounded_rect(6, y, LCD_WIDTH - 12, RESULT_ROW_H,
                                 4, COL_INK);
-            atlas_render(&NUNITO_REGULAR_13, 14, baseline, title, COL_CREAM);
+            atlas_render(&NUNITO_REGULAR_13, 14, baseline, label, COL_CREAM);
         } else {
-            atlas_render(&NUNITO_REGULAR_13, 14, baseline, title, COL_INK);
+            atlas_render(&NUNITO_REGULAR_13, 14, baseline, label, COL_INK);
         }
+        y += RESULT_ROW_H;
     }
 }
 
@@ -203,17 +277,37 @@ void search_draw(const search_t *s) {
 
 /* ---------- Input ---------------------------------------------------- */
 
+/* Highest item index that still fits in the panel given `scroll` as
+ * the topmost item. Mirrors the rendering logic exactly so scroll
+ * decisions match what the user can see. Returns scroll-1 when even
+ * the first item doesn't fit (degenerate case). */
+static int last_visible_item(const search_t *s, int scroll) {
+    int y = RESULTS_TOP + 2;
+    int panel_bottom = RESULTS_TOP + RESULTS_H;
+    search_result_type_t prev = (search_result_type_t)-1;
+    int last = scroll - 1;
+    for (int i = scroll; i < s->result_count; i++) {
+        if (s->results[i].type != prev) {
+            if (y + RESULT_HDR_H > panel_bottom) break;
+            y += RESULT_HDR_H;
+            prev = s->results[i].type;
+        }
+        if (y + RESULT_ROW_H > panel_bottom) break;
+        y += RESULT_ROW_H;
+        last = i;
+    }
+    return last;
+}
+
 static void clamp_result_scroll(search_t *s) {
     if (s->result_selected < s->result_scroll) {
         s->result_scroll = s->result_selected;
     }
-    if (s->result_selected >= s->result_scroll + RESULTS_VISIBLE) {
-        s->result_scroll = s->result_selected - RESULTS_VISIBLE + 1;
+    while (s->result_selected > last_visible_item(s, s->result_scroll)) {
+        s->result_scroll++;
+        if (s->result_scroll > s->result_selected) break;
     }
     if (s->result_scroll < 0) s->result_scroll = 0;
-    int max_off = s->result_count - RESULTS_VISIBLE;
-    if (max_off < 0) max_off = 0;
-    if (s->result_scroll > max_off) s->result_scroll = max_off;
 }
 
 static void apply_key(search_t *s, int idx) {
@@ -233,8 +327,8 @@ static void apply_key(search_t *s, int idx) {
 }
 
 search_action_t search_handle_button(search_t *s, button_t btn,
-                                     int *out_global_idx) {
-    if (out_global_idx) *out_global_idx = -1;
+                                     int *out_idx) {
+    if (out_idx) *out_idx = -1;
 
     if (btn == BUTTON_MENU) return SEARCH_ACT_POP;
 
@@ -274,10 +368,13 @@ search_action_t search_handle_button(search_t *s, button_t btn,
             if (s->result_count > 0
                 && s->result_selected >= 0
                 && s->result_selected < s->result_count) {
-                if (out_global_idx) {
-                    *out_global_idx = s->results[s->result_selected];
+                const search_result_t *r = &s->results[s->result_selected];
+                if (out_idx) *out_idx = r->idx;
+                switch (r->type) {
+                    case SEARCH_RESULT_SONG:   return SEARCH_ACT_PLAY;
+                    case SEARCH_RESULT_ALBUM:  return SEARCH_ACT_DRILL_ALBUM;
+                    case SEARCH_RESULT_ARTIST: return SEARCH_ACT_DRILL_ARTIST;
                 }
-                return SEARCH_ACT_PLAY;
             }
             return SEARCH_ACT_NONE;
         default:

@@ -27,6 +27,7 @@
 #define CORE_APPS_UI_THUMB_CACHE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define THUMB_CACHE_W   22
@@ -39,6 +40,21 @@
  * the tagcache for the same negative answer.
  */
 void thumb_cache_prime(int song_idx);
+
+/*
+ * Same shape as thumb_cache_prime, but the JPEG bytes come from the
+ * caller rather than the song-art tagcache. Used for artist photos
+ * (which live in a parallel section of the .tcdb) and any other
+ * future per-non-song images. `key` must be unique against all other
+ * cache occupants — convention is to use negative pseudo-indices for
+ * non-song entries (e.g. -1000 - artist_idx for artists) so they
+ * never collide with real song_idx values.
+ *
+ * If the slot is already populated for this key, the call is a no-op.
+ * On decode failure the slot is recorded as "no art" so the caller
+ * doesn't retry every frame.
+ */
+void thumb_cache_prime_bytes(int key, const void *bytes, size_t len);
 
 /*
  * Look up a previously-primed thumbnail. Returns a pointer to the

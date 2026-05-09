@@ -86,20 +86,19 @@ static int         filtered_composer_song_count(void)      { return tagcache_son
 static const char *filtered_composer_song_title(int idx)   { return tagcache_song_title_for_composer(g_filter, idx); }
 
 /*
- * Draw a 22 × 22 album-art thumbnail at (x, y) for the album-list row
- * `album_idx`. Pulls the first song's art bytes via the tagcache, hits
- * the thumb_cache, blits real RGB565 pixels on hit; on miss / decode
- * failure / no-embedded-art falls back to a diagonal-stripe pattern so
- * the slot doesn't read as a blank box.
+ * Draw a 22 × 22 art thumbnail for the row at (x, y), pulling the
+ * first song's bytes through the thumb_cache. On hit we blit RGB565
+ * pixels; on miss / decode failure / no-art we fall back to the same
+ * diagonal-stripe pattern the NP screen uses, so the visual language
+ * is consistent end-to-end.
  *
- * Decode is synchronous-on-draw today, so the first time the user
- * lands on the Albums list there's a brief stutter as the visible
- * rows decode their JPEGs. This is acceptable on the host sim;
- * shipping on hardware will need a background decode task before this
- * scales to a 100-album library.
+ * Decode is synchronous-on-draw today: the first time the user lands
+ * on a list with thumbnails there's a brief stutter as the visible
+ * rows decode their JPEGs. Acceptable on the host sim; shipping on
+ * hardware will need a background decode task before this scales to
+ * libraries with hundreds of rows.
  */
-static void album_row_leading(int album_idx, int x, int y) {
-    int song_idx = tagcache_song_index_for_album(album_idx, 0);
+static void draw_thumb_for_song(int song_idx, int x, int y) {
     if (song_idx >= 0) {
         thumb_cache_prime(song_idx);
         const uint16_t *thumb = thumb_cache_get(song_idx);
@@ -114,10 +113,50 @@ static void album_row_leading(int album_idx, int x, int y) {
             return;
         }
     }
-    /* Fallback: diagonal stripes. Matches the no-art treatment on the
-     * NP screen so the visual language is consistent end-to-end. */
     chrome_diagonal_stripes(x, y, LIST_LEADING_W, LIST_LEADING_H,
                             6, 4, theme_stripe_a(), theme_stripe_b());
+}
+
+/* Per-list leading callbacks. Each resolves the row index to a song
+ * index in its own way and delegates the actual blit. */
+static void album_row_leading(int album_idx, int x, int y) {
+    draw_thumb_for_song(tagcache_song_index_for_album(album_idx, 0), x, y);
+}
+static void song_row_leading(int song_idx, int x, int y) {
+    draw_thumb_for_song(song_idx, x, y);
+}
+
+/* Artists are special: they may have a separate fetched photo (from
+ * MusicBrainz/Wikipedia/Commons via `core tagcache build --fetch-art`).
+ * We piggy-back on thumb_cache by routing the artist photo through a
+ * negative pseudo-key (-1000 - artist_idx) so it lives in the same
+ * 32-slot LRU but never collides with real song indices. Falls back
+ * to the first song's album art when the artist has no fetched photo,
+ * keeping the visual experience consistent end-to-end. */
+static int artist_thumb_key(int artist_idx) {
+    return -1000 - artist_idx;
+}
+static void artist_row_leading(int artist_idx, int x, int y) {
+    size_t art_len = 0;
+    const void *art = tagcache_artist_art_bytes(artist_idx, &art_len);
+    if (art && art_len > 0) {
+        int key = artist_thumb_key(artist_idx);
+        thumb_cache_prime_bytes(key, art, art_len);
+        const uint16_t *thumb = thumb_cache_get(key);
+        if (thumb) {
+            lcd_pixel_t *fb = lcd_framebuffer();
+            for (int row = 0; row < THUMB_CACHE_H; row++) {
+                for (int col = 0; col < THUMB_CACHE_W; col++) {
+                    fb[(y + row) * LCD_WIDTH + (x + col)] =
+                        thumb[row * THUMB_CACHE_W + col];
+                }
+            }
+            return;
+        }
+    }
+    /* Fallback: the artist's first song's album art (or stripes if
+     * even that's unavailable). */
+    draw_thumb_for_song(tagcache_song_index_for_artist(artist_idx, 0), x, y);
 }
 
 static const char *const main_items[] = {
@@ -539,13 +578,25 @@ void cabinet_draw(cabinet_t *c) {
     } else if (m->items) {
         list_view_draw(&v, m->items, m->count,
                        COL_INK, COL_CREAM, COL_INK);
-    } else if (current_menu(c) == M_MUSIC_ALBUMS) {
-        list_view_draw_dyn_leading(&v, m->count_fn(), m->item_fn,
-                                   album_row_leading,
-                                   COL_INK, COL_CREAM, COL_INK);
     } else {
-        list_view_draw_dyn(&v, m->count_fn(), m->item_fn,
-                           COL_INK, COL_CREAM, COL_INK);
+        /* Tagcache-backed lists; Artists / Albums / Songs get art
+         * thumbnails on each row. Genres / Composers don't — their
+         * "first song" mapping doesn't represent the group. */
+        list_leading_fn leading = NULL;
+        switch (current_menu(c)) {
+            case M_MUSIC_ARTISTS: leading = artist_row_leading; break;
+            case M_MUSIC_ALBUMS:  leading = album_row_leading;  break;
+            case M_MUSIC_SONGS:   leading = song_row_leading;   break;
+            default:              leading = NULL;
+        }
+        if (leading) {
+            list_view_draw_dyn_leading(&v, m->count_fn(), m->item_fn,
+                                       leading,
+                                       COL_INK, COL_CREAM, COL_INK);
+        } else {
+            list_view_draw_dyn(&v, m->count_fn(), m->item_fn,
+                               COL_INK, COL_CREAM, COL_INK);
+        }
     }
 }
 
@@ -581,14 +632,36 @@ void cabinet_handle_button(cabinet_t *c, button_t btn) {
     }
 
     /* Search frame: keyboard + results live in search_t. POP unwinds
-     * back to the parent menu; PLAY drills into NP via play_global_song. */
+     * back to the parent menu; PLAY drills into NP via play_global_song;
+     * DRILL_ALBUM/DRILL_ARTIST pop the search frame and push a filtered
+     * drilldown menu so the user lands inside the album / artist they
+     * picked, exactly as if they'd navigated there manually. */
     if (current_kind(c) == FRAME_SEARCH) {
-        int global_idx = -1;
-        search_action_t act = search_handle_button(&c->search, btn, &global_idx);
-        if (act == SEARCH_ACT_POP) {
-            pop_frame(c);
-        } else if (act == SEARCH_ACT_PLAY && global_idx >= 0) {
-            play_global_song(c, global_idx);
+        int idx = -1;
+        search_action_t act = search_handle_button(&c->search, btn, &idx);
+        switch (act) {
+            case SEARCH_ACT_POP:
+                pop_frame(c);
+                break;
+            case SEARCH_ACT_PLAY:
+                if (idx >= 0) play_global_song(c, idx);
+                break;
+            case SEARCH_ACT_DRILL_ALBUM:
+                if (idx >= 0) {
+                    pop_frame(c);
+                    push_filtered_menu(c, M_MUSIC_ALBUM_SONGS, idx,
+                                       tagcache_album_name(idx));
+                }
+                break;
+            case SEARCH_ACT_DRILL_ARTIST:
+                if (idx >= 0) {
+                    pop_frame(c);
+                    push_filtered_menu(c, M_MUSIC_ARTIST_SONGS, idx,
+                                       tagcache_artist_name(idx));
+                }
+                break;
+            case SEARCH_ACT_NONE:
+                break;
         }
         return;
     }

@@ -41,6 +41,8 @@ func Read(data []byte) (*Model, error) {
 		{hdr.ComposerIdxOff,    uint64(hdr.NComposers) * 4,              "composer_idx"},
 		{hdr.StringsOff,        hdr.StringsLen,                          "strings"},
 		{hdr.ArtOff,            hdr.ArtLen,                              "art"},
+		{hdr.ArtistArtIdxOff,   uint64(hdr.NArtists) * 16,               "artist_art_idx"},
+		{hdr.ArtistArtBlobOff,  hdr.ArtistArtBlobLen,                    "artist_art_blob"},
 	}
 	for _, c := range checks {
 		if c.off+c.length < c.off /* overflow */ || c.off+c.length > end {
@@ -144,6 +146,21 @@ func Read(data []byte) (*Model, error) {
 		return out
 	}
 
+	// Artist art: pull each (off, len) pair, slice into the blob.
+	// (0, 0) entries stay nil; the firmware falls back to the
+	// artist's first album art when this is unavailable.
+	artistArt := make([][]byte, hdr.NArtists)
+	for i := uint32(0); i < hdr.NArtists; i++ {
+		off := hdr.ArtistArtIdxOff + uint64(i)*16
+		artOff  := LE.Uint64(data[off:])
+		artLen  := LE.Uint64(data[off+8:])
+		if artLen == 0 {
+			continue
+		}
+		start := hdr.ArtistArtBlobOff + artOff
+		artistArt[i] = append([]byte(nil), data[start:start+artLen]...)
+	}
+
 	return &Model{
 		Songs:           songs,
 		UniqArtists:     uniqArtists,
@@ -158,5 +175,6 @@ func Read(data []byte) (*Model, error) {
 		AlbumGroups:     readGroups(hdr.AlbumGroupsOff,    hdr.NAlbums),
 		GenreGroups:     readGroups(hdr.GenreGroupsOff,    hdr.NGenres),
 		ComposerGroups:  readGroups(hdr.ComposerGroupsOff, hdr.NComposers),
+		ArtistArt:       artistArt,
 	}, nil
 }

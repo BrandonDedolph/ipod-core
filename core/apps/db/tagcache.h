@@ -134,6 +134,20 @@ const char *tagcache_song_album(int idx);
  */
 const void *tagcache_song_art_bytes(int idx, size_t *out_len);
 
+/*
+ * Per-artist photo bytes (JPEG), populated when the .tcdb was built
+ * with `core tagcache build --fetch-art`. Returns NULL when:
+ *   - no library has been loaded, or
+ *   - the artist had no fetched photo (Wikipedia turned up empty), or
+ *   - the .tcdb pre-dates the artist-art format (v1).
+ *
+ * Distinct from album art — these come from MusicBrainz / Wikipedia /
+ * Commons rather than the audio file's tags. The Artists list uses
+ * this as the row leading visual; cabinet falls back to the artist's
+ * first album cover when the photo is unavailable.
+ */
+const void *tagcache_artist_art_bytes(int artist_idx, size_t *out_len);
+
 /* ---------- Filtered queries (drilldown) ------------------------- */
 
 /*

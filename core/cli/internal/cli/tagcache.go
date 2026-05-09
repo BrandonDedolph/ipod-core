@@ -1,10 +1,16 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
+	"time"
 
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/artistart"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/tagcache"
 	"github.com/spf13/cobra"
 )
@@ -65,8 +71,9 @@ func newTagcacheDumpCmd() *cobra.Command {
 
 func newTagcacheBuildCmd() *cobra.Command {
 	var (
-		out   string
-		force bool
+		out      string
+		force    bool
+		fetchArt bool
 	)
 	cmd := &cobra.Command{
 		Use:   "build <music-dir>",
@@ -82,6 +89,12 @@ func newTagcacheBuildCmd() *cobra.Command {
 				return err
 			}
 			model := tagcache.Build(songs)
+
+			if fetchArt {
+				if err := fetchArtistArt(cmd, model); err != nil {
+					return err
+				}
+			}
 
 			// Refuse to overwrite an existing file unless --force.
 			// O_EXCL gives us the atomic check; the user gets a clear
@@ -120,7 +133,84 @@ func newTagcacheBuildCmd() *cobra.Command {
 		"Output file path (default: <music-dir>/tagcache.tcdb)")
 	cmd.Flags().BoolVarP(&force, "force", "f", false,
 		"Overwrite the output file if it already exists")
+	cmd.Flags().BoolVar(&fetchArt, "fetch-art", false,
+		"Fetch artist photos from MusicBrainz/Wikipedia/Commons and embed in the tagcache. "+
+			"Rate-limited to 1 req/sec; takes a few minutes for a typical library on first run, "+
+			"then is fast on rebuild via the local cache (~/.cache/core/artist-art).")
 	return cmd
+}
+
+// fetchArtistArt walks UniqArtists and populates model.ArtistArt by
+// hitting MusicBrainz / Wikidata / Commons for each. SIGINT during the
+// run cancels the context cleanly so the user can ctrl-C out without
+// leaving partial state.
+//
+// On a per-artist failure we keep going — the build is allowed to ship
+// with fewer artist photos than artists; the firmware falls back to
+// album art for entries without a fetched image.
+func fetchArtistArt(cmd *cobra.Command, model *tagcache.Model) error {
+	out := cmd.OutOrStdout()
+	cacheDir, err := artistart.DefaultCacheDir()
+	if err != nil {
+		return fmt.Errorf("artist-art cache: %w", err)
+	}
+	if cacheDir == "" {
+		fmt.Fprintln(out, "warning: no user cache dir; fetched artist art won't survive across builds")
+	}
+
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		fmt.Fprintln(out, "\ninterrupt — finishing current request and stopping")
+		cancel()
+	}()
+
+	f := artistart.NewFetcher()
+	defer f.Close()
+
+	model.ArtistArt = make([][]byte, len(model.UniqArtists))
+	hits, miss, fail := 0, 0, 0
+	start := time.Now()
+	const maxDim = 128
+	const quality = 85
+	for i, name := range model.UniqArtists {
+		if ctx.Err() != nil {
+			break
+		}
+		bytes, cached, err := artistart.CachedFetch(ctx, f, cacheDir, name, maxDim, quality)
+		if err == nil {
+			model.ArtistArt[i] = bytes
+			hits++
+			tag := "fetched"
+			if cached {
+				tag = "cached"
+			}
+			fmt.Fprintf(out, "  [%d/%d] %-40s %s (%d B)\n",
+				i+1, len(model.UniqArtists), truncate(name, 40), tag, len(bytes))
+		} else if errors.Is(err, artistart.ErrNotFound) {
+			miss++
+			fmt.Fprintf(out, "  [%d/%d] %-40s no photo\n",
+				i+1, len(model.UniqArtists), truncate(name, 40))
+		} else {
+			fail++
+			fmt.Fprintf(out, "  [%d/%d] %-40s error: %v\n",
+				i+1, len(model.UniqArtists), truncate(name, 40), err)
+		}
+	}
+	fmt.Fprintf(out, "artist art: %d ok, %d not-found, %d errors in %s\n",
+		hits, miss, fail, time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
 }
 
 func pl(n int) string {

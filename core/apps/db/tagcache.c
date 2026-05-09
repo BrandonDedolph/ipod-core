@@ -163,6 +163,14 @@ typedef struct {
      * artist list). */
     char **uniq_artists;
     int    uniq_artist_count;
+    /* Per-artist photo (JPEG bytes) populated only when the .tcdb
+     * was built with --fetch-art. Same indexing as uniq_artists;
+     * per-entry NULL means no fetched photo for that artist (the UI
+     * falls back to the first album's cover). Length matches
+     * uniq_artist_count, or zero arrays if the file had no
+     * artist-art section. */
+    void   **artist_art_bytes;
+    size_t  *artist_art_lens;
     char **uniq_albums;
     int    uniq_album_count;
     char **uniq_genres;
@@ -226,6 +234,12 @@ static void library_clear(void) {
     free(LIBRARY.uniq_genres);
     free(LIBRARY.uniq_composers);
 
+    if (LIBRARY.artist_art_bytes) {
+        for (int i = 0; i < LIBRARY.uniq_artist_count; i++) free(LIBRARY.artist_art_bytes[i]);
+        free(LIBRARY.artist_art_bytes);
+    }
+    free(LIBRARY.artist_art_lens);
+
     free(LIBRARY.song_artist_idx);
     free(LIBRARY.song_album_idx);
     free(LIBRARY.song_genre_idx);
@@ -284,6 +298,11 @@ static void library_free_contents(library_t *lib) {
     for (int i = 0; i < lib->uniq_album_count;    i++) free(lib->uniq_albums   [i]);
     for (int i = 0; i < lib->uniq_genre_count;    i++) free(lib->uniq_genres   [i]);
     for (int i = 0; i < lib->uniq_composer_count; i++) free(lib->uniq_composers[i]);
+    if (lib->artist_art_bytes) {
+        for (int i = 0; i < lib->uniq_artist_count; i++) free(lib->artist_art_bytes[i]);
+        free(lib->artist_art_bytes);
+    }
+    free(lib->artist_art_lens);
     free(lib->uniq_artists);
     free(lib->uniq_albums);
     free(lib->uniq_genres);
@@ -897,6 +916,9 @@ static int tcdb_parse(const void *bytes, size_t len, library_t *staging) {
     uint64_t strings_len        = tcdb_le64(p + TCDB_OFF_STRINGS_LEN);
     uint64_t art_off            = tcdb_le64(p + TCDB_OFF_ART_OFF);
     uint64_t art_len            = tcdb_le64(p + TCDB_OFF_ART_LEN);
+    uint64_t artist_art_idx_off  = tcdb_le64(p + TCDB_OFF_ARTIST_ART_IDX_OFF);
+    uint64_t artist_art_blob_off = tcdb_le64(p + TCDB_OFF_ARTIST_ART_BLOB_OFF);
+    uint64_t artist_art_blob_len = tcdb_le64(p + TCDB_OFF_ARTIST_ART_BLOB_LEN);
 
     /* Bounds-check every fixed-size section against file length. The
      * group blocks have variable bodies; we only check their offset
@@ -911,7 +933,10 @@ static int tcdb_parse(const void *bytes, size_t len, library_t *staging) {
         !tcdb_section_in_bounds(genre_groups_off,    (uint64_t)n_genres    * 4, len) ||
         !tcdb_section_in_bounds(composer_groups_off, (uint64_t)n_composers * 4, len) ||
         !tcdb_section_in_bounds(strings_off, strings_len, len) ||
-        !tcdb_section_in_bounds(art_off,     art_len,     len)) {
+        !tcdb_section_in_bounds(art_off,     art_len,     len) ||
+        !tcdb_section_in_bounds(artist_art_idx_off,
+                                (uint64_t)n_artists * TCDB_ARTIST_ART_ENTRY_SIZE, len) ||
+        !tcdb_section_in_bounds(artist_art_blob_off, artist_art_blob_len, len)) {
         return -1;
     }
 
@@ -996,6 +1021,33 @@ static int tcdb_parse(const void *bytes, size_t len, library_t *staging) {
     }
     staging->uniq_composers = uniq_composers;
     staging->uniq_composer_count = (int)n_composers;
+
+    /* Artist art (v2): per-artist (off, len) into a shared blob. We
+     * allocate one parallel pair sized to n_artists so the accessor
+     * indexes uniformly; entries the file marks as (0, 0) stay NULL.
+     * A v1 file (no artist-art section) reaches here with both index
+     * and blob bounds-validated as zero-length, so the loop runs zero
+     * times and the parallel arrays end up all-NULL — same as a v2
+     * file built without --fetch-art. */
+    if (n_artists > 0) {
+        staging->artist_art_bytes = (void  **)calloc(n_artists, sizeof(void *));
+        staging->artist_art_lens  = (size_t *)calloc(n_artists, sizeof(size_t));
+        if (!staging->artist_art_bytes || !staging->artist_art_lens) return -1;
+    }
+    for (uint32_t i = 0; i < n_artists; i++) {
+        const uint8_t *e = p + artist_art_idx_off + (uint64_t)i * TCDB_ARTIST_ART_ENTRY_SIZE;
+        uint64_t off = tcdb_le64(e);
+        uint64_t art_l = tcdb_le64(e + 8);
+        if (art_l == 0) continue;
+        /* Same anti-overflow shape as the per-song art bounds check. */
+        if (art_l > artist_art_blob_len) return -1;
+        if (off > artist_art_blob_len - art_l) return -1;
+        void *copy = malloc((size_t)art_l);
+        if (!copy) return -1;
+        memcpy(copy, p + artist_art_blob_off + off, (size_t)art_l);
+        staging->artist_art_bytes[i] = copy;
+        staging->artist_art_lens [i] = (size_t)art_l;
+    }
 
     /* Per-song lookup arrays. Allocate up front so the read loop
      * below can fill them; partial-allocation failure leaves them
@@ -1189,6 +1241,17 @@ const void *tagcache_song_art_bytes(int idx, size_t *out_len) {
     void *bytes = LIBRARY.art_bytes[idx];
     if (!bytes) return NULL;
     if (out_len) *out_len = LIBRARY.art_lens[idx];
+    return bytes;
+}
+
+const void *tagcache_artist_art_bytes(int artist_idx, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!LIBRARY.loaded) return NULL;
+    if (artist_idx < 0 || artist_idx >= LIBRARY.uniq_artist_count) return NULL;
+    if (!LIBRARY.artist_art_bytes) return NULL;
+    void *bytes = LIBRARY.artist_art_bytes[artist_idx];
+    if (!bytes) return NULL;
+    if (out_len) *out_len = LIBRARY.artist_art_lens[artist_idx];
     return bytes;
 }
 

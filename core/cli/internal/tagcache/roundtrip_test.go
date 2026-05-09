@@ -127,6 +127,63 @@ func TestEmpty(t *testing.T) {
 	}
 }
 
+// TestArtistArtRoundtrip confirms per-artist photos survive a write/
+// read cycle: present entries come back byte-equal, missing entries
+// stay nil, and the index header bounds-check accepts the resulting
+// file. The .tcdb format is the contract between the Go builder and
+// the firmware C reader, so format-shape regressions here would
+// silently break artist thumbnails on real hardware.
+func TestArtistArtRoundtrip(t *testing.T) {
+	in := []SongInfo{
+		{Path: "/a.flac", Title: "Apple",  Artist: "Aphex Twin"},
+		{Path: "/b.flac", Title: "Banana", Artist: "Brian Eno"},
+		{Path: "/c.flac", Title: "Cherry", Artist: "Caribou"},
+	}
+	m := Build(in)
+	/* Sparse: art for artist 0 + 2, none for 1. The mid-gap is the
+	 * interesting case — encoder must still emit an index entry for
+	 * "Brian Eno" so per-artist offsets stay aligned. */
+	jpegA := []byte{0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 5}
+	jpegC := []byte{0xff, 0xd8, 0xff, 0xe1, 9, 9}
+	m.ArtistArt = make([][]byte, len(m.UniqArtists))
+	for i, name := range m.UniqArtists {
+		switch name {
+		case "Aphex Twin":
+			m.ArtistArt[i] = jpegA
+		case "Caribou":
+			m.ArtistArt[i] = jpegC
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := m.Write(&buf); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := Read(buf.Bytes())
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got.ArtistArt) != len(m.UniqArtists) {
+		t.Fatalf("artist art len: want %d got %d", len(m.UniqArtists), len(got.ArtistArt))
+	}
+	for i, name := range got.UniqArtists {
+		switch name {
+		case "Aphex Twin":
+			if !bytes.Equal(got.ArtistArt[i], jpegA) {
+				t.Errorf("art[%s] mismatch: want %v got %v", name, jpegA, got.ArtistArt[i])
+			}
+		case "Brian Eno":
+			if got.ArtistArt[i] != nil {
+				t.Errorf("art[%s] should be nil, got %v", name, got.ArtistArt[i])
+			}
+		case "Caribou":
+			if !bytes.Equal(got.ArtistArt[i], jpegC) {
+				t.Errorf("art[%s] mismatch: want %v got %v", name, jpegC, got.ArtistArt[i])
+			}
+		}
+	}
+}
+
 // TestNoArt covers the no-embedded-art path on every track. The art
 // blob should be zero-length but still validly addressed.
 func TestNoArt(t *testing.T) {

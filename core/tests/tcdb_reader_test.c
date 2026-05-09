@@ -176,7 +176,15 @@ static int build_happy_fixture(buf_t *out) {
     uint64_t strings_off = groups_end;
     uint64_t art_off     = strings_off + strings.len;
     uint64_t art_len     = jpegA_len;
-    uint64_t total       = art_off + art_len;
+    /* v2: per-artist art index (n_artists * 16 bytes of (off, len)
+     * pairs) followed by an artist-art blob. The fixture exercises the
+     * "no fetched artist photos" path: the index slots stay zero and
+     * the blob is empty. The C reader still has to handle the section
+     * being present-but-trivial without failing. */
+    uint64_t artist_art_idx_off  = art_off + art_len;
+    uint64_t artist_art_blob_off = artist_art_idx_off + (uint64_t)n_artists * TCDB_ARTIST_ART_ENTRY_SIZE;
+    uint64_t artist_art_blob_len = 0;
+    uint64_t total       = artist_art_blob_off + artist_art_blob_len;
 
     /* Allocate the full file. */
     out->data = (uint8_t *)calloc(1, total);
@@ -209,6 +217,12 @@ static int build_happy_fixture(buf_t *out) {
     put_u64(h + TCDB_OFF_STRINGS_LEN, strings.len);
     put_u64(h + TCDB_OFF_ART_OFF,     art_off);
     put_u64(h + TCDB_OFF_ART_LEN,     art_len);
+    put_u64(h + TCDB_OFF_ARTIST_ART_IDX_OFF,  artist_art_idx_off);
+    put_u64(h + TCDB_OFF_ARTIST_ART_BLOB_OFF, artist_art_blob_off);
+    put_u64(h + TCDB_OFF_ARTIST_ART_BLOB_LEN, artist_art_blob_len);
+    /* Artist-art index entries default to all-zero from the calloc above
+     * — exactly the "no photo for this artist" sentinel — so we don't
+     * need to write into them explicitly. */
 
     /* Song records. */
     uint32_t s_titles[3] = { S_apple, S_banana, S_cherry };

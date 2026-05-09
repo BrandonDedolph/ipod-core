@@ -73,6 +73,13 @@ type Model struct {
 	AlbumGroups    [][]uint32
 	GenreGroups    [][]uint32
 	ComposerGroups [][]uint32
+
+	// Optional per-artist photo bytes (JPEG, fetched offline by
+	// `core tagcache build --fetch-art`). Length is either 0 (none
+	// fetched at all — common path) or len(UniqArtists). Per-entry
+	// nil/empty means "no photo for this artist", and is also fine
+	// — the firmware falls back to the artist's first album art.
+	ArtistArt [][]byte
 }
 
 // uniqIndex collects the case-insensitive-distinct values of one tag
@@ -206,6 +213,28 @@ func (m *Model) Write(w io.Writer) error {
 	artOff := stringsOff + stringsLen
 	artLen := uint64(artBlob.Len())
 
+	// Artist art: per-artist (off, len) pairs, then a concatenated
+	// blob. Always emit the index (even when empty) so the on-disk
+	// shape is uniform; bound the index to the smaller of UniqArtists
+	// vs ArtistArt so a partial set is tolerated.
+	var artistArtBlob bytes.Buffer
+	type artistArtEntry struct{ off, length uint64 }
+	artistArtEntries := make([]artistArtEntry, len(m.UniqArtists))
+	for i := 0; i < len(m.UniqArtists) && i < len(m.ArtistArt); i++ {
+		b := m.ArtistArt[i]
+		if len(b) == 0 {
+			continue
+		}
+		artistArtEntries[i] = artistArtEntry{
+			off:    uint64(artistArtBlob.Len()),
+			length: uint64(len(b)),
+		}
+		artistArtBlob.Write(b)
+	}
+	artistArtIdxOff  := artOff + artLen
+	artistArtBlobOff := artistArtIdxOff + uint64(len(m.UniqArtists))*16
+	artistArtBlobLen := uint64(artistArtBlob.Len())
+
 	// Header.
 	hdr := Header{
 		Magic:             Magic,
@@ -228,6 +257,9 @@ func (m *Model) Write(w io.Writer) error {
 		StringsLen:        stringsLen,
 		ArtOff:            artOff,
 		ArtLen:            artLen,
+		ArtistArtIdxOff:   artistArtIdxOff,
+		ArtistArtBlobOff:  artistArtBlobOff,
+		ArtistArtBlobLen:  artistArtBlobLen,
 	}
 
 	// Emit. Order matters: header, songs, uniq tables, group blocks,
@@ -278,6 +310,17 @@ func (m *Model) Write(w io.Writer) error {
 		return err
 	}
 	if _, err := w.Write(artBlob.Bytes()); err != nil {
+		return err
+	}
+	for _, e := range artistArtEntries {
+		if err := binary.Write(w, LE, e.off); err != nil {
+			return err
+		}
+		if err := binary.Write(w, LE, e.length); err != nil {
+			return err
+		}
+	}
+	if _, err := w.Write(artistArtBlob.Bytes()); err != nil {
 		return err
 	}
 	return nil

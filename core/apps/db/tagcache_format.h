@@ -34,13 +34,15 @@
 #define TCDB_MAGIC2 'D'
 #define TCDB_MAGIC3 'B'
 
-/* Bumped on incompatible layout changes. The reader rejects mismatches. */
-#define TCDB_VERSION 1u
+/* Bumped on incompatible layout changes. The reader rejects mismatches.
+ * v2 added the artist-art index + blob (header offsets 132..156),
+ * fetched by `core tagcache build --fetch-art`. */
+#define TCDB_VERSION 2u
 
 /* Byte size of the fixed header. The first byte after this is the
  * start of the song-record array. Mirrors core/cli/internal/tagcache/
  * format.go::HeaderSize. */
-#define TCDB_HEADER_SIZE 132
+#define TCDB_HEADER_SIZE 156
 
 /* Byte size of one song record. Mirrors SongRecord in format.go. */
 #define TCDB_SONG_RECORD_SIZE 40
@@ -71,6 +73,12 @@
 #define TCDB_OFF_STRINGS_LEN       108   /* u64 */
 #define TCDB_OFF_ART_OFF           116   /* u64 */
 #define TCDB_OFF_ART_LEN           124   /* u64 */
+#define TCDB_OFF_ARTIST_ART_IDX_OFF  132 /* u64 — n_artists * (u64 off, u64 len) */
+#define TCDB_OFF_ARTIST_ART_BLOB_OFF 140 /* u64 — base for the per-artist offsets */
+#define TCDB_OFF_ARTIST_ART_BLOB_LEN 148 /* u64 — total bytes; 0 means none fetched */
+
+/* Per-artist-art index entry: (u64 off, u64 len), packed. */
+#define TCDB_ARTIST_ART_ENTRY_SIZE 16
 
 /* Song-record field offsets (from start of one record). */
 #define TCDB_REC_TITLE_OFF        0   /* u32 */

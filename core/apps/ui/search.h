@@ -1,5 +1,6 @@
 /*
- * core/apps/ui/search.h — Search frame: on-screen keyboard + live results.
+ * core/apps/ui/search.h — Search frame: on-screen keyboard + live
+ * categorized results.
  *
  * A click-wheel search screen modeled on the iPod 5G's "Search":
  *   +---------------------------------+
@@ -10,19 +11,26 @@
  *   |  H I J K L M N                  |
  *   |  O P Q R S T U                  |
  *   |  V W X Y Z _ <                  |
- *   |                                 |
- *   |  Result row 1                   |   <- live filtered titles
- *   |  Result row 2                   |
+ *   |  ─── SONGS ───                  |   <- section header
+ *   |  · Track title                  |   <- live filtered results
+ *   |  ─── ALBUMS ───                 |
+ *   |  · Album name                   |
+ *   |  ─── ARTISTS ───                |
+ *   |  · Artist name                  |
  *   +---------------------------------+
  *
  * Wheel cycles the keyboard cursor (or the results when focus shifts);
- * SELECT types the highlighted key (or plays the highlighted result);
+ * SELECT types the highlighted key, plays the highlighted song result,
+ * or drills into the highlighted album/artist;
  * RIGHT moves focus from keyboard to results, LEFT moves it back;
  * MENU pops the frame.
  *
- * Match logic: case-insensitive ASCII substring against song titles.
- * The first SEARCH_RESULT_MAX matches are kept in `results[]` as global
- * tagcache song indexes; cabinet's play_global_song handles the rest.
+ * Match logic: case-insensitive ASCII substring against the field
+ * native to each result type — title for songs, album-name for
+ * albums, artist-name for artists. Songs additionally hit on artist
+ * and album so typing an artist name surfaces their tracks even when
+ * the title doesn't contain the word. Per-category caps keep the
+ * result panel readable on a populous library.
  */
 
 #ifndef CORE_APPS_UI_SEARCH_H
@@ -33,7 +41,13 @@
 #include <stdbool.h>
 
 #define SEARCH_QUERY_MAX  32
-#define SEARCH_RESULT_MAX 64
+
+/* Per-category caps. The result panel is small (~80 px); generous
+ * caps would just hide deeper results behind scroll. Pick numbers
+ * that keep the most relevant matches visible-on-arrival. */
+#define SEARCH_MAX_SONGS   12
+#define SEARCH_MAX_ALBUMS   6
+#define SEARCH_MAX_ARTISTS  6
 
 /* 26 letters + space + delete; arranged 4 rows × 7 cols. */
 #define SEARCH_KB_COLS    7
@@ -48,9 +62,25 @@ typedef enum {
 } search_focus_t;
 
 typedef enum {
+    SEARCH_RESULT_SONG   = 0,
+    SEARCH_RESULT_ALBUM  = 1,
+    SEARCH_RESULT_ARTIST = 2,
+} search_result_type_t;
+
+typedef struct {
+    /* `idx` is interpreted by `type`: a tagcache song index for
+     * SEARCH_RESULT_SONG, an album/artist uniq index for the
+     * corresponding types. */
+    search_result_type_t type;
+    int                  idx;
+} search_result_t;
+
+typedef enum {
     SEARCH_ACT_NONE = 0,
     SEARCH_ACT_POP,
-    SEARCH_ACT_PLAY,
+    SEARCH_ACT_PLAY,           /* play a song (out_idx = global song idx) */
+    SEARCH_ACT_DRILL_ALBUM,    /* drill into Album (out_idx = album uniq idx) */
+    SEARCH_ACT_DRILL_ARTIST,   /* drill into Artist (out_idx = artist uniq idx) */
 } search_action_t;
 
 typedef struct {
@@ -60,7 +90,10 @@ typedef struct {
     search_focus_t focus;
     int            result_selected;  /* row index within results[] */
     int            result_scroll;    /* topmost visible row index */
-    int            results[SEARCH_RESULT_MAX];  /* global song idxs */
+    /* Flat result list, ordered Songs → Albums → Artists. The widget
+     * walks this in order at draw time and emits a section header
+     * each time the type changes. */
+    search_result_t results[SEARCH_MAX_SONGS + SEARCH_MAX_ALBUMS + SEARCH_MAX_ARTISTS];
     int            result_count;
 } search_t;
 
@@ -72,12 +105,15 @@ void search_init(search_t *s);
 void search_draw(const search_t *s);
 
 /*
- * Feed a button event. On SEARCH_ACT_PLAY, *out_global_idx is the
- * tagcache song index the caller should play (and push NP for); on
- * SEARCH_ACT_POP, the caller pops the frame; SEARCH_ACT_NONE means
- * the search frame stays as-is.
+ * Feed a button event. The action codes return:
+ *
+ *   SEARCH_ACT_PLAY          out_idx = tagcache song idx (cabinet plays)
+ *   SEARCH_ACT_DRILL_ALBUM   out_idx = album  uniq idx   (cabinet pushes Album drilldown)
+ *   SEARCH_ACT_DRILL_ARTIST  out_idx = artist uniq idx   (cabinet pushes Artist drilldown)
+ *   SEARCH_ACT_POP           caller pops the frame
+ *   SEARCH_ACT_NONE          search frame stays as-is
  */
 search_action_t search_handle_button(search_t *s, button_t btn,
-                                     int *out_global_idx);
+                                     int *out_idx);
 
 #endif /* CORE_APPS_UI_SEARCH_H */

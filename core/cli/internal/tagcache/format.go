@@ -48,6 +48,15 @@
 //	|  raw JPEG bytes, concatenated.      |
 //	|  Per-song art_off/art_len point     |
 //	|  into here (relative to art_off).   |
+//	+-------- Artist art index -----------+
+//	|  n_artists * (u64 off, u64 len)     |
+//	|  one pair per artist; (0, 0) when   |
+//	|  no fetched artist art.             |
+//	+-------- Artist art blob ------------+
+//	|  raw JPEG bytes, concatenated.      |
+//	|  offsets above are relative to its  |
+//	|  start. May be empty if no artist   |
+//	|  photos were fetched at build time. |
 //	+-------------------------------------+
 //
 // Songs are sorted alphabetically by title (case-insensitive). Uniq
@@ -73,7 +82,11 @@ var Magic = [4]byte{'T', 'C', 'D', 'B'}
 
 // Version is the on-disk format version. Bumped on incompatible layout
 // changes; the firmware reader refuses to load mismatched versions.
-const Version uint32 = 1
+//
+// v2 added the artist-art index + blob (fetched from MusicBrainz +
+// Wikidata + Commons by `core tagcache build --fetch-art`). v1 readers
+// can't safely interpret v2 because the header grew.
+const Version uint32 = 2
 
 // HeaderSize is the byte size of the fixed header. The file's first
 // byte after the header is the start of the song-record array.
@@ -87,7 +100,10 @@ const Version uint32 = 1
 //	[68..100)  4 * u64 group offsets  32 B
 //	[100..116) strings_off, _len u64  16 B
 //	[116..132) art_off,     _len u64  16 B
-const HeaderSize = 132
+//	[132..156) artist_art_idx_off u64,
+//	           artist_art_blob_off u64,
+//	           artist_art_blob_len u64    24 B
+const HeaderSize = 156
 
 // SongRecordSize is the on-disk size of one song record. Fixed so the
 // reader can index by global song idx in O(1).
@@ -126,6 +142,11 @@ type Header struct {
 	StringsLen uint64
 	ArtOff     uint64
 	ArtLen     uint64
+
+	/* v2: artist art (one image per uniq artist, fetched offline). */
+	ArtistArtIdxOff  uint64 /* offset of n_artists * (u64 off, u64 len) */
+	ArtistArtBlobOff uint64 /* offset of the artist-art JPEG concatenation */
+	ArtistArtBlobLen uint64 /* total bytes in the artist-art blob; 0 means none fetched */
 }
 
 // SongRecord mirrors the on-disk layout of one entry in the song-record
