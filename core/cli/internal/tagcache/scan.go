@@ -2,6 +2,7 @@ package tagcache
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,33 +24,50 @@ type SongInfo struct {
 	ArtBytes []byte
 }
 
-// Scan walks `dir` non-recursively for .flac/.mp3 files (case-insensitive)
+// Scan walks `dir` recursively for .flac/.mp3 files (case-insensitive)
 // and parses tags via dhowden/tag. Files we can't open or parse are
 // silently skipped — the user gets a row with the basename-as-title
 // instead of an outright failure, matching the firmware's runtime
-// behavior in tagcache.c.
+// behavior in tagcache.c. Real-world libraries are nearly always nested
+// by artist/album, so recursion is the default; there is no flat mode.
+//
+// Subtrees that error mid-walk (permission denied, vanished while we
+// were iterating) are skipped rather than failing the whole scan: the
+// user gets the music we *could* read, and the worst case is fewer
+// songs than expected — never a half-built tagcache. Symlinks to
+// directories are not followed (filepath.WalkDir's default), which
+// also avoids cycle hazards on libraries built out of symlinks.
 //
 // Returned songs are sorted by title (case-insensitive) so that the
 // global song-index order matches what the firmware would produce.
 func Scan(dir string) ([]SongInfo, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("tagcache: read dir %s: %w", dir, err)
+	if fi, err := os.Stat(dir); err != nil {
+		return nil, fmt.Errorf("tagcache: stat %s: %w", dir, err)
+	} else if !fi.IsDir() {
+		return nil, fmt.Errorf("tagcache: %s is not a directory", dir)
 	}
-	songs := make([]SongInfo, 0, len(entries))
-	for _, ent := range entries {
-		if ent.IsDir() {
-			continue
+	var songs []SongInfo
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
-		name := ent.Name()
-		ext := strings.ToLower(filepath.Ext(name))
+		if d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(d.Name()))
 		if ext != ".flac" && ext != ".mp3" {
-			continue
+			return nil
 		}
-		full := filepath.Join(dir, name)
-		s := SongInfo{Path: full, Title: strings.TrimSuffix(name, filepath.Ext(name))}
-		readTags(&s, full)
+		s := SongInfo{Path: path, Title: strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))}
+		readTags(&s, path)
 		songs = append(songs, s)
+		return nil
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("tagcache: walk %s: %w", dir, walkErr)
 	}
 	sort.SliceStable(songs, func(i, j int) bool {
 		return strings.ToLower(songs[i].Title) < strings.ToLower(songs[j].Title)
