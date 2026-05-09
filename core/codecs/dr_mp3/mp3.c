@@ -114,17 +114,24 @@ static int mp3_open(decoder_t *d, const void *src, size_t src_len,
         return DECODER_ERR_UNSUPPORTED;
     }
 
-    /* dr_mp3 doesn't expose total_frames at init time without a
-     * potentially-expensive seek-table scan (drmp3_get_pcm_frame_count
-     * is O(stream)). For the audio engine we'll either cache this
-     * on the tagcache side or accept "unknown" and let the UI hide
-     * the duration. Leave total_frames as 0 to mean "unknown".
-     */
+    /* total_frames: cheap when the file has a Xing/Info LAME tag (the
+     * vast majority of MP3s in the wild) — dr_mp3 already cached the
+     * count during init. For tagless files this scans the stream to
+     * count frames, then seeks back to frame 0; that scan is O(file)
+     * but the bytes are already in memory at this point so no I/O.
+     * Worst case is ~tens of ms per untagged track, paid once at play
+     * time. The UI's progress bar and remaining-time label require it.
+     *
+     * A future tagcache build pass should compute and cache this
+     * offline so we never scan on-device, but the on-the-fly path
+     * keeps the firmware honest in the meantime. */
+    drmp3_uint64 pcm_frames = drmp3_get_pcm_frame_count(&s->decoder);
+
     d->opaque          = s;
     d->sample_rate     = s->decoder.sampleRate;
     d->channels        = (uint16_t)s->decoder.channels;
     d->bits_per_sample = 16;          /* dr_mp3 emits s16 directly */
-    d->total_frames    = 0;
+    d->total_frames    = (uint64_t)pcm_frames;
     return DECODER_OK;
 }
 
