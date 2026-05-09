@@ -27,11 +27,13 @@ void list_view_init(list_view_t *v) {
 #define CHEV_SEL    theme_chev_sel()
 
 /* Internal: shared draw routine. `provider` returns the i'th item
- * string. Both list_view_draw and list_view_draw_dyn delegate here. */
+ * string. Both list_view_draw and list_view_draw_dyn delegate here.
+ * `leading_at` is optional (NULL = no per-row leading visual). */
 static void draw_internal(const list_view_t *v,
                           int count,
                           const char *(*provider)(int idx, void *user),
                           void *user,
+                          list_leading_fn leading_at,
                           lcd_pixel_t fg, lcd_pixel_t bg,
                           lcd_pixel_t selector_fg);
 
@@ -46,7 +48,7 @@ void list_view_draw(const list_view_t *v,
                     const char * const *items, int count,
                     lcd_pixel_t fg, lcd_pixel_t bg, lcd_pixel_t selector_fg) {
     draw_internal(v, count, array_provider, (void *)items,
-                  fg, bg, selector_fg);
+                  NULL, fg, bg, selector_fg);
 }
 
 /* Wrapping the bare-fn callback in a small struct sidesteps the C
@@ -65,13 +67,25 @@ void list_view_draw_dyn(const list_view_t *v,
                         lcd_pixel_t selector_fg) {
     bare_fn_holder_t holder = { .fn = item_at };
     draw_internal(v, count, bare_provider_glue, &holder,
-                  fg, bg, selector_fg);
+                  NULL, fg, bg, selector_fg);
+}
+
+void list_view_draw_dyn_leading(const list_view_t *v,
+                                int count,
+                                const char *(*item_at)(int idx),
+                                list_leading_fn leading_at,
+                                lcd_pixel_t fg, lcd_pixel_t bg,
+                                lcd_pixel_t selector_fg) {
+    bare_fn_holder_t holder = { .fn = item_at };
+    draw_internal(v, count, bare_provider_glue, &holder,
+                  leading_at, fg, bg, selector_fg);
 }
 
 static void draw_internal(const list_view_t *v,
                           int count,
                           const char *(*provider)(int idx, void *user),
                           void *user,
+                          list_leading_fn leading_at,
                           lcd_pixel_t fg, lcd_pixel_t bg,
                           lcd_pixel_t selector_fg) {
     /* Clear the list region. */
@@ -82,6 +96,12 @@ static void draw_internal(const list_view_t *v,
     if (last > count) last = count;
 
     const atlas_t *body = &NUNITO_REGULAR_13;
+
+    /* Indent the text column when the list reserves a leading slot;
+     * keep the alignment whether or not a given row's leading_at fires,
+     * so rows without art don't have their text jump leftward. */
+    int leading_x = 14;
+    int text_x    = leading_at ? (leading_x + LIST_LEADING_W + 8) : 14;
 
     for (int i = first; i < last; i++) {
         int row_idx = i - first;
@@ -99,9 +119,17 @@ static void draw_internal(const list_view_t *v,
             chrome_rounded_rect(6, row_top,
                                 LCD_WIDTH - 12, LIST_ROW_H,
                                 4, selector_fg);
-            atlas_render(body, 14, baseline, label, bg);
+            atlas_render(body, text_x, baseline, label, bg);
         } else {
-            atlas_render(body, 14, baseline, label, fg);
+            atlas_render(body, text_x, baseline, label, fg);
+        }
+
+        /* Optional leading visual (e.g. album-art thumbnail), centered
+         * vertically within the row. The callback owns the slot
+         * entirely, including no-art fallbacks. */
+        if (leading_at) {
+            int lead_y = row_top + (LIST_ROW_H - LIST_LEADING_H) / 2;
+            leading_at(i, leading_x, lead_y);
         }
 
         /*

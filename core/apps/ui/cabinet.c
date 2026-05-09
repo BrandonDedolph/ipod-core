@@ -15,6 +15,7 @@
 #include "now_playing.h"
 #include "search.h"
 #include "theme.h"
+#include "thumb_cache.h"
 #include "../audio/engine.h"
 #include "../db/tagcache.h"
 #include "../../codecs/dr_flac/flac.h"
@@ -83,6 +84,41 @@ static int         filtered_genre_song_count(void)         { return tagcache_son
 static const char *filtered_genre_song_title(int idx)      { return tagcache_song_title_for_genre(g_filter, idx); }
 static int         filtered_composer_song_count(void)      { return tagcache_song_count_for_composer(g_filter); }
 static const char *filtered_composer_song_title(int idx)   { return tagcache_song_title_for_composer(g_filter, idx); }
+
+/*
+ * Draw a 22 × 22 album-art thumbnail at (x, y) for the album-list row
+ * `album_idx`. Pulls the first song's art bytes via the tagcache, hits
+ * the thumb_cache, blits real RGB565 pixels on hit; on miss / decode
+ * failure / no-embedded-art falls back to a diagonal-stripe pattern so
+ * the slot doesn't read as a blank box.
+ *
+ * Decode is synchronous-on-draw today, so the first time the user
+ * lands on the Albums list there's a brief stutter as the visible
+ * rows decode their JPEGs. This is acceptable on the host sim;
+ * shipping on hardware will need a background decode task before this
+ * scales to a 100-album library.
+ */
+static void album_row_leading(int album_idx, int x, int y) {
+    int song_idx = tagcache_song_index_for_album(album_idx, 0);
+    if (song_idx >= 0) {
+        thumb_cache_prime(song_idx);
+        const uint16_t *thumb = thumb_cache_get(song_idx);
+        if (thumb) {
+            lcd_pixel_t *fb = lcd_framebuffer();
+            for (int row = 0; row < THUMB_CACHE_H; row++) {
+                for (int col = 0; col < THUMB_CACHE_W; col++) {
+                    fb[(y + row) * LCD_WIDTH + (x + col)] =
+                        thumb[row * THUMB_CACHE_W + col];
+                }
+            }
+            return;
+        }
+    }
+    /* Fallback: diagonal stripes. Matches the no-art treatment on the
+     * NP screen so the visual language is consistent end-to-end. */
+    chrome_diagonal_stripes(x, y, LIST_LEADING_W, LIST_LEADING_H,
+                            6, 4, theme_stripe_a(), theme_stripe_b());
+}
 
 static const char *const main_items[] = {
     "Music", "Playlists", "Podcasts", "Audiobooks", "Settings", "Now Playing"
@@ -503,6 +539,10 @@ void cabinet_draw(cabinet_t *c) {
     } else if (m->items) {
         list_view_draw(&v, m->items, m->count,
                        COL_INK, COL_CREAM, COL_INK);
+    } else if (current_menu(c) == M_MUSIC_ALBUMS) {
+        list_view_draw_dyn_leading(&v, m->count_fn(), m->item_fn,
+                                   album_row_leading,
+                                   COL_INK, COL_CREAM, COL_INK);
     } else {
         list_view_draw_dyn(&v, m->count_fn(), m->item_fn,
                            COL_INK, COL_CREAM, COL_INK);

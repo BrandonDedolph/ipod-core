@@ -14,6 +14,7 @@ ui_lib = static_library(
     'theme.c',
     'now_playing.c',
     'search.c',
+    'thumb_cache.c',
     'cabinet.c',
   ],
   dependencies: [hal_dep, audio_engine_dep, flac_dep, image_dep, tagcache_dep],

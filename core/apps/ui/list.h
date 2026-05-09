@@ -62,6 +62,32 @@ void list_view_draw_dyn(const list_view_t *v,
                         lcd_pixel_t fg, lcd_pixel_t bg, lcd_pixel_t selector_fg);
 
 /*
+ * Per-row leading visual (e.g. an album-art thumbnail). Called once
+ * per visible row before the row's text is rendered. The callback
+ * owns the full LIST_LEADING_W × LIST_LEADING_H rectangle anchored at
+ * (x, y), including any no-art / placeholder fallback — the list
+ * widget doesn't draw anything in that slot itself, so callers retain
+ * full control over how missing art looks.
+ */
+#define LIST_LEADING_W  22
+#define LIST_LEADING_H  22
+
+typedef void (*list_leading_fn)(int idx, int x, int y);
+
+/*
+ * Like list_view_draw_dyn, but each row gets a chance to render a
+ * leading visual via `leading_at`. When `leading_at` is NULL the
+ * function behaves exactly like list_view_draw_dyn. When non-NULL,
+ * the row's text is shifted right by the leading slot's width.
+ */
+void list_view_draw_dyn_leading(const list_view_t *v,
+                                int count,
+                                const char *(*item_at)(int idx),
+                                list_leading_fn leading_at,
+                                lcd_pixel_t fg, lcd_pixel_t bg,
+                                lcd_pixel_t selector_fg);
+
+/*
  * Feed a button press. Returns true if the input was consumed (i.e.,
  * scroll up/down). SELECT/MENU pass through unconsumed for the caller
  * to act on.
