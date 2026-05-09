@@ -295,46 +295,49 @@ void chrome_outline_rect(int x, int y, int w, int h, int radius,
 }
 
 /*
- * Shuffle icon — two crossing arrow paths from themes.jsx ShuffleIcon.
- * Drawn into 11×11 (slightly taller than the SVG's 11×9 to fit better
- * with the battery's 11 px height in the status bar).
+ * Shuffle / Repeat icons — pre-rasterized 12×10 alpha masks generated
+ * from the design SVGs (themes.jsx ShuffleIcon / RepeatIcon) by
+ * tools/icon_gen.sh: render at 8× via librsvg, downsample with a box
+ * filter, dump the alpha channel.
+ *
+ * Hand-drawn line art at this size doesn't reproduce 1.4 px strokes
+ * cleanly — diagonals stair-step and arrowhead Vs read as scattered
+ * pixels. Pre-rasterizing means the icons get proper anti-aliased
+ * coverage, the same way the type atlases do. Edit the SVG source +
+ * regenerate, don't hand-tweak the byte arrays.
  */
+static const uint8_t SHUFFLE_ALPHA[12 * 10] = {
+      0,   0,   0,   0,   0,   0,   0,  23,  51,   0,   0,   0,
+    133, 208, 208, 191,  13,   0,   0,  85, 249,  95,   0,   0,
+     65, 117, 117, 220, 135,   0, 123, 185, 241, 254, 103,   0,
+      0,   0,   0,  76, 248,  85, 252, 150, 241, 246,  74,   0,
+      0,   0,   0,   0, 183, 233, 128,  98, 234,  57,   0,   0,
+      0,   0,   0,  19, 198, 252,  69,  49, 111,   0,   0,   0,
+      0,   0,   0, 147, 207, 144, 212,  70, 248, 141,   2,   0,
+    149, 232, 232, 252,  66,  16, 234, 236, 247, 255, 129,   0,
+     49,  94,  94,  76,   0,   0,  49, 109, 242, 228,  47,   0,
+      0,   0,   0,   0,   0,   0,   0,  92, 208,  29,   0,   0,
+};
+
+static const uint8_t REPEAT_ALPHA[12 * 10] = {
+      0,   0,   0,   0,   0,   0,   0, 202, 208,  44,   0,   0,
+      0,   2, 191, 208, 208, 208, 208, 223, 255, 247,  57,   0,
+      0,   0,  99, 117, 117, 117, 117, 195, 255, 255,  28,   0,
+      0,   0,   0,   0,   0,   0,   0, 181, 158, 255,   7,   0,
+      0,   0,  26,   0,   0,   0,   0,   0,  37, 251,   5,   0,
+      0,   5, 251,  37,   0,   0,   0,   0,   0,  26,   0,   0,
+      0,   7, 255, 158, 181,   0,   0,   0,   0,   0,   0,   0,
+      0,  28, 255, 255, 195, 117, 117, 117, 117,  99,   0,   0,
+      0,  57, 246, 255, 223, 208, 208, 208, 208, 191,   2,   0,
+      0,   0,  44, 208, 202,   0,   0,   0,   0,   0,   0,   0,
+};
+
 void chrome_shuffle(int x, int y, lcd_pixel_t color) {
-    /* Top arrow path: enters from left, jumps diagonal, exits right with arrowhead. */
-    chrome_line(x + 0, y + 2, x + 3, y + 2, color);
-    chrome_line(x + 3, y + 2, x + 7, y + 8, color);
-    chrome_line(x + 7, y + 8, x + 9, y + 8, color);
-    /* Top arrowhead (right side, pointing right) */
-    chrome_line(x + 9, y + 8, x + 8,  y + 7,  color);
-    chrome_line(x + 9, y + 8, x + 8,  y + 9,  color);
-    /* Bottom arrow path */
-    chrome_line(x + 0, y + 8, x + 3, y + 8, color);
-    chrome_line(x + 3, y + 8, x + 5, y + 5, color);
-    chrome_line(x + 6, y + 4, x + 7, y + 2, color);
-    chrome_line(x + 7, y + 2, x + 9, y + 2, color);
-    /* Bottom arrowhead */
-    chrome_line(x + 9, y + 2, x + 8, y + 1, color);
-    chrome_line(x + 9, y + 2, x + 8, y + 3, color);
+    chrome_blit_alpha(x, y, 12, 10, SHUFFLE_ALPHA, color);
 }
 
-/*
- * Repeat icon — looped arrows in a rounded rectangle path, with a
- * small arrowhead on each end. Stylized vs the design (which has
- * curved corners).
- */
 void chrome_repeat(int x, int y, lcd_pixel_t color) {
-    /* Top half: horizontal stroke with arrowhead pointing right at end. */
-    chrome_line(x + 1, y + 1, x + 8, y + 1, color);
-    chrome_line(x + 8, y + 1, x + 8, y + 4, color);
-    /* Top arrowhead */
-    chrome_line(x + 8, y + 0, x + 9, y + 1, color);
-    chrome_line(x + 9, y + 1, x + 8, y + 2, color);
-    /* Bottom half: horizontal stroke with arrowhead pointing left at end. */
-    chrome_line(x + 9, y + 8, x + 2, y + 8, color);
-    chrome_line(x + 2, y + 8, x + 2, y + 5, color);
-    /* Bottom arrowhead */
-    chrome_line(x + 2, y + 7, x + 1, y + 8, color);
-    chrome_line(x + 1, y + 8, x + 2, y + 9, color);
+    chrome_blit_alpha(x, y, 12, 10, REPEAT_ALPHA, color);
 }
 
 void chrome_chevron(int x, int y, int size, lcd_pixel_t color) {
