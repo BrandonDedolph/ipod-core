@@ -13,11 +13,11 @@
  */
 
 #include "now_playing.h"
+#include "art_cache.h"
 #include "atlas.h"
 #include "chrome.h"
 #include "theme.h"
 #include "../audio/engine.h"
-#include "../../codecs/stb_image/image.h"
 #include "../../hal/hal.h"
 
 #include <stdint.h>
@@ -31,7 +31,6 @@
 #define COL_INK_DEEP    theme_fg_deep()
 #define COL_INK_MUTED   theme_fg_muted()
 #define COL_TRACK_FAINT theme_track_faint()
-#define COL_STAR_MUTED  theme_star_muted()
 #define COL_STRIPE_A    theme_stripe_a()
 #define COL_STRIPE_B    theme_stripe_b()
 
@@ -47,35 +46,12 @@ void now_playing_load(now_playing_t *np, const audio_engine_t *engine) {
     snprintf(np->format_detail, NP_FORMAT_MAX, "%u kHz",
              engine->sample_rate / 1000);
     snprintf(np->up_next,       NP_NEXT_MAX,   "(end of test playlist)");
-    np->stars = 4;
     np->page  = NP_PAGE_DEFAULT;
 
     np->total_frames = (uint32_t)engine->decoder.total_frames;
     np->sample_rate  = engine->sample_rate;
     np->loaded       = true;
-    np->art_loaded   = false;   /* caller will set art via now_playing_set_art_jpeg */
-}
-
-int now_playing_set_art_jpeg(now_playing_t *np,
-                             const void *jpeg_bytes, size_t jpeg_len) {
-    if (!np) return -1;
-    if (!jpeg_bytes || jpeg_len == 0) {
-        np->art_loaded = false;
-        return -1;
-    }
-    /* Decode twice — once at each target size — rather than upscaling
-     * the small buffer. Two passes through stb_image_resize-equivalent
-     * (our nearest-neighbor scaler) is roughly the same cost as one,
-     * since most of the time is in the JPEG decode itself. Either
-     * decode failing falls back to stripes for both pages. */
-    int rc1 = image_jpeg_decode_rgb565(jpeg_bytes, jpeg_len,
-                                       NP_ART_W, NP_ART_H,
-                                       np->art_pixels);
-    int rc2 = image_jpeg_decode_rgb565(jpeg_bytes, jpeg_len,
-                                       NP_ART_BIG_W, NP_ART_BIG_H,
-                                       np->art_pixels_big);
-    np->art_loaded = (rc1 == 0 && rc2 == 0);
-    return np->art_loaded ? 0 : -1;
+    np->song_idx     = -1;      /* caller overrides for tagcache-backed plays */
 }
 
 void now_playing_advance_page(now_playing_t *np) {
@@ -124,40 +100,35 @@ static void format_time(uint32_t total_seconds, char *buf, size_t buflen) {
 }
 
 /*
- * Star rating row — N filled stars + (5-N) outlined stars, 8 px each,
- * 1 px gap between. Returns the rightmost x for chained layout.
- */
-static int draw_stars(int x, int y, int filled_count) {
-    if (filled_count < 0) filled_count = 0;
-    if (filled_count > 5) filled_count = 5;
-    for (int i = 0; i < 5; i++) {
-        chrome_star(x, y, i < filled_count,
-                    i < filled_count ? COL_INK : COL_STAR_MUTED);
-        x += 9;     /* 8 px star + 1 px gap */
-    }
-    return x;
-}
-
-/*
- * Format badge — "FLAC" in 1px-outlined rounded rect, then a space
- * and "44 kHz" in lighter ink. Returns the rightmost x.
+ * Format badge — "FLAC" in a 1 px-outlined pill, then "44 kHz" in
+ * lighter ink. Returns the rightmost x.
+ *
+ * The pill wraps the caps tightly: ascent (10 px in Bold-9) is taller
+ * than the actual cap height (7 px), so a box sized off ascent leaves
+ * dead space above the letters and crowds them against the baseline.
+ * Take cap geometry from the 'M' glyph instead — it's always full
+ * cap-height and present in any reasonable font.
+ *
+ * Format strings are pure uppercase ("FLAC" / "MP3" / "AAC") so we
+ * don't have to budget for descenders.
  */
 static int draw_format_badge(int x, int y_baseline, const char *label,
                              const char *detail) {
-    /* Outlined pill around `label`. We use Bold-9 (closest atlas to
-     * the design's 8px Bold-800). Add 4px horizontal padding inside
-     * the box. */
-    int label_w = atlas_text_width(&NUNITO_BOLD_9, label);
-    int box_w   = label_w + 8;       /* 4 px padding each side */
-    int box_h   = 12;                /* roughly font ascent + 2px */
-    int box_x   = x;
-    int box_y   = y_baseline - 9;    /* center vertically against the row */
+    const atlas_t *font = &NUNITO_BOLD_9;
+    const atlas_glyph_t *cap = &font->glyphs['M' - 0x20];
+    int pad_x = 4, pad_y = 2;
+    int cap_top = y_baseline - font->ascent + cap->offset_y;
+    int label_w = atlas_text_width(font, label);
+    int box_x = x;
+    int box_y = cap_top - pad_y;
+    int box_w = label_w + 2 * pad_x;
+    int box_h = cap->h + 2 * pad_y;
     chrome_outline_rect(box_x, box_y, box_w, box_h, 2, COL_INK);
-    atlas_render(&NUNITO_BOLD_9, box_x + 4, y_baseline - 1, label, COL_INK);
+    atlas_render(font, box_x + pad_x, y_baseline, label, COL_INK);
 
     /* "44 kHz" detail to the right of the box, gap 4 px. */
     int detail_x = box_x + box_w + 4;
-    atlas_render(&NUNITO_REGULAR_9, detail_x, y_baseline - 1, detail, COL_INK_MUTED);
+    atlas_render(&NUNITO_REGULAR_9, detail_x, y_baseline, detail, COL_INK_MUTED);
     int detail_w = atlas_text_width(&NUNITO_REGULAR_9, detail);
     return detail_x + detail_w;
 }
@@ -188,24 +159,26 @@ static void draw_default(const now_playing_t *np, const audio_engine_t *engine) 
     np_status_bar(87);
 
     /*
-     * Content area: padding 18 px sides; art on the left at 84x84,
-     * text stack on the right starting at art_x + art_w + 14.
+     * Content area: padding 18 px sides; art fills the left half at
+     * NP_ART_W × NP_ART_H, text stack to the right with a 14 px gutter.
      */
     int pad_x  = 18;
-    int art_w  = 84, art_h = 84;
+    int art_w  = NP_ART_W, art_h = NP_ART_H;
     int art_x  = pad_x;
     int art_y  = 30;
-    int text_x = art_x + art_w + 14;   /* 116 */
+    int text_x = art_x + art_w + 14;
 
-    /* Album art: real if decoded, diagonal-stripe placeholder if not. */
-    if (np->art_loaded) {
-        /* Direct framebuffer blit — art_pixels is already in RGB565
-         * matching lcd_pixel_t. NP_ART_W/H matches the layout. */
+    /* Album art: real pixels from the shared cache if the song's JPEG
+     * decoded successfully, diagonal-stripe placeholder otherwise. */
+    const uint16_t *art = art_cache_get(np->song_idx, ART_SIZE_SMALL);
+    if (art) {
+        /* Direct framebuffer blit — cached pixels are already RGB565
+         * matching lcd_pixel_t. */
         lcd_pixel_t *fb = lcd_framebuffer();
         for (int y = 0; y < art_h; y++) {
             for (int x = 0; x < art_w; x++) {
                 fb[(art_y + y) * LCD_WIDTH + (art_x + x)] =
-                    np->art_pixels[y * NP_ART_W + x];
+                    art[y * NP_ART_W + x];
             }
         }
     } else {
@@ -221,7 +194,7 @@ static void draw_default(const now_playing_t *np, const audio_engine_t *engine) 
      *   y=64  Title           — Bold-17 ink
      *   y=80  Artist          — Regular-13 ink-deep
      *   y=94  Album           — Regular-11 ink-muted
-     *   y=108 Stars + Badge row
+     *   y=110 Format badge    — own line
      */
     if (np->loaded) {
         atlas_render(&NUNITO_BOLD_9,     text_x, 42, "TRACK 1 OF 1",
@@ -232,27 +205,16 @@ static void draw_default(const now_playing_t *np, const audio_engine_t *engine) 
                      COL_INK_DEEP);
         atlas_render(&NUNITO_REGULAR_11, text_x, 94, np->album,
                      COL_INK_MUTED);
-
-        /* Stars + format badge in a row. */
-        int sx = draw_stars(text_x, 102, np->stars);
-        sx += 6;        /* gap */
-        draw_format_badge(sx, 110, np->format, np->format_detail);
+        draw_format_badge(text_x, 110, np->format, np->format_detail);
     }
 
-    /*
-     * "Up next" mini-row at y=192 (per design `bottom: 42, left: 18,
-     * right: 18`). Label + thin separator + next-track text.
-     */
-    if (np->loaded && np->up_next[0]) {
-        int up_y = 192;
-        atlas_render(&NUNITO_BOLD_9, pad_x, up_y, "UP NEXT", COL_INK_MUTED);
-        int sep_x = pad_x + atlas_text_width(&NUNITO_BOLD_9, "UP NEXT") + 6;
-        chrome_fill_rect(sep_x, up_y - 7, 1, 8, COL_TRACK_FAINT);
-        atlas_render(&NUNITO_REGULAR_11, sep_x + 6, up_y, np->up_next,
-                     COL_INK_DEEP);
-    }
-
-    /* ---- Progress bar + time labels (bottom band). ---- */
+    /* ---- Progress bar + time labels, then "Up next" below. ----
+     *
+     * The bar is the visual anchor for the current track; the "Up
+     * next" hint sits beneath it as a secondary signal, which keeps
+     * the eye moving downward (title → time → bar → next) instead of
+     * jumping back over the bar. Order departs from the original
+     * Linen design but reads better given the bigger art. */
 
     uint32_t played   = (uint32_t)engine->read_idx;
     uint32_t total    = np->total_frames;
@@ -260,9 +222,10 @@ static void draw_default(const now_playing_t *np, const audio_engine_t *engine) 
     uint32_t remain_s = (total > played && np->sample_rate > 0)
                         ? (total - played) / np->sample_rate : 0;
 
-    int bar_x = pad_x, bar_y = 226;
+    int label_y = 188;
+    int bar_x = pad_x, bar_y = 198;
     int bar_w = LCD_WIDTH - 2 * pad_x;
-    int bar_h = 3;
+    int bar_h = 6;
     chrome_fill_rect(bar_x, bar_y, bar_w, bar_h, COL_TRACK_FAINT);
     if (total > 0 && played > 0) {
         if (played > total) played = total;
@@ -279,10 +242,21 @@ static void draw_default(const now_playing_t *np, const audio_engine_t *engine) 
     } else {
         snprintf(right, sizeof(right), "--:--");
     }
-    int label_y = 219;
-    atlas_render(&NUNITO_BOLD_9, bar_x, label_y, left, COL_INK_DEEP);
-    int rw = atlas_text_width(&NUNITO_BOLD_9, right);
-    atlas_render(&NUNITO_BOLD_9, bar_x + bar_w - rw, label_y, right, COL_INK_DEEP);
+    const atlas_t *time_font = &NUNITO_BOLD_13;
+    atlas_render(time_font, bar_x, label_y, left, COL_INK_DEEP);
+    int rw = atlas_text_width(time_font, right);
+    atlas_render(time_font, bar_x + bar_w - rw, label_y, right, COL_INK_DEEP);
+
+    /* "Up next" mini-row beneath the progress bar. Label + thin
+     * separator tick + next-track text. */
+    if (np->loaded && np->up_next[0]) {
+        int up_y = 230;
+        atlas_render(&NUNITO_BOLD_9, pad_x, up_y, "UP NEXT", COL_INK_MUTED);
+        int sep_x = pad_x + atlas_text_width(&NUNITO_BOLD_9, "UP NEXT") + 6;
+        chrome_fill_rect(sep_x, up_y - 7, 1, 8, COL_TRACK_FAINT);
+        atlas_render(&NUNITO_REGULAR_11, sep_x + 6, up_y, np->up_next,
+                     COL_INK_DEEP);
+    }
 }
 
 /* ---------- Page 1: big art on dark backdrop --------------------- */
@@ -307,12 +281,13 @@ static void draw_big_art(const now_playing_t *np, const audio_engine_t *engine) 
     int art_w = NP_ART_BIG_W, art_h = NP_ART_BIG_H;
     int art_x = (LCD_WIDTH  - art_w) / 2;
     int art_y = (LCD_HEIGHT - art_h) / 2;
-    if (np->art_loaded) {
+    const uint16_t *art = art_cache_get(np->song_idx, ART_SIZE_BIG);
+    if (art) {
         lcd_pixel_t *fb = lcd_framebuffer();
         for (int y = 0; y < art_h; y++) {
             for (int x = 0; x < art_w; x++) {
                 fb[(art_y + y) * LCD_WIDTH + (art_x + x)] =
-                    np->art_pixels_big[y * NP_ART_BIG_W + x];
+                    art[y * NP_ART_BIG_W + x];
             }
         }
     } else {

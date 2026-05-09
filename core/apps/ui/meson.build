@@ -7,6 +7,7 @@
 ui_lib = static_library(
   'core_ui',
   sources: [
+    'art_cache.c',
     'atlas.c',
     'chrome.c',
     'list.c',

@@ -88,11 +88,6 @@ void chrome_shuffle(int x, int y, lcd_pixel_t color);
 void chrome_repeat(int x, int y, lcd_pixel_t color);
 
 /*
- * 5-point filled or outlined star, 8×8. Used for the rating row.
- */
-void chrome_star(int x, int y, bool filled, lcd_pixel_t color);
-
-/*
  * Soft-rounded outline rectangle (used for format badges). Just an
  * outline — the interior is left untouched. radius typically ~2 px.
  */

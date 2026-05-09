@@ -39,7 +39,6 @@ lcd_pixel_t theme_separator(void);   /* 8% fg on bg — status-bar divider */
 lcd_pixel_t theme_chev_unsel(void);  /* 0.4 fg on bg */
 lcd_pixel_t theme_chev_sel(void);    /* 0.7 bg on fg */
 lcd_pixel_t theme_track_faint(void); /* progress-bar bg, peak-meter dim */
-lcd_pixel_t theme_star_muted(void);  /* unfilled rating stars */
 lcd_pixel_t theme_stripe_a(void);    /* placeholder stripe colors — */
 lcd_pixel_t theme_stripe_b(void);    /* art-area no-art fallback */
 

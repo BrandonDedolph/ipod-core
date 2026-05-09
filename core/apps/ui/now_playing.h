@@ -29,6 +29,7 @@
 #ifndef CORE_APPS_UI_NOW_PLAYING_H
 #define CORE_APPS_UI_NOW_PLAYING_H
 
+#include "art_cache.h"
 #include "../audio/engine.h"
 #include "../../hal/hal.h"
 
@@ -63,21 +64,18 @@ typedef enum {
 } np_page_t;
 
 /*
- * Album-art buffers. Two sizes lined up with the two pages that show
- * art:
- *   - default page (NP_PAGE_DEFAULT): 84 × 84 in the inline art rect
- *   - big-art page (NP_PAGE_BIG_ART): 180 × 180 centered on dark bg
- *
- * Both live inline in now_playing_t (no heap). 14 112 + 64 800 =
- * 78 912 bytes total — fits comfortably in the static cabinet_t. When
- * a song has embedded art we decode + nearest-neighbor scale into both
- * buffers at load time; if neither decode succeeds the renderers fall
- * back to their respective stripe placeholders.
+ * Album art lives in the shared art_cache (apps/ui/art_cache.h), keyed
+ * by song_idx. The NP screen carries only the index; renderers ask the
+ * cache for pixel buffers at draw time. Cache miss / decode failure /
+ * no-embedded-art all surface as a NULL pixel pointer, and renderers
+ * fall back to the diagonal-stripe placeholder on those rows. Moving
+ * the buffers out of now_playing_t saves ~78 KB per cabinet_t and lets
+ * future list-row thumbnails read from the same cache.
  */
-#define NP_ART_W      84
-#define NP_ART_H      84
-#define NP_ART_BIG_W  180
-#define NP_ART_BIG_H  180
+#define NP_ART_W      ART_CACHE_SMALL_W
+#define NP_ART_H      ART_CACHE_SMALL_H
+#define NP_ART_BIG_W  ART_CACHE_BIG_W
+#define NP_ART_BIG_H  ART_CACHE_BIG_H
 
 typedef struct {
     char     title[NP_TITLE_MAX];
@@ -87,18 +85,15 @@ typedef struct {
     char     format_detail[NP_FORMAT_MAX]; /* "44.1 kHz" / "192 kbps" / etc */
     char     path[NP_PATH_MAX];            /* filesystem path, for track-info page */
     char     up_next[NP_NEXT_MAX];         /* next-track title */
-    int      stars;                        /* 0..5 */
     uint32_t total_frames;     /* 0 if unknown */
     uint32_t sample_rate;
     bool     loaded;
     np_page_t page;
 
-    /* Decoded album art for the default + big-art pages. art_loaded
-     * is set true after a successful decode of *both* buffers; if
-     * either fails, both pages fall back to stripes. */
-    uint16_t art_pixels    [NP_ART_W     * NP_ART_H];
-    uint16_t art_pixels_big[NP_ART_BIG_W * NP_ART_BIG_H];
-    bool     art_loaded;
+    /* Tagcache song index for the loaded track; -1 if the screen was
+     * loaded from a non-tagcache source (e.g. the FLAC fixture demo).
+     * Renderers feed this to art_cache_get to fetch decoded pixels. */
+    int      song_idx;
 } now_playing_t;
 
 /*
@@ -112,25 +107,14 @@ void now_playing_advance_page(now_playing_t *np);
  * hardcoded for now (the FLAC fixture has no ID3); future PRs that
  * land tagcache + ID3 parsing will fill these from real metadata.
  *
- * Also clears the album-art buffer (art_loaded = false). Caller
- * follows up with now_playing_set_art_jpeg if the song has embedded
- * art.
+ * Sets song_idx = -1; the caller can override it after this call when
+ * the track came from the tagcache (cabinet's play path does), which
+ * lets the renderers pull decoded art from art_cache. Without an
+ * override the art rects stay at their stripe placeholders.
  *
  * Call right after audio_engine_play() returns success.
  */
 void now_playing_load(now_playing_t *np, const audio_engine_t *engine);
-
-/*
- * Decode `jpeg_bytes` into the NP album-art buffer (NP_ART_W ×
- * NP_ART_H RGB565). Sets art_loaded=true on success; on failure
- * leaves art_loaded as-is (the caller's pre-set value, typically
- * false from now_playing_load) and returns -1.
- *
- * Pass NULL to clear the buffer (art_loaded = false). The default
- * page falls back to the diagonal-stripe placeholder when not loaded.
- */
-int now_playing_set_art_jpeg(now_playing_t *np,
-                             const void *jpeg_bytes, size_t jpeg_len);
 
 /*
  * Render the NP screen into the LCD framebuffer. `engine` is read

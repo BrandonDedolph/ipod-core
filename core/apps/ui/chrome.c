@@ -337,37 +337,6 @@ void chrome_repeat(int x, int y, lcd_pixel_t color) {
     chrome_line(x + 1, y + 8, x + 2, y + 9, color);
 }
 
-/*
- * 5-point star, 8×8, hand-pixeled alpha mask. Filled and outline
- * variants. Coverage values approximate AA along the slanted edges.
- */
-static const uint8_t STAR_FILLED[8 * 8] = {
-    0,    0,    0,    255,  255,  0,    0,    0,
-    0,    0,    0,    255,  255,  0,    0,    0,
-    255,  255,  255,  255,  255,  255,  255,  255,
-    180,  255,  255,  255,  255,  255,  255,  180,
-    0,    180,  255,  255,  255,  255,  180,  0,
-    0,    255,  255,  180,  180,  255,  255,  0,
-    0,    255,  180,  0,    0,    180,  255,  0,
-    180,  120,  0,    0,    0,    0,    120,  180,
-};
-
-static const uint8_t STAR_OUTLINE[8 * 8] = {
-    0,    0,    0,    255,  255,  0,    0,    0,
-    0,    0,    0,    255,  255,  0,    0,    0,
-    255,  255,  255,  0,    0,    255,  255,  255,
-    180,  0,    0,    0,    0,    0,    0,    180,
-    0,    180,  0,    0,    0,    0,    180,  0,
-    0,    255,  0,    180,  180,  0,    255,  0,
-    0,    255,  180,  0,    0,    180,  255,  0,
-    180,  120,  0,    0,    0,    0,    120,  180,
-};
-
-void chrome_star(int x, int y, bool filled, lcd_pixel_t color) {
-    chrome_blit_alpha(x, y, 8, 8,
-                      filled ? STAR_FILLED : STAR_OUTLINE, color);
-}
-
 void chrome_chevron(int x, int y, int size, lcd_pixel_t color) {
     /*
      * Thin right-pointing angle bracket (›) — two 1-px diagonals

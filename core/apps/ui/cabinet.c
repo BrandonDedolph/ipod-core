@@ -8,6 +8,7 @@
  */
 
 #include "cabinet.h"
+#include "art_cache.h"
 #include "atlas.h"
 #include "chrome.h"
 #include "list.h"
@@ -431,13 +432,13 @@ static void play_global_song(cabinet_t *c, int global_idx) {
     snprintf(c->np.format_detail, NP_FORMAT_MAX, "%u kHz",
              c->engine->sample_rate / 1000);
     snprintf(c->np.path, NP_PATH_MAX, "%s", path);
-    /* Embedded album art (FLAC PICTURE today; MP3 APIC follows). On
-     * decode failure we silently fall back to the stripe placeholder. */
-    size_t art_len = 0;
-    const void *art_bytes = tagcache_song_art_bytes(global_idx, &art_len);
-    if (art_bytes) {
-        (void)now_playing_set_art_jpeg(&c->np, art_bytes, art_len);
-    }
+    /* Album art lives in the shared art_cache. Pointing the NP screen
+     * at the song index is enough — both renderers (small and big)
+     * pull pixels from the cache, falling back to stripes on miss /
+     * decode failure. Prime here so the JPEG decode happens once at
+     * play time rather than under a frame budget on the first draw. */
+    c->np.song_idx = global_idx;
+    art_cache_prime(global_idx);
     push_now_playing(c);
     log_printf("cabinet: now playing %s", path);
 }

@@ -18,7 +18,6 @@ typedef struct {
     lcd_pixel_t separator;
     lcd_pixel_t chev_unsel, chev_sel;
     lcd_pixel_t track_faint;
-    lcd_pixel_t star_muted;
     lcd_pixel_t stripe_a, stripe_b;
     lcd_pixel_t accent;
 } palette_t;
@@ -34,7 +33,6 @@ static void apply_light(void) {
     g_pal.chev_unsel    = lcd_rgb(0xB0, 0xA8, 0x9E);   /* 0.4 ink on cream */
     g_pal.chev_sel      = lcd_rgb(0xA0, 0x9C, 0x97);   /* 0.7 cream on ink */
     g_pal.track_faint   = lcd_rgb(0xD8, 0xD2, 0xC8);
-    g_pal.star_muted    = lcd_rgb(0xCC, 0xC4, 0xB7);
     g_pal.stripe_a      = lcd_rgb(0xCD, 0xB8, 0xA6);
     g_pal.stripe_b      = lcd_rgb(0xC0, 0xAB, 0x99);
     g_pal.accent        = lcd_rgb(0xC4, 0x5A, 0x3A);
@@ -53,7 +51,6 @@ static void apply_dark(void) {
     g_pal.chev_unsel    = lcd_rgb(0x65, 0x60, 0x55);   /* 0.4 cream on near-black bg */
     g_pal.chev_sel      = lcd_rgb(0x4F, 0x4B, 0x44);   /* 0.7 near-black on cream fg */
     g_pal.track_faint   = lcd_rgb(0x2A, 0x26, 0x21);
-    g_pal.star_muted    = lcd_rgb(0x3C, 0x36, 0x30);
     /* Stripes stay earthy but a touch dimmer so they read on near-black. */
     g_pal.stripe_a      = lcd_rgb(0x6E, 0x5C, 0x4C);
     g_pal.stripe_b      = lcd_rgb(0x82, 0x6E, 0x5A);
@@ -86,7 +83,6 @@ lcd_pixel_t theme_separator(void)     { ensure_init(); return g_pal.separator; }
 lcd_pixel_t theme_chev_unsel(void)    { ensure_init(); return g_pal.chev_unsel; }
 lcd_pixel_t theme_chev_sel(void)      { ensure_init(); return g_pal.chev_sel; }
 lcd_pixel_t theme_track_faint(void)   { ensure_init(); return g_pal.track_faint; }
-lcd_pixel_t theme_star_muted(void)    { ensure_init(); return g_pal.star_muted; }
 lcd_pixel_t theme_stripe_a(void)      { ensure_init(); return g_pal.stripe_a; }
 lcd_pixel_t theme_stripe_b(void)      { ensure_init(); return g_pal.stripe_b; }
 lcd_pixel_t theme_accent(void)        { ensure_init(); return g_pal.accent; }
