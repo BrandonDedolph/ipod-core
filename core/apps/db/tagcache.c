@@ -3,8 +3,8 @@
  * runtime "library mode" for the Songs list.
  *
  * Default state: hardcoded artist / album / song / genre / composer
- * lists drawn from the example library in design_handoff_rockbox_theme/
- * menus.jsx + collection-detail.jsx (Aphex Twin / Drukqs / Avril 14th,
+ * lists drawn from the example library in design_reference/menus.jsx
+ * + collection-detail.jsx (Aphex Twin / Drukqs / Avril 14th,
  * etc). Lets the Music sub-menu show real-looking content while we
  * build the Go-side indexer + on-disk binary tagcache format.
  *

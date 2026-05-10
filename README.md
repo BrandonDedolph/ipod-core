@@ -13,24 +13,29 @@ iPod.
 
 ## Status
 
-The music browser is feature-complete in sim — load, browse all four
+The music browser is feature-complete in sim — recursive scan, four
 iconic groupings (Artists / Albums / Genres / Composers), drill down,
-play. Now Playing shows real metadata + embedded album art.
+play. Now Playing shows real metadata, embedded album art, and a
+proper progress bar. Lists carry 22² thumbnails; Artists pulls real
+artist photos from Deezer at tagcache-build time.
 
 | Working today (sim) | Pending |
 |---|---|
 | FLAC + MP3 decoders (bit-exact via codec KAT) | Bootable ARM image (Phase 1) |
 | Audio engine — SPSC ring + SDL2 HAL | On-device USB / disk / battery |
-| Library scan + tag parse (Vorbis, ID3v2.3/2.4) | Playlists, podcasts, audiobooks |
-| Drilldown: Artists → songs, Albums → songs, Genres → songs, Composers → songs | Per-track gain (replaygain) |
-| Embedded album art (FLAC PICTURE, MP3 APIC → JPEG → 84² + 180²) | Volume / brightness (need HAL knobs) |
-| Binary tagcache (`.tcdb`) — Go-side encoder + C-side reader |  |
-| Search frame — on-screen keyboard, live substring filter |  |
+| Recursive library scan + tag parse (Vorbis, ID3v2.3/2.4) | Playlists, podcasts, audiobooks |
+| Same-track dedup (FLAC > MP3) + combo-artist fold | Per-track gain (replaygain) |
+| Drilldown: Artists / Albums / Genres / Composers → songs | Volume / brightness (need HAL knobs) |
+| Embedded album art (FLAC PICTURE, MP3 APIC → JPEG, box-averaged) |  |
+| Per-list 22² thumbnails (Songs / Albums / Artists), LRU cached |  |
+| Artist photos via Deezer at tagcache-build time |  |
+| Binary tagcache `.tcdb` v2 — Go encoder + C reader, artist art inline |  |
+| Categorized search (songs / albums / artists) with section headers |  |
+| Now Playing layout: cap-aligned format badge, 130² art, 6px progress bar, "Up next" beneath the bar |  |
 | Settings — light / dark theme cycle + About screen |  |
 | End-to-end audio playback test (captures real PCM, bit-compares to reference) |  |
 
-35 PRs squash-merged on `main`. See [`STATUS.md`](STATUS.md) for the
-running list.
+55 commits on `main`. See [`STATUS.md`](STATUS.md) for the running list.
 
 ---
 
@@ -88,9 +93,12 @@ album art flips. **About** shows firmware version + library counts.
 ![Aphex Twin → songs](docs/img/07-aphex-songs.png) ![Genre IDM → songs](docs/img/08-genre-idm.png)
 
 ### Now Playing — four cycle-able pages
-The iconic iPod NP screen. Embedded album art renders at 84² on the
+The iconic iPod NP screen. Embedded album art renders at 130² on the
 default page and 180² on the big-art page; SELECT cycles pages, MENU
-pops.
+pops. Format badge sits cap-aligned with the album line; the progress
+bar runs the full width with elapsed / remaining labels above it,
+"Up next" tucked beneath. Both art sizes go through a 4-slot LRU so
+scrubbing doesn't re-decode the JPEG.
 
 | Default | Big art |
 |---|---|
@@ -114,6 +122,12 @@ cd core/cli
 go build -o /tmp/core ./cmd/core
 /tmp/core tagcache build ~/Music
 # ~/Music/tagcache.tcdb: 1834 songs, 142 artists, 218 albums, 17 genres, 89 composers (412 KB)
+
+# --fetch-art pulls real artist photos from Deezer (no auth, ~150ms
+# per artist, cached under ~/.cache/core/artist-art/). Re-runs reuse
+# the cache; a `.missing` sentinel keeps unknown artists from
+# re-fetching every build.
+/tmp/core tagcache build --fetch-art ~/Music
 
 cd ..
 ./build-sim/sim/core-sim --tagcache ~/Music/tagcache.tcdb
@@ -151,9 +165,10 @@ core/                     C firmware + simulator
 ├── docs/hw/              Phase-0 hardware reference (8 subsystems, ~2,500 lines)
 └── tests/                codec KAT + .tcdb reader + end-to-end audio playback
 
-design_handoff_rockbox_theme/  Original design files (JSX + HTML)
-docs/img/                       Sim screenshots (this README)
-tools/                          Build helpers (atlas generator, deps installer)
+design_reference/              JSX/HTML design source — themes, palette, icon paths
+docs/img/                      Sim screenshots (this README)
+tools/                         Top-level build helpers (atlas generator, deps installer, font sources)
+                               (firmware-side tools live in core/tools/, e.g. icon_gen.sh)
 ```
 
 See [`core/README.md`](core/README.md) for the firmware-side build details

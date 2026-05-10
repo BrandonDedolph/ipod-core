@@ -300,7 +300,7 @@ core/
 │   ├── audio/             # engine, DSP, replaygain
 │   ├── db/                # tagcache build/query
 │   └── ui/
-│       ├── cabinet.c      # the shell (port of plugin/cabinet.c)
+│       ├── cabinet.c      # the shell (originally ported from a Rockbox plugin)
 │       └── render/        # Linen chrome, font cache, primitives
 ├── cli/                   # the `core` Go binary (host tooling, see above)
 │   ├── cmd/core/
@@ -384,10 +384,8 @@ on sim builds catches bugs that would be a hardware mystery otherwise.
 renders frames to PNG, accepts a JSON input script, exits cleanly. The
 Go test runner drives this for visual regression — golden reference
 frames live in `tests/golden/`, the Go `internal/golden` package does
-pixel diff and produces a side-by-side HTML report on failures. We
-port the concept from the existing Cabinet plugin harness
-(`tools/test_plugin.sh`, `tools/render_index.py`), but the Go runner
-replaces the shell + Xvfb + Python entirely.
+pixel diff and produces a side-by-side HTML report on failures. The
+runner replaces the early shell + Xvfb + Python harness entirely.
 
 **Dev loop (hardware):**
 

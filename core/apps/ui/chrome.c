@@ -177,7 +177,7 @@ static void chrome_alpha_rect(int x, int y, int w, int h,
 void chrome_battery(int x, int y, int level_pct, lcd_pixel_t color) {
     /*
      * 32x11 body + 2x5 nub at right. Matches the SVG in
-     * design_handoff_rockbox_theme/themes.jsx Battery() — viewBox
+     * design_reference/themes.jsx Battery() — viewBox
      * 0..32, body rect 0.5..28.5 / 0.5..10.5 with rx=1.5, nub at
      * x=29 y=3 size 2x5, inner soft fill rect at x=2 y=2 width
      * 25*level height 7 opacity 0.18, "NN%" text centered at x=15.

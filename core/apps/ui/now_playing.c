@@ -1,11 +1,10 @@
 /*
  * core/apps/ui/now_playing.c — NP screen renderer.
  *
- * Layout matches Theme 1 ("Linen") in design_handoff_rockbox_theme/
- * themes.jsx Theme1NowPlaying. Status bar with shuffle/repeat icons
- * + battery; flex row art/text; star rating + format badge below
- * the album line; "Up next" mini-row near the bottom; progress bar +
- * time labels at the very bottom.
+ * Layout matches Theme 1 ("Linen") in design_reference/themes.jsx
+ * Theme1NowPlaying. Status bar with shuffle/repeat icons + battery;
+ * flex row art/text; format badge below the album line; progress bar
+ * with time labels above it; "Up next" mini-row beneath the bar.
  *
  * Album art is a diagonal-stripe placeholder until ID3 + JPEG decode
  * lands. Title / artist / album hardcoded for the FLAC fixture
