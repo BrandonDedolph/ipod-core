@@ -84,13 +84,18 @@ album art flips. **About** shows firmware version + library counts.
 | ![Main dark](docs/img/16-main-dark.png) | ![About](docs/img/17-about.png) |
 
 ### Library views (all backed by the tagcache)
-![Songs](docs/img/03-songs.png) ![Artists](docs/img/04-artists.png)
+22² thumbnails are decoded from embedded album art (Songs / Albums)
+or fetched from Deezer at tagcache-build time (Artists). All slots
+go through a 32-entry LRU so scrolling doesn't re-decode JPEGs.
 
-### Genres / Composers — same shape as Artists/Albums
-![Genres](docs/img/05-genres.png) ![Composers](docs/img/06-composers.png)
+![Songs](docs/img/03-songs.png) ![Albums](docs/img/03b-albums.png)
+
+![Artists](docs/img/04-artists.png) ![Genres](docs/img/05-genres.png)
+
+![Composers](docs/img/06-composers.png)
 
 ### Drilldowns — pick a row, see its songs
-![Aphex Twin → songs](docs/img/07-aphex-songs.png) ![Genre IDM → songs](docs/img/08-genre-idm.png)
+![Artist → songs](docs/img/07-artist-songs.png) ![Genre → songs](docs/img/08-genre-songs.png)
 
 ### Now Playing — four cycle-able pages
 The iconic iPod NP screen. Embedded album art renders at 130² on the
@@ -106,7 +111,7 @@ scrubbing doesn't re-decode the JPEG.
 
 | Peak meter (synthesized) | Track info |
 |---|---|
-| ![NP peak meter](docs/img/12-np-peakmeter.png) | ![NP track info](docs/img/11-np-trackinfo.png) |
+| ![NP peak meter](docs/img/11-np-peakmeter.png) | ![NP track info](docs/img/12-np-trackinfo.png) |
 
 ---
 
