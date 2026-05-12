@@ -1,9 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="14" height="11" viewBox="0 0 14 11">
-  <g stroke="black" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M1 2 L4 2 L8 8.5 L11 8.5"/>
-    <path d="M1 8.5 L4 8.5 L5.2 6.5"/>
-    <path d="M7.2 4.5 L8 3.2 L11 3.2"/>
-    <path d="M9.5 1.4 L11.7 3.2 L9.5 5"/>
-    <path d="M9.5 6.7 L11.7 8.5 L9.5 10.3"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="12" height="10" viewBox="0 0 12 10">
+  <!--
+    Status-bar shuffle icon: two arrows that cross. Designed in the
+    output coordinate space (12×10 viewBox) so geometry lines up with
+    pixels after downsample. The "top" arrow is one continuous path
+    drawn in front; the "bottom" arrow has a small gap at the crossing
+    so it visibly passes BEHIND the front arrow.
+
+    Stroke 1.5 was chosen by sweep: 1.4 reads too faint after
+    box-downsample, 1.6+ starts merging diagonals into a blob at the
+    cross. Endpoints are biased onto half-pixel offsets so horizontal
+    tails land on a single output row instead of straddling two.
+  -->
+  <g stroke="black" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Front arrow: tail at top-left → diagonal down-right → tip at bottom-right -->
+    <path d="M0.5 2.5 L3.5 2.5 L7.5 7.5 L10.5 7.5"/>
+    <!-- Back arrow split into two segments with a gap at the crossing -->
+    <path d="M0.5 7.5 L3.5 7.5 L4.7 6.0"/>
+    <path d="M6.3 4.0 L7.5 2.5 L10.5 2.5"/>
+    <!-- Arrowheads. Tips pushed to x=11.2 so the V lands a column out
+         and the cap-rounding bleeds into the rightmost output column. -->
+    <path d="M9 0.8 L11.2 2.5 L9 4.2"/>
+    <path d="M9 5.8 L11.2 7.5 L9 9.2"/>
   </g>
 </svg>
