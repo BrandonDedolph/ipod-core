@@ -1,8 +1,22 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="14" height="11" viewBox="0 0 14 11">
-  <g stroke="black" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M3 2 L11 2 L11 5"/>
-    <path d="M11 9 L3 9 L3 6"/>
-    <path d="M9 0.4 L11.4 2 L9 3.6"/>
-    <path d="M5 7.4 L2.6 9 L5 10.6"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="12" height="10" viewBox="0 0 12 10">
+  <!--
+    Status-bar repeat icon: two arrows forming a loop. Same design
+    rules as shuffle.svg — viewBox matches output pixel grid, endpoints
+    sit on half-pixel offsets, stroke 1.5 reads cleanly after the
+    box-filter downsample.
+
+    Arrowhead tips bleed past the corner by 0.3 SVG units so the
+    pointy end registers on the edge output row instead of being lost
+    inside the round line-cap.
+  -->
+  <g stroke="black" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Top arrow: left tail → right → short stub down to its arrowhead anchor -->
+    <path d="M2.5 2.5 L9.5 2.5 L9.5 4.5"/>
+    <!-- Bottom arrow: right tail → left → short stub up to its arrowhead anchor -->
+    <path d="M9.5 7.5 L2.5 7.5 L2.5 5.5"/>
+    <!-- Top-right arrowhead -->
+    <path d="M7.5 0.7 L9.5 2.5 L7.5 4.3"/>
+    <!-- Bottom-left arrowhead -->
+    <path d="M4.5 5.7 L2.5 7.5 L4.5 9.3"/>
   </g>
 </svg>
