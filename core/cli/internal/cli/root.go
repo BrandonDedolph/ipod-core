@@ -32,6 +32,7 @@ func Root() *cobra.Command {
 		newTestCmd(),
 		newReleaseCmd(),
 		newTagcacheCmd(),
+		newFirmwareCmd(),
 	)
 
 	return root
@@ -58,6 +59,9 @@ Test and release:
 
 Music index:
   core tagcache       Build and inspect the binary music index (.tcdb)
+
+Firmware images:
+  core firmware       Pack / unpack .ipod transport-format images
 
 Run "core <command> --help" for command-specific options.
 `

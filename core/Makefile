@@ -7,21 +7,29 @@
 BUILD_HW  := build-hw
 BUILD_SIM := build-sim
 
-.PHONY: help hw sim clean realclean reconfigure-hw reconfigure-sim
+.PHONY: help hw ipod sim clean realclean reconfigure-hw reconfigure-sim
 
 help:
 	@echo "Targets:"
-	@echo "  make hw           Build the firmware image (ARM, iPod 5G/5.5G)"
+	@echo "  make hw           Build the firmware ELF + flat binary (ARM, iPod 5G/5.5G)"
+	@echo "  make ipod         Build hw, then wrap as .ipod transport image"
 	@echo "  make sim          Build the host simulator (SDL2)"
 	@echo "  make clean        Remove build artifacts"
 	@echo "  make realclean    Remove build directories entirely"
 	@echo
 	@echo "Build directories:"
-	@echo "  $(BUILD_HW)/      ARM cross-build"
+	@echo "  $(BUILD_HW)/      ARM cross-build (core.elf, core.bin, core.ipod)"
 	@echo "  $(BUILD_SIM)/     host build"
 
 hw: $(BUILD_HW)/build.ninja
 	ninja -C $(BUILD_HW)
+
+# `make ipod` produces $(BUILD_HW)/core.ipod by running the host Go CLI
+# against the flat binary that `make hw` already emits. `go run` here
+# avoids requiring a pre-built `core` binary; once the CLI ships in CI
+# we'll switch this to the released binary.
+ipod: hw
+	cd cli && go run ./cmd/core firmware pack ../$(BUILD_HW)/core.bin --out ../$(BUILD_HW)/core.ipod
 
 sim: $(BUILD_SIM)/build.ninja
 	ninja -C $(BUILD_SIM)
