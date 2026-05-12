@@ -23,14 +23,10 @@ cpu        = 'arm7tdmi'
 endian     = 'little'
 
 [built-in options]
-c_args = [
-  '-mcpu=arm7tdmi',
-  '-ffreestanding',
-]
-c_link_args = [
-  '-nostdlib',
-  '-nostartfiles',
-]
+# Meson machine files use configparser syntax; multi-line list values
+# must be indented continuation lines, so we keep these single-line.
+c_args = ['-mcpu=arm7tdmi', '-ffreestanding']
+c_link_args = ['-nostdlib', '-nostartfiles']
 # Note: -mthumb-interwork was removed — it's a no-op on arm-none-eabi-gcc
 # 5+ (which has handled ARM/Thumb interworking automatically since then).
 # Add -mthumb explicitly per-file if/when we want Thumb code.

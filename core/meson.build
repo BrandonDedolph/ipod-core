@@ -65,19 +65,34 @@ else
 endif
 
 subdir('hal')         # hardware abstraction layer (sim or hw backend)
-subdir('codecs')      # vendored audio decoders (FLAC + MP3)
-subdir('apps/audio')  # playback engine: decoder_t -> ring -> hal_audio
-subdir('apps/db')     # tagcache (music library index)
-subdir('apps/ui')     # Cabinet shell, list view, font
 
-# Sim target also gets the simulator entry point + the test harness.
-if target == 'sim'
-  subdir('sim')
-  subdir('tests')
+if target == 'hw'
+  # Bare-metal ARM build. boot/ + kernel/ are all that's freestanding-
+  # clean today; codecs, audio engine, tagcache, and UI still pull in
+  # host libc and land in subsequent PRs as they're brought up.
+  subdir('boot')
+  subdir('kernel')
+
+  executable(
+    'core.elf',
+    boot_sources + kernel_sources,
+    link_args: [
+      '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),
+      '-Wl,-Map=core.map',
+    ],
+    link_depends: boot_linker_script,
+  )
+
+elif target == 'sim'
+  subdir('codecs')      # vendored audio decoders (FLAC + MP3)
+  subdir('apps/audio')  # playback engine: decoder_t -> ring -> hal_audio
+  subdir('apps/db')     # tagcache (music library index)
+  subdir('apps/ui')     # Cabinet shell, list view, font
+  subdir('sim')         # core-sim entry point
+  subdir('tests')       # codec KAT + .tcdb reader + audio playback
 endif
 
 # Future subsystems land here as they're written:
 #
-# subdir('boot')        # crt0, linker, image header (hw only)
-# subdir('kernel')      # tasks, IPC, IRQs
-# subdir('fs')          # FAT32
+#   target == 'hw':  fs/ (FAT32), then codecs/apps once freestanding-clean
+#   either:          kernel/ scheduler, IRQ table
