@@ -27,9 +27,11 @@ hw: $(BUILD_HW)/build.ninja
 # `make ipod` produces $(BUILD_HW)/core.ipod by running the host Go CLI
 # against the flat binary that `make hw` already emits. `go run` here
 # avoids requiring a pre-built `core` binary; once the CLI ships in CI
-# we'll switch this to the released binary.
+# we'll switch this to the released binary. --force because remaking
+# over a previous run's core.ipod is the normal case here, not an
+# accident the CLI's overwrite guard should block.
 ipod: hw
-	cd cli && go run ./cmd/core firmware pack ../$(BUILD_HW)/core.bin --out ../$(BUILD_HW)/core.ipod
+	cd cli && go run ./cmd/core firmware pack ../$(BUILD_HW)/core.bin --out ../$(BUILD_HW)/core.ipod --force
 
 sim: $(BUILD_SIM)/build.ninja
 	ninja -C $(BUILD_SIM)
