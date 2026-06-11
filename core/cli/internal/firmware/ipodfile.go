@@ -19,6 +19,19 @@ var (
 	ModelNameIPodNano  = ModelName{'n', 'a', 'n', 'o'}
 )
 
+// ModelNumForName maps an embedded .ipod model name to the checksum
+// seed for that model (per core/docs/hw/08-boot-dock.md: "ipvd" for
+// Video, "nano" for Nano). ok is false for names we don't know.
+func ModelNumForName(name ModelName) (num ModelNum, ok bool) {
+	switch name {
+	case ModelNameIPodVideo:
+		return ModelIPodVideo, true
+	case ModelNameIPodNano:
+		return ModelIPodNano, true
+	}
+	return 0, false
+}
+
 // IPodFileHeaderSize is the fixed 8-byte prefix of an .ipod-format file:
 // 4 bytes of big-endian additive checksum + 4 bytes of model name.
 const IPodFileHeaderSize = 8
@@ -30,6 +43,11 @@ var ErrShortIPodFile = errors.New(".ipod file: truncated before header")
 // ErrIPodChecksumMismatch is returned by ReadIPodFile when the embedded
 // checksum doesn't match a fresh computation over the image bytes.
 var ErrIPodChecksumMismatch = errors.New(".ipod file: checksum mismatch")
+
+// ErrUnknownModelName is returned by ReadIPodFile when the embedded
+// 4-byte model name isn't one we know a checksum seed for, so the
+// checksum can't be verified.
+var ErrUnknownModelName = errors.New(".ipod file: unknown model name")
 
 // WriteIPodFile emits an .ipod-format image to w: a 4-byte big-endian
 // additive checksum (computed over `image` with `model` as the seed),
@@ -64,11 +82,17 @@ func WriteIPodFile(w io.Writer, model ModelNum, name ModelName, image []byte) er
 // ReadIPodFile parses an .ipod-format image from r. Returns the model
 // name, image bytes, and any error.
 //
+// The checksum seed is derived from the embedded model name (via
+// ModelNumForName), so a Nano image verifies with the Nano seed and a
+// Video image with the Video seed. If the name isn't one we know,
+// ErrUnknownModelName is returned — with the name and image bytes
+// still populated, consistent with the recovery-tool philosophy below.
+//
 // The embedded checksum is verified against a fresh computation; on
 // mismatch the image bytes are still returned alongside ErrIPodChecksumMismatch
 // so callers can choose whether to trust them (e.g. recovery tools that
 // want to inspect a corrupt image).
-func ReadIPodFile(r io.Reader, model ModelNum) (ModelName, []byte, error) {
+func ReadIPodFile(r io.Reader) (ModelName, []byte, error) {
 	var hdr [IPodFileHeaderSize]byte
 	n, err := io.ReadFull(r, hdr[:])
 	if err != nil {
@@ -85,6 +109,11 @@ func ReadIPodFile(r io.Reader, model ModelNum) (ModelName, []byte, error) {
 	image, err := io.ReadAll(r)
 	if err != nil {
 		return name, nil, fmt.Errorf(".ipod image read: %w", err)
+	}
+
+	model, ok := ModelNumForName(name)
+	if !ok {
+		return name, image, fmt.Errorf("%w: %q", ErrUnknownModelName, string(name[:]))
 	}
 
 	if got := Checksum(model, image); got != want {

@@ -24,8 +24,30 @@ and "core install", which call into this package internally.`,
 	return cmd
 }
 
+// createOutputFile opens path for writing, refusing to overwrite an
+// existing file unless force is set. O_EXCL gives us the atomic check;
+// the user gets a clear error rather than silently losing the existing
+// file. Mirrors the "tagcache build" overwrite-safety pattern.
+func createOutputFile(path string, force bool) (*os.File, error) {
+	flag := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if !force {
+		flag = os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	}
+	f, err := os.OpenFile(path, flag, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("%s already exists; pass --force to overwrite", path)
+		}
+		return nil, fmt.Errorf("create %s: %w", path, err)
+	}
+	return f, nil
+}
+
 func newFirmwarePackCmd() *cobra.Command {
-	var out string
+	var (
+		out   string
+		force bool
+	)
 	cmd := &cobra.Command{
 		Use:   "pack <image.bin>",
 		Short: "Wrap a raw firmware image in the .ipod transport format",
@@ -45,9 +67,9 @@ The output is what "core install" / "core update" write to the device.`,
 				return fmt.Errorf("read %s: %w", args[0], err)
 			}
 
-			f, err := os.Create(out)
+			f, err := createOutputFile(out, force)
 			if err != nil {
-				return fmt.Errorf("create %s: %w", out, err)
+				return err
 			}
 			defer f.Close()
 
@@ -61,11 +83,16 @@ The output is what "core install" / "core update" write to the device.`,
 		},
 	}
 	cmd.Flags().StringVarP(&out, "out", "o", "", "Output .ipod path (required)")
+	cmd.Flags().BoolVarP(&force, "force", "f", false,
+		"Overwrite the output file if it already exists")
 	return cmd
 }
 
 func newFirmwareUnpackCmd() *cobra.Command {
-	var out string
+	var (
+		out   string
+		force bool
+	)
 	cmd := &cobra.Command{
 		Use:   "unpack <image.ipod>",
 		Short: "Extract the raw image bytes from a .ipod file (verifying checksum)",
@@ -80,11 +107,16 @@ func newFirmwareUnpackCmd() *cobra.Command {
 			}
 			defer f.Close()
 
-			name, image, err := firmware.ReadIPodFile(f, firmware.ModelIPodVideo)
+			name, image, err := firmware.ReadIPodFile(f)
 			if err != nil {
 				return err
 			}
-			if err := os.WriteFile(out, image, 0o644); err != nil {
+			of, err := createOutputFile(out, force)
+			if err != nil {
+				return err
+			}
+			defer of.Close()
+			if _, err := of.Write(image); err != nil {
 				return fmt.Errorf("write %s: %w", out, err)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(),
@@ -94,5 +126,7 @@ func newFirmwareUnpackCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&out, "out", "o", "", "Output raw image path (required)")
+	cmd.Flags().BoolVarP(&force, "force", "f", false,
+		"Overwrite the output file if it already exists")
 	return cmd
 }

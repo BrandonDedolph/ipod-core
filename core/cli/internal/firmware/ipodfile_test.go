@@ -41,7 +41,7 @@ func TestIPodFileRoundtrip(t *testing.T) {
 		t.Fatalf("WriteIPodFile: %v", err)
 	}
 
-	name, decoded, err := ReadIPodFile(&buf, ModelIPodVideo)
+	name, decoded, err := ReadIPodFile(&buf)
 	if err != nil {
 		t.Fatalf("ReadIPodFile: %v", err)
 	}
@@ -50,6 +50,70 @@ func TestIPodFileRoundtrip(t *testing.T) {
 	}
 	if !bytes.Equal(decoded, image) {
 		t.Error("image bytes mismatch after roundtrip")
+	}
+}
+
+func TestIPodFileRoundtrip_Nano(t *testing.T) {
+	// A Nano image is written with the 0x04 seed; ReadIPodFile must
+	// derive that same seed from the embedded "nano" name rather than
+	// assuming Video's 0x05 (which would falsely report a mismatch).
+	image := []byte{0x10, 0x20, 0x30}
+	var buf bytes.Buffer
+	if err := WriteIPodFile(&buf, ModelIPodNano, ModelNameIPodNano, image); err != nil {
+		t.Fatalf("WriteIPodFile: %v", err)
+	}
+
+	// Sanity: the stored checksum really is seeded with 0x04.
+	if got := binary.BigEndian.Uint32(buf.Bytes()[0:4]); got != 0x64 {
+		t.Fatalf("stored checksum = %#x, want %#x (0x04 seed)", got, 0x64)
+	}
+
+	name, decoded, err := ReadIPodFile(&buf)
+	if err != nil {
+		t.Fatalf("ReadIPodFile: %v", err)
+	}
+	if name != ModelNameIPodNano {
+		t.Errorf("name = %v, want %v", name, ModelNameIPodNano)
+	}
+	if !bytes.Equal(decoded, image) {
+		t.Error("image bytes mismatch after roundtrip")
+	}
+}
+
+func TestReadIPodFile_UnknownModelName(t *testing.T) {
+	// A structurally valid file with a model name we have no seed for:
+	// the name and bytes still come back so recovery tools can inspect,
+	// but with ErrUnknownModelName since the checksum can't be verified.
+	unknown := ModelName{'x', 'y', 'z', 'w'}
+	image := []byte{0x10, 0x20, 0x30}
+	var buf bytes.Buffer
+	var hdr [IPodFileHeaderSize]byte
+	binary.BigEndian.PutUint32(hdr[0:4], 0x65) // value irrelevant; never checked
+	copy(hdr[4:8], unknown[:])
+	buf.Write(hdr[:])
+	buf.Write(image)
+
+	name, decoded, err := ReadIPodFile(&buf)
+	if !errors.Is(err, ErrUnknownModelName) {
+		t.Errorf("err = %v, want ErrUnknownModelName", err)
+	}
+	if name != unknown {
+		t.Errorf("name = %v, want %v", name, unknown)
+	}
+	if !bytes.Equal(decoded, image) {
+		t.Error("image bytes should be returned even for an unknown model name")
+	}
+}
+
+func TestModelNumForName(t *testing.T) {
+	if num, ok := ModelNumForName(ModelNameIPodVideo); !ok || num != ModelIPodVideo {
+		t.Errorf("ModelNumForName(ipvd) = %#x, %v; want %#x, true", uint32(num), ok, uint32(ModelIPodVideo))
+	}
+	if num, ok := ModelNumForName(ModelNameIPodNano); !ok || num != ModelIPodNano {
+		t.Errorf("ModelNumForName(nano) = %#x, %v; want %#x, true", uint32(num), ok, uint32(ModelIPodNano))
+	}
+	if _, ok := ModelNumForName(ModelName{'?', '?', '?', '?'}); ok {
+		t.Error("ModelNumForName(????) ok = true, want false")
 	}
 }
 
@@ -63,7 +127,7 @@ func TestReadIPodFile_ChecksumMismatch(t *testing.T) {
 	buf.Write(hdr[:])
 	buf.Write(image)
 
-	name, decoded, err := ReadIPodFile(&buf, ModelIPodVideo)
+	name, decoded, err := ReadIPodFile(&buf)
 	if !errors.Is(err, ErrIPodChecksumMismatch) {
 		t.Errorf("err = %v, want ErrIPodChecksumMismatch", err)
 	}
@@ -78,14 +142,14 @@ func TestReadIPodFile_ChecksumMismatch(t *testing.T) {
 
 func TestReadIPodFile_TruncatedHeader(t *testing.T) {
 	// Only 4 bytes — short of the 8-byte header.
-	_, _, err := ReadIPodFile(bytes.NewReader([]byte{0, 0, 0, 0}), ModelIPodVideo)
+	_, _, err := ReadIPodFile(bytes.NewReader([]byte{0, 0, 0, 0}))
 	if !errors.Is(err, ErrShortIPodFile) {
 		t.Errorf("err = %v, want ErrShortIPodFile", err)
 	}
 }
 
 func TestReadIPodFile_EmptyInput(t *testing.T) {
-	_, _, err := ReadIPodFile(bytes.NewReader(nil), ModelIPodVideo)
+	_, _, err := ReadIPodFile(bytes.NewReader(nil))
 	// io.ReadFull returns io.EOF when nothing was read; our wrapper treats
 	// that as a short file.
 	if !errors.Is(err, ErrShortIPodFile) && !errors.Is(err, io.EOF) {
