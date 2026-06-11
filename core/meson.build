@@ -76,6 +76,7 @@ if target == 'hw'
   core_elf = executable(
     'core.elf',
     boot_sources + kernel_sources,
+    dependencies: [hal_dep],     # hal/hw: SER0 debug UART
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),
       '-Wl,-Map=core.map',

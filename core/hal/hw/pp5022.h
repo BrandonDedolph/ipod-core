@@ -1,0 +1,194 @@
+/*
+ * core/hal/hw/pp5022.h — PortalPlayer PP5022 platform constants.
+ *
+ * Canonical home for the hardware constants used by the hw HAL backend
+ * and (eventually) boot/crt0.S. Every value here is transcribed from
+ * the Phase-0 hardware reference under core/docs/hw/ — that reference
+ * is the ONLY permitted source for MMIO addresses and bit layouts.
+ * Each block cites the doc section it came from. Where the docs are
+ * silent or self-inconsistent, the gap is marked TODO(hw-doc) rather
+ * than filled from memory.
+ *
+ * The header is dual-mode: bare addresses (*_ADDR / sizes / bit masks)
+ * are visible to both C and assembly; the volatile lvalue accessors
+ * (SER0_LCR = ...) are C-only behind the __ASSEMBLER__ guard. crt0.S
+ * still carries its own inline constants for now — rewiring it to use
+ * this header is deliberately out of scope for this PR.
+ */
+
+#ifndef CORE_HAL_HW_PP5022_H
+#define CORE_HAL_HW_PP5022_H
+
+/* ---------- MMIO accessors (C only) --------------------------------- */
+
+#ifndef __ASSEMBLER__
+#include <stdint.h>
+
+#define PP_REG32(addr)  (*(volatile uint32_t *)(addr))
+#define PP_REG8(addr)   (*(volatile uint8_t  *)(addr))
+#endif
+
+/* ---------- Memory map ----------------------------------------------
+ * core/docs/hw/01-soc-pp5022.md, "Memory map".
+ *
+ * SDRAM sits at its native 0x10000000 at boot-ROM handoff; the
+ * bootloader/crt0 remaps it to 0x00000000 so the ARM exception vectors
+ * land in our image (see MMAP0 below and boot/crt0.S).
+ */
+
+#define SDRAM_BASE          0x00000000  /* post-MMAP0-remap logical base */
+#define SDRAM_NATIVE_BASE   0x10000000  /* physical base, pre-remap      */
+#define SDRAM_SIZE_5G       0x02000000  /* 32 MB (iPod Video 5G)         */
+#define SDRAM_SIZE_5_5G     0x04000000  /* 64 MB (iPod Video 5.5G)       */
+
+#define IRAM_BASE           0x40000000
+#define IRAM_SIZE           0x00020000  /* 128 KB total                  */
+#define IRAM_USABLE_SIZE    0x00018000  /* ~96 KB usable to user code    */
+
+/* ---------- MMAP0: logical->physical remap ---------------------------
+ * core/docs/hw/01-soc-pp5022.md, "Memory remap (MMAP0)": MMAP0_LOGICAL
+ * (0xF000F000) is set to 0x00000000 and MMAP0_PHYSICAL (0xF000F004) to
+ * 0x10000000 with flags 0x0F84 (read/write, data/code). The flags are
+ * OR'd into the low bits of the PHYSICAL register value.
+ *
+ * TODO(hw-boot): verify the flags nibble against upstream Rockbox
+ * crt0-pp.S before first hardware boot — our doc says 0x0F84 but
+ * Rockbox may use 0x3F84 (the 0x0F00 vs 0x3F00 bits look like a
+ * window-size mask: 32 MB vs 64 MB, which matters on the 64 MB 5.5G).
+ * Same open question is flagged at the use site in boot/crt0.S.
+ */
+
+#define MMAP0_LOGICAL_ADDR    0xF000F000
+#define MMAP0_PHYSICAL_ADDR   0xF000F004
+#define MMAP0_REMAP_FLAGS     0x00000F84  /* read/write, data/code */
+
+#ifndef __ASSEMBLER__
+#define MMAP0_LOGICAL   PP_REG32(MMAP0_LOGICAL_ADDR)
+#define MMAP0_PHYSICAL  PP_REG32(MMAP0_PHYSICAL_ADDR)
+#endif
+
+/* ---------- Processor ID ---------------------------------------------
+ * core/docs/hw/01-soc-pp5022.md, "Dual core: CPU and COP". Reading
+ * PROCESSOR_ID distinguishes the two ARM7TDMI cores.
+ */
+
+#define PROCESSOR_ID_ADDR   0x60000000
+#define PROC_ID_CPU         0x55
+#define PROC_ID_COP         0xAA
+
+#ifndef __ASSEMBLER__
+#define PROCESSOR_ID    PP_REG32(PROCESSOR_ID_ADDR)
+#endif
+
+/* ---------- Device enable / reset / clock control --------------------
+ * core/docs/hw/01-soc-pp5022.md, "Power management" (DEV_*) and
+ * "Clock tree" (PLL_*, CLOCK_SOURCE, DEV_TIMING1). These gate
+ * per-peripheral clock and reset.
+ *
+ * TODO(hw-doc): the SER0 init sequence in core/docs/hw/08-boot-dock.md
+ * ("Init sequence") requires `DEV_EN |= DEV_SER0` plus a DEV_RS reset
+ * pulse, but no doc gives the DEV_SER0 bit value. Until the doc grows
+ * it, uart_init() cannot perform the enable/reset step — see the
+ * matching TODO(hw-doc) in core/hal/hw/uart.c.
+ */
+
+#define DEV_RS_ADDR         0x60006004
+#define DEV_RS2_ADDR        0x60006008
+#define DEV_EN_ADDR         0x6000600C
+#define DEV_EN2_ADDR        0x60006010
+#define DEV_INIT1_ADDR      0x70000010
+#define DEV_INIT2_ADDR      0x70000020
+
+#define CLOCK_SOURCE_ADDR   0x60006020
+#define PLL_CONTROL_ADDR    0x60006034
+#define PLL_STATUS_ADDR     0x6000603C
+#define DEV_TIMING1_ADDR    0x70000034
+
+#ifndef __ASSEMBLER__
+#define DEV_RS          PP_REG32(DEV_RS_ADDR)
+#define DEV_RS2         PP_REG32(DEV_RS2_ADDR)
+#define DEV_EN          PP_REG32(DEV_EN_ADDR)
+#define DEV_EN2         PP_REG32(DEV_EN2_ADDR)
+#define DEV_INIT1       PP_REG32(DEV_INIT1_ADDR)
+#define DEV_INIT2       PP_REG32(DEV_INIT2_ADDR)
+
+#define CLOCK_SOURCE    PP_REG32(CLOCK_SOURCE_ADDR)
+#define PLL_CONTROL     PP_REG32(PLL_CONTROL_ADDR)
+#define PLL_STATUS      PP_REG32(PLL_STATUS_ADDR)
+#define DEV_TIMING1     PP_REG32(DEV_TIMING1_ADDR)
+#endif
+
+/* ---------- SER0: dock-connector debug UART (8250-style) -------------
+ * core/docs/hw/08-boot-dock.md, "UART debug" -> "SoC registers
+ * (8250-style at SER0)". RBR (read), THR (write) and DLL (write, with
+ * LCR.DLAB set) share offset 0x0; DLM shares 0x4 semantics per 8250
+ * convention. Reference clock is 24 MHz; divisor = 24e6 / (16 * baud)
+ * (08-boot-dock.md, "Baud rate").
+ *
+ * TODO(hw-doc): the doc's SER0_IER (0x70006001) and SER0_FCR
+ * (0x70006002) addresses are byte-strided, which contradicts the
+ * 4-byte stride implied by SER0_DLM/LCR/LSR (0x04/0x0C/0x14) — and in
+ * a real 8250, IER and DLM share one offset, yet the doc gives them
+ * different addresses. One of the two stride conventions is a
+ * transcription slip. Verify against Rockbox firmware/export/pp5020.h
+ * before relying on IER/FCR; the polled-TX driver in uart.c
+ * deliberately avoids touching either register.
+ */
+
+#define SER0_BASE_ADDR      0x70006000
+
+#define SER0_RBR_ADDR       0x70006000  /* RX buffer (read)              */
+#define SER0_THR_ADDR       0x70006000  /* TX holding (write)            */
+#define SER0_DLL_ADDR       0x70006000  /* divisor low  (when LCR.DLAB)  */
+#define SER0_DLM_ADDR       0x70006004  /* divisor high (when LCR.DLAB)  */
+#define SER0_LCR_ADDR       0x7000600C  /* line control                  */
+#define SER0_LSR_ADDR       0x70006014  /* line status                   */
+#define SER0_IER_ADDR       0x70006001  /* IRQ enable   — see TODO above */
+#define SER0_FCR_ADDR       0x70006002  /* FIFO control — see TODO above */
+
+/* SER0_LCR bits (08-boot-dock.md, "Init sequence"). */
+#define SER0_LCR_DLAB       0x80        /* divisor latch access          */
+#define SER0_LCR_8N1        0x03        /* 8 data, no parity, 1 stop     */
+
+/* SER0_LSR bits (08-boot-dock.md, register table). */
+#define SER0_LSR_RX_RDY     0x01        /* bit 0: RX data ready          */
+#define SER0_LSR_THRE       0x20        /* bit 5: TX holding empty       */
+
+/* Divisor latch values for the 24 MHz reference
+ * (08-boot-dock.md, "Baud rate" table). DLM is 0 for all of these. */
+#define SER0_DIV_9600       0x9C
+#define SER0_DIV_19200      0x4E
+#define SER0_DIV_38400      0x27
+#define SER0_DIV_57600      0x1A
+#define SER0_DIV_115200     0x0D
+
+/* GPIO routing for SER0 on the iPod Video (08-boot-dock.md, "GPIO
+ * routing for SER0 on iPod Video"): clear bits 2-3 of the (unnamed in
+ * the doc) routing register at 0x7000008C to route SER0 TX/RX to the
+ * dock pins. The doc's second step, `GPO32_ENABLE &= ~0x0000000C`, has
+ * no documented address — see TODO(hw-doc) in uart.c. */
+#define SER0_GPIO_ROUTE_ADDR  0x7000008C
+#define SER0_GPIO_ROUTE_MASK  0x0000000C
+
+/* SER0 interrupt: IRQ #36, i.e. high bank bit 4
+ * (01-soc-pp5022.md, "IRQ numbers" table). Unused by the polled
+ * driver; recorded for the future IRQ-driven RX path. */
+#define SER0_IRQ            36
+
+#ifndef __ASSEMBLER__
+/* The doc's init sequence uses 8-bit accesses (ATA_OUT8) for the 8250
+ * register file, so the accessors below are byte-wide; the routing
+ * register is a normal 32-bit word (inl/outl in the doc). */
+#define SER0_RBR        PP_REG8(SER0_RBR_ADDR)
+#define SER0_THR        PP_REG8(SER0_THR_ADDR)
+#define SER0_DLL        PP_REG8(SER0_DLL_ADDR)
+#define SER0_DLM        PP_REG8(SER0_DLM_ADDR)
+#define SER0_LCR        PP_REG8(SER0_LCR_ADDR)
+#define SER0_LSR        PP_REG8(SER0_LSR_ADDR)
+#define SER0_IER        PP_REG8(SER0_IER_ADDR)
+#define SER0_FCR        PP_REG8(SER0_FCR_ADDR)
+
+#define SER0_GPIO_ROUTE PP_REG32(SER0_GPIO_ROUTE_ADDR)
+#endif
+
+#endif /* CORE_HAL_HW_PP5022_H */
