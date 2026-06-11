@@ -21,7 +21,7 @@ artist photos from Deezer at tagcache-build time.
 
 | Working today (sim) | Pending |
 |---|---|
-| FLAC + MP3 decoders (bit-exact via codec KAT) | Bootable ARM image (Phase 1) |
+| FLAC + MP3 decoders (bit-exact via codec KAT) | Boots on hardware (UART → LCD → scheduler) |
 | Audio engine — SPSC ring + SDL2 HAL | On-device USB / disk / battery |
 | Recursive library scan + tag parse (Vorbis, ID3v2.3/2.4) | Playlists, podcasts, audiobooks |
 | Same-track dedup (FLAC > MP3) + combo-artist fold | Per-track gain (replaygain) |
@@ -34,8 +34,9 @@ artist photos from Deezer at tagcache-build time.
 | Now Playing layout: cap-aligned format badge, 130² art, 6px progress bar, "Up next" beneath the bar |  |
 | Settings — light / dark theme cycle + About screen |  |
 | End-to-end audio playback test (captures real PCM, bit-compares to reference) |  |
+| **Phase 1 hw bringup** — `arm-none-eabi` cross-build + `.ipod` transport packaging (kernel still a spin loop) |  |
 
-55 commits on `main`. See [`STATUS.md`](STATUS.md) for the running list.
+Each commit on `main` squash-merges one PR; see [`STATUS.md`](STATUS.md) for the running list.
 
 ---
 
@@ -53,6 +54,26 @@ meson test -C build-sim                   # codec KAT + .tcdb parser + audio pla
 ```
 
 Wheel = scroll, center = SELECT, MENU = back, SPACE = pause/resume.
+
+## Quick start (hardware build)
+
+Requires `arm-none-eabi-gcc` (Arch: `arm-none-eabi-gcc`; Debian /
+Ubuntu: `gcc-arm-none-eabi`) and Go 1.22+. `make hw` cross-compiles a
+bare-metal ARMv4T ELF; `make ipod` wraps the flat binary in the
+ipodpatcher-style transport format ready to flash.
+
+```bash
+cd core
+make hw                                   # → build-hw/core.elf + core.bin
+make ipod                                 # → build-hw/core.ipod
+arm-none-eabi-readelf -h build-hw/core.elf | grep Entry
+# Entry point address:               0x0
+```
+
+The kernel currently spins on a NOP loop; UART, LCD, and the
+cooperative scheduler land in upcoming PRs (see [`STATUS.md`](STATUS.md)
+§ Phase 1). Flashing on a real iPod is gated on the install flow
+(`core install`) being implemented.
 
 ---
 
@@ -142,6 +163,30 @@ Format spec: [`core/apps/db/tagcache_format.h`](core/apps/db/tagcache_format.h)
 (C side) and [`core/cli/internal/tagcache/format.go`](core/cli/internal/tagcache/format.go)
 (Go side). Both sides have round-trip tests; a layout drift fails both
 simultaneously.
+
+---
+
+## Firmware image packaging
+
+`make hw` emits a flat binary (`core.bin`); the host CLI wraps it in
+the `.ipod` transport format the installer / updater pushes to the
+device. Same binary unpacks too — useful for inspecting third-party
+images or verifying a write went out intact.
+
+```bash
+cd core/cli
+go build -o /tmp/core ./cmd/core
+/tmp/core firmware pack ../build-hw/core.bin --out /tmp/core.ipod
+/tmp/core firmware unpack /tmp/core.ipod --out /tmp/back.bin
+# back.bin is byte-identical to the input
+```
+
+Format: `[BE32 additive checksum][4-byte model name "ipvd"][image]`.
+The checksum seeds with the iPod model ID (`0x05` for Video) and
+wraps at 32 bits. Spec at
+[`core/docs/hw/08-boot-dock.md`](core/docs/hw/08-boot-dock.md);
+implementation at [`core/cli/internal/firmware/`](core/cli/internal/firmware/)
+with tests covering wrap-at-2^32, mismatch, truncation, and round-trip.
 
 ---
 

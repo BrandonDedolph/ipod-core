@@ -48,14 +48,18 @@ half** — Phase 1 is where ~90% of from-scratch iPod firmware projects
 die. Don't stack another sim PR without weighing that tradeoff.
 
 1. **Phase 1: bootable ARM skeleton** — in progress.
-   - **PR #1 (this branch):** `arm-none-eabi-gcc` cross-build, minimal
+   - **PR #1 (#40):** `arm-none-eabi-gcc` cross-build, minimal
      `boot/crt0.S` + `boot/linker.ld`, `kernel/main.c` spin loop.
      `make hw` produces a 60-byte ARM ELF entered at 0x0; `make sim`
      and the four test suites are unaffected.
-   - **PR #2 (next):** Rockbox-bootloader-compatible image header +
-     `.ipod` packaging (objcopy + Go-side packager) so the ELF becomes
-     a flashable artifact.
-   - **PR #3:** UART debug @ 115200 via SER0 (panic channel before LCD).
+   - **PR #2 (this branch):** `.ipod` transport-format packaging.
+     `make hw` now also emits `core.bin` (objcopy `-O binary`);
+     `make ipod` wraps it as `core.ipod` (BE32 additive checksum +
+     `ipvd` model name + image). `core firmware pack` / `unpack`
+     subcommands expose the format; round-trip verified against the
+     ARM ELF. Go tests cover empty / wrap / mismatch / truncated.
+   - **PR #3 (next):** UART debug @ 115200 via SER0 (panic channel
+     before LCD). Needs `hal/hw/` + first real freestanding driver.
    - **PR #4:** LCD init + solid-color present (5G + 5.5G variants).
    - **PR #5:** Kernel scheduler skeleton + idle task.
    See `PLAN.md` § Phase 1.

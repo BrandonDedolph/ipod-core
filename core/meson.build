@@ -73,7 +73,7 @@ if target == 'hw'
   subdir('boot')
   subdir('kernel')
 
-  executable(
+  core_elf = executable(
     'core.elf',
     boot_sources + kernel_sources,
     link_args: [
@@ -81,6 +81,18 @@ if target == 'hw'
       '-Wl,-Map=core.map',
     ],
     link_depends: boot_linker_script,
+  )
+
+  # Flat binary derived from the ELF — the host-side `core firmware pack`
+  # wraps this in the .ipod transport format. Both products are byproducts
+  # of `make hw`; the Makefile's `ipod` target does the .ipod wrap.
+  objcopy = find_program('objcopy')
+  custom_target(
+    'core.bin',
+    input: core_elf,
+    output: 'core.bin',
+    command: [objcopy, '-O', 'binary', '@INPUT@', '@OUTPUT@'],
+    build_by_default: true,
   )
 
 elif target == 'sim'

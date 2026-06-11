@@ -2,8 +2,15 @@
  * core/boot/linker.ld — link-time memory layout for the iPod Video image.
  *
  * Memory map (PP5022, see core/docs/hw/01-soc-pp5022.md):
- *   SDRAM @ 0x00000000 (after bootloader remap) — code, rodata, data, bss
- *   IRAM  @ 0x40000000 — stack (top-down) and future fast paths
+ *   SDRAM @ 0x00000000 — code, rodata, data, bss. These are POST-REMAP
+ *          addresses: at bootloader handoff SDRAM is still at its native
+ *          0x10000000 and our crt0.S performs the MMAP0 remap to
+ *          0x00000000 itself before relying on any address linked here
+ *          (core/docs/hw/08-boot-dock.md, "Boot ROM → our code:
+ *          handoff state"). Everything in crt0.S up to that point is
+ *          position-independent.
+ *   IRAM  @ 0x40000000 — stack (top-down), crt0's remap stub, and
+ *          future fast paths
  *
  * The image entry point is _start (boot/crt0.S), placed first in .text
  * via the .text.startup section so it sits at offset 0 of the loaded
