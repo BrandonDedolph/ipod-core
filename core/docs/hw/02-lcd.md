@@ -25,8 +25,15 @@ sequences. We just need to drive the BCM correctly.
 ## Memory-mapped BCM interface
 
 The BCM occupies `0x30000000`–`0x30070000` of MMIO. Each "register"
-is actually a port, with separate addresses for 16-bit and 32-bit
-access aliases.
+is actually a port; the 16-bit and 32-bit "aliases" below are the
+**same address**, not separate ones. The BCM decodes only PP address
+bits 16..18 — the low address bits are undecoded — so a 32-bit store
+(or an `stmia` burst) to a port is consumed as consecutive 16-bit
+pushes. This is why the pixel-stream fast path can blast 32-bit
+words (two RGB565 pixels each) at `0x30000000` without per-pixel
+addressing. *(Corrected 2026-06-11 against Rockbox `lcd-video.c` /
+ipodloader2 `fb.c`: an earlier revision called these "separate
+addresses for 16-bit and 32-bit access aliases".)*
 
 | Name             | Address      | Width | Purpose |
 |------------------|--------------|-------|---------|
@@ -49,8 +56,22 @@ Source: `firmware/target/arm/ipod/video/lcd-video.c` lines 40–57.
 | Bit / value     | Meaning |
 |-----------------|---------|
 | `0x02`          | Write ready — BCM can accept new write addr/data |
-| `0x10`          | Read ready — BCM has data on `BCM_RD_ADDR` |
+| `0x10`          | Read ready — BCM has data on `BCM_DATA32` |
 | Write `0x31`    | Strobe to execute the queued command |
+
+The read handshake (verified against Rockbox `lcd-video.c`
+`bcm_read32`, 2026-06-11 — an earlier revision implied the data was
+read "on `BCM_RD_ADDR`"):
+
+1. Poll `BCM_RD_ADDR` (16-bit read) until bit 0 is set — read port
+   ready to accept an address.
+2. Write the BCM-internal address as a 32-bit store to `BCM_RD_ADDR32`.
+3. Poll `BCM_CONTROL` until `& 0x10` — data available.
+4. Read the value as a 32-bit load from `BCM_DATA32`.
+
+The write handshake: write the address as a 32-bit store to
+`BCM_WR_ADDR32`, then poll `BCM_CONTROL` until `& 0x02` before
+pushing data at `BCM_DATA32`.
 
 ## Internal BCM addresses
 
@@ -59,9 +80,9 @@ memory, addressed via `bcm_write_addr` / `bcm_write32`) matter to us:
 
 | Symbol           | Absolute addr | Purpose |
 |------------------|---------------|---------|
-| `BCMA_CMDPARAM`  | `0xE0000`     | Command parameter region — also serves as the framebuffer for `LCD_UPDATE` (full-frame writes start here; partial-rect writes use the same address with rect params elsewhere) |
+| `BCMA_CMDPARAM`  | `0xE0000`     | Command parameter region — also serves as the framebuffer for `LCD_UPDATE` (full-frame writes start here; `LCD_UPDATERECT` puts its 8-word rect header here with pixels at `0xE0020`, see below) |
 | `BCMA_COMMAND`   | `0x1F8`       | Command-code register — write the `BCM_CMD(...)` encoded value here, then strobe `BCM_CONTROL = 0x31` to execute |
-| (parameter alt)  | `0xE00000`    | Higher-up command parameter region used by `LCD_UPDATERECT` (Rockbox doesn't drive this) |
+| `BCMA_STATUS`    | `0x1FC`       | Status word — read by the finishup/poll path after a command (verified against ipodloader2 `fb.c`, 2026-06-11) |
 
 Pixel `(x, y)` in the framebuffer is at offset `(LCD_WIDTH * 2) * y +
 (x * 2)` from `0xE0000`, RGB565 little-endian.
@@ -80,10 +101,10 @@ reject corrupt writes (it checks the bit-inverse against the low half).
 | Command            | Code           | Purpose |
 |--------------------|----------------|---------|
 | `BCMCMD_LCD_UPDATE`| `BCM_CMD(0)`   | Update entire 320×240 frame from `0xE0000` |
-| `BCMCMD_SELFTEST`  | `BCM_CMD(1)`   | M25 diagnostics; ~40 s, displays status on-panel |
+| `BCMCMD_SELFTEST`  | `BCM_CMD(1)`   | M25 diagnostics; <40 s, displays status on-panel |
 | `BCMCMD_TV_PALBMP` | `BCM_CMD(2)`   | Output PAL test pattern on TV out |
 | `BCMCMD_TV_NTSCBMP`| `BCM_CMD(3)`   | Output NTSC test pattern |
-| `BCMCMD_LCD_UPDATERECT` | `BCM_CMD(5)` | Partial-region update — params at `0xE00000` (Rockbox doesn't implement this) |
+| `BCMCMD_LCD_UPDATERECT` | `BCM_CMD(5)` | Partial-region update — 8-word param header at `0xE0000`, pixels at `0xE0020` (see "Partial updates" below) |
 | `BCMCMD_LCD_SLEEP` | `BCM_CMD(8)`   | Blank LCD, low-power |
 | `BCM_CMD(0xC)`     | `BCM_CMD(12)`  | Some shutdown sub-step (undocumented) |
 | `BCMCMD_TV_MVOFF`  | `BCM_CMD(0xE)` | Disable Macrovision on TV out |
@@ -100,7 +121,7 @@ powered off and needs its firmware re-uploaded.
 GPO32_VAL |= 0x4000;
 sleep(HZ/20);                    // 50 ms
 
-STRAP_OPT_A &= ~0xF00;           // clear strap config
+STRAP_OPT_A &= ~0xF00;           // clear strap config; STRAP_OPT_A = 0x70000008
 outl(0x1313, 0x70000040);        // strap pins for boot
 
 // Stage 2 — wait for BCM
@@ -114,11 +135,20 @@ static const u8 boot_seq[8] = {
 for (i = 0; i < 8; i++)  BCM_CONTROL     = boot_seq[i];
 for (i = 3; i < 8; i++)  BCM_ALT_CONTROL = boot_seq[i];
 
+// Post-handshake sync (verified against Rockbox lcd-video.c,
+// 2026-06-11): wait until both read ports come ready, then
+// dummy-read the write-address ports to flush them.
+while (!((BCM_RD_ADDR & 1) && (BCM_ALT_RD_ADDR & 1))) ;
+(void)BCM_WR_ADDR;
+(void)BCM_ALT_WR_ADDR;
+
 // Stage 3 — upload firmware blob to BCM SRAM
 while (BCM_ALT_CONTROL & 0x80) ;
 while (!(BCM_ALT_CONTROL & 0x40)) ;
 
 bcm_write_addr(BCMA_SRAM_BASE);  // 0x0 in BCM-internal mem
+// Upload length rounds to an even number of 16-bit units:
+// ((flash_vmcs_length + 3) >> 1) & ~1.
 lcd_write_data(flash_vmcs_offset, flash_vmcs_length);
 
 // Initialize BCM processor
@@ -133,7 +163,12 @@ while (bcm_read32(BCMA_COMMAND) == 0) yield();
 ```
 
 The firmware blob (`vmcs` section) is in the iPod's flash ROM; located
-via the firmware-partition directory at offset `0x20FFE00`. `flash_get_section(ROM_ID('v','m','c','s'), ...)` finds it. Its length and offset are stored in `flash_vmcs_offset` / `flash_vmcs_length`.
+via the flash directory at `0x200FFE00` (ROM base `0x20000000` +
+`0xFFE00`). `flash_get_section(ROM_ID('v','m','c','s'), ...)` finds it. Its length and offset are stored in `flash_vmcs_offset` / `flash_vmcs_length`.
+
+*(Corrected 2026-06-11 against Rockbox `lcd-video.c`: an earlier
+revision gave the directory address as `0x20FFE00`, dropping a zero —
+the flash ROM is mapped at `0x20000000`, not `0x2000000`.)*
 
 **Magic constants we don't fully understand:**
 - `0x10001400` — modified during shutdown (mask `0xF0`).
@@ -144,6 +179,41 @@ These came from iPodLinux reverse-engineering and aren't documented
 beyond "this is what works."
 
 Source: `lcd-video.c` lines 539–599.
+
+## Host-side port init (always runs)
+
+Separate from the BCM bootstrap, Rockbox `lcd_init_device()` does a
+host-side GPIO/port setup that runs **even when the BCM is already
+alive** (verified against Rockbox `lcd-video.c`, 2026-06-11):
+
+```c
+GPO32_ENABLE     |=  0xC000;   // BCM power rail + companion bit as GPO
+GPIOC_ENABLE     &= ~0x80;     // release C7
+GPIOC_ENABLE     |=  0x40;     // C6 = BCM interrupt pin, GPIO mode
+GPIOC_OUTPUT_EN  &= ~0x40;     //   ... as input
+GPO32_ENABLE     &= ~1;        // release GPO32 bit 0
+```
+
+Probe for a live BCM: `GPO32_VAL & 0x4000` nonzero ⇒ the BCM is
+powered (and, after a chainload, already initialized — see below).
+
+## Chainload handoff state
+
+ipodloader2 performs **no BCM bootstrap** — the Apple flash ROM has
+already powered the BCM and uploaded its firmware by the time any
+loader runs. ipodloader2's `fb.c` just issues update commands, and it
+finishes its final frame **synchronously** (it polls completion before
+jumping to the loaded image). So at handoff to us the BCM is powered,
+awake, and idle, with the panel initialized. ipodloader2 also leaves
+the backlight **on** when booting a non-Apple image. (Verified against
+ipodloader2 `fb.c`, 2026-06-11.)
+
+Rockbox's `BOOTLOADER` build exploits the same guarantee with a
+simplified update variant: wait for BCM idle **before** issuing
+(skippable on the very first frame, since handoff guarantees idle),
+then write params/data, write the command, strobe `0x31`, and return
+**without** waiting for completion. Our Phase-1 driver follows this
+bootloader variant.
 
 ## LCD update protocol
 
@@ -201,17 +271,39 @@ After waking from sleep, the first update can take up to 500 ms
 panel init.
 
 ### Constraints
-- `x` and `width` must be even. Odd values are silently ignored.
+- `x` and `width` must be even (BCM bus alignment). The driver
+  rounds them — `x` down and `width` up to cover the requested
+  rect — rather than odd values being "silently ignored".
 - The data write throughput must keep ahead of BCM consumption; if
   not, BCM stalls (no observed bug in practice).
 
-### `BCMCMD_LCD_UPDATERECT` is unimplemented in Rockbox
+### Partial updates (`BCMCMD_LCD_UPDATERECT`)
 
-Rockbox always does full-frame updates. The partial-rect command
-exists but Rockbox doesn't supply parameters (params expected at
-`0xE00000`; layout unknown). For us, this means: if we want
-damage-tracked rendering, we either contribute to upstream BCM RE work
-or just accept full frames as the cost.
+Rockbox always does full-frame updates, but a working partial-rect
+protocol ships in ipodloader2 `fb.c` (inherited from iPodLinux;
+verified 2026-06-11):
+
+1. `bcm_write_addr(0xE0000)`, then push an 8-word parameter header:
+
+   ```c
+   { 0x34,                 // header magic / opcode
+     start_horiz,          // left   (inclusive)
+     start_vert,           // top    (inclusive)
+     max_horiz,            // right  (inclusive)
+     max_vert,             // bottom (inclusive)
+     count_bytes,          // pixel byte count
+     count_bytes,          // repeated
+     0 }
+   ```
+
+2. Stream the rect's pixel data starting at internal addr `0xE0020`.
+3. `bcm_write32(0x1F8, 0xFFFA0005)` — `BCM_CMD(5)`.
+4. Strobe `BCM_CONTROL = 0x31`.
+
+*(Corrected 2026-06-11: an earlier revision said the params were
+expected at `0xE00000` with unknown layout. That `0xE00000` figure
+survives only as unverified upstream speculation — the shipped
+ipodloader2 layout above is at `0xE0000`/`0xE0020`.)*
 
 ## Tearing
 
@@ -266,8 +358,11 @@ if (current_dim < val) {
 }
 ```
 
-Each step is ~10 ms in software. The level is preserved internally
-in the backlight driver chip; the GPIO toggles are commands to it.
+`udelay` is **microseconds**: each step is ~20 µs going up
+(10 + 10 µs) and ~210 µs going down (200 + 10 µs) — not "~10 ms" as
+an earlier revision claimed (corrected 2026-06-11). The level is
+preserved internally in the backlight driver chip; the GPIO toggles
+are commands to it.
 
 ### Enable / disable
 

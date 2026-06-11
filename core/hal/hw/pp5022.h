@@ -25,6 +25,7 @@
 #include <stdint.h>
 
 #define PP_REG32(addr)  (*(volatile uint32_t *)(addr))
+#define PP_REG16(addr)  (*(volatile uint16_t *)(addr))
 #define PP_REG8(addr)   (*(volatile uint8_t  *)(addr))
 #endif
 
@@ -199,6 +200,84 @@
 #define SER0_GPIO_ROUTE PP_REG32(SER0_GPIO_ROUTE_ADDR)
 #define GPO32_VAL       PP_REG32(GPO32_VAL_ADDR)
 #define GPO32_ENABLE    PP_REG32(GPO32_ENABLE_ADDR)
+#endif
+
+/* ---------- GPIO port C ----------------------------------------------
+ * Used by the LCD host-side port init (02-lcd.md, "Host-side port
+ * init"): GPIOC bit 6 is the BCM interrupt pin (configured as a GPIO
+ * input), bit 7 is released to its alternate function. The doc's GPIO
+ * sections carry no port-register addresses, so these come from
+ * verified Rockbox pp5020.h facts (2026-06-11): ports A-D base
+ * 0x6000D000, ENABLE at +0x00/04/08/0C per port A/B/C/D, OUTPUT_EN at
+ * +0x10/14/18/1C. Only the two registers the LCD driver touches are
+ * defined here.
+ */
+
+#define GPIOC_ENABLE_ADDR     0x6000D008
+#define GPIOC_OUTPUT_EN_ADDR  0x6000D018
+
+#ifndef __ASSEMBLER__
+#define GPIOC_ENABLE     PP_REG32(GPIOC_ENABLE_ADDR)
+#define GPIOC_OUTPUT_EN  PP_REG32(GPIOC_OUTPUT_EN_ADDR)
+#endif
+
+/* ---------- BCM video coprocessor (LCD) -------------------------------
+ * core/docs/hw/02-lcd.md, "Memory-mapped BCM interface" + "Internal
+ * BCM addresses" + "Commands", verified against Rockbox lcd-video.c /
+ * ipodloader2 fb.c (2026-06-11).
+ *
+ * Each BCM "register" is a port: the BCM decodes only PP address bits
+ * 16..18, low address bits are undecoded, so 16-bit and 32-bit
+ * accesses to the same base address both work — a 32-bit store is
+ * consumed as two consecutive 16-bit pushes (this is the pixel-stream
+ * fast path). Address ports take 32-bit writes; status polls are
+ * 16-bit reads.
+ */
+
+#define BCM_DATA_ADDR         0x30000000  /* data port (pixels/params)   */
+#define BCM_WR_ADDR_ADDR      0x30010000  /* write-destination port      */
+#define BCM_RD_ADDR_ADDR      0x30020000  /* read-source port            */
+#define BCM_CONTROL_ADDR      0x30030000  /* status flags + cmd strobe   */
+#define BCM_ALT_DATA_ADDR     0x30040000  /* alt channel (bootstrap only,*/
+#define BCM_ALT_WR_ADDR_ADDR  0x30050000  /*   unused by this driver —   */
+#define BCM_ALT_RD_ADDR_ADDR  0x30060000  /*   constants recorded for    */
+#define BCM_ALT_CONTROL_ADDR  0x30070000  /*   the future bootstrap PR)  */
+
+/* BCM_CONTROL bits / values (02-lcd.md, "BCM_CONTROL"). */
+#define BCM_CONTROL_WR_READY  0x02        /* can accept write addr/data  */
+#define BCM_CONTROL_RD_READY  0x10        /* data available on BCM_DATA32*/
+#define BCM_CONTROL_STROBE    0x31        /* write: execute queued cmd   */
+
+/* BCM_RD_ADDR (16-bit read) bit 0: read port ready to take an address
+ * — poll this BEFORE writing the address (02-lcd.md, read handshake). */
+#define BCM_RD_ADDR_READY     0x01
+
+/* BCM-internal absolute addresses (02-lcd.md, "Internal BCM
+ * addresses"). CMDPARAM doubles as the LCD_UPDATE framebuffer. */
+#define BCMA_CMDPARAM         0xE0000
+#define BCMA_COMMAND          0x1F8
+#define BCMA_STATUS           0x1FC
+
+/* GPO32 bit 14: BCM power rail. Nonzero in GPO32_VAL means the BCM is
+ * powered (and, post-chainload, initialized) — the lcd_init probe
+ * (02-lcd.md, "Host-side port init"). */
+#define GPO32_BCM_POWER       0x4000
+
+#ifndef __ASSEMBLER__
+/* Command encoding: low half is the command, high half its bit
+ * inverse, so the BCM's parser rejects corrupt writes (02-lcd.md,
+ * "Commands"). BCM_CMD(0) = 0xFFFF0000 = LCD_UPDATE. */
+#define BCM_CMD(x)            ((~(uint32_t)(x) << 16) | (uint32_t)(x))
+#define BCMCMD_LCD_UPDATE     BCM_CMD(0)
+
+/* 32-bit views: address ports + data fast path. */
+#define BCM_DATA32      PP_REG32(BCM_DATA_ADDR)
+#define BCM_WR_ADDR32   PP_REG32(BCM_WR_ADDR_ADDR)
+#define BCM_RD_ADDR32   PP_REG32(BCM_RD_ADDR_ADDR)
+
+/* 16-bit views: status polls + control strobe. */
+#define BCM_RD_ADDR     PP_REG16(BCM_RD_ADDR_ADDR)
+#define BCM_CONTROL     PP_REG16(BCM_CONTROL_ADDR)
 #endif
 
 #endif /* CORE_HAL_HW_PP5022_H */

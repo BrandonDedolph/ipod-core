@@ -81,7 +81,24 @@ die. Don't stack another sim PR without weighing that tradeoff.
      state confirmed from its source: it restores the Apple-ROM MMAP
      and jumps at native `0x10000000` — crt0's remap-it-ourselves
      approach is right.
-   - **PR #4:** LCD init + solid-color present (5G + 5.5G variants).
+   - **PR #4 (`phase1/lcd-init`, stacked on PR #3):** LCD init +
+     solid-color present. 02-lcd.md fact-checked against Rockbox
+     lcd-video.c + ipodloader2 fb.c first (10 corrections, incl.
+     another dropped-zero address slip: flash directory is
+     `0x200FFE00`, and the UPDATERECT param layout the doc thought
+     was unknown ships in ipodloader2). Key facts: ipodloader2 does
+     no BCM bootstrap (Apple flash ROM does it), hands off with the
+     BCM powered/awake/idle and the backlight ON for non-Apple
+     images — so the driver needs no bootstrap and no backlight
+     code. hal/hw/lcd.c: host-side port init + `GPO32_VAL & 0x4000`
+     powered-probe, full-frame fill via BCMA_CMDPARAM stream +
+     LCD_UPDATE + 0x31 strobe (Rockbox BOOTLOADER variant: no
+     completion wait), bounded spins throughout. kernel_main fills
+     red→green→blue with serial narration, gated on the probe (an
+     unpowered BCM is never touched — also keeps the clicky smoke
+     alive, since clicky fatals on 0x30000000). One 5G/5.5G image:
+     verified no host-side LCD differences. Untestable in clicky
+     beyond the gate path; needs the device for visual confirmation.
    - **PR #5:** Kernel scheduler skeleton + idle task.
    See `PLAN.md` § Phase 1.
 2. **Playlists** — M3U8 reader → tagcache resolver → read-only
@@ -130,7 +147,12 @@ bug (unparked COP racing the CPU through crt0 — its HLE boot enters
 both cores). Caveats: it's the 4G/PP5020 machine model (PROCESSOR_ID
 reads full-word 0x55555555, SER0 DLAB unmodeled, no BCM2722 LCD, no
 2048-byte-sector ATA), and the GUI needs a display (WSLg ok; xvfb for
-CI). Expected output: the three `core:` banner lines, single-stream.
+CI). Expected output: the `core:` banner lines, single-stream —
+since PR #4, that's banner / self-test / PROCESSOR_ID followed by
+`lcd bcm NOT powered, skipping fills` (clicky has no BCM at
+0x30000000 and fatals on unmapped access, so the driver's
+GPO32-probe gate is what keeps the emulator smoke alive; the gate is
+also correct hardware behavior — never touch an unpowered BCM).
 
 ```bash
 # one-time setup (Rust via asdf; clicky clone + build)
