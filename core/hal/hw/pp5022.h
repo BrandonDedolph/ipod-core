@@ -31,9 +31,10 @@
 /* ---------- Memory map ----------------------------------------------
  * core/docs/hw/01-soc-pp5022.md, "Memory map".
  *
- * SDRAM sits at its native 0x10000000 at boot-ROM handoff; the
- * bootloader/crt0 remaps it to 0x00000000 so the ARM exception vectors
- * land in our image (see MMAP0 below and boot/crt0.S).
+ * SDRAM sits at its native 0x10000000 at handoff (the chainloading
+ * bootloader restores the Apple-ROM MMAP state before jumping); OUR
+ * crt0 remaps it to 0x00000000 so the ARM exception vectors land in
+ * our image (see MMAP0 below and boot/crt0.S).
  */
 
 #define SDRAM_BASE          0x00000000  /* post-MMAP0-remap logical base */
@@ -46,21 +47,21 @@
 #define IRAM_USABLE_SIZE    0x00018000  /* ~96 KB usable to user code    */
 
 /* ---------- MMAP0: logical->physical remap ---------------------------
- * core/docs/hw/01-soc-pp5022.md, "Memory remap (MMAP0)": MMAP0_LOGICAL
- * (0xF000F000) is set to 0x00000000 and MMAP0_PHYSICAL (0xF000F004) to
- * 0x10000000 with flags 0x0F84 (read/write, data/code). The flags are
- * OR'd into the low bits of the PHYSICAL register value.
- *
- * TODO(hw-boot): verify the flags nibble against upstream Rockbox
- * crt0-pp.S before first hardware boot — our doc says 0x0F84 but
- * Rockbox may use 0x3F84 (the 0x0F00 vs 0x3F00 bits look like a
- * window-size mask: 32 MB vs 64 MB, which matters on the 64 MB 5.5G).
- * Same open question is flagged at the use site in boot/crt0.S.
+ * core/docs/hw/01-soc-pp5022.md, "Memory remap (MMAP0)", verified
+ * against Rockbox crt0-pp.S + pp5020.h (2026-06-10): MMAP0_LOGICAL
+ * (0xF000F000) takes the logical base OR'd with the window-size mask
+ * (the mask lives HERE, not in the physical flags); MMAP0_PHYSICAL
+ * (0xF000F004) takes the physical base OR'd with permission flags.
+ * 0x0F00 = read|write|data|code; 0x84 is undocumented but present in
+ * every known user. 0x0F84 is the PP502x flags value (0x3F84 is
+ * PP5002's). Write order: logical first, then physical; no barrier.
  */
 
 #define MMAP0_LOGICAL_ADDR    0xF000F000
 #define MMAP0_PHYSICAL_ADDR   0xF000F004
-#define MMAP0_REMAP_FLAGS     0x00000F84  /* read/write, data/code */
+#define MMAP0_REMAP_FLAGS     0x00000F84  /* read|write|data|code (+0x84) */
+#define MMAP0_WINDOW_64M      0x00003C00  /* logical-register size mask   */
+#define MMAP0_WINDOW_32M      0x00003E00  /*   (64M used for all Videos)  */
 
 #ifndef __ASSEMBLER__
 #define MMAP0_LOGICAL   PP_REG32(MMAP0_LOGICAL_ADDR)
@@ -83,19 +84,18 @@
 /* ---------- Device enable / reset / clock control --------------------
  * core/docs/hw/01-soc-pp5022.md, "Power management" (DEV_*) and
  * "Clock tree" (PLL_*, CLOCK_SOURCE, DEV_TIMING1). These gate
- * per-peripheral clock and reset.
- *
- * TODO(hw-doc): the SER0 init sequence in core/docs/hw/08-boot-dock.md
- * ("Init sequence") requires `DEV_EN |= DEV_SER0` plus a DEV_RS reset
- * pulse, but no doc gives the DEV_SER0 bit value. Until the doc grows
- * it, uart_init() cannot perform the enable/reset step — see the
- * matching TODO(hw-doc) in core/hal/hw/uart.c.
+ * per-peripheral clock and reset. DEV_SER0/SER1 bit values verified
+ * against Rockbox pp5020.h (2026-06-10); used by the 08-boot-dock.md
+ * "Init sequence" enable + reset pulse.
  */
 
 #define DEV_RS_ADDR         0x60006004
 #define DEV_RS2_ADDR        0x60006008
 #define DEV_EN_ADDR         0x6000600C
 #define DEV_EN2_ADDR        0x60006010
+
+#define DEV_SER0            0x00000040  /* bit 6 in DEV_EN / DEV_RS */
+#define DEV_SER1            0x00000080  /* bit 7 */
 #define DEV_INIT1_ADDR      0x70000010
 #define DEV_INIT2_ADDR      0x70000020
 
@@ -120,19 +120,15 @@
 
 /* ---------- SER0: dock-connector debug UART (8250-style) -------------
  * core/docs/hw/08-boot-dock.md, "UART debug" -> "SoC registers
- * (8250-style at SER0)". RBR (read), THR (write) and DLL (write, with
- * LCR.DLAB set) share offset 0x0; DLM shares 0x4 semantics per 8250
- * convention. Reference clock is 24 MHz; divisor = 24e6 / (16 * baud)
- * (08-boot-dock.md, "Baud rate").
- *
- * TODO(hw-doc): the doc's SER0_IER (0x70006001) and SER0_FCR
- * (0x70006002) addresses are byte-strided, which contradicts the
- * 4-byte stride implied by SER0_DLM/LCR/LSR (0x04/0x0C/0x14) — and in
- * a real 8250, IER and DLM share one offset, yet the doc gives them
- * different addresses. One of the two stride conventions is a
- * transcription slip. Verify against Rockbox firmware/export/pp5020.h
- * before relying on IER/FCR; the polled-TX driver in uart.c
- * deliberately avoids touching either register.
+ * (8250-style at SER0)", stride verified against Rockbox pp5020.h
+ * (2026-06-10): the standard 8250 register file with each byte
+ * register widened to a 32-bit word slot (uniform 4-byte stride, all
+ * accesses word-wide). The classic 8250 sharing holds: RBR (read),
+ * THR (write) and DLL (with LCR.DLAB) share +0x00; IER/DLM share
+ * +0x04; IIR (read) / FCR (write) share +0x08. Reference clock is
+ * 24 MHz; divisor = 24e6 / (16 * baud) (08-boot-dock.md, "Baud rate").
+ * (An earlier doc revision byte-strided IER/FCR at 0x70006001/2 —
+ * that was a transcription slip, now corrected in the doc.)
  */
 
 #define SER0_BASE_ADDR      0x70006000
@@ -140,11 +136,14 @@
 #define SER0_RBR_ADDR       0x70006000  /* RX buffer (read)              */
 #define SER0_THR_ADDR       0x70006000  /* TX holding (write)            */
 #define SER0_DLL_ADDR       0x70006000  /* divisor low  (when LCR.DLAB)  */
+#define SER0_IER_ADDR       0x70006004  /* IRQ enable                    */
 #define SER0_DLM_ADDR       0x70006004  /* divisor high (when LCR.DLAB)  */
+#define SER0_IIR_ADDR       0x70006008  /* IRQ identification (read)     */
+#define SER0_FCR_ADDR       0x70006008  /* FIFO control (write)          */
 #define SER0_LCR_ADDR       0x7000600C  /* line control                  */
+#define SER0_MCR_ADDR       0x70006010  /* modem control                 */
 #define SER0_LSR_ADDR       0x70006014  /* line status                   */
-#define SER0_IER_ADDR       0x70006001  /* IRQ enable   — see TODO above */
-#define SER0_FCR_ADDR       0x70006002  /* FIFO control — see TODO above */
+#define SER0_MSR_ADDR       0x70006018  /* modem status                  */
 
 /* SER0_LCR bits (08-boot-dock.md, "Init sequence"). */
 #define SER0_LCR_DLAB       0x80        /* divisor latch access          */
@@ -163,12 +162,17 @@
 #define SER0_DIV_115200     0x0D
 
 /* GPIO routing for SER0 on the iPod Video (08-boot-dock.md, "GPIO
- * routing for SER0 on iPod Video"): clear bits 2-3 of the (unnamed in
- * the doc) routing register at 0x7000008C to route SER0 TX/RX to the
- * dock pins. The doc's second step, `GPO32_ENABLE &= ~0x0000000C`, has
- * no documented address — see TODO(hw-doc) in uart.c. */
+ * routing for SER0 on iPod Video"): clear bits 2-3 of the routing
+ * register at 0x7000008C (unnamed even in Rockbox, which uses the raw
+ * literal), then clear the same bits in GPO32_ENABLE to release those
+ * pads from general-purpose-output mode so the SER0 alternate function
+ * drives them. GPO32 addresses verified against Rockbox pp5020.h
+ * (2026-06-10). */
 #define SER0_GPIO_ROUTE_ADDR  0x7000008C
 #define SER0_GPIO_ROUTE_MASK  0x0000000C
+
+#define GPO32_VAL_ADDR        0x70000080
+#define GPO32_ENABLE_ADDR     0x70000084
 
 /* SER0 interrupt: IRQ #36, i.e. high bank bit 4
  * (01-soc-pp5022.md, "IRQ numbers" table). Unused by the polled
@@ -176,19 +180,25 @@
 #define SER0_IRQ            36
 
 #ifndef __ASSEMBLER__
-/* The doc's init sequence uses 8-bit accesses (ATA_OUT8) for the 8250
- * register file, so the accessors below are byte-wide; the routing
- * register is a normal 32-bit word (inl/outl in the doc). */
-#define SER0_RBR        PP_REG8(SER0_RBR_ADDR)
-#define SER0_THR        PP_REG8(SER0_THR_ADDR)
-#define SER0_DLL        PP_REG8(SER0_DLL_ADDR)
-#define SER0_DLM        PP_REG8(SER0_DLM_ADDR)
-#define SER0_LCR        PP_REG8(SER0_LCR_ADDR)
-#define SER0_LSR        PP_REG8(SER0_LSR_ADDR)
-#define SER0_IER        PP_REG8(SER0_IER_ADDR)
-#define SER0_FCR        PP_REG8(SER0_FCR_ADDR)
+/* Word-wide accessors throughout: each 8250 byte register occupies a
+ * 32-bit slot and Rockbox accesses them all as 32-bit words (verified
+ * 2026-06-10 against pp5020.h / uart-pp.c) — we follow that precedent
+ * rather than gamble on byte-lane behavior. */
+#define SER0_RBR        PP_REG32(SER0_RBR_ADDR)
+#define SER0_THR        PP_REG32(SER0_THR_ADDR)
+#define SER0_DLL        PP_REG32(SER0_DLL_ADDR)
+#define SER0_IER        PP_REG32(SER0_IER_ADDR)
+#define SER0_DLM        PP_REG32(SER0_DLM_ADDR)
+#define SER0_IIR        PP_REG32(SER0_IIR_ADDR)
+#define SER0_FCR        PP_REG32(SER0_FCR_ADDR)
+#define SER0_LCR        PP_REG32(SER0_LCR_ADDR)
+#define SER0_MCR        PP_REG32(SER0_MCR_ADDR)
+#define SER0_LSR        PP_REG32(SER0_LSR_ADDR)
+#define SER0_MSR        PP_REG32(SER0_MSR_ADDR)
 
 #define SER0_GPIO_ROUTE PP_REG32(SER0_GPIO_ROUTE_ADDR)
+#define GPO32_VAL       PP_REG32(GPO32_VAL_ADDR)
+#define GPO32_ENABLE    PP_REG32(GPO32_ENABLE_ADDR)
 #endif
 
 #endif /* CORE_HAL_HW_PP5022_H */

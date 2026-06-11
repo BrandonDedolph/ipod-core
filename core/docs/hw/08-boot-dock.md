@@ -140,16 +140,34 @@ panics and the LCD is dead, this is what we have left.
 
 ### SoC registers (8250-style at SER0)
 
+The register file is the standard 8250 byte layout widened so each
+register occupies a 32-bit word slot — uniform 4-byte stride, all
+accesses word-wide. The classic 8250 sharing holds: RBR/THR/DLL share
+`+0x00`, IER/DLM share `+0x04`, IIR/FCR share `+0x08`.
+
 | Register   | Address      | Purpose |
 |------------|--------------|---------|
 | `SER0_RBR` | `0x70006000` | RX buffer (read) |
 | `SER0_THR` | `0x70006000` | TX holding (write) |
-| `SER0_LCR` | `0x7000600C` | Line control |
-| `SER0_DLM` | `0x70006004` | Divisor latch (high) — when `LCR.bit7` set |
 | `SER0_DLL` | `0x70006000` | Divisor latch (low)  — when `LCR.bit7` set |
+| `SER0_IER` | `0x70006004` | IRQ enable |
+| `SER0_DLM` | `0x70006004` | Divisor latch (high) — when `LCR.bit7` set |
+| `SER0_IIR` | `0x70006008` | IRQ identification (read) |
+| `SER0_FCR` | `0x70006008` | FIFO control (write) |
+| `SER0_LCR` | `0x7000600C` | Line control |
+| `SER0_MCR` | `0x70006010` | Modem control |
 | `SER0_LSR` | `0x70006014` | Line status: bit 0 = RX ready, bit 5 = TX empty |
-| `SER0_IER` | `0x70006001` | IRQ enable |
-| `SER0_FCR` | `0x70006002` | FIFO control |
+| `SER0_MSR` | `0x70006018` | Modem status |
+
+*(Corrected 2026-06-10 against Rockbox `pp5020.h`: an earlier revision
+byte-strided `SER0_IER`/`SER0_FCR` at `0x70006001`/`0x70006002`, which
+contradicted both the word stride of the other registers and the 8250
+offset-sharing convention — a transcription slip.)*
+
+`DEV_SER0` (the SER0 bit in `DEV_EN`/`DEV_RS`) = `0x40` (bit 6);
+`DEV_SER1` = `0x80` (bit 7). `GPO32_VAL` = `0x70000080`,
+`GPO32_ENABLE` = `0x70000084` (verified against Rockbox `pp5020.h`,
+2026-06-10).
 
 ### Baud rate
 
@@ -165,28 +183,48 @@ Reference clock = 24 MHz. Divisor = `24_000_000 / (16 * baud)`.
 
 ### Init sequence (default 115200 8-N-1)
 
+Full iPod Video order (routing first, then power/reset, then line
+setup; the reference also masks the SER0 IRQ at the controller via
+`CPU_HI_INT_DIS` between enable and reset — only needed if `IER` is
+going to be set):
+
 ```c
-DEV_EN |= DEV_SER0;                    // power UART
+// GPIO routing first — see next section
+routing_reg(0x7000008C) &= ~0x0C;      // route SER0 TX/RX to dock pins
+GPO32_ENABLE            &= ~0x0C;      // release pads from GPO mode
+
+DEV_EN |= DEV_SER0;                    // power UART (bit 6)
 DEV_RS |= DEV_SER0;                    // assert reset
-sleep(1);
+sleep(1);                              // one ~10 ms tick
 DEV_RS &= ~DEV_SER0;                   // release
 
-ATA_OUT8(SER0_LCR, 0x80);              // enable divisor latch access
-ATA_OUT8(SER0_DLM, 0x00);              // 115200 baud
-ATA_OUT8(SER0_DLL, 0x0D);
-ATA_OUT8(SER0_LCR, 0x03);              // disable latch, 8-N-1
-ATA_OUT8(SER0_IER, 0x01);              // enable RX IRQ
-ATA_OUT8(SER0_FCR, 0x07);              // enable + reset FIFOs
+SER0_LCR = 0x80;                       // enable divisor latch access
+SER0_DLM = 0x00;
+SER0_LCR = 0x03;                       // disable latch, 8-N-1
+SER0_IER = 0x01;                       // RX IRQ (for accessory RX)
+SER0_FCR = 0x07;                       // enable + reset FIFOs
+SER0_LCR = 0x80; SER0_DLL = 0x0D;      // 115200: divisor low byte,
+SER0_LCR = 0x03;                       //   via a second DLAB window
 ```
 
-(Source: `firmware/target/arm/pp/uart-pp.c` lines 63–87.)
+All accesses are 32-bit word writes. The divisor's low byte is
+programmed last through a second DLAB window in the reference;
+writing DLL inside the first window is functionally equivalent.
+A polled-TX-only driver can skip the `IER`/`FCR` lines (non-FIFO
+8250 TX works via THR/THRE).
+
+(Source: `firmware/target/arm/pp/uart-pp.c` — init block ~lines
+67–87 + `set_bitrate`; re-verified 2026-06-10.)
 
 ### GPIO routing for SER0 on iPod Video
 
 ```c
 outl(inl(0x7000008C) & ~0x0000000C, 0x7000008C);  // route SER0 TX/RX via GPIO bits 2-3
-GPO32_ENABLE &= ~0x0000000C;
+GPO32_ENABLE &= ~0x0000000C;                      // 0x70000084 — release pads from GPO mode
 ```
+
+(The `0x7000008C` routing register has no symbolic name even in
+Rockbox, which uses the raw literal.)
 
 ### Autobaud (Apple Accessory Protocol)
 

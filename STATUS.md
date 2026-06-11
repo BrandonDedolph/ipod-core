@@ -67,12 +67,20 @@ die. Don't stack another sim PR without weighing that tradeoff.
      115200 via SER0 — first freestanding driver. `hal/hw/pp5022.h`
      is the canonical platform header (memory map, MMAP0, SER0; every
      constant cites its doc section). Polled TX with bounded spin;
-     kernel banner + hex self-test + PROCESSOR_ID dump. **Open hw
-     questions before first boot** (all TODO-tagged in code): MMAP0
-     flags nibble 0x0F84 vs 0x3F84; DEV_SER0 enable bit undocumented;
-     GPO32_ENABLE address undocumented; SER0 IER/FCR stride
-     inconsistency in the doc. Resolve against Rockbox
-     `firmware/export/pp5020.h` before bring-up.
+     kernel banner + hex self-test + PROCESSOR_ID dump. The four hw
+     questions raised during review were **resolved 2026-06-10**
+     against Rockbox `crt0-pp.S` / `pp5020.h` / `uart-pp.c` and
+     ipodloader2 source; facts folded into `core/docs/hw/` + code.
+     The real bug was elsewhere: `MMAP0_LOGICAL` needs the window
+     mask (`0x3C00`, the size mask lives in the *logical* register),
+     not `0x00000000`; `0x0F84` was correct all along (`0x3F84` is
+     PP5002's). `DEV_SER0` = bit 6, `GPO32_ENABLE` = `0x70000084`
+     (uart_init now does the full routing/enable/reset sequence);
+     SER0 registers are word-strided (the doc's byte-strided IER/FCR
+     were a transcription slip, corrected). ipodloader2's handoff
+     state confirmed from its source: it restores the Apple-ROM MMAP
+     and jumps at native `0x10000000` — crt0's remap-it-ourselves
+     approach is right.
    - **PR #4:** LCD init + solid-color present (5G + 5.5G variants).
    - **PR #5:** Kernel scheduler skeleton + idle task.
    See `PLAN.md` § Phase 1.
