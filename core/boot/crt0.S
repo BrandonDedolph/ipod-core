@@ -76,26 +76,32 @@ _start:
      * mov/orr immediates, and its one literal (the post-remap target)
      * sits inside the copied region.
      *
-     * TODO(hw-boot): verify the flags nibble against upstream Rockbox
-     * crt0-pp.S before first hardware boot — our doc says 0x0F84 but
-     * Rockbox may use 0x3F84 (the 0x0F00 vs 0x3F00 bits look like a
-     * window-size mask: 32 MB vs 64 MB, which matters on the 64 MB 5.5G).
-     * If the doc transcribed it wrong the fix is one orr immediate below.
-     *
      * Register programming per core/docs/hw/01-soc-pp5022.md, "Memory
-     * remap (MMAP0)": MMAP0_LOGICAL (0xF000F000) is set to 0x00000000
-     * and MMAP0_PHYSICAL (0xF000F004) is set to 0x10000000 with flags
-     * 0x0F84 (read/write, data/code). Physical is written first so the
-     * mapping is fully described before the logical side activates it. */
+     * remap (MMAP0)", verified against Rockbox crt0-pp.S + pp5020.h
+     * (2026-06-10, master):
+     *   MMAP0_LOGICAL (0xF000F000) = 0x00003C00 — logical base 0x0 OR
+     *     the window mask. The size mask lives HERE, not in the physical
+     *     flags: 0x3C00 = 64 MB window, 0x3E00 = 32 MB. Rockbox builds
+     *     iPod Video with the 64 MB mask unconditionally (32 MB 5Gs
+     *     included; actual RAM size is probed at runtime, not via MMAP),
+     *     so we do the same. Writing 0 here (no mask bits) is a value no
+     *     known firmware ever writes — undefined behavior.
+     *   MMAP0_PHYSICAL (0xF000F004) = 0x10000F84 — physical base OR
+     *     flags 0x0F84. 0x0F00 = read|write|data|code permission bits;
+     *     0x84 is undocumented but present in every known user. 0x0F84
+     *     is confirmed correct for PP502x (0x3F84 is the PP5002 value).
+     * Logical is written first, physical second — the order Rockbox has
+     * shipped on this silicon for two decades. Both writes execute from
+     * IRAM, so the transient half-programmed mapping never bites. */
 remap_stub:
     mov     r0, #0xF0000000
     orr     r0, r0, #0x0000F000     /* r0 = 0xF000F000 (MMAP0_LOGICAL) */
+    mov     r2, #0x00003C00
+    str     r2, [r0]                /* MMAP0_LOGICAL  = 0x3C00: base 0 | 64M mask */
     mov     r1, #0x10000000
     orr     r1, r1, #0x00000F00
     orr     r1, r1, #0x00000084     /* r1 = 0x10000F84: phys | flags 0x0F84 */
     str     r1, [r0, #4]            /* MMAP0_PHYSICAL = 0x10000F84 */
-    mov     r2, #0
-    str     r2, [r0]                /* MMAP0_LOGICAL  = 0x00000000 */
     /* Enter the remapped image: load the link-time (0x0-based) address
      * of post_remap into pc. The ldr itself is PC-relative into the
      * stub's own copied literal; only the loaded VALUE is absolute, and
