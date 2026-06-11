@@ -52,14 +52,27 @@ die. Don't stack another sim PR without weighing that tradeoff.
      `boot/crt0.S` + `boot/linker.ld`, `kernel/main.c` spin loop.
      `make hw` produces a 60-byte ARM ELF entered at 0x0; `make sim`
      and the four test suites are unaffected.
-   - **PR #2 (this branch):** `.ipod` transport-format packaging.
-     `make hw` now also emits `core.bin` (objcopy `-O binary`);
-     `make ipod` wraps it as `core.ipod` (BE32 additive checksum +
-     `ipvd` model name + image). `core firmware pack` / `unpack`
-     subcommands expose the format; round-trip verified against the
-     ARM ELF. Go tests cover empty / wrap / mismatch / truncated.
-   - **PR #3 (next):** UART debug @ 115200 via SER0 (panic channel
-     before LCD). Needs `hal/hw/` + first real freestanding driver.
+   - **PR #2 (`phase1/image-packaging`):** `.ipod` transport-format
+     packaging. `make hw` now also emits `core.bin` (objcopy `-O
+     binary`); `make ipod` wraps it as `core.ipod` (BE32 additive
+     checksum + `ipvd` model name + image). `core firmware pack` /
+     `unpack` subcommands expose the format; round-trip verified
+     against the ARM ELF. Go tests cover empty / wrap / mismatch /
+     truncated. Review fixes on the branch: crt0 now performs the
+     MMAP0 SDRAM remap itself (the doc-documented handoff has SDRAM
+     at native 0x10000000, not 0x0 as crt0 first assumed — would have
+     crashed on hardware); unpack derives the checksum seed from the
+     embedded model name; pack/unpack got O_EXCL + `--force`.
+   - **PR #3 (`phase1/uart-debug`, stacked on PR #2):** UART debug @
+     115200 via SER0 — first freestanding driver. `hal/hw/pp5022.h`
+     is the canonical platform header (memory map, MMAP0, SER0; every
+     constant cites its doc section). Polled TX with bounded spin;
+     kernel banner + hex self-test + PROCESSOR_ID dump. **Open hw
+     questions before first boot** (all TODO-tagged in code): MMAP0
+     flags nibble 0x0F84 vs 0x3F84; DEV_SER0 enable bit undocumented;
+     GPO32_ENABLE address undocumented; SER0 IER/FCR stride
+     inconsistency in the doc. Resolve against Rockbox
+     `firmware/export/pp5020.h` before bring-up.
    - **PR #4:** LCD init + solid-color present (5G + 5.5G variants).
    - **PR #5:** Kernel scheduler skeleton + idle task.
    See `PLAN.md` § Phase 1.
