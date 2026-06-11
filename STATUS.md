@@ -119,6 +119,38 @@ always be green.
 Quick visual smoke: `./build-sim/sim/core-sim --shot /tmp/x.bmp`
 (headless, no window pop).
 
+### Emulator smoke for the hw image (clicky)
+
+The [clicky](https://github.com/daniel5151/clicky) PortalPlayer
+emulator (evaluated 2026-06-11) boots our unmodified `core.bin`: it
+models the MMAP0 remap (functionally — our 0x3C00/0x10000F84 pair
+produces a real 0→0x10000000 mapping), the SER0 UART (TX → stdout),
+GPO32, and stubs DEV_EN/DEV_RS harmlessly. It already caught one real
+bug (unparked COP racing the CPU through crt0 — its HLE boot enters
+both cores). Caveats: it's the 4G/PP5020 machine model (PROCESSOR_ID
+reads full-word 0x55555555, SER0 DLAB unmodeled, no BCM2722 LCD, no
+2048-byte-sector ATA), and the GUI needs a display (WSLg ok; xvfb for
+CI). Expected output: the three `core:` banner lines, single-stream.
+
+```bash
+# one-time setup (Rust via asdf; clicky clone + build)
+asdf plugin add rust && asdf install rust 1.96.0
+git clone https://github.com/daniel5151/clicky && cd clicky
+echo 'rust 1.96.0' > .tool-versions && cargo build --release -p clicky-desktop
+cc -o make_fw resources/ipodloader/make_fw.c
+printf '\x01\x02\xa0\xe3\x10\xff\x2f\xe1' > jumpstub.bin  # mov r0,#0x10000000; bx r0
+
+# per run (from the clicky dir; core.bin from `make hw`)
+./make_fw -g 4g -o core_fw.bin -l <repo>/core/build-hw/core.bin jumpstub.bin
+timeout 15 ./target/release/clicky-desktop --hle=core_fw.bin --hdd=null:len=64MiB \
+  2>&1 | grep '^core:'
+```
+
+(GDB works too: `--gdb` + `arm-none-eabi`-aware gdb against
+`core.elf` gives source-level breakpoints — verified at
+`kernel_main`. Current checkout lives in `/tmp/clicky-eval/` and
+will not survive a reboot; re-clone per the recipe.)
+
 ## Recent PRs (since #31 — most recent first)
 
 - pre-rasterized shuffle / repeat icons (preliminary)
