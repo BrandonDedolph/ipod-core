@@ -46,6 +46,22 @@ _start:
      * (Immediate-only, no memory access — position-independent.) */
     msr     cpsr_c, #0xD3
 
+    /* Park the COP. The handoff contract says only the CPU runs, but
+     * Rockbox parks the second core at entry defensively — and the
+     * clicky emulator's HLE boot really does start both cores, where
+     * an unparked COP races the CPU through BSS-zero and uart_init
+     * (caught 2026-06-11; doubled UART output). PROCESSOR_ID low byte
+     * is 0x55 on the CPU, 0xAA on the COP (01-soc-pp5022.md, "Dual
+     * core: CPU and COP"). Busy-spin park for now; the scheduler PR
+     * replaces this with a proper COP_CTL sleep + wake protocol.
+     * (Immediates + fixed MMIO only — position-independent.) */
+    mov     r0, #0x60000000
+    ldr     r0, [r0]
+    and     r0, r0, #0xFF
+    cmp     r0, #0x55
+cop_park:
+    bne     cop_park
+
     /* Step 1 (08-boot-dock.md): temporary stack at the top of usable
      * IRAM, growing downward. IRAM is 0x40000000..0x4001FFFF (128 KB);
      * 96 KB usable to user code per core/docs/hw/01-soc-pp5022.md.
