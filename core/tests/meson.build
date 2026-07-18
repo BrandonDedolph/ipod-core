@@ -135,6 +135,26 @@ if target == 'sim'
   )
   test('hw-clock', clock_test, suite: 'unit')
 
+  # hw-audio: the first-sound driver chain (I2C controller -> WM8758
+  # codec -> I2S serializer), host-side under -DMMIO_MOCK. The only
+  # automated check of the audio register grammar — clicky models no
+  # I2C/I2S/DAC and the device needs a logic analyzer; sound itself is
+  # the on-device proof. Asserts i2c_init/i2c_send grammar + guards, the
+  # 30-write wm8758_init with correct 9-bit framing / DAC route / unmute-
+  # last ordering, i2s_init clock+FIFO grammar, and the polled write
+  # (TXFree poll + packed word, plus the no-drain bail).
+  audio_trace_test = executable(
+    'audio_trace_test',
+    sources: ['hw_audio/audio_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/i2c.c',
+              '../hal/hw/wm8758.c',
+              '../hal/hw/i2s.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+  )
+  test('hw-audio', audio_trace_test, suite: 'unit')
+
   # hw-console: the on-screen debug console (framebuffer + 8x8 hex font).
   # Pure rendering logic, no MMIO — verifies glyph output pixel-for-pixel.
   console_test = executable(

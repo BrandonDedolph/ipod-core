@@ -380,4 +380,114 @@
 #define BCM_CONTROL     PP_REG16(BCM_CONTROL_ADDR)
 #endif
 
+/* ---------- Audio: device clock gating (DEV_EN / DEV_RS bits) --------
+ * core/docs/hw/05-audio.md, "MCLK / clock-gating enable path", and
+ * core/docs/hw/09-i2c.md, "Controller init". DEV_EN (0x6000600C) and
+ * DEV_RS (0x60006004) are declared above; these are the peripheral bits
+ * the audio path gates. The EXT-clock select clears bits 3:2 of
+ * 0x70000018 to pick the 24 MHz external device clock (codec MCLK
+ * reference). Undocumented encodings of that field are left untouched.
+ */
+#define DEV_EXTCLOCKS         0x00000002  /* DEV_EN bit 1: external device clocks */
+#define DEV_I2S               0x00000800  /* DEV_EN/RS bit 11: I2S serializer clock */
+#define DEV_I2C               0x00001000  /* DEV_EN/RS bit 12: I2C controller */
+#define DEV_OPTO              0x00010000  /* DEV_EN/RS bit 16: clickwheel (03-clickwheel) */
+
+#define DEV_EXTCLK_SEL_ADDR   0x70000018  /* clear the 24 MHz-select field to run EXT@24MHz */
+#define DEV_EXTCLK_24MHZ_MASK 0x0000000C  /* bits 3:2 */
+
+/* I2S/CDI pad-function select. Clearing these fields routes the pads to
+ * their I2S alternate function (05-audio.md, "MCLK / clock-gating enable
+ * path"). DEV_INIT1/2_ADDR are declared above (0x70000010/0x70000020). */
+#define DEV_INIT2_I2S_PADS    0x00000300  /* DEV_INIT2 bits 9:8: CDI+I2S pad group */
+#define DEV_INIT1_I2S_PADS    0x03000000  /* DEV_INIT1 bits 25:24: second pad group */
+
+/* ---------- On-SoC I2C controller (0x7000C000) ----------------------
+ * core/docs/hw/09-i2c.md. BYTE-WIDE registers (use mmio_*8). Distinct
+ * from the clickwheel OPTO block at 0x7000C100 (03-clickwheel.md). Only
+ * consumer in Phase 1 is the WM8758 codec control port; a transaction
+ * carries at most 4 payload bytes (DATA0..DATA3, stride 4).
+ */
+#define I2C_CTRL_ADDR      0x7000C000  /* strobe/read-sel/count            */
+#define I2C_ADDR_ADDR      0x7000C004  /* dev addr <<1 | R/W               */
+#define I2C_DATA0_ADDR     0x7000C00C  /* payload byte 0 (stride 4)        */
+#define I2C_DATA1_ADDR     0x7000C010  /* payload byte 1                   */
+#define I2C_DATA2_ADDR     0x7000C014  /* payload byte 2                   */
+#define I2C_DATA3_ADDR     0x7000C018  /* payload byte 3                   */
+#define I2C_STATUS_ADDR    0x7000C01C  /* BUSY in bit 6                    */
+#define I2C_CLKCFG_ADDR    0x600060A4  /* undocumented init clock poke     */
+
+#define I2C_SEND           0x80        /* CTRL bit 7: begin transaction    */
+#define I2C_READ           0x20        /* CTRL bit 5: 1=read, 0=write      */
+#define I2C_COUNT_MASK     0x06        /* CTRL bits 2:1: (len-1)           */
+#define I2C_ADDR_RW        0x01        /* ADDR bit 0: 1=read, 0=write      */
+#define I2C_BUSY           0x40        /* STATUS bit 6: 1=busy             */
+
+#ifndef __ASSEMBLER__
+#define I2C_DATA_ADDR(n)   (I2C_DATA0_ADDR + 4u * (uintptr_t)(n))
+#endif
+
+/* ---------- On-SoC I2S serializer / FIFO (0x70002800) ---------------
+ * core/docs/hw/05-audio.md, "SoC I2S block" + "i2s_reset() config
+ * sequence". 32-bit registers, absolute addresses (no base-relative
+ * offsets in the hardware). On the iPod the WM8758 masters the bus
+ * clocks, so IIS_MASTER stays clear and IISCLK is left alone.
+ */
+#define IISCONFIG_ADDR     0x70002800
+#define IISCLK_ADDR        0x70002808
+#define IISFIFO_CFG_ADDR   0x7000280C
+#define IISFIFO_WR_ADDR    0x70002840  /* 32-bit packed [R<<16 | L] TX port */
+#define IISFIFO_RD_ADDR    0x70002880
+
+/* IISCONFIG bits */
+#define IIS_RESET              0x80000000  /* bit 31: soft-reset pulse       */
+#define IIS_TXFIFOEN           0x20000000  /* bit 29: enable TX / transmit   */
+#define IIS_RXFIFOEN           0x10000000  /* bit 28: enable RX              */
+#define IIS_MASTER             0x02000000  /* bit 25: SoC masters (NOT iPod) */
+#define IIS_FORMAT_MASK        0x00000C00  /* bits 11:10                     */
+#define IIS_FORMAT_IIS         0x00000000  /* standard I2S                   */
+#define IIS_SIZE_MASK          0x00000300  /* bits 9:8                       */
+#define IIS_SIZE_16BIT         0x00000000  /* 16-bit samples                 */
+#define IIS_FIFO_FORMAT_MASK   0x00000070  /* bits 6:4                       */
+#define IIS_FIFO_FORMAT_LE16_2 0x00000070  /* the PP502x-programmed value    */
+#define IIS_IRQTX              0x00000002  /* bit 1                          */
+#define IIS_IRQRX              0x00000001  /* bit 0                          */
+
+/* IISFIFO_CFG bits */
+#define IISFIFO_CFG_TXFREE_SHIFT 16         /* TX-free count in bits 21:16   */
+#define IISFIFO_CFG_TXFREE_MASK  0x0000003F /* 6-bit count, after shift      */
+#define IIS_RXCLR              0x00001000   /* bit 12: flush RX FIFO         */
+#define IIS_TXCLR              0x00000100   /* bit 8:  flush TX FIFO         */
+#define IIS_RX_FULL_LVL_12     0x00000030   /* RX attention at 12 slots      */
+#define IIS_TX_EMPTY_LVL_4     0x00000001   /* TX request at 4 free slots    */
+#define IIS_TX_FIFO_DEPTH      16           /* derived: TX_FREE tops at 16   */
+
+/* ---------- On-SoC DMA engine (continuous playback — follow-up) ------
+ * core/docs/hw/05-audio.md, "DMA engine". NOT used by the polled
+ * first-sound path; recorded now so the continuous-playback driver has
+ * a single source. Master control at 0x6000A000; per-channel file at
+ * 0x6000B000 (stride 0x20, channel 0 = playback). The CMD size field is
+ * written as (bytes - 4). Untested until the playback driver lands.
+ */
+#define DMA_MASTER_CONTROL_ADDR 0x6000A000
+#define DMA_MASTER_CONTROL_EN   0x80000000  /* bit 31 */
+#define DMA_REQ_STATUS_ADDR     0x6000A008
+#define DMA0_CMD_ADDR           0x6000B000
+#define DMA0_STATUS_ADDR        0x6000B004  /* read clears the channel IRQ */
+#define DMA0_RAM_ADDR_ADDR      0x6000B010
+#define DMA0_FLAGS_ADDR         0x6000B014
+#define DMA0_PER_ADDR_ADDR      0x6000B018
+#define DMA0_INCR_ADDR          0x6000B01C
+
+#define DMA_REQ_IIS             2            /* IIS request id (REQ_ID field) */
+#define DMA_CMD_START           0x80000000   /* bit 31 */
+#define DMA_CMD_INTR            0x40000000   /* bit 30 */
+#define DMA_CMD_RAM_TO_PER      0x08000000   /* bit 27 */
+#define DMA_CMD_SINGLE          0x04000000   /* bit 26 */
+#define DMA_CMD_WAIT_REQ        0x01000000   /* bit 24 */
+#define DMA_CMD_REQ_ID_POS      16           /* REQ_ID in bits 19:16 */
+#define DMA_PLAY_CONFIG         0x4D020000   /* INTR|RAM_TO_PER|SINGLE|WAIT_REQ|(IIS<<16) */
+#define DMA_INCR_PLAY           0x20010000   /* RANGE_FIXED(1<<16) | WIDTH_32BIT(2<<28) */
+#define DMA_IRQ                 26           /* CPU int source; DMA_MASK = 1<<26 */
+
 #endif /* CORE_HAL_HW_PP5022_H */

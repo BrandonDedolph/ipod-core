@@ -15,6 +15,9 @@
 #include "hw/mmio.h"
 #include "hw/uart.h"
 #include "hw/lcd.h"
+#include "hw/i2c.h"
+#include "hw/wm8758.h"
+#include "hw/i2s.h"
 #include "sched.h"
 #include "timer.h"
 #include "irq.h"
@@ -33,6 +36,61 @@
 static void cpu_wait_ms(uint8_t ms) {
     mmio_write32(CPU_CTL_ADDR, PROC_WAIT_CNT | PROC_CNT_MSEC | ms);
     __asm__ volatile("nop\n\tnop\n\tnop");
+}
+
+/*
+ * First-sound tone. A single-cycle 64-sample sine (~689 Hz when streamed
+ * one sample per frame at 44.1 kHz), amplitude 12000 ≈ -8.7 dBFS so a
+ * 0 dB headphone gain lands at a reasonable listening level. Generated
+ * offline (round(12000·sin(2π·i/64))).
+ */
+static const int16_t sine64[64] = {
+        0,   1176,   2341,   3483,   4592,   5657,   6667,   7613,
+     8485,   9276,   9978,  10583,  11087,  11483,  11769,  11942,
+    12000,  11942,  11769,  11483,  11087,  10583,   9978,   9276,
+     8485,   7613,   6667,   5657,   4592,   3483,   2341,   1176,
+        0,  -1176,  -2341,  -3483,  -4592,  -5657,  -6667,  -7613,
+    -8485,  -9276,  -9978, -10583, -11087, -11483, -11769, -11942,
+   -12000, -11942, -11769, -11483, -11087, -10583,  -9978,  -9276,
+    -8485,  -7613,  -6667,  -5657,  -4592,  -3483,  -2341,  -1176,
+};
+
+/* Crude bounded settle delay for the codec VMID ramp, so the first
+ * samples don't land on a still-charging bias rail and pop. This path
+ * runs at CPUFREQ_NORMAL = 30 MHz (kernel_main calls clock_init only,
+ * never cpu_boost), so 1<<21 volatile iterations is ~100 ms — roughly a
+ * VMID_10K settle. No timer needed; this runs before the scheduler.
+ * Revisit the loop count if this ever moves onto the boosted clock. */
+static void audio_settle(void)
+{
+    for (volatile uint32_t i = 0; i < (1u << 21); i++) {
+        /* spin */
+    }
+}
+
+/*
+ * Stream `frames` stereo sine frames through the polled I2S FIFO. The
+ * write self-paces on FIFO space, so this takes ~frames/44100 seconds of
+ * wall-clock on working hardware. Returns 0 if it streamed, -1 if the
+ * TX FIFO never drained (codec not clocking — 64 consecutive write
+ * timeouts) so we bail instead of grinding for minutes.
+ */
+static int audio_play_tone(uint32_t frames)
+{
+    uint32_t phase = 0;
+    uint32_t misses = 0;
+    for (uint32_t n = 0; n < frames; n++) {
+        int16_t s = sine64[phase & 63];
+        if (i2s_write_stereo(s, s) != 0) {
+            if (++misses >= 64) {
+                return -1;
+            }
+            continue;
+        }
+        misses = 0;
+        phase++;
+    }
+    return 0;
 }
 
 /* Per-task stacks (carved from .bss; the scheduler builds each task's
@@ -129,6 +187,36 @@ _Noreturn void kernel_main(void) {
         console_hex32(8, 7, mmio_read32(PLL_CONTROL_ADDR), CON_WHITE, bg);
         lcd_present_fb(console_framebuffer());
         uart_puts("core: debug screen presented\n");
+
+        /* FIRST SOUND. Gated behind the same BCM-powered probe as the
+         * debug screen: it means we are on real hardware, not the clicky
+         * emulator (which models no BCM — and no I2S/DAC either, so sound
+         * can only be proven on device; the register grammar is checked
+         * host-side by the mock-bus trace tests). Chain: I2C controller ->
+         * WM8758 codec -> I2S serializer -> a polled 689 Hz sine. i2s_init
+         * runs before wm8758_init because the codec's MCLK reference must
+         * be alive before the codec is told to master the bus clocks
+         * (05-audio.md). Blocks ~2 s, then continues to the scheduler. */
+        uart_puts("core: audio bring-up (I2C -> WM8758 -> I2S)\n");
+        console_str(2, 9, "SND INIT", CON_WHITE, bg);
+        lcd_present_fb(console_framebuffer());
+        i2c_init();
+        i2s_init();
+        wm8758_init();
+        audio_settle();
+        i2s_tx_enable();
+
+        console_str(2, 9, "SND PLAY", CON_WHITE, bg);
+        lcd_present_fb(console_framebuffer());
+        uart_puts("core: playing ~2s 689 Hz tone\n");
+        int tone_rc = audio_play_tone(44100u * 2u);
+
+        console_str(2, 9, tone_rc == 0 ? "SND DONE " : "SND NOCLK",
+                    CON_WHITE, bg);
+        lcd_present_fb(console_framebuffer());
+        uart_puts(tone_rc == 0
+                      ? "core: tone done\n"
+                      : "core: I2S FIFO never drained (no codec clock)\n");
     } else {
         uart_puts("core: lcd bcm NOT powered, skipping debug screen\n");
     }

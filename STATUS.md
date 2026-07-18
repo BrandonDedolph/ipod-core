@@ -100,6 +100,31 @@ die. Don't stack another sim PR without weighing that tradeoff.
      verified no host-side LCD differences. Untestable in clicky
      beyond the gate path; needs the device for visual confirmation.
    - **PR #5:** Kernel scheduler skeleton + idle task.
+   - **PR #6/#7 (`phase1/irq-tick`, `phase1/clock`):** ARM exception
+     vectors + interrupt controller + 100 Hz timer tick; clock/PLL
+     driver (24→30 MHz, refcounted 80 MHz boost). Both host-trace-tested
+     + clicky-proven. Then `phase1/screen-debug`: on-screen register
+     console (framebuffer + 8×8 hex font) — a cable-free debug channel,
+     validated on real silicon (PLL lock + 30 MHz read back on device).
+   - **PR #8 (`phase1/audio-first-sound`, stacked on screen-debug):**
+     the first-sound driver chain toward a polled sine tone. Five
+     cleanroom facts-digs (I²C controller, WM8758 bit values, I²S
+     FIFO/clock, DMA block, ATA sector-size) preceded the code. New
+     `docs/hw/09-i2c.md` + a numeric register appendix in `05-audio.md`
+     (which was also cleaned of reproduced Rockbox code bodies — an
+     adversarial-review HIGH — so both docs are now prose + fact tables).
+     `hal/hw/i2c.c` (polled byte-wide master), `wm8758.c` (array-driven
+     codec bring-up: soft-RESET first for chainload safety, DAC routed
+     before unmute, unmute last), `i2s.c` (clock/pad-mux plumbing + FIFO
+     config + polled 32-bit `[R<<16|L]` write with a bounded no-clock
+     bail). `main.c` streams a ~689 Hz sine, gated behind the same
+     BCM-power probe as the LCD (so clicky, which models no I²S/DAC,
+     skips it and stays green). New `hw-audio` trace test (19 checks)
+     locks the exact I²C/codec/I²S register grammar under `-DMMIO_MOCK` —
+     the only automated audio check. **Not yet heard on silicon**; the
+     resolved I²S pad-mux writes (`DEV_INIT2 &= ~0x300`, `DEV_INIT1 &=
+     ~0x03000000`) are the top suspect if it's silent. DMA/continuous
+     playback + ATA→FAT32 deliberately deferred.
    See `PLAN.md` § Phase 1.
 2. **Playlists** — M3U8 reader → tagcache resolver → read-only
    browse is the right opening PR. Sim-only, ships visible value.
@@ -132,6 +157,17 @@ always be green.
 - **sim-audio-playback** (integration) — spawns `core-sim` with
   SDL's disk audio driver, drives Music → Songs → SELECT, bit-
   compares 176 400 captured bytes against the codec KAT reference.
+- **hw-uart-trace / hw-lcd-trace / hw-clock / hw-timer / hw-audio**
+  (unit) — freestanding hw drivers host-compiled with `-DMMIO_MOCK`
+  against a recording fake bus, asserting each driver's exact ordered
+  register grammar. `hw-audio` covers the first-sound chain (I²C
+  send/init, the 31-write WM8758 bring-up with 9-bit framing + unmute-
+  last, I²S clock/pad-mux/FIFO config, the polled TXFree write + no-
+  clock bail) — the only automated check of the audio path, since
+  clicky models no I²S/DAC and the device would need a logic analyzer.
+- **hw-sched / hw-console / hw-doc-consistency** (unit) — scheduler
+  policy, console glyph rendering, and pp5022.h↔docs address
+  consistency.
 
 Quick visual smoke: `./build-sim/sim/core-sim --shot /tmp/x.bmp`
 (headless, no window pop).
