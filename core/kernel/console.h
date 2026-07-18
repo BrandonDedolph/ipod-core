@@ -32,7 +32,7 @@ void console_clear(uint16_t rgb565);
 /* Draw one character at character-cell (col,row) [col 0..39, row 0..29]
  * with fg/bg colors. Supported glyphs: '0'-'9', 'A'-'F' (hex), space,
  * and the uppercase letters used for labels: at minimum
- * F R E Q P L S T C U N G I O W = - (any unsupported char draws as a
+ * F R E Q P L S T C U N G I O W M = - (any unsupported char draws as a
  * blank/space cell). Out-of-range
  * col/row is a no-op (bounds-checked). */
 void console_char(int col, int row, char ch, uint16_t fg, uint16_t bg);

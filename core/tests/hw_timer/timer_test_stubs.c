@@ -16,6 +16,7 @@
 
 #include "sched.h"
 #include "timer.h"
+#include "hw/audio.h"
 
 /* Number of sched_yield() calls since the test last reset it. */
 int sched_yield_calls;
@@ -24,4 +25,11 @@ void sched_yield(void)
 {
     sched_yield_calls++;
     timer_tick_isr();   /* advance the mocked tick, as a real yield would */
+}
+
+/* irq_dispatch() now also fans out to the DMA-completion handler; the
+ * timer test never asserts a DMA interrupt (CPU_INT_STAT reads have no
+ * DMA_IRQ bit set), so a no-op stub satisfies the link. */
+void audio_dma_isr(void)
+{
 }

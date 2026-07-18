@@ -26,6 +26,7 @@
 #include "wm8758.h"
 #include "i2c.h"
 #include "i2s.h"
+#include "dma.h"
 #include "mmio_mock.h"
 #include "trace_expect.h"
 
@@ -286,6 +287,77 @@ static int test_i2s_write_noclock(void)
     return fails;
 }
 
+/* Case 8: dma_playback_init grammar — enable master + IIS request line,
+ * static channel config (dest = I2S FIFO fixed 32-bit), clear latched. */
+static int test_dma_init_grammar(void)
+{
+    mmio_mock_reset();
+    mmio_mock_set_read(CPU_INT_PRIORITY_ADDR,   0);
+    mmio_mock_set_read(DMA_MASTER_CONTROL_ADDR, 0);
+    mmio_mock_set_read(DMA_REQ_STATUS_ADDR,     0);
+    mmio_mock_set_read(DMA0_STATUS_ADDR,        0);
+
+    dma_playback_init();
+
+    trace_cursor tc = trace_begin("dma_init");
+    /* force IRQ (not FIQ) routing for source 26 */
+    expect_r(&tc, 32, CPU_INT_PRIORITY_ADDR);
+    expect_w(&tc, 32, CPU_INT_PRIORITY_ADDR, 0);   /* 0 & ~DMA_MASK */
+    expect_r(&tc, 32, DMA_MASTER_CONTROL_ADDR);
+    expect_w(&tc, 32, DMA_MASTER_CONTROL_ADDR, DMA_MASTER_CONTROL_EN);
+    expect_r(&tc, 32, DMA_REQ_STATUS_ADDR);
+    expect_w(&tc, 32, DMA_REQ_STATUS_ADDR, 1u << DMA_REQ_IIS);   /* 0x4 */
+    expect_w(&tc, 32, DMA0_PER_ADDR_ADDR, IISFIFO_WR_ADDR);      /* 0x70002840 */
+    expect_w(&tc, 32, DMA0_FLAGS_ADDR, DMA_FLAGS_PLAY);          /* 0x04000000 */
+    expect_w(&tc, 32, DMA0_INCR_ADDR, DMA_INCR_PLAY);            /* 0x20010000 */
+    expect_r(&tc, 32, DMA0_STATUS_ADDR);                         /* clear latched */
+    trace_expect_end(&tc);
+    return trace_done(&tc);
+}
+
+/* Case 9: dma_playback_kick programs RAM address then the command word
+ * with SIZE = bytes-4 and START. 8192 bytes -> CMD 0xCD021FFC. */
+static int test_dma_kick_grammar(void)
+{
+    mmio_mock_reset();
+
+    dma_playback_kick(0x10004000u, 8192u);
+
+    trace_cursor tc = trace_begin("dma_kick");
+    expect_w(&tc, 32, DMA0_RAM_ADDR_ADDR, 0x10004000u);
+    /* 0x4D020000 | (8192-4=0x1FFC) | 0x80000000 = 0xCD021FFC */
+    expect_w(&tc, 32, DMA0_CMD_ADDR,
+             DMA_PLAY_CONFIG | ((8192u - DMA_SIZE_BIAS) & DMA_CMD_SIZE_MASK)
+                 | DMA_CMD_START);
+    trace_expect_end(&tc);
+    return trace_done(&tc);
+}
+
+/* Case 10: ack is a bare status read (clears the IRQ); stop clears
+ * START/INTR and, with STATUS idle, exits its bounded wait immediately. */
+static int test_dma_ack_stop(void)
+{
+    int fails = 0;
+
+    mmio_mock_reset();
+    dma_playback_ack();
+    fails += check("dma_ack: single status read",
+                   mmio_mock_log_len() == 1 &&
+                   mmio_mock_count(MMIO_OP_READ, DMA0_STATUS_ADDR) == 1);
+
+    mmio_mock_reset();
+    mmio_mock_set_read(DMA0_CMD_ADDR,    0);
+    mmio_mock_set_read(DMA0_STATUS_ADDR, 0);   /* idle */
+    dma_playback_stop();
+    trace_cursor tc = trace_begin("dma_stop");
+    expect_r(&tc, 32, DMA0_CMD_ADDR);
+    expect_w(&tc, 32, DMA0_CMD_ADDR, 0);       /* START|INTR cleared from 0 */
+    expect_r(&tc, 32, DMA0_STATUS_ADDR);       /* not busy -> one poll */
+    trace_expect_end(&tc);
+    fails += trace_done(&tc);
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
@@ -296,6 +368,9 @@ int main(void)
     fails += test_i2s_init_grammar();
     fails += test_i2s_write();
     fails += test_i2s_write_noclock();
+    fails += test_dma_init_grammar();
+    fails += test_dma_kick_grammar();
+    fails += test_dma_ack_stop();
 
     if (fails == 0) {
         printf("ALL PASS\n");

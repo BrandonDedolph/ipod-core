@@ -37,6 +37,7 @@ static const exp_glyph_t k_expected[] = {
     /* Label glyphs added for the audio diagnostic screen. */
     { 'G', { 0x70, 0x88, 0x80, 0xB8, 0x88, 0x88, 0x70, 0x00 } },
     { 'I', { 0x70, 0x20, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00 } },
+    { 'M', { 0x88, 0xD8, 0xA8, 0xA8, 0x88, 0x88, 0x88, 0x00 } },
     { 'O', { 0x70, 0x88, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00 } },
     { 'W', { 0x88, 0x88, 0x88, 0xA8, 0xA8, 0xA8, 0x50, 0x00 } },
 };
@@ -180,11 +181,11 @@ static int case4_bounds(void)
 static int case5_label_glyphs(void)
 {
     console_clear(CON_BLACK);
-    console_str(0, 0, "WOGI", CON_WHITE, CON_BLACK);
+    console_str(0, 0, "WOGIM", CON_WHITE, CON_BLACK);
     const uint16_t *fb = console_framebuffer();
 
-    const char *expect = "WOGI";
-    for (int i = 0; i < 4; i++) {
+    const char *expect = "WOGIM";
+    for (int i = 0; i < 5; i++) {
         if (!cell_matches(fb, i, 0, expect[i], CON_WHITE, CON_BLACK)) {
             printf("FAIL case5: cell (%d,0) != '%c'\n", i, expect[i]);
             return 0;

@@ -18,6 +18,8 @@
 #include "hw/i2c.h"
 #include "hw/wm8758.h"
 #include "hw/i2s.h"
+#include "hw/audio.h"
+#include "hal.h"
 #include "sched.h"
 #include "timer.h"
 #include "irq.h"
@@ -100,6 +102,26 @@ static uint32_t audio_play_tone(uint32_t frames)
     return wrote;
 }
 
+/*
+ * DMA-path source callback (hal_audio_set_source): fill `frames` stereo
+ * frames of the same 689 Hz sine into the interleaved [L,R,...] buffer.
+ * Phase persists across calls so the tone is continuous across the
+ * ping-pong buffer boundary. Runs in IRQ context (the DMA-completion ISR)
+ * on hw — leaf, no allocation, no blocking. Always fills the full request.
+ */
+static uint32_t g_sine_phase;
+static int sine_source(void *ud, int16_t *buf, int frames)
+{
+    (void)ud;
+    for (int f = 0; f < frames; f++) {
+        int16_t s = sine64[g_sine_phase & 63];
+        buf[2 * f]     = s;   /* L */
+        buf[2 * f + 1] = s;   /* R */
+        g_sine_phase++;
+    }
+    return frames;
+}
+
 /* Per-task stacks (carved from .bss; the scheduler builds each task's
  * initial context frame at the top). 1 KB is ample for these leaf
  * narrators; real subsystem tasks size their own later. */
@@ -175,85 +197,14 @@ _Noreturn void kernel_main(void) {
      * FatalMemException on any 0x3xxxxxxx access — gating on the
      * probe keeps both the dead-BCM hardware case and the emulator
      * smoke well-defined. */
-    if (lcd_init()) {
-        /* On-screen register readout — the panel reports the boot state
-         * with no serial cable. The whole screen is GREEN if the PLL
-         * locked (core reached CPUFREQ_NORMAL) or RED if clock_init
-         * degraded to the crystal, with the raw clock registers on top:
-         * FREQ = cpu_frequency(), STAT = PLL_STATUS (bit 31 = lock),
-         * CTRL = PLL_CONTROL readback. */
-        uint16_t bg = (cpu_frequency() == CPUFREQ_NORMAL) ? CON_GREEN
-                                                          : CON_RED;
-
-        /* FIRST SOUND — run the WHOLE audio chain BEFORE touching the
-         * panel, then report the result in a SINGLE framebuffer present.
-         *
-         * Why this order: lcd_present_fb is only silicon-proven for the
-         * FIRST frame. An earlier version updated an on-screen "SND"
-         * status with extra presents interleaved through the bring-up;
-         * the second present stalled in the BCM wait-for-idle poll and
-         * masked the audio result (frozen debug screen, no status, no
-         * sound). Every audio driver spin is bounded, so running all of
-         * it first is safe, and rendering once uses only the proven
-         * present path. On clicky this whole block is skipped (no BCM ->
-         * lcd_init() false); the register grammar is proven host-side by
-         * the mock-bus trace tests regardless.
-         *
-         * Chain: I2C controller -> WM8758 codec -> I2S serializer -> a
-         * polled 689 Hz sine. i2s_init runs before wm8758_init because
-         * the codec's MCLK reference must be alive before the codec is
-         * told to master the bus clocks (05-audio.md). The tone plays
-         * (~3 s) against a blank panel, THEN the screen reports how many
-         * frames the FIFO accepted. */
-        uart_puts("core: audio bring-up (I2C -> WM8758 -> I2S)\n");
-        i2c_init();
-        i2s_init();
-        wm8758_init();
-        audio_settle();
-        i2s_tx_enable();
-        uart_puts("core: playing ~3s 689 Hz tone\n");
-        uint32_t wrote  = audio_play_tone(44100u * 3u);
-        uint32_t fifo   = mmio_read32(IISFIFO_CFG_ADDR);
-        uint32_t iiscfg = mmio_read32(IISCONFIG_ADDR);
-        uart_puts("core: tone frames written ");
-        uart_put_hex32(wrote);
-        uart_putc('\n');
-
-        /* The single on-screen diagnostic (the only silicon-proven
-         * present path). GREEN bg = PLL locked. Rows:
-         *   FREQ = cpu_frequency()   STAT = PLL_STATUS (bit31 = lock)
-         *   WROT = frames the I2S TX FIFO accepted. ~0x000204CC (132300 =
-         *          3 s x 44100) => the FIFO drained, i.e. the codec IS
-         *          clocking the data out; ~0x10 (only the initial 16-slot
-         *          FIFO fill) => it never drained, i.e. no codec clock.
-         *   FIFO = IISFIFO_CFG readback (TX-free count in bits 21:16:
-         *          ~0x0010xxxx healthy/drained, 0x0000xxxx stuck-full).
-         *   CFG  = IISCONFIG readback (expect TXFIFOEN bit29 + LE16_2). */
-        console_clear(bg);
-        console_str  (2, 3, "FREQ", CON_WHITE, bg);
-        console_hex32(8, 3, cpu_frequency(),              CON_WHITE, bg);
-        console_str  (2, 5, "STAT", CON_WHITE, bg);
-        console_hex32(8, 5, mmio_read32(PLL_STATUS_ADDR), CON_WHITE, bg);
-        console_str  (2, 7, "WROT", CON_WHITE, bg);
-        console_hex32(8, 7, wrote,                        CON_WHITE, bg);
-        console_str  (2, 9, "FIFO", CON_WHITE, bg);
-        console_hex32(8, 9, fifo,                         CON_WHITE, bg);
-        console_str  (2, 11, "CFG",  CON_WHITE, bg);
-        console_hex32(8, 11, iiscfg,                      CON_WHITE, bg);
-        lcd_present_fb(console_framebuffer());
-        uart_puts("core: audio diagnostic screen presented\n");
-    } else {
-        uart_puts("core: lcd bcm NOT powered, skipping audio + screen\n");
-    }
-
-    /* Bring up the 100 Hz system tick: install the timer, then unmask
-     * IRQs at the core. Prove the interrupt path end-to-end before the
-     * scheduler starts — sleep_ms yields cooperatively, and with no
-     * scheduler running yet sched_yield is a no-op, so this simply spins
-     * on the IRQ-driven tick counter. If the two tick readings differ by
-     * ~10 (100 Hz x 0.1 s), the timer fired, the controller delivered,
-     * irq_vector_entry -> irq_dispatch -> timer_tick_isr ran, and
-     * sleep_ms observed the counter. */
+    /* Bring up the 100 Hz system tick and unmask IRQs at the core BEFORE
+     * the audio bring-up: continuous playback is DMA-driven and needs its
+     * completion interrupt (source 26) delivered, and sleep_ms below spins
+     * on the IRQ-fed tick. Prove the IRQ path first with the tick counter
+     * (with no scheduler yet sched_yield is a no-op): if the two readings
+     * differ by ~10 (100 Hz x 0.1 s), timer -> controller ->
+     * irq_vector_entry -> irq_dispatch -> timer_tick_isr -> sleep_ms all
+     * work. */
     uart_puts("core: timer init @ 100 Hz, enabling IRQs\n");
     timer_init();
     arch_irq_enable();
@@ -265,6 +216,73 @@ _Noreturn void kernel_main(void) {
     uart_puts("core: tick ");
     uart_put_hex32(current_tick());
     uart_puts(" (post-sleep, ~+10)\n");
+
+    /* LCD + AUDIO. Probe the BCM power rail: nonzero => real hardware. The
+     * clicky emulator has no BCM (lcd_init() false there), so this whole
+     * block — every I2S/DAC/DMA access — is skipped, keeping the emulator
+     * smoke green; the audio register grammar is proven host-side by the
+     * mock-bus trace tests. We run the audio chain first, then report the
+     * result in a SINGLE framebuffer present (lcd_present_fb is only
+     * silicon-proven for the first frame; a second present stalls in the
+     * BCM wait-for-idle poll). GREEN bg = PLL locked. */
+    if (lcd_init()) {
+        uint16_t bg = (cpu_frequency() == CPUFREQ_NORMAL) ? CON_GREEN
+                                                          : CON_RED;
+
+        /* (a) Polled first-sound: a known-good ~1 s tone straight to the
+         * I2S FIFO, proving the codec/output path independently of DMA. */
+        uart_puts("core: [polled] bring-up + ~1s tone\n");
+        i2c_init();
+        i2s_init();
+        wm8758_init();
+        audio_settle();
+        i2s_tx_enable();
+        uint32_t wrote = audio_play_tone(44100u);
+
+        /* (b) DMA continuous playback via the hal_audio backend: re-init
+         * through hal_audio, register the sine source, start, and let it
+         * run ~3 s. DMA feeds the FIFO autonomously (paced by the I2S
+         * request) while the CPU just waits on the tick; each completion
+         * IRQ refills a buffer. The completion count proves the DMA + IRQ
+         * path end to end. */
+        uart_puts("core: [dma] hal_audio continuous ~3s tone\n");
+        uint32_t dmac = 0;
+        if (hal_audio_init(44100u, 2u) == 0) {
+            g_sine_phase = 0;
+            hal_audio_set_source(sine_source, 0);
+            hal_audio_start();
+            sleep_ms(3000);
+            hal_audio_stop();
+            dmac = audio_dma_completions();
+        }
+        uart_puts("core: dma completions ");
+        uart_put_hex32(dmac);
+        uart_putc('\n');
+
+        /* Single on-screen diagnostic (the only silicon-proven present).
+         *   FREQ/STAT = clock.
+         *   WROT = frames the polled path pushed (~0x0000AC44 = 44100 =>
+         *          FIFO drained / codec clocking; ~0x10 => no codec clock).
+         *   DMAC = DMA chunks completed in ~3 s (~0x40 = 64 => DMA + IRQ
+         *          path live; 0 => no completion — suspect the RAM-address
+         *          alias in audio.c buf_phys() or the IRQ wiring).
+         *   CFG  = IISCONFIG readback (TXFIFOEN bit29 + LE16_2). */
+        console_clear(bg);
+        console_str  (2, 3, "FREQ", CON_WHITE, bg);
+        console_hex32(8, 3, cpu_frequency(),               CON_WHITE, bg);
+        console_str  (2, 5, "STAT", CON_WHITE, bg);
+        console_hex32(8, 5, mmio_read32(PLL_STATUS_ADDR),  CON_WHITE, bg);
+        console_str  (2, 7, "WROT", CON_WHITE, bg);
+        console_hex32(8, 7, wrote,                         CON_WHITE, bg);
+        console_str  (2, 9, "DMAC", CON_WHITE, bg);
+        console_hex32(8, 9, dmac,                          CON_WHITE, bg);
+        console_str  (2, 11, "CFG",  CON_WHITE, bg);
+        console_hex32(8, 11, mmio_read32(IISCONFIG_ADDR),  CON_WHITE, bg);
+        lcd_present_fb(console_framebuffer());
+        uart_puts("core: audio diagnostic screen presented\n");
+    } else {
+        uart_puts("core: lcd bcm NOT powered, skipping audio + screen\n");
+    }
 
     /* Hand off to the cooperative scheduler. Demo task is added first
      * so it runs first; it finishes and drops out, leaving the idle

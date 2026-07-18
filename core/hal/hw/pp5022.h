@@ -471,6 +471,8 @@
  */
 #define DMA_MASTER_CONTROL_ADDR 0x6000A000
 #define DMA_MASTER_CONTROL_EN   0x80000000  /* bit 31 */
+#define DMA_MASTER_STATUS_ADDR  0x6000A004  /* per-channel done bits */
+#define DMA_MASTER_STATUS_CH0   0x01000000  /* bit 24: channel-0 done */
 #define DMA_REQ_STATUS_ADDR     0x6000A008
 #define DMA0_CMD_ADDR           0x6000B000
 #define DMA0_STATUS_ADDR        0x6000B004  /* read clears the channel IRQ */
@@ -486,8 +488,14 @@
 #define DMA_CMD_SINGLE          0x04000000   /* bit 26 */
 #define DMA_CMD_WAIT_REQ        0x01000000   /* bit 24 */
 #define DMA_CMD_REQ_ID_POS      16           /* REQ_ID in bits 19:16 */
+#define DMA_CMD_SIZE_MASK       0x0000FFFF   /* byte-count field (bits 15:0) */
+#define DMA_SIZE_BIAS           4            /* SIZE field = bytes - 4 */
 #define DMA_PLAY_CONFIG         0x4D020000   /* INTR|RAM_TO_PER|SINGLE|WAIT_REQ|(IIS<<16) */
 #define DMA_INCR_PLAY           0x20010000   /* RANGE_FIXED(1<<16) | WIDTH_32BIT(2<<28) */
+#define DMA_FLAGS_PLAY          0x04000000   /* DMA0_FLAGS bit 26 (Rockbox sets unconditionally) */
+#define DMA0_STATUS_INTR        0x40000000   /* bit 30: completion flag */
+#define DMA0_STATUS_BUSY        0x80000000   /* bit 31: channel busy */
 #define DMA_IRQ                 26           /* CPU int source; DMA_MASK = 1<<26 */
+#define DMA_MASK                0x04000000   /* 1 << DMA_IRQ */
 
 #endif /* CORE_HAL_HW_PP5022_H */

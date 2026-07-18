@@ -19,6 +19,7 @@
 #include "timer.h"
 #include "hw/pp5022.h"
 #include "hw/mmio.h"
+#include "hw/audio.h"
 
 void irq_dispatch(void)
 {
@@ -28,6 +29,10 @@ void irq_dispatch(void)
     if (pending & (1u << TIMER1_IRQ)) {
         timer_tick_isr();
         handled |= (1u << TIMER1_IRQ);
+    }
+    if (pending & (1u << DMA_IRQ)) {
+        audio_dma_isr();
+        handled |= (1u << DMA_IRQ);
     }
     /* future sources chain here, each OR-ing its bit into `handled` */
 
