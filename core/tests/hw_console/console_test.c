@@ -34,6 +34,11 @@ static const exp_glyph_t k_expected[] = {
     { 'B', { 0xF0, 0x88, 0x88, 0xF0, 0x88, 0x88, 0xF0, 0x00 } },
     { 'C', { 0x70, 0x88, 0x80, 0x80, 0x80, 0x88, 0x70, 0x00 } },
     { 'D', { 0xF0, 0x88, 0x88, 0x88, 0x88, 0x88, 0xF0, 0x00 } },
+    /* Label glyphs added for the audio diagnostic screen. */
+    { 'G', { 0x70, 0x88, 0x80, 0xB8, 0x88, 0x88, 0x70, 0x00 } },
+    { 'I', { 0x70, 0x20, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00 } },
+    { 'O', { 0x70, 0x88, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00 } },
+    { 'W', { 0x88, 0x88, 0x88, 0xA8, 0xA8, 0xA8, 0x50, 0x00 } },
 };
 
 static const uint8_t *expected_rows(char ch)
@@ -170,6 +175,25 @@ static int case4_bounds(void)
     return 1;
 }
 
+/* The label glyphs added for the audio diagnostic screen (W/O/G/I) — the
+ * ones that used to render blank and garbled WROT/FIFO/CFG into R T/F F/CF. */
+static int case5_label_glyphs(void)
+{
+    console_clear(CON_BLACK);
+    console_str(0, 0, "WOGI", CON_WHITE, CON_BLACK);
+    const uint16_t *fb = console_framebuffer();
+
+    const char *expect = "WOGI";
+    for (int i = 0; i < 4; i++) {
+        if (!cell_matches(fb, i, 0, expect[i], CON_WHITE, CON_BLACK)) {
+            printf("FAIL case5: cell (%d,0) != '%c'\n", i, expect[i]);
+            return 0;
+        }
+    }
+    printf("PASS case5: W/O/G/I label glyphs render\n");
+    return 1;
+}
+
 int main(void)
 {
     int ok = 1;
@@ -177,6 +201,7 @@ int main(void)
     ok &= case2_char();
     ok &= case3_hex32();
     ok &= case4_bounds();
+    ok &= case5_label_glyphs();
 
     if (ok) {
         printf("ALL PASS\n");
