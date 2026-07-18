@@ -16,6 +16,8 @@
 #include "hw/uart.h"
 #include "hw/lcd.h"
 #include "sched.h"
+#include "timer.h"
+#include "irq.h"
 
 /*
  * Crude bounded busy-delay between LCD fill colors so a human can see
@@ -129,6 +131,26 @@ _Noreturn void kernel_main(void) {
     } else {
         uart_puts("core: lcd bcm NOT powered, skipping fills (no bootstrap yet)\n");
     }
+
+    /* Bring up the 100 Hz system tick: install the timer, then unmask
+     * IRQs at the core. Prove the interrupt path end-to-end before the
+     * scheduler starts — sleep_ms yields cooperatively, and with no
+     * scheduler running yet sched_yield is a no-op, so this simply spins
+     * on the IRQ-driven tick counter. If the two tick readings differ by
+     * ~10 (100 Hz x 0.1 s), the timer fired, the controller delivered,
+     * irq_vector_entry -> irq_dispatch -> timer_tick_isr ran, and
+     * sleep_ms observed the counter. */
+    uart_puts("core: timer init @ 100 Hz, enabling IRQs\n");
+    timer_init();
+    arch_irq_enable();
+
+    uart_puts("core: tick ");
+    uart_put_hex32(current_tick());
+    uart_puts(" (pre-sleep)\n");
+    sleep_ms(100);
+    uart_puts("core: tick ");
+    uart_put_hex32(current_tick());
+    uart_puts(" (post-sleep, ~+10)\n");
 
     /* Hand off to the cooperative scheduler. Demo task is added first
      * so it runs first; it finishes and drops out, leaving the idle

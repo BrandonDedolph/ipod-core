@@ -138,6 +138,15 @@ def main():
     eq("GPO32_VAL_ADDR", "GPO32_ENABLE_ADDR", 0x04)
     # Per-core control CPU_CTL / COP_CTL are an adjacent pair.
     eq("CPU_CTL_ADDR", "COP_CTL_ADDR", 0x04)
+    # Interrupt-controller low-bank register offsets (from CPU_INT_STAT).
+    eq("CPU_INT_STAT_ADDR", "CPU_INT_EN_ADDR", 0x24)
+    eq("CPU_INT_STAT_ADDR", "CPU_INT_DIS_ADDR", 0x28)
+    eq("CPU_INT_STAT_ADDR", "CPU_INT_PRIORITY_ADDR", 0x2C)
+    # Timer register block spacing (from TIMER1_CFG).
+    eq("TIMER1_CFG_ADDR", "TIMER1_VAL_ADDR", 0x04)
+    eq("TIMER1_CFG_ADDR", "TIMER2_CFG_ADDR", 0x08)
+    eq("TIMER1_CFG_ADDR", "TIMER2_VAL_ADDR", 0x0C)
+    eq("TIMER1_CFG_ADDR", "USEC_TIMER_ADDR", 0x10)
     # MMAP0 logical/physical are an adjacent pair.
     eq("MMAP0_LOGICAL_ADDR", "MMAP0_PHYSICAL_ADDR", 0x04)
     # BCM ports are spaced one decoded-bit (0x10000) apart, in order.

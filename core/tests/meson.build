@@ -102,6 +102,26 @@ if target == 'sim'
   )
   test('hw-sched', sched_test, suite: 'unit')
 
+  # hw-timer: the interrupt dispatcher + 100 Hz timer tick, compiled
+  # host-side with -DMMIO_MOCK against the recording fake bus. Asserts
+  # timer_init's exact register grammar (arm CFG + unmask), that
+  # timer_tick_isr acks by reading TIMER1_VAL and advances the counter,
+  # that irq_dispatch only ticks when CPU_INT_STAT shows TIMER1 pending,
+  # and the sleep_ms tick math (a sched_yield stub advances the mocked
+  # tick so the cooperative wait terminates). The IRQ entry asm + real
+  # interrupt delivery are exercised end-to-end in clicky.
+  timer_test = executable(
+    'timer_test',
+    sources: ['hw_timer/timer_test.c',
+              'hw_timer/timer_test_stubs.c',
+              '../kernel/timer.c',
+              '../kernel/irq.c',
+              'hw_mmio/mmio_mock.c'],
+    include_directories: include_directories('../hal', '../hal/hw', '../kernel', 'hw_mmio'),
+    c_args: ['-DMMIO_MOCK'],
+  )
+  test('hw-timer', timer_test, suite: 'unit')
+
   # End-to-end audio-playback test: spawns core-sim with the SDL2
   # disk audio driver, plays the FLAC fixture, then bit-compares
   # the captured PCM to the codec_kat reference. Exercises the

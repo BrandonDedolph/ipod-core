@@ -19,20 +19,74 @@
  *      remap from an IRAM-resident stub so the code doing the remap is
  *      not itself affected by it (08-boot-dock.md step 2;
  *      01-soc-pp5022.md, "Memory remap (MMAP0)").
- *   3. Zero .bss, call kernel_main, hang.
+ *   3. Zero .bss, set up the IRQ-mode stack, call kernel_main, hang.
+ *
+ * The 0x0-based exception vector table forms the first 32 bytes of the
+ * image (it IS _start), and the banked IRQ stack is established in
+ * reset_handler; IRQs are left MASKED for the C side to unmask after
+ * timer_init. The first-level IRQ entry stub (irq_vector_entry) is a leaf
+ * ISR that calls the extern C dispatcher irq_dispatch (kernel/irq.c).
  *
  * No .data copy is needed (doc step 3 doesn't apply to us): the
  * bootloader loads the entire image into SDRAM and linker.ld links with
  * VMA == LMA, so .data is already in place at its final address. Cache
- * init, COP wake, vector table install and IRQ setup come in subsequent
- * PRs as the kernel grows.
+ * init and COP wake come in subsequent PRs as the kernel grows.
  */
 
     .section .text.startup, "ax"
     .arm
     .global _start
 
+    /* ===================================================================
+     * ARM7TDMI exception vector table — the first 32 bytes of the image.
+     * _start IS the table, so _start stays at offset 0x0, which is what
+     * both the layout check and the bootloader's entry-at-offset-0 rely on
+     * (the table and the entry are the same bytes).
+     *
+     * Reset (0x00) is a PC-RELATIVE `b`: at bootloader entry SDRAM is still
+     * at native 0x10000000 and the MMAP0 remap to 0x0 has NOT happened, so
+     * an absolute `ldr pc,[pc,#..]` loading a 0x0-based address would jump
+     * into unmapped space and brick. `b` is PC-relative and safe pre-remap.
+     *
+     * The other seven slots (0x04..0x1C) use `ldr pc, <literal>` loading
+     * ABSOLUTE 0x0-based handler addresses from the explicit `.word` pool
+     * placed immediately after the slots (NOT `ldr pc,=sym`, which would
+     * let the literal pool drift out of the [pc,#imm] +/-4KB range and
+     * reorder the table). These only ever fire AFTER remap + IRQ-unmask,
+     * when 0x0-based addresses are live.
+     * =================================================================== */
 _start:
+    b       reset_handler           @ 0x00 reset  (PC-relative, pre-remap safe)
+    ldr     pc, _v_undef            @ 0x04 undefined instruction
+    ldr     pc, _v_swi              @ 0x08 software interrupt (SWI)
+    ldr     pc, _v_pabt             @ 0x0C prefetch abort
+    ldr     pc, _v_dabt             @ 0x10 data abort
+    ldr     pc, _v_resv             @ 0x14 reserved
+    ldr     pc, _v_irq              @ 0x18 IRQ
+    ldr     pc, _v_fiq              @ 0x1C FIQ
+
+    /* Absolute (0x0-based) handler literals — kept adjacent to the slots
+     * so every `ldr pc` above stays in [pc,#imm] range and the table does
+     * not get reordered by an implicit literal pool. */
+_v_undef:   .word trap_hang
+_v_swi:     .word trap_hang
+_v_pabt:    .word trap_hang
+_v_dabt:    .word trap_hang
+_v_resv:    .word trap_hang
+_v_fiq:     .word trap_hang
+_v_irq:     .word irq_vector_entry
+
+    /* Deterministic park for unhandled exceptions — a tight self-branch so
+     * a stray undef/abort/SWI stops here where GDB can see it, instead of
+     * running off into garbage. */
+trap_hang:
+    b       trap_hang
+
+    /* ===================================================================
+     * RESET PATH. Reached via the reset slot's `b` above. This is the
+     * entire original crt0 startup body, unchanged.
+     * =================================================================== */
+reset_handler:
     /* ===================================================================
      * PRE-REMAP. The PC is somewhere in SDRAM's native 0x10000000 window
      * but all symbols are linked at 0x0-based addresses. Until the MMAP0
@@ -162,11 +216,41 @@ post_remap:
     strlo   r2, [r0], #4
     blo     2b
 
+    /* Set up the banked IRQ-mode stack, then return to supervisor. We are
+     * post-remap and running at link addresses, so `ldr sp,=` literals now
+     * resolve to live IRAM addresses. Enter IRQ mode (I+F still masked) to
+     * get at the banked SP_irq, point it at its own 1 KB region at the top
+     * of IRAM, then switch back to supervisor and re-load SP_svc. IRQs stay
+     * MASKED here — the C side unmasks after timer_init. (The earlier
+     * `ldr sp,=_stack_top` at cpu_start ran on the temp/remap stack; this
+     * re-load is harmless and just re-establishes SP_svc post-remap.) */
+    msr     cpsr_c, #0xD2           @ IRQ mode, I+F masked (0x12 | 0xC0)
+    ldr     sp, =_irq_stack_top
+    msr     cpsr_c, #0xD3           @ supervisor mode, I+F masked
+    ldr     sp, =_stack_top
+
     /* Hand off to C. */
     bl      kernel_main
 
     /* kernel_main is _Noreturn; if it ever does return, park. */
 3:
     b       3b
+
+    /* ===================================================================
+     * First-level IRQ entry. Leaf ISR — no context switch (the scheduler
+     * is cooperative). Vectored to from slot 0x18 via _v_irq. Fixes up the
+     * IRQ return address, saves the caller-saved (AAPCS) registers plus the
+     * return address, calls the C dispatcher, then restores and returns,
+     * with `^` on the ldm restoring CPSR from SPSR_irq. `irq_dispatch` is
+     * an extern C function (kernel/irq.c) supplied by another agent.
+     * =================================================================== */
+    .global irq_vector_entry
+irq_vector_entry:
+    sub     lr, lr, #4              @ IRQ return-address fixup
+    @ Save an EVEN number of registers (6) so sp stays 8-byte aligned at
+    @ the bl below, per AAPCS — do not add/remove one without padding.
+    stmfd   sp!, {r0-r3, r12, lr}   @ save caller-saved + return
+    bl      irq_dispatch            @ C dispatcher (extern, kernel/irq.c)
+    ldmfd   sp!, {r0-r3, r12, pc}^  @ restore + return, ^ = CPSR <- SPSR
 
     .size _start, . - _start

@@ -20,7 +20,11 @@ NM="${2:-arm-none-eabi-nm}"
 # Expected constants (must track hal/hw/pp5022.h + boot/linker.ld):
 #   IRAM_BASE 0x40000000 + IRAM_USABLE_SIZE 0x18000 = 0x40018000
 EXP_START="0"
-EXP_STACK_TOP="40018000"
+# PR #6 split the top of IRAM into a banked IRQ stack + the supervisor
+# stack below it: _irq_stack_top = IRAM top (0x40018000), _stack_top =
+# 1 KB below (0x40017C00).
+EXP_IRQ_STACK_TOP="40018000"
+EXP_STACK_TOP="40017c00"
 SDRAM_SIZE_5_5G=$((0x04000000))   # 64 MB — .bss must fit below this
 
 fails=0
@@ -32,6 +36,7 @@ sym() {  # sym <name> -> hex address (lowercase, no 0x), empty if absent
 
 START=$(sym _start)
 STACK=$(sym _stack_top)
+IRQ_STACK=$(sym _irq_stack_top)
 BSS_S=$(sym __bss_start)
 BSS_E=$(sym __bss_end)
 KMAIN=$(sym kernel_main)
@@ -43,9 +48,12 @@ if [ "$((0x${START:-1}))" -ne "$((0x$EXP_START))" ]; then
     note "_start = 0x$START, expected 0x$EXP_START (vector base)"
 fi
 
-# Temp stack at top of usable IRAM.
+# Supervisor stack just below the IRQ stack; IRQ stack at the IRAM top.
 if [ "$(printf '%s' "$STACK" | tr 'A-F' 'a-f')" != "$EXP_STACK_TOP" ]; then
     note "_stack_top = 0x$STACK, expected 0x$EXP_STACK_TOP"
+fi
+if [ "$(printf '%s' "$IRQ_STACK" | tr 'A-F' 'a-f')" != "$EXP_IRQ_STACK_TOP" ]; then
+    note "_irq_stack_top = 0x$IRQ_STACK, expected 0x$EXP_IRQ_STACK_TOP"
 fi
 
 # .bss must be a word-aligned, non-negative range within SDRAM so the

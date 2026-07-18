@@ -113,6 +113,53 @@
 #define COP_CTL         PP_REG32(COP_CTL_ADDR)
 #endif
 
+/* ---------- Interrupt controller -------------------------------------
+ * core/docs/hw/01-soc-pp5022.md, "Interrupt controller". Low-priority
+ * bank only (the timer sources we need live there). Sources #<32 route
+ * through CPU_INT_EN/DIS at bit #N; write-1-to-enable / write-1-to-
+ * disable. The CPSR I-bit gates IRQs at the core.
+ */
+
+#define CPU_INT_STAT_ADDR     0x60004000
+#define CPU_INT_EN_ADDR       0x60004024  /* write 1<<N to enable IRQ N  */
+#define CPU_INT_DIS_ADDR      0x60004028  /* write 1<<N to disable IRQ N */
+#define CPU_INT_PRIORITY_ADDR 0x6000402C
+
+#define TIMER1_IRQ          0             /* low bank, 1<<0 (01-soc, IRQ #) */
+#define TIMER2_IRQ          1             /* low bank, 1<<1 */
+
+#define CPSR_I_BIT          0x00000080    /* CPSR IRQ-disable bit */
+
+#ifndef __ASSEMBLER__
+#define CPU_INT_STAT    PP_REG32(CPU_INT_STAT_ADDR)
+#define CPU_INT_EN      PP_REG32(CPU_INT_EN_ADDR)
+#define CPU_INT_DIS     PP_REG32(CPU_INT_DIS_ADDR)
+#endif
+
+/* ---------- Timers / system tick -------------------------------------
+ * core/docs/hw/01-soc-pp5022.md, "Timers and the system tick". Two
+ * programmable down-counters + a free-running microsecond counter, all
+ * clocked at a fixed 1 MHz (TIMER_FREQ). TIMERx_CFG is armed in one
+ * write: 0xC0000000 | (period_us - 1) — enable + IRQ/periodic-reload +
+ * the reload period. Reading TIMERx_VAL acknowledges that timer's IRQ.
+ */
+
+#define TIMER1_CFG_ADDR     0x60005000
+#define TIMER1_VAL_ADDR     0x60005004
+#define TIMER2_CFG_ADDR     0x60005008  /* recorded; unused by the tick */
+#define TIMER2_VAL_ADDR     0x6000500C
+#define USEC_TIMER_ADDR     0x60005010  /* free-running 1 MHz counter   */
+
+#define TIMER_FREQ          1000000     /* 1 MHz timer clock            */
+#define TIMER_CFG_ENABLE    0x80000000  /* CFG bit 31: timer enable     */
+#define TIMER_CFG_IRQEN     0x40000000  /* CFG bit 30: IRQ + periodic reload */
+
+#ifndef __ASSEMBLER__
+#define TIMER1_CFG      PP_REG32(TIMER1_CFG_ADDR)
+#define TIMER1_VAL      PP_REG32(TIMER1_VAL_ADDR)
+#define USEC_TIMER      PP_REG32(USEC_TIMER_ADDR)
+#endif
+
 /* ---------- Device enable / reset / clock control --------------------
  * core/docs/hw/01-soc-pp5022.md, "Power management" (DEV_*) and
  * "Clock tree" (PLL_*, CLOCK_SOURCE, DEV_TIMING1). These gate

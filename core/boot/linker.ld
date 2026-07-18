@@ -64,4 +64,12 @@ SECTIONS {
     }
 }
 
-_stack_top = ORIGIN(IRAM) + LENGTH(IRAM);
+/*
+ * Two stacks carved from the top of IRAM, both growing downward:
+ *   - IRQ stack:        [0x40017C00, 0x40018000)  — 1 KB at the very top,
+ *                       banked SP_irq, set up in crt0.S reset_handler.
+ *   - Supervisor stack: grows down from 0x40017C00 — SP_svc, the main
+ *                       C-code stack.
+ */
+_irq_stack_top = ORIGIN(IRAM) + LENGTH(IRAM);   /* 0x40018000 */
+_stack_top     = _irq_stack_top - 0x400;        /* 1 KB IRQ stack; svc top = 0x40017C00 */
