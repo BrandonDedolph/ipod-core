@@ -7,7 +7,7 @@
 BUILD_HW  := build-hw
 BUILD_SIM := build-sim
 
-.PHONY: help hw ipod sim clean realclean reconfigure-hw reconfigure-sim
+.PHONY: help hw ipod sim clean realclean reconfigure-hw reconfigure-sim verify-hw
 
 help:
 	@echo "Targets:"
@@ -35,6 +35,14 @@ ipod: hw
 
 sim: $(BUILD_SIM)/build.ninja
 	ninja -C $(BUILD_SIM)
+
+# Static verification of the hw image that needs the linked ELF:
+# crt0/linker layout asserts, plus the header<->doc address
+# consistency check (also run standalone in `meson test`). Depends on a
+# fresh `make hw`. The MMIO trace tests run under `meson test`.
+verify-hw: hw
+	sh tests/scripts/check_hw_layout.sh $(BUILD_HW)/core.elf
+	python3 tests/scripts/check_hw_consistency.py
 
 $(BUILD_HW)/build.ninja:
 	meson setup $(BUILD_HW) --cross-file cross/arm-none-eabi.txt -Dtarget=hw

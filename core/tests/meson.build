@@ -73,6 +73,19 @@ if target == 'sim'
   )
   test('hw-lcd-trace', lcd_trace_test, suite: 'unit')
 
+  # Static header<->doc consistency: pp5022.h addresses vs the
+  # docs/hw/ reference + internal stride/window invariants. Pure source
+  # parsing (no ARM build needed), so it runs in the common test path.
+  # Catches the dropped-zero and byte-vs-word-stride bug classes. The
+  # ELF-layout half (crt0/linker asserts, needs core.elf) runs via
+  # `make verify-hw`.
+  py = find_program('python3', required: false)
+  if py.found()
+    test('hw-doc-consistency', py,
+         args: [meson.current_source_dir() / 'scripts' / 'check_hw_consistency.py'],
+         suite: 'unit')
+  endif
+
   # End-to-end audio-playback test: spawns core-sim with the SDL2
   # disk audio driver, plays the FLAC fixture, then bit-compares
   # the captured PCM to the codec_kat reference. Exercises the
