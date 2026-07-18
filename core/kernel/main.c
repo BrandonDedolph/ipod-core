@@ -69,28 +69,35 @@ static void audio_settle(void)
 }
 
 /*
- * Stream `frames` stereo sine frames through the polled I2S FIFO. The
- * write self-paces on FIFO space, so this takes ~frames/44100 seconds of
- * wall-clock on working hardware. Returns 0 if it streamed, -1 if the
- * TX FIFO never drained (codec not clocking — 64 consecutive write
- * timeouts) so we bail instead of grinding for minutes.
+ * Stream up to `frames` stereo sine frames through the polled I2S FIFO
+ * and return the number that were actually ACCEPTED by the FIFO. The
+ * write self-paces on FIFO space, so a full run takes ~frames/44100 s of
+ * wall-clock on working hardware. If the TX FIFO never drains (codec not
+ * clocking) we bail after 64 consecutive write timeouts and return the
+ * count so far — so the returned value is the headline diagnostic:
+ *   ~frames  => the FIFO drained, i.e. the codec IS clocking the data
+ *              out (a silent output is then an output-stage problem);
+ *   ~0       => the FIFO never drained, i.e. no codec clock (I2S
+ *              pad-mux / MCLK / config).
  */
-static int audio_play_tone(uint32_t frames)
+static uint32_t audio_play_tone(uint32_t frames)
 {
     uint32_t phase = 0;
     uint32_t misses = 0;
+    uint32_t wrote = 0;
     for (uint32_t n = 0; n < frames; n++) {
         int16_t s = sine64[phase & 63];
         if (i2s_write_stereo(s, s) != 0) {
             if (++misses >= 64) {
-                return -1;
+                break;
             }
             continue;
         }
         misses = 0;
+        wrote++;
         phase++;
     }
-    return 0;
+    return wrote;
 }
 
 /* Per-task stacks (carved from .bss; the scheduler builds each task's
@@ -177,48 +184,66 @@ _Noreturn void kernel_main(void) {
          * CTRL = PLL_CONTROL readback. */
         uint16_t bg = (cpu_frequency() == CPUFREQ_NORMAL) ? CON_GREEN
                                                           : CON_RED;
-        uart_puts("core: lcd bcm powered - rendering debug screen\n");
-        console_clear(bg);
-        console_str  (2, 3, "FREQ", CON_WHITE, bg);
-        console_hex32(8, 3, cpu_frequency(),               CON_WHITE, bg);
-        console_str  (2, 5, "STAT", CON_WHITE, bg);
-        console_hex32(8, 5, mmio_read32(PLL_STATUS_ADDR),  CON_WHITE, bg);
-        console_str  (2, 7, "CTRL", CON_WHITE, bg);
-        console_hex32(8, 7, mmio_read32(PLL_CONTROL_ADDR), CON_WHITE, bg);
-        lcd_present_fb(console_framebuffer());
-        uart_puts("core: debug screen presented\n");
 
-        /* FIRST SOUND. Gated behind the same BCM-powered probe as the
-         * debug screen: it means we are on real hardware, not the clicky
-         * emulator (which models no BCM — and no I2S/DAC either, so sound
-         * can only be proven on device; the register grammar is checked
-         * host-side by the mock-bus trace tests). Chain: I2C controller ->
-         * WM8758 codec -> I2S serializer -> a polled 689 Hz sine. i2s_init
-         * runs before wm8758_init because the codec's MCLK reference must
-         * be alive before the codec is told to master the bus clocks
-         * (05-audio.md). Blocks ~2 s, then continues to the scheduler. */
+        /* FIRST SOUND — run the WHOLE audio chain BEFORE touching the
+         * panel, then report the result in a SINGLE framebuffer present.
+         *
+         * Why this order: lcd_present_fb is only silicon-proven for the
+         * FIRST frame. An earlier version updated an on-screen "SND"
+         * status with extra presents interleaved through the bring-up;
+         * the second present stalled in the BCM wait-for-idle poll and
+         * masked the audio result (frozen debug screen, no status, no
+         * sound). Every audio driver spin is bounded, so running all of
+         * it first is safe, and rendering once uses only the proven
+         * present path. On clicky this whole block is skipped (no BCM ->
+         * lcd_init() false); the register grammar is proven host-side by
+         * the mock-bus trace tests regardless.
+         *
+         * Chain: I2C controller -> WM8758 codec -> I2S serializer -> a
+         * polled 689 Hz sine. i2s_init runs before wm8758_init because
+         * the codec's MCLK reference must be alive before the codec is
+         * told to master the bus clocks (05-audio.md). The tone plays
+         * (~3 s) against a blank panel, THEN the screen reports how many
+         * frames the FIFO accepted. */
         uart_puts("core: audio bring-up (I2C -> WM8758 -> I2S)\n");
-        console_str(2, 9, "SND INIT", CON_WHITE, bg);
-        lcd_present_fb(console_framebuffer());
         i2c_init();
         i2s_init();
         wm8758_init();
         audio_settle();
         i2s_tx_enable();
+        uart_puts("core: playing ~3s 689 Hz tone\n");
+        uint32_t wrote  = audio_play_tone(44100u * 3u);
+        uint32_t fifo   = mmio_read32(IISFIFO_CFG_ADDR);
+        uint32_t iiscfg = mmio_read32(IISCONFIG_ADDR);
+        uart_puts("core: tone frames written ");
+        uart_put_hex32(wrote);
+        uart_putc('\n');
 
-        console_str(2, 9, "SND PLAY", CON_WHITE, bg);
+        /* The single on-screen diagnostic (the only silicon-proven
+         * present path). GREEN bg = PLL locked. Rows:
+         *   FREQ = cpu_frequency()   STAT = PLL_STATUS (bit31 = lock)
+         *   WROT = frames the I2S TX FIFO accepted. ~0x000204CC (132300 =
+         *          3 s x 44100) => the FIFO drained, i.e. the codec IS
+         *          clocking the data out; ~0x10 (only the initial 16-slot
+         *          FIFO fill) => it never drained, i.e. no codec clock.
+         *   FIFO = IISFIFO_CFG readback (TX-free count in bits 21:16:
+         *          ~0x0010xxxx healthy/drained, 0x0000xxxx stuck-full).
+         *   CFG  = IISCONFIG readback (expect TXFIFOEN bit29 + LE16_2). */
+        console_clear(bg);
+        console_str  (2, 3, "FREQ", CON_WHITE, bg);
+        console_hex32(8, 3, cpu_frequency(),              CON_WHITE, bg);
+        console_str  (2, 5, "STAT", CON_WHITE, bg);
+        console_hex32(8, 5, mmio_read32(PLL_STATUS_ADDR), CON_WHITE, bg);
+        console_str  (2, 7, "WROT", CON_WHITE, bg);
+        console_hex32(8, 7, wrote,                        CON_WHITE, bg);
+        console_str  (2, 9, "FIFO", CON_WHITE, bg);
+        console_hex32(8, 9, fifo,                         CON_WHITE, bg);
+        console_str  (2, 11, "CFG",  CON_WHITE, bg);
+        console_hex32(8, 11, iiscfg,                      CON_WHITE, bg);
         lcd_present_fb(console_framebuffer());
-        uart_puts("core: playing ~2s 689 Hz tone\n");
-        int tone_rc = audio_play_tone(44100u * 2u);
-
-        console_str(2, 9, tone_rc == 0 ? "SND DONE " : "SND NOCLK",
-                    CON_WHITE, bg);
-        lcd_present_fb(console_framebuffer());
-        uart_puts(tone_rc == 0
-                      ? "core: tone done\n"
-                      : "core: I2S FIFO never drained (no codec clock)\n");
+        uart_puts("core: audio diagnostic screen presented\n");
     } else {
-        uart_puts("core: lcd bcm NOT powered, skipping debug screen\n");
+        uart_puts("core: lcd bcm NOT powered, skipping audio + screen\n");
     }
 
     /* Bring up the 100 Hz system tick: install the timer, then unmask
