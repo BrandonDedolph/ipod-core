@@ -4,7 +4,7 @@
 # driver per PR: uart, lcd (this one), then clickwheel, ATA, audio.
 hal_lib = static_library(
   'core_hal_hw',
-  sources: ['uart.c', 'lcd.c', 'i2c.c', 'wm8758.c', 'i2s.c', 'dma.c', 'audio.c'],
+  sources: ['uart.c', 'lcd.c', 'i2c.c', 'wm8758.c', 'i2s.c', 'dma.c', 'audio.c', 'ata.c'],
   include_directories: include_directories('..'),
 )
 

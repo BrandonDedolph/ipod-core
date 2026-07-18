@@ -27,6 +27,7 @@
 #include "i2c.h"
 #include "i2s.h"
 #include "dma.h"
+#include "ata.h"
 #include "mmio_mock.h"
 #include "trace_expect.h"
 
@@ -358,6 +359,53 @@ static int test_dma_ack_stop(void)
     return fails;
 }
 
+/* Case 11: ata_init — mask the ATA IRQ, select master, wait ready.
+ * ALT_STATUS reads RDY (BSY clear) so both waits satisfy on first read. */
+static int test_ata_init_grammar(void)
+{
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, ATA_STATUS_RDY);   /* 0x40 */
+
+    int rc = ata_init();
+
+    int fails = check("ata_init: returns 0", rc == 0);
+    trace_cursor tc = trace_begin("ata_init");
+    expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
+    expect_w(&tc, 8, ATA_SELECT_ADDR, 0);
+    expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);   /* wait not-busy */
+    expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);   /* wait ready    */
+    trace_expect_end(&tc);
+    fails += trace_done(&tc);
+    return fails;
+}
+
+/* Case 12: ata_read_sectors register grammar + LBA byte split + the
+ * 256-halfword data burst. ALT_STATUS reads RDY|DRQ so every poll passes. */
+static int test_ata_read_grammar(void)
+{
+    int fails = 0;
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, ATA_STATUS_RDY | ATA_STATUS_DRQ);
+    uint16_t buf[256];
+
+    int rc = ata_read_sectors(0x01234567u, 1, buf);
+    fails += check("ata_read: returns 0", rc == 0);
+
+    /* LBA 0x01234567 splits across the task registers. */
+    fails += check("ata_read: NSECTOR=1",  nth_write(ATA_NSECTOR_ADDR, 0) == 1);
+    fails += check("ata_read: SECTOR=0x67", nth_write(ATA_SECTOR_ADDR, 0) == 0x67);
+    fails += check("ata_read: LCYL=0x45",   nth_write(ATA_LCYL_ADDR, 0)   == 0x45);
+    fails += check("ata_read: HCYL=0x23",   nth_write(ATA_HCYL_ADDR, 0)   == 0x23);
+    fails += check("ata_read: SELECT=0x41 (LBA|high nibble)",
+                   nth_write(ATA_SELECT_ADDR, 0) == (ATA_SELECT_LBA | 0x1));
+    fails += check("ata_read: COMMAND=READ SECTORS",
+                   nth_write(ATA_COMMAND_ADDR, 0) == ATA_CMD_READ_SECTORS);
+    /* One 512-byte sector = exactly 256 halfword reads of the data port. */
+    fails += check("ata_read: 256 data-port reads",
+                   mmio_mock_count(MMIO_OP_READ, ATA_DATA_ADDR) == 256);
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
@@ -371,6 +419,8 @@ int main(void)
     fails += test_dma_init_grammar();
     fails += test_dma_kick_grammar();
     fails += test_dma_ack_stop();
+    fails += test_ata_init_grammar();
+    fails += test_ata_read_grammar();
 
     if (fails == 0) {
         printf("ALL PASS\n");

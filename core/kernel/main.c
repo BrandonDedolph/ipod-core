@@ -19,6 +19,7 @@
 #include "hw/wm8758.h"
 #include "hw/i2s.h"
 #include "hw/audio.h"
+#include "hw/ata.h"
 #include "hal.h"
 #include "sched.h"
 #include "timer.h"
@@ -128,6 +129,10 @@ static int sine_source(void *ud, int16_t *buf, int frames)
 #define TASK_STACK_SIZE 1024
 static uint8_t demo_stack[TASK_STACK_SIZE];
 static uint8_t idle_stack[TASK_STACK_SIZE];
+
+/* One-sector scratch for the MBR read (uint16_t for the 2-byte alignment
+ * ata_read_sectors needs). */
+static uint16_t mbr_sector[256];
 
 /*
  * Idle task: never exits. Sleep the CPU for a short countdown, then
@@ -259,27 +264,63 @@ _Noreturn void kernel_main(void) {
         uart_put_hex32(dmac);
         uart_putc('\n');
 
+        /* (c) ATA: read the MBR (LBA 0) and scan the partition table for
+         * the FAT32 data partition. This verifies the disk reader on the
+         * device before FAT32 is built on top. `wrote` (polled tone) is
+         * folded away to make room; DMAC already proves the audio path. */
+        uart_puts("core: [ata] init + read MBR\n");
+        uint8_t *mbr = (uint8_t *)mbr_sector;
+        int      ata_rc = ata_init();
+        int      rd_rc  = -1;
+        uint32_t sig    = 0;
+        uint32_t fat_lba = 0;
+        uint8_t  fat_type = 0;
+        if (ata_rc == 0) {
+            rd_rc = ata_read_sectors(0, 1, mbr);
+            if (rd_rc == 0) {
+                sig = (uint32_t)mbr[510] | ((uint32_t)mbr[511] << 8);
+                /* Four 16-byte partition entries at 0x1BE; type at +4,
+                 * start LBA (LE32) at +8. FAT32 type = 0x0B or 0x0C. */
+                for (int p = 0; p < 4; p++) {
+                    const uint8_t *e = &mbr[0x1BE + 16 * p];
+                    if (e[4] == 0x0B || e[4] == 0x0C) {
+                        fat_type = e[4];
+                        fat_lba = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
+                                  ((uint32_t)e[10] << 16) |
+                                  ((uint32_t)e[11] << 24);
+                        break;
+                    }
+                }
+            }
+        }
+        uart_puts("core: MBR sig ");
+        uart_put_hex32(sig);
+        uart_puts(" fat_lba ");
+        uart_put_hex32(fat_lba);
+        uart_putc('\n');
+        (void)wrote;
+
         /* Single on-screen diagnostic (the only silicon-proven present).
-         *   FREQ/STAT = clock.
-         *   WROT = frames the polled path pushed (~0x0000AC44 = 44100 =>
-         *          FIFO drained / codec clocking; ~0x10 => no codec clock).
-         *   DMAC = DMA chunks completed in ~3 s (~0x40 = 64 => DMA + IRQ
-         *          path live; 0 => no completion — suspect the RAM-address
-         *          alias in audio.c buf_phys() or the IRQ wiring).
-         *   CFG  = IISCONFIG readback (TXFIFOEN bit29 + LE16_2). */
+         *   FREQ = clock.  DMAC = DMA chunks in ~3 s (~0x40 => audio OK).
+         *   RD   = ata_read_sectors return code (0 => MBR read OK).
+         *   SIG  = MBR boot signature — expect 0000AA55 (=> disk reader
+         *          works on silicon). PART = FAT32 partition type (0B/0C).
+         *   PLBA = that partition's start LBA (what FAT32 mount needs). */
         console_clear(bg);
         console_str  (2, 3, "FREQ", CON_WHITE, bg);
         console_hex32(8, 3, cpu_frequency(),               CON_WHITE, bg);
-        console_str  (2, 5, "STAT", CON_WHITE, bg);
-        console_hex32(8, 5, mmio_read32(PLL_STATUS_ADDR),  CON_WHITE, bg);
-        console_str  (2, 7, "WROT", CON_WHITE, bg);
-        console_hex32(8, 7, wrote,                         CON_WHITE, bg);
-        console_str  (2, 9, "DMAC", CON_WHITE, bg);
-        console_hex32(8, 9, dmac,                          CON_WHITE, bg);
-        console_str  (2, 11, "CFG",  CON_WHITE, bg);
-        console_hex32(8, 11, mmio_read32(IISCONFIG_ADDR),  CON_WHITE, bg);
+        console_str  (2, 5, "DMAC", CON_WHITE, bg);
+        console_hex32(8, 5, dmac,                          CON_WHITE, bg);
+        console_str  (2, 7, "RD",   CON_WHITE, bg);
+        console_hex32(8, 7, (uint32_t)rd_rc,               CON_WHITE, bg);
+        console_str  (2, 9, "SIG",  CON_WHITE, bg);
+        console_hex32(8, 9, sig,                           CON_WHITE, bg);
+        console_str  (2, 11, "PART", CON_WHITE, bg);
+        console_hex32(8, 11, fat_type,                     CON_WHITE, bg);
+        console_str  (2, 13, "PLBA", CON_WHITE, bg);
+        console_hex32(8, 13, fat_lba,                      CON_WHITE, bg);
         lcd_present_fb(console_framebuffer());
-        uart_puts("core: audio diagnostic screen presented\n");
+        uart_puts("core: diagnostic screen presented\n");
     } else {
         uart_puts("core: lcd bcm NOT powered, skipping audio + screen\n");
     }

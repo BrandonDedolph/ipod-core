@@ -40,6 +40,7 @@ WINDOWS = [
     (0x30000000, 0x30080000),   # BCM video coprocessor ports
     (0x60000000, 0x60100000),   # system / device-control / GPIO
     (0x70000000, 0x70100000),   # GPO32 / SER0 / misc peripherals
+    (0xC3000000, 0xC3001000),   # ATA/IDE controller (04-ata.md)
     (0xF000F000, 0xF000F008),   # MMAP0 remap pair
 ]
 

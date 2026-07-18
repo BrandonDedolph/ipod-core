@@ -498,4 +498,43 @@
 #define DMA_IRQ                 26           /* CPU int source; DMA_MASK = 1<<26 */
 #define DMA_MASK                0x04000000   /* 1 << DMA_IRQ */
 
+/* ---------- ATA / IDE storage controller (0xC3000000) ---------------
+ * core/docs/hw/04-ata.md. Integrated PIO/UDMA IDE controller. The
+ * chainloading bootloader already powered, spun, and PIO-timed the drive
+ * (it read our image off the FAT32 partition), so our reader reuses that
+ * config: no power/reset/IDENTIFY, and DO NOT rewrite IDE0_PRI_TIMING
+ * (those PIO values are CPU-frequency-dependent). On PP502x the task
+ * registers are plain accesses — the PP5002 IDE_CFG write-complete
+ * handshake does NOT apply. Control registers are 8-bit; the data port is
+ * 16-bit (256 halfwords per 512-byte sector, little-endian, no swap).
+ */
+#define IDE_BASE_ADDR         0xC3000000
+#define ATA_DATA_ADDR         0xC30001E0  /* 16-bit data port              */
+#define ATA_ERROR_ADDR        0xC30001E4  /* read: error (write: feature)  */
+#define ATA_NSECTOR_ADDR      0xC30001E8  /* sector count (0 = 256)        */
+#define ATA_SECTOR_ADDR       0xC30001EC  /* LBA[7:0]                      */
+#define ATA_LCYL_ADDR         0xC30001F0  /* LBA[15:8]                     */
+#define ATA_HCYL_ADDR         0xC30001F4  /* LBA[23:16]                    */
+#define ATA_SELECT_ADDR       0xC30001F8  /* device/head + LBA[27:24]      */
+#define ATA_COMMAND_ADDR      0xC30001FC  /* write: command; read: status  */
+#define ATA_ALT_STATUS_ADDR   0xC30003F8  /* read: status (no side effect);
+                                           * write: device control         */
+#define ATA_CONTROL_ADDR      0xC30003F8
+
+/* Status bits (ATA_COMMAND read / ATA_ALT_STATUS). */
+#define ATA_STATUS_BSY        0x80
+#define ATA_STATUS_RDY        0x40
+#define ATA_STATUS_DF         0x20
+#define ATA_STATUS_DRQ        0x08
+#define ATA_STATUS_ERR        0x01
+/* Error bits (ATA_ERROR read). */
+#define ATA_ERROR_IDNF        0x10  /* ID not found / bad LBA */
+/* Device control bits. */
+#define ATA_CONTROL_NIEN      0x02  /* mask the ATA IRQ (pure polling) */
+#define ATA_CONTROL_SRST      0x04  /* software reset */
+/* ATA_SELECT bits. */
+#define ATA_SELECT_LBA        0x40  /* LBA mode + master */
+/* Commands. */
+#define ATA_CMD_READ_SECTORS  0x20  /* LBA28 PIO read (one DRQ per sector) */
+
 #endif /* CORE_HAL_HW_PP5022_H */

@@ -150,7 +150,8 @@ if target == 'sim'
               '../hal/hw/i2c.c',
               '../hal/hw/wm8758.c',
               '../hal/hw/i2s.c',
-              '../hal/hw/dma.c'],
+              '../hal/hw/dma.c',
+              '../hal/hw/ata.c'],
     include_directories: hw_mmio_inc,
     c_args: ['-DMMIO_MOCK'],
   )
