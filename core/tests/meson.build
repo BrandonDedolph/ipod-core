@@ -86,6 +86,22 @@ if target == 'sim'
          suite: 'unit')
   endif
 
+  # hw-sched: the cooperative scheduler's task-table + round-robin
+  # policy, compiled host-side with -DSCHED_TEST against inert stubs for
+  # the two asm symbols (switch_context / task_trampoline). Proves task
+  # add/bounds, round-robin selection, done-task skipping, and the
+  # single-runnable no-switch case. The context-switch asm itself is
+  # exercised end-to-end in the clicky emulator, not here.
+  sched_test = executable(
+    'sched_test',
+    sources: ['hw_sched/sched_test.c',
+              'hw_sched/sched_test_mocks.c',
+              '../kernel/sched.c'],
+    include_directories: include_directories('../kernel'),
+    c_args: ['-DSCHED_TEST'],
+  )
+  test('hw-sched', sched_test, suite: 'unit')
+
   # End-to-end audio-playback test: spawns core-sim with the SDL2
   # disk audio driver, plays the FLAC fixture, then bit-compares
   # the captured PCM to the codec_kat reference. Exercises the

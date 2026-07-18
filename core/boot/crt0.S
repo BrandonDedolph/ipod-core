@@ -52,16 +52,36 @@ _start:
      * an unparked COP races the CPU through BSS-zero and uart_init
      * (caught 2026-06-11; doubled UART output). PROCESSOR_ID low byte
      * is 0x55 on the CPU, 0xAA on the COP (01-soc-pp5022.md, "Dual
-     * core: CPU and COP"). Busy-spin park for now; the scheduler PR
-     * replaces this with a proper COP_CTL sleep + wake protocol.
+     * core: CPU and COP"). The COP is now put into COP_CTL sleep
+     * (PROC_SLEEP = 0x80000000, sleep until interrupt) rather than
+     * merely busy-spinning — clicky models this (a slept core is not
+     * stepped), so the emulator's dual-core HLE boot no longer doubles
+     * UART output (verified 2026-07-17). A busy-spin `cop_park` follows
+     * as a backstop in case of a spurious wake before mailbox IPC
+     * exists. (01-soc-pp5022.md, "Dual core: CPU and COP" -> "Sleep /
+     * wake": CPU_CTL = 0x60007000, COP_CTL = 0x60007004; a write to a
+     * PROC_CTL register must be followed by 3 NOPs for the pipeline.)
      * (Immediates + fixed MMIO only — position-independent.) */
     mov     r0, #0x60000000
     ldr     r0, [r0]
     and     r0, r0, #0xFF
     cmp     r0, #0x55
-cop_park:
-    bne     cop_park
+    beq     cpu_start
 
+    /* COP: sleep via its control register until an interrupt. Build
+     * COP_CTL (0x60007004) as a 0x60007000 base + [#4] offset, and
+     * PROC_SLEEP (0x80000000) as a single rotated immediate. */
+    mov     r0, #0x60000000
+    orr     r0, r0, #0x00007000     /* r0 = 0x60007000 (PROC_CTL base) */
+    mov     r1, #0x80000000
+    str     r1, [r0, #4]            /* COP_CTL (base+4 = 0x60007004) = PROC_SLEEP */
+    nop
+    nop
+    nop
+cop_park:
+    b       cop_park
+
+cpu_start:
     /* Step 1 (08-boot-dock.md): temporary stack at the top of usable
      * IRAM, growing downward. IRAM is 0x40000000..0x4001FFFF (128 KB);
      * 96 KB usable to user code per core/docs/hw/01-soc-pp5022.md.

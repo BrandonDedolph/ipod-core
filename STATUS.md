@@ -148,11 +148,19 @@ both cores). Caveats: it's the 4G/PP5020 machine model (PROCESSOR_ID
 reads full-word 0x55555555, SER0 DLAB unmodeled, no BCM2722 LCD, no
 2048-byte-sector ATA), and the GUI needs a display (WSLg ok; xvfb for
 CI). Expected output: the `core:` banner lines, single-stream —
-since PR #4, that's banner / self-test / PROCESSOR_ID followed by
+since PR #5 that's banner / self-test / PROCESSOR_ID, then
 `lcd bcm NOT powered, skipping fills` (clicky has no BCM at
 0x30000000 and fatals on unmapped access, so the driver's
 GPO32-probe gate is what keeps the emulator smoke alive; the gate is
-also correct hardware behavior — never touch an unpowered BCM).
+also correct hardware behavior — never touch an unpowered BCM), then
+the scheduler narration: `sched init` / `task A running` / `task A
+yielding to idle` / `idle task entered` / `task A resumed, exiting`
+(after which the idle task low-power-sleeps the CPU via PROC_WAIT_CNT
+and the stream goes quiet). Single-stream is the COP-sleep proof: the
+COP now writes PROC_SLEEP to COP_CTL instead of busy-parking, and
+clicky honors it (verified end-to-end 2026-07-17, all 9 lines exactly
+once). NB the first banner line carries a leading `\r`, so strip CR
+before anchoring: `... 2>&1 | tr -d '\r' | grep '^core:'`.
 
 ```bash
 # one-time setup (Rust via asdf; clicky clone + build)
@@ -165,7 +173,7 @@ printf '\x01\x02\xa0\xe3\x10\xff\x2f\xe1' > jumpstub.bin  # mov r0,#0x10000000; 
 # per run (from the clicky dir; core.bin from `make hw`)
 ./make_fw -g 4g -o core_fw.bin -l <repo>/core/build-hw/core.bin jumpstub.bin
 timeout 15 ./target/release/clicky-desktop --hle=core_fw.bin --hdd=null:len=64MiB \
-  2>&1 | grep '^core:'
+  2>&1 | tr -d '\r' | grep '^core:'
 ```
 
 (GDB works too: `--gdb` + `arm-none-eabi`-aware gdb against

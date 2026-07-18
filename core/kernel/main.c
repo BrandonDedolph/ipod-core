@@ -3,26 +3,80 @@
  *
  * Phase 1 PR #3 brought up the SER0 debug UART (boot banner — the
  * out-of-band channel every later bring-up step reports through).
- * PR #4 adds the first visible sign of life: BCM LCD init plus a
- * red → green → blue solid-fill cycle, narrated over the UART so the
- * serial log and the panel can be cross-checked. After that: spin.
- * The cooperative scheduler lands in a subsequent PR.
+ * PR #4 added the first visible sign of life: BCM LCD init plus a
+ * red → green → blue solid-fill cycle, narrated over the UART.
+ * PR #5 (this one) stands up the cooperative scheduler: after the
+ * bring-up narration, kernel_main hands control to a two-task set (a
+ * one-shot demo task + an idle task) and never returns. The idle task
+ * low-power sleeps the CPU via the per-core countdown between yields.
  */
 
 #include "hw/pp5022.h"
+#include "hw/mmio.h"
 #include "hw/uart.h"
 #include "hw/lcd.h"
+#include "sched.h"
 
 /*
  * Crude bounded busy-delay between LCD fill colors so a human can see
  * the cycle — same volatile-loop idiom as uart.c's reset hold, just
- * bigger: ~16.8M iterations is on the order of a second at the 80 MHz
- * core clock. Replaced by a real timer driver in a later PR.
+ * bigger. Replaced by a real timer driver in a later PR. (The core is
+ * at the 24 MHz boot clock here — the PLL is not configured yet — so
+ * this is on the order of a second, not tuned precisely.)
  */
 static void delay_eyeball(void) {
     for (volatile uint32_t i = 0; i < (1u << 24); i++) {
         /* spin */
     }
+}
+
+/*
+ * Idle-task CPU sleep. Program the per-core countdown to wake this core
+ * after ~`ms` milliseconds and halt until then (01-soc-pp5022.md, "Sleep
+ * / wake"). We use PROC_WAIT_CNT (self-wakes on the countdown), NOT
+ * PROC_SLEEP — with no interrupt controller installed yet, sleep-until-
+ * interrupt would never wake. Only the CPU runs the kernel in Phase 1,
+ * so CPU_CTL is correct. Three NOPs after the write per the doc's
+ * pipeline rule.
+ */
+static void cpu_wait_ms(uint8_t ms) {
+    mmio_write32(CPU_CTL_ADDR, PROC_WAIT_CNT | PROC_CNT_MSEC | ms);
+    __asm__ volatile("nop\n\tnop\n\tnop");
+}
+
+/* Per-task stacks (carved from .bss; the scheduler builds each task's
+ * initial context frame at the top). 1 KB is ample for these leaf
+ * narrators; real subsystem tasks size their own later. */
+#define TASK_STACK_SIZE 1024
+static uint8_t demo_stack[TASK_STACK_SIZE];
+static uint8_t idle_stack[TASK_STACK_SIZE];
+
+/*
+ * Idle task: never exits. Sleep the CPU for a short countdown, then
+ * yield. Once the demo task has finished, this is the only runnable
+ * task, so sched_yield() is a no-op and the loop just idles the core.
+ */
+_Noreturn static void idle_task(void) {
+    uart_puts("core: idle task entered\n");
+    for (;;) {
+        cpu_wait_ms(10);
+        sched_yield();
+    }
+}
+
+/*
+ * Demo task: proves the context switch actually runs a task, that a
+ * task can yield and be resumed, and that a task which RETURNS from its
+ * entry function lands cleanly in sched_task_exit (via the trampoline)
+ * and is dropped from the round-robin. Runs once, yields to let idle
+ * start, resumes, then returns.
+ */
+static void demo_task(void) {
+    uart_puts("core: task A running\n");
+    uart_puts("core: task A yielding to idle\n");
+    sched_yield();
+    uart_puts("core: task A resumed, exiting\n");
+    /* falls off the end → task_trampoline's lr → sched_task_exit */
 }
 
 _Noreturn void kernel_main(void) {
@@ -76,7 +130,16 @@ _Noreturn void kernel_main(void) {
         uart_puts("core: lcd bcm NOT powered, skipping fills (no bootstrap yet)\n");
     }
 
-    for (;;) {
-        __asm__ volatile ("nop");
+    /* Hand off to the cooperative scheduler. Demo task is added first
+     * so it runs first; it finishes and drops out, leaving the idle
+     * task to low-power the core. sched_start never returns. */
+    uart_puts("core: sched init\n");
+    sched_init();
+    if (sched_add_task(demo_task, demo_stack, sizeof demo_stack, "demoA") < 0 ||
+        sched_add_task(idle_task, idle_stack, sizeof idle_stack, "idle") < 0) {
+        uart_puts("core: FATAL sched_add_task failed\n");
+        for (;;) {
+        }
     }
+    sched_start();
 }

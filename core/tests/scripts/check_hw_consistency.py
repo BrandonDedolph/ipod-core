@@ -62,9 +62,15 @@ def parse_header_addrs():
 
 def doc_addr_tokens_by_symbol():
     """
-    Scan every doc line; for each backtick-quoted `SYMBOL` on the line,
-    associate every backtick-quoted `0xADDR` (>= ADDR_FLOOR) also on
-    that line. Returns {symbol: set(addrs)}.
+    Associate each backtick-quoted `0xADDR` (>= ADDR_FLOOR) in the docs
+    with the backtick-quoted `SYMBOL`s near it — on the same line or the
+    preceding one. The 2-line window matches the reference's prose, which
+    routinely wraps a symbol and its address across a line break
+    (e.g. "`COP_CTL`\n(`0x60007004`)"). Returns {symbol: set(addrs)}.
+
+    A dropped/added hex digit still appears nowhere near its symbol, so
+    the looser window keeps catching that bug class while eliminating
+    line-wrap false positives.
     """
     sym_rx = re.compile(r"`([A-Z][A-Z0-9_]+)`")
     hex_rx = re.compile(r"`(0x[0-9A-Fa-f]+)`")
@@ -72,14 +78,16 @@ def doc_addr_tokens_by_symbol():
     for name in sorted(os.listdir(DOCDIR)):
         if not name.endswith(".md"):
             continue
+        prev_syms = []
         with open(os.path.join(DOCDIR, name)) as f:
             for line in f:
+                syms = sym_rx.findall(line)
                 addrs = {int(h, 16) for h in hex_rx.findall(line)
                          if int(h, 16) >= ADDR_FLOOR}
-                if not addrs:
-                    continue
-                for sym in sym_rx.findall(line):
-                    assoc.setdefault(sym, set()).update(addrs)
+                for sym in syms + prev_syms:
+                    if addrs:
+                        assoc.setdefault(sym, set()).update(addrs)
+                prev_syms = syms
     return assoc
 
 
@@ -128,6 +136,8 @@ def main():
     eq("SER0_RBR_ADDR", "SER0_MSR_ADDR", 0x18)
     # GPO32 value/enable are an adjacent pair.
     eq("GPO32_VAL_ADDR", "GPO32_ENABLE_ADDR", 0x04)
+    # Per-core control CPU_CTL / COP_CTL are an adjacent pair.
+    eq("CPU_CTL_ADDR", "COP_CTL_ADDR", 0x04)
     # MMAP0 logical/physical are an adjacent pair.
     eq("MMAP0_LOGICAL_ADDR", "MMAP0_PHYSICAL_ADDR", 0x04)
     # BCM ports are spaced one decoded-bit (0x10000) apart, in order.

@@ -82,6 +82,37 @@
 #define PROCESSOR_ID    PP_REG32(PROCESSOR_ID_ADDR)
 #endif
 
+/* ---------- Dual-core control: CPU_CTL / COP_CTL ---------------------
+ * core/docs/hw/01-soc-pp5022.md, "Dual core: CPU and COP" -> "Sleep /
+ * wake". Per-core power/flow control; PROC_CTL(core) selects between
+ * them. CPU is 0x55 / COP is 0xAA in PROCESSOR_ID. A write must be
+ * followed by 3 NOPs (the pipeline needs a beat to take effect).
+ *
+ *   PROC_SLEEP     sleep until an interrupt (hangs with no IRQ source)
+ *   PROC_WAIT_CNT  sleep until a countdown expires (self-wakes)
+ *   PROC_WAKE_INT  also raise an IRQ on wake
+ *   PROC_CNT_*     countdown tick unit; low 8 bits are the count
+ *
+ * clicky models this (cpucon.rs: a core with any flow bit set is not
+ * stepped), so a COP_CTL sleep halts the COP in the emulator exactly as
+ * on hardware — verified 2026-07-17.
+ */
+
+#define CPU_CTL_ADDR        0x60007000
+#define COP_CTL_ADDR        0x60007004
+
+#define PROC_SLEEP          0x80000000
+#define PROC_WAIT_CNT       0x40000000
+#define PROC_WAKE_INT       0x20000000
+#define PROC_CNT_USEC       0x02000000
+#define PROC_CNT_MSEC       0x01000000
+#define PROC_CNT_MASK       0x000000FF  /* low 8 bits: countdown value */
+
+#ifndef __ASSEMBLER__
+#define CPU_CTL         PP_REG32(CPU_CTL_ADDR)
+#define COP_CTL         PP_REG32(COP_CTL_ADDR)
+#endif
+
 /* ---------- Device enable / reset / clock control --------------------
  * core/docs/hw/01-soc-pp5022.md, "Power management" (DEV_*) and
  * "Clock tree" (PLL_*, CLOCK_SOURCE, DEV_TIMING1). These gate
