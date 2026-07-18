@@ -21,6 +21,7 @@
  */
 
 #include "pp5022.h"
+#include "mmio.h"
 #include "lcd.h"
 #include "hal.h"
 
@@ -55,8 +56,9 @@ static void bcm_write_addr(uint32_t addr)
 {
     uint32_t spin = BCM_SPIN_LIMIT;
 
-    BCM_WR_ADDR32 = addr;
-    while (!(BCM_CONTROL & BCM_CONTROL_WR_READY) && --spin != 0) {
+    mmio_write32(BCM_WR_ADDR_ADDR, addr);
+    while (!(mmio_read16(BCM_CONTROL_ADDR) & BCM_CONTROL_WR_READY) &&
+           --spin != 0) {
         /* poll */
     }
 }
@@ -65,7 +67,7 @@ static void bcm_write_addr(uint32_t addr)
 static void bcm_write32(uint32_t addr, uint32_t value)
 {
     bcm_write_addr(addr);
-    BCM_DATA32 = value;
+    mmio_write32(BCM_DATA_ADDR, value);
 }
 
 /* Read one 32-bit word from a BCM-internal address. Handshake order
@@ -76,16 +78,18 @@ static uint32_t bcm_read32(uint32_t addr)
 {
     uint32_t spin = BCM_SPIN_LIMIT;
 
-    while (!(BCM_RD_ADDR & BCM_RD_ADDR_READY) && --spin != 0) {
+    while (!(mmio_read16(BCM_RD_ADDR_ADDR) & BCM_RD_ADDR_READY) &&
+           --spin != 0) {
         /* poll */
     }
-    BCM_RD_ADDR32 = addr;
+    mmio_write32(BCM_RD_ADDR_ADDR, addr);
 
     spin = BCM_SPIN_LIMIT;
-    while (!(BCM_CONTROL & BCM_CONTROL_RD_READY) && --spin != 0) {
+    while (!(mmio_read16(BCM_CONTROL_ADDR) & BCM_CONTROL_RD_READY) &&
+           --spin != 0) {
         /* poll */
     }
-    return BCM_DATA32;
+    return mmio_read32(BCM_DATA_ADDR);
 }
 
 int lcd_init(void)
@@ -95,15 +99,16 @@ int lcd_init(void)
      * the BCM is already alive): BCM power rail + companion bit as
      * GPO, GPIOC bit 6 = BCM interrupt pin as a GPIO input, bit 7
      * released to its alternate function, GPO32 bit 0 released. */
-    GPO32_ENABLE    |=  0xC000;
-    GPIOC_ENABLE    &= ~0x80;
-    GPIOC_ENABLE    |=  0x40;
-    GPIOC_OUTPUT_EN &= ~0x40;
-    GPO32_ENABLE    &= ~1;
+    mmio_write32(GPO32_ENABLE_ADDR, mmio_read32(GPO32_ENABLE_ADDR) | 0xC000);
+    mmio_write32(GPIOC_ENABLE_ADDR, mmio_read32(GPIOC_ENABLE_ADDR) & ~0x80);
+    mmio_write32(GPIOC_ENABLE_ADDR, mmio_read32(GPIOC_ENABLE_ADDR) | 0x40);
+    mmio_write32(GPIOC_OUTPUT_EN_ADDR,
+                 mmio_read32(GPIOC_OUTPUT_EN_ADDR) & ~0x40);
+    mmio_write32(GPO32_ENABLE_ADDR, mmio_read32(GPO32_ENABLE_ADDR) & ~1u);
 
     /* Probe: nonzero means the BCM is powered (and, post-chainload,
      * initialized). We do not bootstrap a dead BCM in this PR. */
-    return (GPO32_VAL & GPO32_BCM_POWER) != 0;
+    return (mmio_read32(GPO32_VAL_ADDR) & GPO32_BCM_POWER) != 0;
 }
 
 void lcd_fill(uint16_t rgb565)
@@ -139,12 +144,12 @@ void lcd_fill(uint16_t rgb565)
         uint32_t n = (LCD_WIDTH * LCD_HEIGHT) / 2;
 
         while (n-- != 0) {
-            BCM_DATA32 = pair;
+            mmio_write32(BCM_DATA_ADDR, pair);
         }
     }
 
     /* (4) Queue the full-frame update command, (5) strobe execute.
      * Bootloader variant: return without a completion wait. */
     bcm_write32(BCMA_COMMAND, BCMCMD_LCD_UPDATE);
-    BCM_CONTROL = BCM_CONTROL_STROBE;
+    mmio_write16(BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
 }

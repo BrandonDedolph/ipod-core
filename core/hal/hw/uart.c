@@ -11,6 +11,7 @@
  */
 
 #include "pp5022.h"
+#include "mmio.h"
 #include "uart.h"
 
 /*
@@ -27,10 +28,10 @@
 static void uart_tx_byte(uint8_t b)
 {
     uint32_t spin = UART_TX_SPIN_LIMIT;
-    while (!(SER0_LSR & SER0_LSR_THRE) && --spin != 0) {
+    while (!(mmio_read32(SER0_LSR_ADDR) & SER0_LSR_THRE) && --spin != 0) {
         /* poll */
     }
-    SER0_THR = b;
+    mmio_write32(SER0_THR_ADDR, b);
 }
 
 void uart_init(void)
@@ -45,30 +46,32 @@ void uart_init(void)
      * to release those pads from general-purpose-output mode so the
      * SER0 alternate function drives them (08-boot-dock.md, "GPIO
      * routing for SER0 on iPod Video"). */
-    SER0_GPIO_ROUTE &= ~SER0_GPIO_ROUTE_MASK;
-    GPO32_ENABLE    &= ~SER0_GPIO_ROUTE_MASK;
+    mmio_write32(SER0_GPIO_ROUTE_ADDR,
+                 mmio_read32(SER0_GPIO_ROUTE_ADDR) & ~SER0_GPIO_ROUTE_MASK);
+    mmio_write32(GPO32_ENABLE_ADDR,
+                 mmio_read32(GPO32_ENABLE_ADDR) & ~SER0_GPIO_ROUTE_MASK);
 
     /* Power the UART block, then pulse its reset (08-boot-dock.md,
      * "Init sequence"; DEV_SER0 = bit 6). The reference holds reset
      * for one ~10 ms scheduler tick; with no timer driver yet we
      * busy-wait a conservatively long bounded loop instead (1M
      * iterations is multiple ms even at 80 MHz). */
-    DEV_EN |= DEV_SER0;
-    DEV_RS |= DEV_SER0;
+    mmio_write32(DEV_EN_ADDR, mmio_read32(DEV_EN_ADDR) | DEV_SER0);
+    mmio_write32(DEV_RS_ADDR, mmio_read32(DEV_RS_ADDR) | DEV_SER0);
     for (volatile uint32_t i = 0; i < (1u << 20); i++) {
         /* hold reset */
     }
-    DEV_RS &= ~DEV_SER0;
+    mmio_write32(DEV_RS_ADDR, mmio_read32(DEV_RS_ADDR) & ~DEV_SER0);
 
     /* Program the divisor latch for 115200 on the 24 MHz reference:
      * divisor 13 = 0x0D (08-boot-dock.md, "Baud rate" table), then
      * drop DLAB and set 8N1 ("Init sequence"). The reference programs
      * DLL through a second DLAB window after LCR/IER/FCR; writing it
      * inside the first window is functionally equivalent. */
-    SER0_LCR = SER0_LCR_DLAB;
-    SER0_DLM = 0x00;
-    SER0_DLL = SER0_DIV_115200;
-    SER0_LCR = SER0_LCR_8N1;
+    mmio_write32(SER0_LCR_ADDR, SER0_LCR_DLAB);
+    mmio_write32(SER0_DLM_ADDR, 0x00);
+    mmio_write32(SER0_DLL_ADDR, SER0_DIV_115200);
+    mmio_write32(SER0_LCR_ADDR, SER0_LCR_8N1);
 
     /*
      * Deliberate deviations from the reference init tail (the IER/FCR

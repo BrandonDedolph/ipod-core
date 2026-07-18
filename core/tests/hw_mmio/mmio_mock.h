@@ -1,0 +1,58 @@
+/*
+ * tests/hw_mmio/mmio_mock.h — recording fake MMIO bus for host tests.
+ *
+ * Backs the -DMMIO_MOCK accessors declared in hal/hw/mmio.h. It does
+ * two things:
+ *
+ *   1. Records every access as an ordered {op, width, addr, value}
+ *      event, so a test can assert the exact register grammar a driver
+ *      emits — addresses, values, widths, and their order.
+ *
+ *   2. Answers reads from a per-address script, so a test can drive the
+ *      poll loops: e.g. "SER0_LSR reads not-ready N times, then ready"
+ *      proves the driver actually spins on THRE, not just that it
+ *      eventually wrote THR.
+ *
+ * Values are hand-derived from core/docs/hw/ (via pp5022.h), never
+ * extracted from Rockbox source — the cleanroom boundary applies to
+ * test vectors too.
+ */
+
+#ifndef CORE_TESTS_HW_MMIO_MOCK_H
+#define CORE_TESTS_HW_MMIO_MOCK_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef enum { MMIO_OP_READ, MMIO_OP_WRITE } mmio_op;
+
+typedef struct {
+    mmio_op  op;
+    int      width;   /* 8, 16, or 32 */
+    uint32_t addr;
+    uint32_t value;   /* value written, or value returned to a read */
+} mmio_event;
+
+/* Clear the event log and all programmed reads. Call at the top of
+ * every test case. */
+void mmio_mock_reset(void);
+
+/* Program the value a read of `addr` returns. Without a program, reads
+ * return 0 (which, for a status register whose ready bit the driver
+ * polls, means "never ready" — the driver spins to its bounded limit).
+ * A constant program makes the register read `value` on every access. */
+void mmio_mock_set_read(uint32_t addr, uint32_t value);
+
+/* Program a finite read sequence for `addr`: the first `n` reads return
+ * seq[0..n-1] in order, and every read after that repeats seq[n-1].
+ * Used to model "busy K times, then ready". `n` must be >= 1. */
+void mmio_mock_queue_read(uint32_t addr, const uint32_t *seq, size_t n);
+
+/* The recorded event log, in access order. */
+const mmio_event *mmio_mock_log(void);
+size_t            mmio_mock_log_len(void);
+
+/* Convenience: count recorded events of a given op+addr (any width). */
+size_t mmio_mock_count(mmio_op op, uint32_t addr);
+
+#endif /* CORE_TESTS_HW_MMIO_MOCK_H */

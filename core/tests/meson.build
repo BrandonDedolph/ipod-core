@@ -43,6 +43,36 @@ if target == 'sim'
   )
   test('tag-mp3', tag_mp3_test, suite: 'unit')
 
+  # hw-mmio golden-trace tests: compile the freestanding hw drivers
+  # host-side with -DMMIO_MOCK so the recording fake bus
+  # (hw_mmio/mmio_mock.c) captures the exact register-access grammar,
+  # then assert it. This is the only automated check of the BCM/LCD
+  # transaction stream — clicky models no BCM, the device needs a logic
+  # analyzer. The drivers compile unchanged (freestanding: stdint +
+  # hal.h + the mmio.h seam only); in the firmware build the same seam
+  # is a static-inline volatile deref, so core.bin is byte-identical.
+  hw_mmio_inc = include_directories('../hal/hw', '../hal', 'hw_mmio')
+
+  uart_trace_test = executable(
+    'uart_trace_test',
+    sources: ['hw_mmio/uart_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/uart.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK', '-Wno-unterminated-string-initialization'],
+  )
+  test('hw-uart-trace', uart_trace_test, suite: 'unit')
+
+  lcd_trace_test = executable(
+    'lcd_trace_test',
+    sources: ['hw_mmio/lcd_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/lcd.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK', '-Wno-unterminated-string-initialization'],
+  )
+  test('hw-lcd-trace', lcd_trace_test, suite: 'unit')
+
   # End-to-end audio-playback test: spawns core-sim with the SDL2
   # disk audio driver, plays the FLAC fixture, then bit-compares
   # the captured PCM to the codec_kat reference. Exercises the
