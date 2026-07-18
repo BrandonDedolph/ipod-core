@@ -197,6 +197,28 @@
 #define DEV_TIMING1     PP_REG32(DEV_TIMING1_ADDR)
 #endif
 
+/* ---------- Clock tree / PLL programming values ---------------------
+ * core/docs/hw/01-soc-pp5022.md, "Clock tree" (the frequency-switch
+ * sequence). Opaque multiplier/divider encodings transcribed from the
+ * doc, not re-derived. The PLL runs off the 24 MHz crystal. The
+ * PLL_STATUS lock poll MUST be a bounded spin: clicky (and a dead PLL)
+ * never sets the lock bit, so an unbounded wait would hang.
+ */
+#define DEV_INIT2_PLL_POWER   0x40000000  /* DEV_INIT2 bit 30: PLL power */
+#define PLL_CONTROL_ENABLE    0x88000000  /* PLL_CONTROL enable bits     */
+#define PLL_STATUS_LOCK       0x80000000  /* PLL_STATUS bit 31: locked   */
+
+/* PP5022 programs the PLL in a SINGLE write per target — no pre-stage.
+ * (The 0x8A020A03 pre-stage in some references is the PP5020 sequence.) */
+#define PLL_CONTROL_30MHZ     0x8A220501  /* 30 MHz: mult 5/1, /4         */
+#define PLL_CONTROL_80MHZ     0x8A121403  /* 80 MHz: mult 20/3, /2        */
+
+#define CLOCK_SOURCE_XTAL     0x20002222  /* all domains -> 24 MHz xtal   */
+#define CLOCK_SOURCE_PLL      0x20007777  /* all domains -> PLL output    */
+
+#define DEV_TIMING1_SLOW      0x00000303  /* relaxed timing (slow clock)  */
+#define DEV_TIMING1_FAST      0x00000808  /* high-speed timing            */
+
 /* ---------- SER0: dock-connector debug UART (8250-style) -------------
  * core/docs/hw/08-boot-dock.md, "UART debug" -> "SoC registers
  * (8250-style at SER0)", stride verified against Rockbox pp5020.h

@@ -18,13 +18,15 @@
 #include "sched.h"
 #include "timer.h"
 #include "irq.h"
+#include "clock.h"
 
 /*
  * Crude bounded busy-delay between LCD fill colors so a human can see
  * the cycle — same volatile-loop idiom as uart.c's reset hold, just
- * bigger. Replaced by a real timer driver in a later PR. (The core is
- * at the 24 MHz boot clock here — the PLL is not configured yet — so
- * this is on the order of a second, not tuned precisely.)
+ * bigger. Replaced by a real timer-based delay in a later PR. (By the
+ * time this runs the core is at CPUFREQ_NORMAL = 30 MHz — clock_init()
+ * has already run — so the cycle is faster than at the 24 MHz boot
+ * clock, but it's still not tuned precisely.)
  */
 static void delay_eyeball(void) {
     for (volatile uint32_t i = 0; i < (1u << 24); i++) {
@@ -99,6 +101,17 @@ _Noreturn void kernel_main(void) {
      * "Dual core: CPU and COP"). */
     uart_puts("core: PROCESSOR_ID ");
     uart_put_hex32(PROCESSOR_ID);
+    uart_putc('\n');
+
+    /* Come off the 24 MHz boot clock up to CPUFREQ_NORMAL (30 MHz)
+     * before the rest of bring-up, so it runs at a sane speed (the
+     * boot-clock crawl is what made the LCD cycle take ~1 min/frame on
+     * the first hardware boot). Codec-heavy work later requests a
+     * further cpu_boost() to 80 MHz. */
+    uart_puts("core: clock init -> 30 MHz\n");
+    clock_init();
+    uart_puts("core: cpu freq ");
+    uart_put_hex32(cpu_frequency());
     uart_putc('\n');
 
     /* LCD bring-up: host-side port init, then probe the BCM power

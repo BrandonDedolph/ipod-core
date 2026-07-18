@@ -122,6 +122,19 @@ if target == 'sim'
   )
   test('hw-timer', timer_test, suite: 'unit')
 
+  # hw-clock: the PLL/clock-boost driver's register grammar (arm CFG +
+  # lock poll + timing), the bounded lock-spin (clicky never sets the PLL
+  # lock bit), and the boost refcount edges — host-side under -DMMIO_MOCK.
+  clock_test = executable(
+    'clock_test',
+    sources: ['hw_clock/clock_test.c',
+              '../kernel/clock.c',
+              'hw_mmio/mmio_mock.c'],
+    include_directories: include_directories('../hal', '../hal/hw', '../kernel', 'hw_mmio'),
+    c_args: ['-DMMIO_MOCK'],
+  )
+  test('hw-clock', clock_test, suite: 'unit')
+
   # End-to-end audio-playback test: spawns core-sim with the SDL2
   # disk audio driver, plays the FLAC fixture, then bit-compares
   # the captured PCM to the codec_kat reference. Exercises the

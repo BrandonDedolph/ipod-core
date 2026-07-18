@@ -5,4 +5,4 @@
 # switch.S (the ARM context switch + initial-frame trampoline). IRQ
 # vectors and the timer tick land in subsequent PRs.
 
-kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c')
+kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c')
