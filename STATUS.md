@@ -1,8 +1,39 @@
 # Status — picking up where we left off
 
-Last working session ended **2026-05-11** on `main`. The README is the
-canonical public story; this doc is the running list of what works,
+Last working session ended **2026-07-18** on `phase1/audio-first-sound`
+(the live branch — **check out this branch, not `main`**; all of Phase 1
+is stacked here unmerged, and `main` is 30 commits behind). The README is
+the canonical public story; this doc is the running list of what works,
 what doesn't, and what to pick up next.
+
+## Where we are right now (2026-07-18)
+
+**Phase 1 HAL bring-up is real music on real hardware.** The whole
+bare-metal stack is proven end to end on an actual iPod 5.5G 80GB: boot
++ MMAP0 remap → clock/PLL (30 MHz, PLL lock confirmed) → timer/IRQ →
+LCD (BCM present) → I²C/WM8758/I²S first sound → DMA continuous playback
+→ ATA PIO reader → FAT32 read → WAV parse → **a 20 s WAV clip off the
+iPod's own disk played through the headphones.** On-screen console
+(framebuffer hex readout) is the cable-free debug channel — there is NO
+serial cable (user ruled it out; don't re-suggest — confirm hw state on
+screen instead).
+
+**The next concrete build:** playback currently *preloads the whole file
+to a 4 MB RAM buffer*, so it's a clip, not a full song. The next PR is
+the **streaming ring buffer + pump** (read disk while playing) so a
+full-length track plays. See PR #8 notes below and `PLAN.md`.
+
+**Working on the hardware (dev-environment note):** the clean flash
+environment is **native Linux** (e.g. an Arch/Omarchy box), NOT WSL — on
+native Linux the iPod is a real `/dev/sdX`, so `ipodpatcher` (AUR) writes
+the firmware partition with plain `sudo` and data-partition file copies
+actually persist. The WSL path (drive over Windows interop, `/mnt` writes
+DON'T persist — must go Windows-native + `Write-VolumeCache`) is a
+Windows-only workaround. Toolchain on Arch is all official `extra`:
+`pacman -S arm-none-eabi-gcc arm-none-eabi-binutils arm-none-eabi-newlib
+meson ninja pkgconf`, then `make hw` / `make sim` from `core/`. Reflash
+loop keeps the bootloader installed (ipodloader2 chainloads our `.ipod`):
+just rebuild + copy `core.ipod` to the FAT32 root, eject, boot.
 
 ## What works end-to-end today
 
@@ -121,10 +152,32 @@ die. Don't stack another sim PR without weighing that tradeoff.
      BCM-power probe as the LCD (so clicky, which models no I²S/DAC,
      skips it and stays green). New `hw-audio` trace test (19 checks)
      locks the exact I²C/codec/I²S register grammar under `-DMMIO_MOCK` —
-     the only automated audio check. **Not yet heard on silicon**; the
-     resolved I²S pad-mux writes (`DEV_INIT2 &= ~0x300`, `DEV_INIT1 &=
-     ~0x03000000`) are the top suspect if it's silent. DMA/continuous
-     playback + ATA→FAT32 deliberately deferred.
+     the only automated audio check. **FIRST SOUND HEARD ON SILICON
+     2026-07-18** — audible ~689 Hz tone through headphones on the real
+     5.5G; the whole HAL-hard-part (codec over I²C, I²S serializer, MCLK
+     + pad-mux) works. Gotcha that cost a boot: the device had an OLD
+     pre-audio `core.ipod` — always verify on-device `core.ipod`
+     size/timestamp matches the fresh build before concluding anything.
+   - **DMA continuous playback (`phase1/audio-first-sound`):** the
+     `hal/hw/audio.c` + `dma.c` backend plays a continuous DMA-fed tone
+     on the real 5.5G — DMA channel 0 + completion IRQ (source 26 via
+     irq_dispatch, defensively forced to IRQ not FIQ) + ping-pong double
+     buffer + the `buf_phys` native-SDRAM-alias (0x10000000+logical) all
+     work on silicon. CACHE CAVEAT: fill→DMA is coherent only because
+     D-cache is OFF; needs a cache-clean once caches are enabled.
+   - **ATA + FAT32 + WAV off disk (`phase1/audio-first-sound`):** PIO-
+     polled ATA reader (physical-sector-aligned — the drive requires it)
+     + IDENTIFY + on-device MBR verify; minimal read-only FAT32 reader
+     (host-tested); WAV parse. **REAL MUSIC PLAYS OFF THE DISK
+     2026-07-18** — a 20 s WAV clip on the iPod's FAT32 partition plays
+     through the headphones. KEY: the MBR partition-start LBA is in the
+     disk's 2048-byte units, times 4 for the 512-byte LBA (the FAT-layer
+     x4; mount tries raw LBA then x4). libgcc now linked (ARM7TDMI has no
+     HW divide; FAT sector math needs `__aeabi_uidivmod`). **NEXT:
+     streaming ring buffer + pump** — playback preloads the whole file to
+     a 4 MB buffer (clip only, ~7 s PIO load for 3.5 MB); full songs need
+     read-disk-while-playing. Transcode source with `ffmpeg -i in.mp3 -ar
+     44100 -ac 2 -c:a pcm_s16le TEST.WAV`, drop on the FAT32 root.
    See `PLAN.md` § Phase 1.
 2. **Playlists** — M3U8 reader → tagcache resolver → read-only
    browse is the right opening PR. Sim-only, ships visible value.
@@ -219,6 +272,20 @@ will not survive a reboot; re-clone per the recipe.)
 
 ## Recent PRs (since #31 — most recent first)
 
+Phase 1 hardware bring-up (on `phase1/audio-first-sound`, unmerged):
+- WAV file played off the disk — real music on hardware
+- read-only FAT32 reader (host-tested)
+- ATA physical-sector-aligned reads + IDENTIFY
+- PIO-polled ATA sector reader + on-device MBR verify
+- DMA-driven continuous audio playback, proven on hardware
+- I²C/WM8758/I²S first-sound chain — first sound on silicon
+- clock/PLL/CPU-boost driver; on-screen register console
+- exception vectors + interrupt controller + 100 Hz tick
+- cooperative scheduler + COP sleep
+- BCM LCD init + solid-color present; SER0 debug UART
+- `.ipod` transport-format packaging; arm-none-eabi hw skeleton
+
+Sim / UI (on `main`):
 - pre-rasterized shuffle / repeat icons (preliminary)
 - artist photos + categorized search (`.tcdb` v2)
 - tagcache scan: dedup same-track copies + fold combo artists
