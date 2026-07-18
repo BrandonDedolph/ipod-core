@@ -370,8 +370,9 @@ static int test_ata_init_grammar(void)
 
     int fails = check("ata_init: returns 0", rc == 0);
     trace_cursor tc = trace_begin("ata_init");
+    expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_SRST | ATA_CONTROL_NIEN);
     expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
-    expect_w(&tc, 8, ATA_SELECT_ADDR, 0);
+    expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
     expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);   /* wait not-busy */
     expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);   /* wait ready    */
     trace_expect_end(&tc);
@@ -379,8 +380,10 @@ static int test_ata_init_grammar(void)
     return fails;
 }
 
-/* Case 12: ata_read_sectors register grammar + LBA byte split + the
- * 256-halfword data burst. ALT_STATUS reads RDY|DRQ so every poll passes. */
+/* Case 12: ata_read_sectors physical-alignment wrapper. A single-logical
+ * read at an ODD LBA rounds DOWN to the physical boundary and reads a
+ * whole 2-sector physical sector; the LBA byte-split reflects the rounded
+ * address. ALT_STATUS reads RDY|DRQ so every poll passes. */
 static int test_ata_read_grammar(void)
 {
     int fails = 0;
@@ -388,21 +391,25 @@ static int test_ata_read_grammar(void)
     mmio_mock_set_read(ATA_ALT_STATUS_ADDR, ATA_STATUS_RDY | ATA_STATUS_DRQ);
     uint16_t buf[256];
 
+    /* LBA 0x01234567 (odd) -> physical boundary 0x01234566, count 2. */
     int rc = ata_read_sectors(0x01234567u, 1, buf);
     fails += check("ata_read: returns 0", rc == 0);
 
-    /* LBA 0x01234567 splits across the task registers. */
-    fails += check("ata_read: NSECTOR=1",  nth_write(ATA_NSECTOR_ADDR, 0) == 1);
-    fails += check("ata_read: SECTOR=0x67", nth_write(ATA_SECTOR_ADDR, 0) == 0x67);
+    /* ATA_PHYS_LOG (physical/logical ratio) is a driver-internal 2. */
+    fails += check("ata_read: NSECTOR=2 (whole physical sector)",
+                   nth_write(ATA_NSECTOR_ADDR, 0) == 2);
+    fails += check("ata_read: SECTOR=0x66 (rounded to physical boundary)",
+                   nth_write(ATA_SECTOR_ADDR, 0) == 0x66);
     fails += check("ata_read: LCYL=0x45",   nth_write(ATA_LCYL_ADDR, 0)   == 0x45);
     fails += check("ata_read: HCYL=0x23",   nth_write(ATA_HCYL_ADDR, 0)   == 0x23);
-    fails += check("ata_read: SELECT=0x41 (LBA|high nibble)",
-                   nth_write(ATA_SELECT_ADDR, 0) == (ATA_SELECT_LBA | 0x1));
+    fails += check("ata_read: SELECT=0xE1 (obs|LBA|high nibble)",
+                   nth_write(ATA_SELECT_ADDR, 0) ==
+                       (ATA_SELECT_OBS | ATA_SELECT_LBA | 0x1));
     fails += check("ata_read: COMMAND=READ SECTORS",
                    nth_write(ATA_COMMAND_ADDR, 0) == ATA_CMD_READ_SECTORS);
-    /* One 512-byte sector = exactly 256 halfword reads of the data port. */
-    fails += check("ata_read: 256 data-port reads",
-                   mmio_mock_count(MMIO_OP_READ, ATA_DATA_ADDR) == 256);
+    /* Two 512-byte sectors = 512 halfword reads of the data port. */
+    fails += check("ata_read: 512 data-port reads (2 physical sectors)",
+                   mmio_mock_count(MMIO_OP_READ, ATA_DATA_ADDR) == 512);
     return fails;
 }
 

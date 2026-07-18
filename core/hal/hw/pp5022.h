@@ -532,9 +532,14 @@
 /* Device control bits. */
 #define ATA_CONTROL_NIEN      0x02  /* mask the ATA IRQ (pure polling) */
 #define ATA_CONTROL_SRST      0x04  /* software reset */
-/* ATA_SELECT bits. */
-#define ATA_SELECT_LBA        0x40  /* LBA mode + master */
+/* ATA_SELECT (device/head) bits. Bits 7 and 5 are "obsolete" in the ATA
+ * spec but historically must be 1 — a drive left in CHS mode reads LBA 0
+ * as CHS sector 0 (invalid -> IDNF), so the LBA-mode device byte must be
+ * ATA_SELECT_OBS | ATA_SELECT_LBA (= 0xE0) for the master, not 0x40. */
+#define ATA_SELECT_OBS        0xA0  /* obsolete must-be-1 bits (7,5) + master */
+#define ATA_SELECT_LBA        0x40  /* LBA-mode bit (6) */
 /* Commands. */
 #define ATA_CMD_READ_SECTORS  0x20  /* LBA28 PIO read (one DRQ per sector) */
+#define ATA_CMD_IDENTIFY      0xEC  /* IDENTIFY DEVICE (256-word block, no LBA) */
 
 #endif /* CORE_HAL_HW_PP5022_H */

@@ -130,9 +130,10 @@ static int sine_source(void *ud, int16_t *buf, int frames)
 static uint8_t demo_stack[TASK_STACK_SIZE];
 static uint8_t idle_stack[TASK_STACK_SIZE];
 
-/* One-sector scratch for the MBR read (uint16_t for the 2-byte alignment
- * ata_read_sectors needs). */
-static uint16_t mbr_sector[256];
+/* Disk scratch (uint16_t for the 2-byte alignment ata_read_sectors needs).
+ * 1024 words = 2048 bytes = up to 4 logical sectors, enough to read a
+ * whole physical sector at once. */
+static uint16_t mbr_sector[1024];
 
 /*
  * Idle task: never exits. Sleep the CPU for a short countdown, then
@@ -264,23 +265,24 @@ _Noreturn void kernel_main(void) {
         uart_put_hex32(dmac);
         uart_putc('\n');
 
-        /* (c) ATA: read the MBR (LBA 0) and scan the partition table for
-         * the FAT32 data partition. This verifies the disk reader on the
-         * device before FAT32 is built on top. `wrote` (polled tone) is
-         * folded away to make room; DMAC already proves the audio path. */
-        uart_puts("core: [ata] init + read MBR\n");
+        /* (c) ATA probe. READ SECTORS to LBA 0 keeps returning IDNF on
+         * this drive (the MK8010GAH with 2048-byte sectors), so before
+         * building FAT32 we get GROUND TRUTH: IDENTIFY DEVICE takes no LBA
+         * (can't IDNF), which both proves the read/DRQ path works and
+         * reports the true logical sector size (word 106 bit 12 => >512;
+         * words 117/118 = size in 16-bit words). */
+        uart_puts("core: [ata] init + read MBR + find FAT32\n");
         uint8_t *mbr = (uint8_t *)mbr_sector;
         int      ata_rc = ata_init();
         int      rd_rc  = -1;
-        uint32_t sig    = 0;
-        uint32_t fat_lba = 0;
+        uint32_t sig = 0, fat_lba = 0;
         uint8_t  fat_type = 0;
         if (ata_rc == 0) {
+            /* The wrapper now reads whole physical sectors internally, so a
+             * plain single-sector MBR read works. */
             rd_rc = ata_read_sectors(0, 1, mbr);
             if (rd_rc == 0) {
                 sig = (uint32_t)mbr[510] | ((uint32_t)mbr[511] << 8);
-                /* Four 16-byte partition entries at 0x1BE; type at +4,
-                 * start LBA (LE32) at +8. FAT32 type = 0x0B or 0x0C. */
                 for (int p = 0; p < 4; p++) {
                     const uint8_t *e = &mbr[0x1BE + 16 * p];
                     if (e[4] == 0x0B || e[4] == 0x0C) {
@@ -293,32 +295,34 @@ _Noreturn void kernel_main(void) {
                 }
             }
         }
-        uart_puts("core: MBR sig ");
+        uart_puts("core: rd ");
+        uart_put_hex32((uint32_t)rd_rc);
+        uart_puts(" sig ");
         uart_put_hex32(sig);
         uart_puts(" fat_lba ");
         uart_put_hex32(fat_lba);
         uart_putc('\n');
         (void)wrote;
 
-        /* Single on-screen diagnostic (the only silicon-proven present).
-         *   FREQ = clock.  DMAC = DMA chunks in ~3 s (~0x40 => audio OK).
-         *   RD   = ata_read_sectors return code (0 => MBR read OK).
-         *   SIG  = MBR boot signature — expect 0000AA55 (=> disk reader
-         *          works on silicon). PART = FAT32 partition type (0B/0C).
-         *   PLBA = that partition's start LBA (what FAT32 mount needs). */
+        /* Diagnostic screen (single silicon-proven present):
+         *   ID   = ata_identify rc (0 => read/DRQ path works, so the READ
+         *          SECTORS IDNF is purely an addressing issue).
+         *   W106 = identify word 106 (bit 12 / 0x1000 set => logical
+         *          sector > 512 bytes).
+         *   W117/W118 = logical sector size in 16-bit words (x2 = bytes);
+         *          0400/0000 => 2048-byte sectors.
+         *   RD   = ata_read_sectors rc; SIG = MBR signature (AA55 if OK). */
         console_clear(bg);
         console_str  (2, 3, "FREQ", CON_WHITE, bg);
-        console_hex32(8, 3, cpu_frequency(),               CON_WHITE, bg);
-        console_str  (2, 5, "DMAC", CON_WHITE, bg);
-        console_hex32(8, 5, dmac,                          CON_WHITE, bg);
-        console_str  (2, 7, "RD",   CON_WHITE, bg);
-        console_hex32(8, 7, (uint32_t)rd_rc,               CON_WHITE, bg);
-        console_str  (2, 9, "SIG",  CON_WHITE, bg);
-        console_hex32(8, 9, sig,                           CON_WHITE, bg);
-        console_str  (2, 11, "PART", CON_WHITE, bg);
-        console_hex32(8, 11, fat_type,                     CON_WHITE, bg);
-        console_str  (2, 13, "PLBA", CON_WHITE, bg);
-        console_hex32(8, 13, fat_lba,                      CON_WHITE, bg);
+        console_hex32(8, 3, cpu_frequency(),  CON_WHITE, bg);
+        console_str  (2, 5, "RD",   CON_WHITE, bg);   /* MBR read rc (0 = OK) */
+        console_hex32(8, 5, (uint32_t)rd_rc,  CON_WHITE, bg);
+        console_str  (2, 7, "SIG",  CON_WHITE, bg);   /* AA55 = real MBR */
+        console_hex32(8, 7, sig,              CON_WHITE, bg);
+        console_str  (2, 9, "PART", CON_WHITE, bg);   /* FAT32 type 0B/0C */
+        console_hex32(8, 9, fat_type,         CON_WHITE, bg);
+        console_str  (2, 11, "PLBA", CON_WHITE, bg);  /* FAT32 partition start LBA */
+        console_hex32(8, 11, fat_lba,         CON_WHITE, bg);
         lcd_present_fb(console_framebuffer());
         uart_puts("core: diagnostic screen presented\n");
     } else {

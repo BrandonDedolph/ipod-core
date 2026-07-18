@@ -25,4 +25,13 @@ int ata_init(void);
  */
 int ata_read_sectors(uint32_t lba, uint32_t count, void *buf);
 
+/*
+ * IDENTIFY DEVICE: read the drive's 256-word (512-byte) identify block
+ * into `buf` (16-bit aligned). Takes no LBA, so it works even when sector
+ * reads fail — used to learn the logical sector size (word 106 bit 12;
+ * words 117/118 = size in 16-bit words). Returns 0 on success, negative on
+ * a not-ready/DRQ timeout or drive error.
+ */
+int ata_identify(void *buf);
+
 #endif /* CORE_HAL_HW_ATA_H */
