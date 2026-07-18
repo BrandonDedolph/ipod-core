@@ -26,4 +26,20 @@ int lcd_init(void);
  * waiting for completion). */
 void lcd_fill(uint16_t rgb565);
 
+/* Present a full host-side framebuffer to the panel: stream all
+ * LCD_WIDTH*LCD_HEIGHT RGB565 pixels of `fb` (row-major, same layout
+ * lcd_fill writes) via the full-frame BCMCMD_LCD_UPDATE fast path,
+ * bootloader variant (returns without waiting for completion). `fb`
+ * points to exactly LCD_WIDTH*LCD_HEIGHT uint16_t. Like lcd_fill, the
+ * caller must have gated on lcd_init() reporting the BCM powered before
+ * calling (the driver does no dead-BCM bootstrap).
+ *
+ * NOTE: this is the hw-only worker, deliberately NOT named lcd_present
+ * — the portable HAL contract (hal.h) reserves `void lcd_present(void)`
+ * for the back-buffer present that lands with lcd_framebuffer() in a
+ * later PR; that entry point will simply forward
+ * lcd_present_fb(lcd_framebuffer()). Naming it lcd_present here would
+ * collide with hal.h (lcd.c includes both). */
+void lcd_present_fb(const uint16_t *fb);
+
 #endif /* CORE_HAL_HW_LCD_H */

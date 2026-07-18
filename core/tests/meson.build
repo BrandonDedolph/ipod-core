@@ -135,6 +135,28 @@ if target == 'sim'
   )
   test('hw-clock', clock_test, suite: 'unit')
 
+  # hw-console: the on-screen debug console (framebuffer + 8x8 hex font).
+  # Pure rendering logic, no MMIO — verifies glyph output pixel-for-pixel.
+  console_test = executable(
+    'console_test',
+    sources: ['hw_console/console_test.c', '../kernel/console.c'],
+    include_directories: include_directories('../kernel', '../hal'),
+  )
+  test('hw-console', console_test, suite: 'unit')
+
+  # hw-lcd-present: lcd_present() streams a caller framebuffer over the
+  # BCM (same path as lcd_fill) — asserts the exact 38400-word grammar
+  # and pixel packing against the recording mock bus.
+  lcd_present_test = executable(
+    'lcd_present_test',
+    sources: ['hw_mmio/lcd_present_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/lcd.c'],
+    include_directories: include_directories('../hal', '../hal/hw', 'hw_mmio'),
+    c_args: ['-DMMIO_MOCK', '-Wno-unterminated-string-initialization'],
+  )
+  test('hw-lcd-present', lcd_present_test, suite: 'unit')
+
   # End-to-end audio-playback test: spawns core-sim with the SDL2
   # disk audio driver, plays the FLAC fixture, then bit-compares
   # the captured PCM to the codec_kat reference. Exercises the

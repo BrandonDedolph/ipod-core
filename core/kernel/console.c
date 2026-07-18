@@ -1,0 +1,138 @@
+/*
+ * core/kernel/console.c — minimal on-screen text/hex console.
+ *
+ * Portable freestanding logic: an 8x8 bitmap font rasterized into a static
+ * RGB565 back buffer. No hardware access. See console.h for the contract.
+ *
+ * Font layout: each glyph is 8 bytes, one byte per pixel row (top to
+ * bottom). Within a byte the MSB (bit 7) is the leftmost pixel. A set bit
+ * paints the foreground color; a clear bit paints the background color.
+ */
+
+#include "console.h"
+#include "hal.h"        /* LCD_WIDTH, LCD_HEIGHT */
+
+#include <stdint.h>
+
+/* 320*240 RGB565 = 153,600 bytes, lives in .bss. */
+static uint16_t g_fb[LCD_WIDTH * LCD_HEIGHT];
+
+#define GLYPH_W 8
+#define GLYPH_H 8
+
+/* Character grid dimensions derived from the panel + font size. */
+#define CON_COLS (LCD_WIDTH  / GLYPH_W)   /* 40 */
+#define CON_ROWS (LCD_HEIGHT / GLYPH_H)   /* 30 */
+
+/* One 8x8 glyph. */
+typedef struct {
+    char          ch;
+    uint8_t       rows[GLYPH_H];
+} glyph_t;
+
+/* Hand-authored 5x7-in-8x8 font. Bit 7 = leftmost pixel. */
+static const glyph_t g_font[] = {
+    { ' ', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+
+    { '0', { 0x70, 0x88, 0x98, 0xA8, 0xC8, 0x88, 0x70, 0x00 } },
+    { '1', { 0x20, 0x60, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00 } },
+    { '2', { 0x70, 0x88, 0x10, 0x20, 0x40, 0x80, 0xF8, 0x00 } },
+    { '3', { 0x70, 0x88, 0x08, 0x30, 0x08, 0x88, 0x70, 0x00 } },
+    { '4', { 0x10, 0x30, 0x50, 0x90, 0xF8, 0x10, 0x10, 0x00 } },
+    { '5', { 0xF8, 0x80, 0xF0, 0x08, 0x08, 0x88, 0x70, 0x00 } },
+    { '6', { 0x70, 0x80, 0x80, 0xF0, 0x88, 0x88, 0x70, 0x00 } },
+    { '7', { 0xF8, 0x08, 0x10, 0x20, 0x40, 0x40, 0x40, 0x00 } },
+    { '8', { 0x70, 0x88, 0x88, 0x70, 0x88, 0x88, 0x70, 0x00 } },
+    { '9', { 0x70, 0x88, 0x88, 0x78, 0x08, 0x08, 0x70, 0x00 } },
+
+    { 'A', { 0x70, 0x88, 0x88, 0xF8, 0x88, 0x88, 0x88, 0x00 } },
+    { 'B', { 0xF0, 0x88, 0x88, 0xF0, 0x88, 0x88, 0xF0, 0x00 } },
+    { 'C', { 0x70, 0x88, 0x80, 0x80, 0x80, 0x88, 0x70, 0x00 } },
+    { 'D', { 0xF0, 0x88, 0x88, 0x88, 0x88, 0x88, 0xF0, 0x00 } },
+    { 'E', { 0xF8, 0x80, 0x80, 0xF0, 0x80, 0x80, 0xF8, 0x00 } },
+    { 'F', { 0xF8, 0x80, 0x80, 0xF0, 0x80, 0x80, 0x80, 0x00 } },
+
+    /* Label letters. */
+    { 'L', { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0xF8, 0x00 } },
+    { 'N', { 0x88, 0xC8, 0xC8, 0xA8, 0x98, 0x98, 0x88, 0x00 } },
+    { 'P', { 0xF0, 0x88, 0x88, 0xF0, 0x80, 0x80, 0x80, 0x00 } },
+    { 'Q', { 0x70, 0x88, 0x88, 0x88, 0xA8, 0x90, 0x68, 0x00 } },
+    { 'R', { 0xF0, 0x88, 0x88, 0xF0, 0xA0, 0x90, 0x88, 0x00 } },
+    { 'S', { 0x70, 0x88, 0x80, 0x70, 0x08, 0x88, 0x70, 0x00 } },
+    { 'T', { 0xF8, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00 } },
+    { 'U', { 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00 } },
+
+    { '=', { 0x00, 0x00, 0xF8, 0x00, 0xF8, 0x00, 0x00, 0x00 } },
+    { '-', { 0x00, 0x00, 0x00, 0xF8, 0x00, 0x00, 0x00, 0x00 } },
+};
+
+#define FONT_COUNT ((int)(sizeof g_font / sizeof g_font[0]))
+
+/* Return the 8-byte glyph rows for ch, or the blank glyph (index 0, space)
+ * if unsupported. Never NULL: g_font[0] is guaranteed to be the blank. */
+static const uint8_t *glyph_for(char ch)
+{
+    int i;
+    for (i = 0; i < FONT_COUNT; i++) {
+        if (g_font[i].ch == ch) {
+            return g_font[i].rows;
+        }
+    }
+    return g_font[0].rows;   /* blank cell */
+}
+
+const uint16_t *console_framebuffer(void)
+{
+    return g_fb;
+}
+
+void console_clear(uint16_t rgb565)
+{
+    int i;
+    for (i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
+        g_fb[i] = rgb565;
+    }
+}
+
+void console_char(int col, int row, char ch, uint16_t fg, uint16_t bg)
+{
+    const uint8_t *glyph;
+    int base_x, base_y, ry, cx;
+
+    if (col < 0 || col >= CON_COLS || row < 0 || row >= CON_ROWS) {
+        return;   /* out of range: no-op */
+    }
+
+    glyph  = glyph_for(ch);
+    base_x = col * GLYPH_W;
+    base_y = row * GLYPH_H;
+
+    for (ry = 0; ry < GLYPH_H; ry++) {
+        uint8_t bits = glyph[ry];
+        for (cx = 0; cx < GLYPH_W; cx++) {
+            int set = (bits >> (7 - cx)) & 1;
+            g_fb[(base_y + ry) * LCD_WIDTH + (base_x + cx)] = set ? fg : bg;
+        }
+    }
+}
+
+void console_str(int col, int row, const char *s, uint16_t fg, uint16_t bg)
+{
+    if (s == 0) {
+        return;
+    }
+    for (; *s != '\0' && col < CON_COLS; s++, col++) {
+        console_char(col, row, *s, fg, bg);
+    }
+}
+
+void console_hex32(int col, int row, uint32_t value, uint16_t fg, uint16_t bg)
+{
+    static const char hexdigits[] = "0123456789ABCDEF";
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        unsigned nibble = (value >> (28 - 4 * i)) & 0xFu;
+        console_char(col + i, row, hexdigits[nibble], fg, bg);
+    }
+}

@@ -111,14 +111,25 @@ int lcd_init(void)
     return (mmio_read32(GPO32_VAL_ADDR) & GPO32_BCM_POWER) != 0;
 }
 
-void lcd_fill(uint16_t rgb565)
+/* Number of 32-bit stores that carry one full 320x240 frame: two
+ * RGB565 pixels are packed per store. */
+#define BCM_FRAME_WORDS  ((LCD_WIDTH * LCD_HEIGHT) / 2u)
+
+/*
+ * Shared full-frame update preamble (steps 1-2, identical for
+ * lcd_fill and lcd_present):
+ *
+ *  (1) Wait for idle, unless this is the first frame after the
+ *      chainload handoff (guaranteed idle). The BCM is busy while
+ *      BCMA_COMMAND still reads the in-flight LCD_UPDATE code
+ *      (0xFFFF0000) or its half-consumed remnant 0xFFFF (02-lcd.md,
+ *      "LCD update protocol"; verified against Rockbox lcd-video.c,
+ *      2026-06-11). On timeout, proceed anyway.
+ *  (2) Point the BCM write port at the framebuffer / command
+ *      parameter region so the caller can stream pixel data.
+ */
+static void bcm_frame_begin(void)
 {
-    /* (1) Wait for idle, unless this is the first frame after the
-     * chainload handoff (guaranteed idle). The BCM is busy while
-     * BCMA_COMMAND still reads the in-flight LCD_UPDATE code
-     * (0xFFFF0000) or its half-consumed remnant 0xFFFF (02-lcd.md,
-     * "LCD update protocol"; verified against Rockbox lcd-video.c,
-     * 2026-06-11). On timeout, proceed anyway. */
     if (!lcd_first_frame) {
         uint32_t spin = BCM_IDLE_SPIN_LIMIT;
         uint32_t stat;
@@ -130,26 +141,69 @@ void lcd_fill(uint16_t rgb565)
     }
     lcd_first_frame = 0;
 
-    /* (2) Point the BCM write port at the framebuffer / command
-     * parameter region. */
     bcm_write_addr(BCMA_CMDPARAM);
+}
+
+/*
+ * Shared full-frame update commit (steps 4-5, identical for lcd_fill
+ * and lcd_present): queue the full-frame update command, then strobe
+ * execute. Bootloader variant: return without a completion wait.
+ */
+static void bcm_frame_commit(void)
+{
+    bcm_write32(BCMA_COMMAND, BCMCMD_LCD_UPDATE);
+    mmio_write16(BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
+}
+
+void lcd_fill(uint16_t rgb565)
+{
+    /* Solid color: both packed halves are the same pixel, so the
+     * high/low ordering (see lcd_present) is irrelevant here. */
+    const uint32_t pair = ((uint32_t)rgb565 << 16) | rgb565;
+    uint32_t n = BCM_FRAME_WORDS;
+
+    bcm_frame_begin();
 
     /* (3) Stream the full 320x240 frame as 32-bit stores, two RGB565
      * pixels per store, no per-store handshake — the BCM's undecoded
      * low address bits consume each word as two consecutive 16-bit
      * pushes (02-lcd.md, "Memory-mapped BCM interface"; verified
      * against Rockbox lcd-video.c / ipodloader2 fb.c, 2026-06-11). */
-    {
-        const uint32_t pair = ((uint32_t)rgb565 << 16) | rgb565;
-        uint32_t n = (LCD_WIDTH * LCD_HEIGHT) / 2;
-
-        while (n-- != 0) {
-            mmio_write32(BCM_DATA_ADDR, pair);
-        }
+    while (n-- != 0) {
+        mmio_write32(BCM_DATA_ADDR, pair);
     }
 
-    /* (4) Queue the full-frame update command, (5) strobe execute.
-     * Bootloader variant: return without a completion wait. */
-    bcm_write32(BCMA_COMMAND, BCMCMD_LCD_UPDATE);
-    mmio_write16(BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
+    bcm_frame_commit();
+}
+
+void lcd_present_fb(const uint16_t *fb)
+{
+    uint32_t i = 0;
+
+    bcm_frame_begin();
+
+    /* (3) Stream the caller's framebuffer as 32-bit stores, two RGB565
+     * pixels per store — same fast path as lcd_fill, only the pixel
+     * source differs.
+     *
+     * Packing / half order (matching lcd_fill's (rgb<<16)|rgb): the BCM
+     * consumes each 32-bit store as two consecutive 16-bit pushes to
+     * ascending BCM-internal framebuffer addresses (02-lcd.md,
+     * "Memory-mapped BCM interface"), and on this little-endian bus the
+     * store's low 16 bits are the first push. Framebuffer offset
+     * ascends with x (02-lcd.md: pixel (x,y) at (LCD_WIDTH*2)*y+(x*2),
+     * RGB565 little-endian), so the earlier pixel fb[2*i] (even x) is
+     * the first push and MUST go in the LOW half, and the later pixel
+     * fb[2*i+1] (odd x) is the second push and goes in the HIGH half.
+     * For a solid frame fb[2*i]==fb[2*i+1], which collapses to exactly
+     * lcd_fill's (rgb<<16)|rgb — so a constant framebuffer streamed
+     * here is byte-identical to lcd_fill's output. */
+    while (i < BCM_FRAME_WORDS) {
+        const uint32_t pair = ((uint32_t)fb[2u * i + 1u] << 16) |
+                              fb[2u * i];
+        mmio_write32(BCM_DATA_ADDR, pair);
+        i++;
+    }
+
+    bcm_frame_commit();
 }

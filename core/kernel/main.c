@@ -19,20 +19,7 @@
 #include "timer.h"
 #include "irq.h"
 #include "clock.h"
-
-/*
- * Crude bounded busy-delay between LCD fill colors so a human can see
- * the cycle — same volatile-loop idiom as uart.c's reset hold, just
- * bigger. Replaced by a real timer-based delay in a later PR. (By the
- * time this runs the core is at CPUFREQ_NORMAL = 30 MHz — clock_init()
- * has already run — so the cycle is faster than at the 24 MHz boot
- * clock, but it's still not tuned precisely.)
- */
-static void delay_eyeball(void) {
-    for (volatile uint32_t i = 0; i < (1u << 24); i++) {
-        /* spin */
-    }
-}
+#include "console.h"
 
 /*
  * Idle-task CPU sleep. Program the per-core countdown to wake this core
@@ -124,25 +111,26 @@ _Noreturn void kernel_main(void) {
      * probe keeps both the dead-BCM hardware case and the emulator
      * smoke well-defined. */
     if (lcd_init()) {
-        uart_puts("core: lcd bcm powered\n");
-
-        /* Solid-fill cycle: red -> green -> blue, ~1 s apart, ending
-         * on blue. One narration line per fill so the serial log
-         * pinpoints exactly which BCM transaction wedged if the
-         * panel stays dark. */
-        uart_puts("core: lcd fill red\n");
-        lcd_fill(0xF800);
-        delay_eyeball();
-
-        uart_puts("core: lcd fill green\n");
-        lcd_fill(0x07E0);
-        delay_eyeball();
-
-        uart_puts("core: lcd fill blue\n");
-        lcd_fill(0x001F);
-        uart_puts("core: lcd cycle done (panel should be blue)\n");
+        /* On-screen register readout — the panel reports the boot state
+         * with no serial cable. The whole screen is GREEN if the PLL
+         * locked (core reached CPUFREQ_NORMAL) or RED if clock_init
+         * degraded to the crystal, with the raw clock registers on top:
+         * FREQ = cpu_frequency(), STAT = PLL_STATUS (bit 31 = lock),
+         * CTRL = PLL_CONTROL readback. */
+        uint16_t bg = (cpu_frequency() == CPUFREQ_NORMAL) ? CON_GREEN
+                                                          : CON_RED;
+        uart_puts("core: lcd bcm powered - rendering debug screen\n");
+        console_clear(bg);
+        console_str  (2, 3, "FREQ", CON_WHITE, bg);
+        console_hex32(8, 3, cpu_frequency(),               CON_WHITE, bg);
+        console_str  (2, 5, "STAT", CON_WHITE, bg);
+        console_hex32(8, 5, mmio_read32(PLL_STATUS_ADDR),  CON_WHITE, bg);
+        console_str  (2, 7, "CTRL", CON_WHITE, bg);
+        console_hex32(8, 7, mmio_read32(PLL_CONTROL_ADDR), CON_WHITE, bg);
+        lcd_present_fb(console_framebuffer());
+        uart_puts("core: debug screen presented\n");
     } else {
-        uart_puts("core: lcd bcm NOT powered, skipping fills (no bootstrap yet)\n");
+        uart_puts("core: lcd bcm NOT powered, skipping debug screen\n");
     }
 
     /* Bring up the 100 Hz system tick: install the timer, then unmask
