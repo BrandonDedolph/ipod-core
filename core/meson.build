@@ -72,14 +72,19 @@ if target == 'hw'
   # host libc and land in subsequent PRs as they're brought up.
   subdir('boot')
   subdir('kernel')
+  subdir('fs')
 
   core_elf = executable(
     'core.elf',
-    boot_sources + kernel_sources,
+    boot_sources + kernel_sources + fs_sources,
     dependencies: [hal_dep],     # hal/hw: SER0 debug UART
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),
       '-Wl,-Map=core.map',
+      # libgcc: the ARM7TDMI has no hardware divide, so integer division
+      # (fat32 sector math, playback timing) needs the compiler runtime's
+      # __aeabi_*divmod helpers. This is the compiler runtime, NOT libc.
+      '-lgcc',
     ],
     link_depends: boot_linker_script,
   )

@@ -21,6 +21,7 @@
 #include "hw/audio.h"
 #include "hw/ata.h"
 #include "hal.h"
+#include "../fs/fat32.h"
 #include "sched.h"
 #include "timer.h"
 #include "irq.h"
@@ -42,85 +43,81 @@ static void cpu_wait_ms(uint8_t ms) {
 }
 
 /*
- * First-sound tone. A single-cycle 64-sample sine (~689 Hz when streamed
- * one sample per frame at 44.1 kHz), amplitude 12000 ≈ -8.7 dBFS so a
- * 0 dB headphone gain lands at a reasonable listening level. Generated
- * offline (round(12000·sin(2π·i/64))).
+ * WAV playback. The file is preloaded from disk into this RAM buffer, then
+ * the source callback streams PCM from RAM — ISR-safe, no disk access in
+ * the DMA-completion interrupt. 4 MB holds ~23 s of 44.1 kHz/16-bit/stereo.
+ * uint16_t element type keeps it 2-byte aligned for the int16 PCM.
  */
-static const int16_t sine64[64] = {
-        0,   1176,   2341,   3483,   4592,   5657,   6667,   7613,
-     8485,   9276,   9978,  10583,  11087,  11483,  11769,  11942,
-    12000,  11942,  11769,  11483,  11087,  10583,   9978,   9276,
-     8485,   7613,   6667,   5657,   4592,   3483,   2341,   1176,
-        0,  -1176,  -2341,  -3483,  -4592,  -5657,  -6667,  -7613,
-    -8485,  -9276,  -9978, -10583, -11087, -11483, -11769, -11942,
-   -12000, -11942, -11769, -11483, -11087, -10583,  -9978,  -9276,
-    -8485,  -7613,  -6667,  -5657,  -4592,  -3483,  -2341,  -1176,
-};
+#define WAV_BUF_WORDS (2u * 1024u * 1024u)   /* 4 MB */
+static uint16_t wav_buf[WAV_BUF_WORDS];
 
-/* Crude bounded settle delay for the codec VMID ramp, so the first
- * samples don't land on a still-charging bias rail and pop. This path
- * runs at CPUFREQ_NORMAL = 30 MHz (kernel_main calls clock_init only,
- * never cpu_boost), so 1<<21 volatile iterations is ~100 ms — roughly a
- * VMID_10K settle. No timer needed; this runs before the scheduler.
- * Revisit the loop count if this ever moves onto the boosted clock. */
-static void audio_settle(void)
-{
-    for (volatile uint32_t i = 0; i < (1u << 21); i++) {
-        /* spin */
-    }
-}
+static const int16_t    *g_pcm;        /* interleaved [L,R,...] at data start */
+static uint32_t          g_pcm_frames; /* total stereo frames                 */
+static volatile uint32_t g_pcm_pos;    /* next frame to emit                  */
 
-/*
- * Stream up to `frames` stereo sine frames through the polled I2S FIFO
- * and return the number that were actually ACCEPTED by the FIFO. The
- * write self-paces on FIFO space, so a full run takes ~frames/44100 s of
- * wall-clock on working hardware. If the TX FIFO never drains (codec not
- * clocking) we bail after 64 consecutive write timeouts and return the
- * count so far — so the returned value is the headline diagnostic:
- *   ~frames  => the FIFO drained, i.e. the codec IS clocking the data
- *              out (a silent output is then an output-stage problem);
- *   ~0       => the FIFO never drained, i.e. no codec clock (I2S
- *              pad-mux / MCLK / config).
- */
-static uint32_t audio_play_tone(uint32_t frames)
-{
-    uint32_t phase = 0;
-    uint32_t misses = 0;
-    uint32_t wrote = 0;
-    for (uint32_t n = 0; n < frames; n++) {
-        int16_t s = sine64[phase & 63];
-        if (i2s_write_stereo(s, s) != 0) {
-            if (++misses >= 64) {
-                break;
-            }
-            continue;
-        }
-        misses = 0;
-        wrote++;
-        phase++;
-    }
-    return wrote;
-}
-
-/*
- * DMA-path source callback (hal_audio_set_source): fill `frames` stereo
- * frames of the same 689 Hz sine into the interleaved [L,R,...] buffer.
- * Phase persists across calls so the tone is continuous across the
- * ping-pong buffer boundary. Runs in IRQ context (the DMA-completion ISR)
- * on hw — leaf, no allocation, no blocking. Always fills the full request.
- */
-static uint32_t g_sine_phase;
-static int sine_source(void *ud, int16_t *buf, int frames)
+/* hal_audio source: stream the preloaded PCM; returns fewer than `frames`
+ * at end-of-file (the HAL zero-pads the rest). Runs in the DMA ISR. */
+static int wav_source(void *ud, int16_t *buf, int frames)
 {
     (void)ud;
-    for (int f = 0; f < frames; f++) {
-        int16_t s = sine64[g_sine_phase & 63];
-        buf[2 * f]     = s;   /* L */
-        buf[2 * f + 1] = s;   /* R */
-        g_sine_phase++;
+    int n = 0;
+    while (n < frames && g_pcm_pos < g_pcm_frames) {
+        buf[2 * n]     = g_pcm[2 * g_pcm_pos];       /* L */
+        buf[2 * n + 1] = g_pcm[2 * g_pcm_pos + 1];   /* R */
+        g_pcm_pos++;
+        n++;
     }
-    return frames;
+    return n;
+}
+
+/* FAT32 block callback: read absolute 512-byte LBAs off the disk. */
+static int disk_read(void *ud, uint32_t lba, uint32_t count, void *buf)
+{
+    (void)ud;
+    return ata_read_sectors(lba, count, buf);
+}
+
+/*
+ * Locate the PCM 'data' chunk of a RIFF/WAVE file already in `wav`
+ * (filelen bytes). On success sets *data_off / *data_len / *rate; returns
+ * 0 only for PCM (format tag 1), 16-bit, stereo.
+ */
+static int wav_parse(const uint8_t *wav, uint32_t filelen,
+                     uint32_t *data_off, uint32_t *data_len, uint32_t *rate)
+{
+    if (filelen < 12 ||
+        wav[0] != 'R' || wav[1] != 'I' || wav[2] != 'F' || wav[3] != 'F' ||
+        wav[8] != 'W' || wav[9] != 'A' || wav[10] != 'V' || wav[11] != 'E') {
+        return -1;
+    }
+    uint32_t fmt_tag = 0, fmt_ch = 0, fmt_rate = 0, fmt_bits = 0;
+    int have_fmt = 0;
+    uint32_t off = 12;
+    while (off + 8u <= filelen) {
+        const uint8_t *id = &wav[off];
+        uint32_t sz = (uint32_t)wav[off + 4] | ((uint32_t)wav[off + 5] << 8) |
+                      ((uint32_t)wav[off + 6] << 16) |
+                      ((uint32_t)wav[off + 7] << 24);
+        const uint8_t *body = &wav[off + 8];
+        if (id[0] == 'f' && id[1] == 'm' && id[2] == 't' && id[3] == ' ' &&
+            sz >= 16u && off + 8u + 16u <= filelen) {
+            fmt_tag  = (uint32_t)body[0]  | ((uint32_t)body[1] << 8);
+            fmt_ch   = (uint32_t)body[2]  | ((uint32_t)body[3] << 8);
+            fmt_rate = (uint32_t)body[4]  | ((uint32_t)body[5] << 8) |
+                       ((uint32_t)body[6] << 16) | ((uint32_t)body[7] << 24);
+            fmt_bits = (uint32_t)body[14] | ((uint32_t)body[15] << 8);
+            have_fmt = 1;
+        } else if (id[0] == 'd' && id[1] == 'a' && id[2] == 't' && id[3] == 'a') {
+            uint32_t avail = filelen - (off + 8u);
+            *data_off = off + 8u;
+            *data_len = sz <= avail ? sz : avail;
+            *rate     = fmt_rate;
+            return (have_fmt && fmt_tag == 1u && fmt_ch == 2u && fmt_bits == 16u)
+                       ? 0 : -1;
+        }
+        off += 8u + sz + (sz & 1u);
+    }
+    return -1;
 }
 
 /* Per-task stacks (carved from .bss; the scheduler builds each task's
@@ -235,58 +232,20 @@ _Noreturn void kernel_main(void) {
         uint16_t bg = (cpu_frequency() == CPUFREQ_NORMAL) ? CON_GREEN
                                                           : CON_RED;
 
-        /* (a) Polled first-sound: a known-good ~1 s tone straight to the
-         * I2S FIFO, proving the codec/output path independently of DMA. */
-        uart_puts("core: [polled] bring-up + ~1s tone\n");
-        i2c_init();
-        i2s_init();
-        wm8758_init();
-        audio_settle();
-        i2s_tx_enable();
-        uint32_t wrote = audio_play_tone(44100u);
-
-        /* (b) DMA continuous playback via the hal_audio backend: re-init
-         * through hal_audio, register the sine source, start, and let it
-         * run ~3 s. DMA feeds the FIFO autonomously (paced by the I2S
-         * request) while the CPU just waits on the tick; each completion
-         * IRQ refills a buffer. The completion count proves the DMA + IRQ
-         * path end to end. */
-        uart_puts("core: [dma] hal_audio continuous ~3s tone\n");
-        uint32_t dmac = 0;
-        if (hal_audio_init(44100u, 2u) == 0) {
-            g_sine_phase = 0;
-            hal_audio_set_source(sine_source, 0);
-            hal_audio_start();
-            sleep_ms(3000);
-            hal_audio_stop();
-            dmac = audio_dma_completions();
-        }
-        uart_puts("core: dma completions ");
-        uart_put_hex32(dmac);
-        uart_putc('\n');
-
-        /* (c) ATA probe. READ SECTORS to LBA 0 keeps returning IDNF on
-         * this drive (the MK8010GAH with 2048-byte sectors), so before
-         * building FAT32 we get GROUND TRUTH: IDENTIFY DEVICE takes no LBA
-         * (can't IDNF), which both proves the read/DRQ path works and
-         * reports the true logical sector size (word 106 bit 12 => >512;
-         * words 117/118 = size in 16-bit words). */
-        uart_puts("core: [ata] init + read MBR + find FAT32\n");
+        /* Read the MBR, find the FAT32 data partition (type 0B/0C), mount
+         * it, open TEST.WAV and preload it to RAM — then play it through
+         * the DMA-fed hal_audio backend. Audio and the disk reader are each
+         * proven separately; this is the payoff path. */
         uint8_t *mbr = (uint8_t *)mbr_sector;
-        int      ata_rc = ata_init();
-        int      rd_rc  = -1;
+        int      rd_rc = -1;
         uint32_t sig = 0, fat_lba = 0;
-        uint8_t  fat_type = 0;
-        if (ata_rc == 0) {
-            /* The wrapper now reads whole physical sectors internally, so a
-             * plain single-sector MBR read works. */
+        if (ata_init() == 0) {
             rd_rc = ata_read_sectors(0, 1, mbr);
             if (rd_rc == 0) {
                 sig = (uint32_t)mbr[510] | ((uint32_t)mbr[511] << 8);
                 for (int p = 0; p < 4; p++) {
                     const uint8_t *e = &mbr[0x1BE + 16 * p];
                     if (e[4] == 0x0B || e[4] == 0x0C) {
-                        fat_type = e[4];
                         fat_lba = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
                                   ((uint32_t)e[10] << 16) |
                                   ((uint32_t)e[11] << 24);
@@ -295,36 +254,80 @@ _Noreturn void kernel_main(void) {
                 }
             }
         }
-        uart_puts("core: rd ");
-        uart_put_hex32((uint32_t)rd_rc);
-        uart_puts(" sig ");
-        uart_put_hex32(sig);
-        uart_puts(" fat_lba ");
-        uart_put_hex32(fat_lba);
-        uart_putc('\n');
-        (void)wrote;
 
-        /* Diagnostic screen (single silicon-proven present):
-         *   ID   = ata_identify rc (0 => read/DRQ path works, so the READ
-         *          SECTORS IDNF is purely an addressing issue).
-         *   W106 = identify word 106 (bit 12 / 0x1000 set => logical
-         *          sector > 512 bytes).
-         *   W117/W118 = logical sector size in 16-bit words (x2 = bytes);
-         *          0400/0000 => 2048-byte sectors.
-         *   RD   = ata_read_sectors rc; SIG = MBR signature (AA55 if OK). */
+        fat32_t  fs;
+        int      mnt = -1, op = -1;
+        int32_t  rd = -1;
+        uint32_t fclus = 0, fsize = 0;
+        uint32_t data_off = 0, data_len = 0, wrate = 0;
+        int      wav_ok = -1;
+        if (sig == 0xAA55u && fat_lba != 0) {
+            uart_puts("core: [fat32] mount + open TEST.WAV\n");
+            /* The MBR partition-start LBA may be in the disk's native
+             * 512-byte units OR (on the stock 80 GB, whose FAT uses
+             * 2048-byte sectors) in 2048-byte units. Try as-is first, then
+             * x4; fat32_mount validates the boot signature + BPB so a wrong
+             * base just fails cleanly. */
+            mnt = fat32_mount(&fs, disk_read, 0, fat_lba);
+            if (mnt != 0) {
+                mnt = fat32_mount(&fs, disk_read, 0, fat_lba * 4u);
+            }
+            if (mnt == 0) {
+                op = fat32_open(&fs, "TEST.WAV", &fclus, &fsize);
+            }
+            if (op == 0) {
+                uint32_t want = fsize < sizeof wav_buf ? fsize : sizeof wav_buf;
+                uart_puts("core: loading TEST.WAV to RAM (this takes a moment)\n");
+                rd = fat32_read_file(&fs, fclus, wav_buf, want);
+                if (rd > 0) {
+                    wav_ok = wav_parse((const uint8_t *)wav_buf, (uint32_t)rd,
+                                       &data_off, &data_len, &wrate);
+                }
+            }
+        }
+
+        /* One diagnostic screen (single silicon-proven present):
+         *   SIG  = MBR signature (AA55).  MNT/OP = fat32 mount/open rc (0).
+         *   RD   = bytes preloaded from TEST.WAV.
+         *   RATE = WAV sample rate (0000AC44 = 44100).
+         *   DLEN = PCM data-chunk length in bytes. */
         console_clear(bg);
-        console_str  (2, 3, "FREQ", CON_WHITE, bg);
-        console_hex32(8, 3, cpu_frequency(),  CON_WHITE, bg);
-        console_str  (2, 5, "RD",   CON_WHITE, bg);   /* MBR read rc (0 = OK) */
-        console_hex32(8, 5, (uint32_t)rd_rc,  CON_WHITE, bg);
-        console_str  (2, 7, "SIG",  CON_WHITE, bg);   /* AA55 = real MBR */
-        console_hex32(8, 7, sig,              CON_WHITE, bg);
-        console_str  (2, 9, "PART", CON_WHITE, bg);   /* FAT32 type 0B/0C */
-        console_hex32(8, 9, fat_type,         CON_WHITE, bg);
-        console_str  (2, 11, "PLBA", CON_WHITE, bg);  /* FAT32 partition start LBA */
-        console_hex32(8, 11, fat_lba,         CON_WHITE, bg);
+        console_str  (2, 3, "SIG",  CON_WHITE, bg);
+        console_hex32(8, 3, sig,               CON_WHITE, bg);
+        console_str  (2, 5, "MNT",  CON_WHITE, bg);
+        console_hex32(8, 5, (uint32_t)mnt,     CON_WHITE, bg);
+        console_str  (2, 7, "OP",   CON_WHITE, bg);
+        console_hex32(8, 7, (uint32_t)op,      CON_WHITE, bg);
+        console_str  (2, 9, "RD",   CON_WHITE, bg);
+        console_hex32(8, 9, (uint32_t)rd,      CON_WHITE, bg);
+        console_str  (2, 11, "RATE", CON_WHITE, bg);
+        console_hex32(8, 11, wrate,            CON_WHITE, bg);
+        console_str  (2, 13, "DLEN", CON_WHITE, bg);
+        console_hex32(8, 13, data_len,         CON_WHITE, bg);
         lcd_present_fb(console_framebuffer());
         uart_puts("core: diagnostic screen presented\n");
+
+        /* Play the track: point the source at the preloaded PCM and let the
+         * DMA-fed backend stream it. Blocks (on the tick) for the clip's
+         * duration while DMA + IRQ refills do the work. */
+        if (wav_ok == 0 && wrate == 44100u) {
+            uart_puts("core: playing TEST.WAV\n");
+            g_pcm        = (const int16_t *)((const uint8_t *)wav_buf + data_off);
+            g_pcm_frames = data_len / 4u;
+            g_pcm_pos    = 0;
+            if (hal_audio_init(44100u, 2u) == 0) {
+                hal_audio_set_source(wav_source, 0);
+                hal_audio_start();
+                /* Play until the source has emitted every frame, then a
+                 * moment more for the FIFO/DMA to drain the tail. */
+                while (g_pcm_pos < g_pcm_frames) {
+                    sleep_ms(100);
+                }
+                sleep_ms(500);
+                hal_audio_stop();
+            }
+            uart_puts("core: playback done\n");
+        }
     } else {
         uart_puts("core: lcd bcm NOT powered, skipping audio + screen\n");
     }
