@@ -22,6 +22,7 @@ PortalPlayer documentation; cross-referenced where possible.
 | [06-power.md](06-power.md)           | PCF50605 PMIC, battery curve, charge detection, sleep |
 | [07-usb.md](07-usb.md)               | ARC USBOTG controller, MSC stack, exclusive-storage handoff |
 | [08-boot-dock.md](08-boot-dock.md)   | Firmware partition format, bootloader handoff, dock UART, recovery |
+| [09-i2c.md](09-i2c.md)               | On-SoC I²C controller (WM8758 codec control bus) |
 
 ## Conventions
 
