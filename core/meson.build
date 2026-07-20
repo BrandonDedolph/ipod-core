@@ -85,6 +85,16 @@ if target == 'hw'
       # (fat32 sector math, playback timing) needs the compiler runtime's
       # __aeabi_*divmod helpers. This is the compiler runtime, NOT libc.
       '-lgcc',
+      # The pcm_ring SPSC indices use __atomic acquire/release ordering.
+      # On ARMv4T (no barrier instruction) GCC lowers the fence to a
+      # __sync_synchronize libcall; sync-none selects its no-op form. That
+      # is correct HERE: the ring's producer (foreground pump) and consumer
+      # (DMA ISR) run on the SAME core — ARM7TDMI is in-order and strongly
+      # ordered, and the DMA engine reads the PCM buffer, never the indices,
+      # so no cross-observer hardware fence is needed. The __atomic builtins
+      # still emit the compiler-ordering barrier we actually rely on. Absent
+      # this spec the stub links anyway but warns on every build.
+      '-specs=sync-none.specs',
     ],
     link_depends: boot_linker_script,
   )

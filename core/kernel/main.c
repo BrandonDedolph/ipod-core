@@ -27,6 +27,7 @@
 #include "irq.h"
 #include "clock.h"
 #include "console.h"
+#include "pcm_ring.h"
 
 /*
  * Idle-task CPU sleep. Program the per-core countdown to wake this core
@@ -43,31 +44,62 @@ static void cpu_wait_ms(uint8_t ms) {
 }
 
 /*
- * WAV playback. The file is preloaded from disk into this RAM buffer, then
- * the source callback streams PCM from RAM — ISR-safe, no disk access in
- * the DMA-completion interrupt. 4 MB holds ~23 s of 44.1 kHz/16-bit/stereo.
- * uint16_t element type keeps it 2-byte aligned for the int16 PCM.
+ * Streaming WAV playback. Instead of preloading the whole file, a small ring
+ * buffer decouples the foreground disk pump (producer) from the DMA-completion
+ * ISR (consumer): the pump reads PCM off the disk into the ring, the ISR
+ * drains it into the DMA buffer without ever touching the disk. The ring holds
+ * ~1.5 s of headroom — far more than the pump's read latency — and disk PIO
+ * (~512 KB/s) out-reads playback (~172 KB/s) by ~3x, so a full-length song
+ * streams without underrunning. See kernel/pcm_ring.h + fs/fat32.h.
  */
-#define WAV_BUF_WORDS (2u * 1024u * 1024u)   /* 4 MB */
-static uint16_t wav_buf[WAV_BUF_WORDS];
+#define RING_FRAMES  (1u << 16)          /* 65536 frames = 256 KB ~ 1.49 s     */
+#define PUMP_BYTES   (16u * 1024u)       /* per-pump disk read chunk            */
+#define HDR_BYTES    4096u               /* enough to hold any real WAV header  */
 
-static const int16_t    *g_pcm;        /* interleaved [L,R,...] at data start */
-static uint32_t          g_pcm_frames; /* total stereo frames                 */
-static volatile uint32_t g_pcm_pos;    /* next frame to emit                  */
+static int16_t  ring_storage[RING_FRAMES * 2];
+static uint8_t  pump_buf[PUMP_BYTES] __attribute__((aligned(4)));
+static uint8_t  hdr_buf[HDR_BYTES]   __attribute__((aligned(4)));
 
-/* hal_audio source: stream the preloaded PCM; returns fewer than `frames`
- * at end-of-file (the HAL zero-pads the rest). Runs in the DMA ISR. */
-static int wav_source(void *ud, int16_t *buf, int frames)
+static pcm_ring_t     g_ring;
+static fat32_stream_t g_pcm_stream;      /* positioned at the PCM data start    */
+static uint32_t       g_pcm_remaining;   /* PCM data bytes not yet pumped in     */
+
+/* hal_audio source (runs in the DMA ISR): drain the ring. A short return on
+ * underrun makes the HAL zero-pad the rest — a glitch, never a stall. */
+static int ring_source(void *ud, int16_t *buf, int frames)
 {
     (void)ud;
-    int n = 0;
-    while (n < frames && g_pcm_pos < g_pcm_frames) {
-        buf[2 * n]     = g_pcm[2 * g_pcm_pos];       /* L */
-        buf[2 * n + 1] = g_pcm[2 * g_pcm_pos + 1];   /* R */
-        g_pcm_pos++;
-        n++;
+    return (int)pcm_ring_read(&g_ring, buf, (uint32_t)frames);
+}
+
+/* Producer: top the ring up from disk. Reads whole frames (4 bytes) in
+ * PUMP_BYTES chunks until the ring is full or the file's PCM is exhausted.
+ * Foreground only — never the ISR. */
+static void pump_ring(void)
+{
+    uint32_t freef = pcm_ring_free(&g_ring);
+    while (freef > 0 && g_pcm_remaining >= 4u) {
+        uint32_t want = freef * 4u;                  /* free space, in bytes  */
+        if (want > sizeof pump_buf) {
+            want = sizeof pump_buf;
+        }
+        if (want > g_pcm_remaining) {
+            want = g_pcm_remaining;
+        }
+        want &= ~3u;                                 /* whole frames only     */
+        if (want == 0u) {
+            break;
+        }
+        int32_t got = fat32_stream_read(&g_pcm_stream, pump_buf, want);
+        if (got <= 0) {
+            g_pcm_remaining = 0;                     /* EOF or read error     */
+            break;
+        }
+        uint32_t nframes = (uint32_t)got / 4u;
+        pcm_ring_write(&g_ring, (const int16_t *)pump_buf, nframes);
+        g_pcm_remaining -= nframes * 4u;
+        freef           -= nframes;
     }
-    return n;
 }
 
 /* FAT32 block callback: read absolute 512-byte LBAs off the disk. */
@@ -78,14 +110,19 @@ static int disk_read(void *ud, uint32_t lba, uint32_t count, void *buf)
 }
 
 /*
- * Locate the PCM 'data' chunk of a RIFF/WAVE file already in `wav`
- * (filelen bytes). On success sets *data_off / *data_len / *rate; returns
- * 0 only for PCM (format tag 1), 16-bit, stereo.
+ * Locate the PCM 'data' chunk of a RIFF/WAVE file. `buflen` is how many
+ * header bytes are actually present in `wav[]` (all chunk parsing/bounds use
+ * it); `filelen` is the true on-disk file size, used only to clamp the
+ * reported PCM length. In the streaming path only the ~4 KB header is in the
+ * buffer while filelen is the whole multi-MB file — so the two must be kept
+ * distinct (passing buflen for both would clamp data_len to the buffer). On
+ * success sets *data_off / *data_len / *rate; returns 0 only for PCM (format
+ * tag 1), 16-bit, stereo.
  */
-static int wav_parse(const uint8_t *wav, uint32_t filelen,
+static int wav_parse(const uint8_t *wav, uint32_t buflen, uint32_t filelen,
                      uint32_t *data_off, uint32_t *data_len, uint32_t *rate)
 {
-    if (filelen < 12 ||
+    if (buflen < 12 ||
         wav[0] != 'R' || wav[1] != 'I' || wav[2] != 'F' || wav[3] != 'F' ||
         wav[8] != 'W' || wav[9] != 'A' || wav[10] != 'V' || wav[11] != 'E') {
         return -1;
@@ -93,14 +130,14 @@ static int wav_parse(const uint8_t *wav, uint32_t filelen,
     uint32_t fmt_tag = 0, fmt_ch = 0, fmt_rate = 0, fmt_bits = 0;
     int have_fmt = 0;
     uint32_t off = 12;
-    while (off + 8u <= filelen) {
+    while (off + 8u <= buflen) {
         const uint8_t *id = &wav[off];
         uint32_t sz = (uint32_t)wav[off + 4] | ((uint32_t)wav[off + 5] << 8) |
                       ((uint32_t)wav[off + 6] << 16) |
                       ((uint32_t)wav[off + 7] << 24);
         const uint8_t *body = &wav[off + 8];
         if (id[0] == 'f' && id[1] == 'm' && id[2] == 't' && id[3] == ' ' &&
-            sz >= 16u && off + 8u + 16u <= filelen) {
+            sz >= 16u && off + 8u + 16u <= buflen) {
             fmt_tag  = (uint32_t)body[0]  | ((uint32_t)body[1] << 8);
             fmt_ch   = (uint32_t)body[2]  | ((uint32_t)body[3] << 8);
             fmt_rate = (uint32_t)body[4]  | ((uint32_t)body[5] << 8) |
@@ -108,7 +145,7 @@ static int wav_parse(const uint8_t *wav, uint32_t filelen,
             fmt_bits = (uint32_t)body[14] | ((uint32_t)body[15] << 8);
             have_fmt = 1;
         } else if (id[0] == 'd' && id[1] == 'a' && id[2] == 't' && id[3] == 'a') {
-            uint32_t avail = filelen - (off + 8u);
+            uint32_t avail = filelen - (off + 8u);   /* PCM bytes on disk     */
             *data_off = off + 8u;
             *data_len = sz <= avail ? sz : avail;
             *rate     = fmt_rate;
@@ -257,10 +294,9 @@ _Noreturn void kernel_main(void) {
 
         fat32_t  fs;
         int      mnt = -1, op = -1;
-        int32_t  rd = -1;
         uint32_t fclus = 0, fsize = 0;
         uint32_t data_off = 0, data_len = 0, wrate = 0;
-        int      wav_ok = -1;
+        int      hdr_ok = -1;
         if (sig == 0xAA55u && fat_lba != 0) {
             uart_puts("core: [fat32] mount + open TEST.WAV\n");
             /* The MBR partition-start LBA may be in the disk's native
@@ -276,11 +312,14 @@ _Noreturn void kernel_main(void) {
                 op = fat32_open(&fs, "TEST.WAV", &fclus, &fsize);
             }
             if (op == 0) {
-                uint32_t want = fsize < sizeof wav_buf ? fsize : sizeof wav_buf;
-                uart_puts("core: loading TEST.WAV to RAM (this takes a moment)\n");
-                rd = fat32_read_file(&fs, fclus, wav_buf, want);
-                if (rd > 0) {
-                    wav_ok = wav_parse((const uint8_t *)wav_buf, (uint32_t)rd,
+                /* Read just the header region (not the whole file) and parse
+                 * it: wav_parse scans for the 'data' chunk and reports where
+                 * the PCM starts + how long it is. Streaming begins there. */
+                fat32_stream_t hs;
+                fat32_stream_open(&hs, &fs, fclus, fsize);
+                int32_t hn = fat32_stream_read(&hs, hdr_buf, sizeof hdr_buf);
+                if (hn > 0) {
+                    hdr_ok = wav_parse(hdr_buf, (uint32_t)hn, fsize,
                                        &data_off, &data_len, &wrate);
                 }
             }
@@ -288,9 +327,11 @@ _Noreturn void kernel_main(void) {
 
         /* One diagnostic screen (single silicon-proven present):
          *   SIG  = MBR signature (AA55).  MNT/OP = fat32 mount/open rc (0).
-         *   RD   = bytes preloaded from TEST.WAV.
+         *   DOFF = byte offset of the PCM 'data' chunk in the file.
          *   RATE = WAV sample rate (0000AC44 = 44100).
-         *   DLEN = PCM data-chunk length in bytes. */
+         *   DLEN = PCM data length in bytes (should be ~the whole file, NOT
+         *          clamped to the 4 KB header — a small DLEN means the
+         *          buflen/filelen split regressed). */
         console_clear(bg);
         console_str  (2, 3, "SIG",  CON_WHITE, bg);
         console_hex32(8, 3, sig,               CON_WHITE, bg);
@@ -298,8 +339,8 @@ _Noreturn void kernel_main(void) {
         console_hex32(8, 5, (uint32_t)mnt,     CON_WHITE, bg);
         console_str  (2, 7, "OP",   CON_WHITE, bg);
         console_hex32(8, 7, (uint32_t)op,      CON_WHITE, bg);
-        console_str  (2, 9, "RD",   CON_WHITE, bg);
-        console_hex32(8, 9, (uint32_t)rd,      CON_WHITE, bg);
+        console_str  (2, 9, "DOFF", CON_WHITE, bg);
+        console_hex32(8, 9, data_off,          CON_WHITE, bg);
         console_str  (2, 11, "RATE", CON_WHITE, bg);
         console_hex32(8, 11, wrate,            CON_WHITE, bg);
         console_str  (2, 13, "DLEN", CON_WHITE, bg);
@@ -307,26 +348,47 @@ _Noreturn void kernel_main(void) {
         lcd_present_fb(console_framebuffer());
         uart_puts("core: diagnostic screen presented\n");
 
-        /* Play the track: point the source at the preloaded PCM and let the
-         * DMA-fed backend stream it. Blocks (on the tick) for the clip's
-         * duration while DMA + IRQ refills do the work. */
-        if (wav_ok == 0 && wrate == 44100u) {
-            uart_puts("core: playing TEST.WAV\n");
-            g_pcm        = (const int16_t *)((const uint8_t *)wav_buf + data_off);
-            g_pcm_frames = data_len / 4u;
-            g_pcm_pos    = 0;
-            if (hal_audio_init(44100u, 2u) == 0) {
-                hal_audio_set_source(wav_source, 0);
-                hal_audio_start();
-                /* Play until the source has emitted every frame, then a
-                 * moment more for the FIFO/DMA to drain the tail. */
-                while (g_pcm_pos < g_pcm_frames) {
-                    sleep_ms(100);
+        /* Stream the track: position a fresh cursor at the PCM data start,
+         * prime the ring, then let the DMA-fed backend drain it while the
+         * foreground loop keeps refilling from disk. Plays a whole song —
+         * no 4 MB preload cap. */
+        if (hdr_ok == 0 && wrate == 44100u) {
+            uart_puts("core: streaming TEST.WAV\n");
+
+            /* Position at PCM start: skip data_off header bytes. */
+            fat32_stream_open(&g_pcm_stream, &fs, fclus, fsize);
+            uint32_t to_skip = data_off;
+            while (to_skip > 0) {
+                uint32_t chunk = to_skip < sizeof pump_buf ? to_skip
+                                                           : sizeof pump_buf;
+                int32_t got = fat32_stream_read(&g_pcm_stream, pump_buf, chunk);
+                if (got <= 0) {
+                    break;
                 }
-                sleep_ms(500);
+                to_skip -= (uint32_t)got;
+            }
+
+            /* Whole frames only: a sub-frame tail (data_len not a multiple
+             * of 4) would otherwise strand 1-3 bytes and spin the drain loop
+             * forever, since pump_ring stops below one frame. */
+            g_pcm_remaining = data_len & ~3u;
+            pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
+            pump_ring();                 /* prime before the DAC starts pulling */
+
+            if (hal_audio_init(44100u, 2u) == 0) {
+                hal_audio_set_source(ring_source, 0);
+                hal_audio_start();
+                /* Refill from disk until all PCM is pumped AND the ring has
+                 * drained. sleep_ms yields the CPU between top-ups; the DMA
+                 * ISR is what actually clocks samples out meanwhile. */
+                while (g_pcm_remaining > 0u || pcm_ring_fill(&g_ring) > 0u) {
+                    pump_ring();
+                    sleep_ms(20);
+                }
+                sleep_ms(200);           /* let the FIFO/DMA drain the tail */
                 hal_audio_stop();
             }
-            uart_puts("core: playback done\n");
+            uart_puts("core: streaming done\n");
         }
     } else {
         uart_puts("core: lcd bcm NOT powered, skipping audio + screen\n");
