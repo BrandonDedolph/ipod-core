@@ -63,4 +63,35 @@ int fat32_open(fat32_t *fs, const char *name,
 int32_t fat32_read_file(fat32_t *fs, uint32_t first_clus,
                         void *buf, uint32_t maxlen);
 
+/*
+ * Forward-only streaming cursor over a file's cluster chain. Lets a caller
+ * read a large file in bounded pieces — e.g. a playback pump refilling a
+ * ring buffer — without a RAM buffer big enough for the whole file. Forward
+ * only: there is no seek-back. Open it with the (first_clus, size) pair that
+ * fat32_open returns.
+ */
+typedef struct {
+    fat32_t *fs;
+    uint32_t clus;      /* current cluster (>=2 while data remains, else 0) */
+    uint32_t clus_off;  /* bytes already consumed within the current cluster */
+    uint32_t remaining; /* file bytes not yet returned                       */
+} fat32_stream_t;
+
+/*
+ * Begin streaming `size` bytes of the file that starts at `first_clus`.
+ * Pure initialisation (no I/O) — always succeeds. A size of 0 yields an
+ * immediately-empty stream.
+ */
+void fat32_stream_open(fat32_stream_t *st, fat32_t *fs,
+                       uint32_t first_clus, uint32_t size);
+
+/*
+ * Read up to `len` bytes forward from the cursor into `buf`, following the
+ * cluster chain as needed. Returns the number of bytes read (0 once the
+ * file is exhausted), or negative on a disk read error. A short *non-zero*
+ * return happens only at end-of-file; mid-file the call always fills `len`.
+ * Advances the cursor by the number of bytes returned.
+ */
+int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len);
+
 #endif /* CORE_FS_FAT32_H */

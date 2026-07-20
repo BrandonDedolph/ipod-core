@@ -102,6 +102,70 @@ int main(int argc, char **argv)
     fails += check("partial read (maxlen=100) returns 100 correct bytes",
                    partial_ok);
 
+    /* ---- streaming reader (forward cursor) ----
+     * HELLO.TXT is 3000 bytes of i&0xFF spanning clusters 3->4 at the
+     * 2048-byte (one-cluster) boundary. Read it forward in small 7-byte
+     * chunks and verify every byte, the cross-cluster follow, and clean EOF. */
+    fat32_stream_t st;
+    fat32_stream_open(&st, &fs, clus, size);
+    static uint8_t sbuf[8192];
+    uint32_t spos = 0;
+    int stream_ok = 1;
+    for (;;) {
+        int32_t got = fat32_stream_read(&st, &sbuf[spos], 7);
+        if (got < 0) {
+            stream_ok = 0;
+            break;
+        }
+        if (got == 0) {
+            break;                       /* EOF */
+        }
+        spos += (uint32_t)got;
+        if (spos > sizeof sbuf) {        /* runaway guard */
+            stream_ok = 0;
+            break;
+        }
+    }
+    fails += check("stream (7-byte chunks) totals 3000 bytes", spos == 3000);
+    if (stream_ok) {
+        for (uint32_t i = 0; i < spos; i++) {
+            if (sbuf[i] != (uint8_t)(i & 0xFF)) {
+                stream_ok = 0;
+                printf("  stream mismatch at %u: got %02X want %02X\n",
+                       i, sbuf[i], (uint8_t)(i & 0xFF));
+                break;
+            }
+        }
+    }
+    fails += check("stream (7-byte chunks) content matches across clusters",
+                   stream_ok);
+
+    /* One big read is clamped to the file size (remaining), not the request. */
+    fat32_stream_open(&st, &fs, clus, size);
+    memset(sbuf, 0xCC, sizeof sbuf);
+    int32_t big = fat32_stream_read(&st, sbuf, 4096);
+    int big_ok = (big == 3000);
+    for (int i = 0; i < 3000 && big_ok; i++) {
+        big_ok = sbuf[i] == (uint8_t)(i & 0xFF);
+    }
+    fails += check("stream big read (len>size) returns 3000 correct bytes",
+                   big_ok);
+    fails += check("stream at EOF returns 0",
+                   fat32_stream_read(&st, sbuf, 16) == 0);
+
+    /* Aligned full-sector read (the direct-into-buffer fast path), then the
+     * 952-byte tail in the next cluster — exercises both paths + the follow. */
+    fat32_stream_open(&st, &fs, clus, size);
+    memset(sbuf, 0xCC, sizeof sbuf);
+    int32_t a1 = fat32_stream_read(&st, sbuf, 2048);           /* whole clus 3 */
+    int32_t a2 = fat32_stream_read(&st, &sbuf[2048], 4096);    /* tail, clus 4 */
+    int aligned_ok = (a1 == 2048 && a2 == 952);
+    for (int i = 0; i < 3000 && aligned_ok; i++) {
+        aligned_ok = sbuf[i] == (uint8_t)(i & 0xFF);
+    }
+    fails += check("stream aligned 2048 + 952 tail crosses cluster cleanly",
+                   aligned_ok);
+
     fclose(g_img);
     if (fails == 0) {
         printf("ALL PASS\n");

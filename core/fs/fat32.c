@@ -213,3 +213,68 @@ int32_t fat32_read_file(fat32_t *fs, uint32_t clus, void *buf, uint32_t maxlen)
     }
     return (int32_t)total;
 }
+
+void fat32_stream_open(fat32_stream_t *st, fat32_t *fs,
+                       uint32_t first_clus, uint32_t size)
+{
+    st->fs        = fs;
+    st->clus      = (size == 0) ? 0 : first_clus;
+    st->clus_off  = 0;
+    st->remaining = size;
+}
+
+int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len)
+{
+    fat32_t *fs    = st->fs;
+    uint8_t *out   = (uint8_t *)buf;
+    uint32_t total = 0;
+
+    while (total < len && st->remaining > 0 &&
+           st->clus >= 2 && st->clus < FAT_EOC) {
+        uint32_t sec_in_clus = st->clus_off / fs->bytes_per_sec;
+        uint32_t off_in_sec  = st->clus_off % fs->bytes_per_sec;
+        uint32_t fs_sec      = cluster_fs_sector(fs, st->clus) + sec_in_clus;
+
+        /* How much this iteration can copy: bounded by the request, what's
+         * left of the file, and what's left in the current FS-sector. */
+        uint32_t want = len - total;
+        if (want > st->remaining) {
+            want = st->remaining;
+        }
+        uint32_t sec_avail = fs->bytes_per_sec - off_in_sec;
+        uint32_t take      = want < sec_avail ? want : sec_avail;
+
+        if (off_in_sec == 0 && take == fs->bytes_per_sec) {
+            /* Whole aligned FS-sector straight into the caller's buffer. */
+            if (read_fs_sector(fs, fs_sec, out) != 0) {
+                return -1;
+            }
+        } else {
+            /* Partial sector (head, tail, or sub-sector chunk): stage via
+             * the scratch sector so we copy out exactly `take` bytes. */
+            if (read_fs_sector(fs, fs_sec, fat_scratch) != 0) {
+                return -1;
+            }
+            for (uint32_t i = 0; i < take; i++) {
+                out[i] = fat_scratch[off_in_sec + i];
+            }
+        }
+
+        out           += take;
+        total         += take;
+        st->clus_off  += take;
+        st->remaining -= take;
+
+        /* Advance to the next cluster only when the current one is fully
+         * consumed AND more file remains — so we never walk the FAT (and
+         * risk a spurious read error) once we've returned the last byte. */
+        if (st->clus_off == fs->clus_bytes && st->remaining > 0) {
+            st->clus     = next_cluster(fs, st->clus);
+            st->clus_off = 0;
+            if (st->clus == 0) {
+                return -1;   /* read error walking the FAT */
+            }
+        }
+    }
+    return (int32_t)total;
+}

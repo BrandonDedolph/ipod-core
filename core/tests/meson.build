@@ -172,6 +172,18 @@ if target == 'sim'
     test('fat32', fat32_test, args: [fat32_img], suite: 'unit')
   endif
 
+  # pcm-ring: the SPSC PCM ring that decouples the streaming disk pump
+  # (producer) from the DMA-completion ISR (consumer). Portable logic, no
+  # MMIO — verifies free/fill accounting, over-write / under-read clamping,
+  # the power-of-two wrap, and end-to-end FIFO byte integrity across many
+  # wrap cycles.
+  pcm_ring_test = executable(
+    'pcm_ring_test',
+    sources: ['kernel/pcm_ring_test.c', '../kernel/pcm_ring.c'],
+    include_directories: include_directories('../kernel'),
+  )
+  test('pcm-ring', pcm_ring_test, suite: 'unit')
+
   # hw-console: the on-screen debug console (framebuffer + 8x8 hex font).
   # Pure rendering logic, no MMIO — verifies glyph output pixel-for-pixel.
   console_test = executable(
