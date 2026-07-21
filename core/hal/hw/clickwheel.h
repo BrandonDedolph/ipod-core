@@ -121,4 +121,9 @@ bool clickwheel_get_event(wheel_event_t *ev);
 /* True while the hold switch is engaged (a single cheap GPIO read). */
 bool clickwheel_hold(void);
 
+/* Current held-button set (WHEEL_BTN_* bitmask) from the last tick sample —
+ * the LIVE state, vs clickwheel_get_event's latched down-edges. For long-press
+ * detection (e.g. hold PLAY to power off). 0 while held/before bring-up. */
+uint8_t clickwheel_buttons(void);
+
 #endif /* CORE_HAL_HW_CLICKWHEEL_H */

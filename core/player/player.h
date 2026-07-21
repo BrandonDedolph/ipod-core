@@ -55,7 +55,14 @@ void player_pump(void);
 /* Stop playback (does NOT close the decoder — see header note). */
 void player_stop(void);
 
-/* 1 while a track is decoding + the DAC is running. */
+/* Pause / resume the current track (suspends the DAC, holds decoder+position);
+ * toggle picks the opposite. No-ops when nothing is loaded. */
+void player_pause(void);
+void player_resume(void);
+void player_toggle_pause(void);
+int  player_paused(void);              /* 1 while paused */
+
+/* 1 while a track is loaded (playing OR paused). */
 int  player_active(void);
 
 /* Now-playing readouts (valid while active; elapsed/buf return 0 otherwise). */

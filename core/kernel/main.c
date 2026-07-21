@@ -19,6 +19,7 @@
 #include "hw/backlight.h"
 #include "hw/battery.h"
 #include "hw/i2c.h"
+#include "hw/power.h"
 #include "hal.h"
 #include "../fs/fat32.h"
 #include "../player/player.h"
@@ -898,9 +899,11 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
     bs[5] = (char)('0' + p % 10);
     bs[6] = '\0';
     ui_text(14, 208, bs, FONT_SMALL, p < 20u ? LINEN_ACCENT : LINEN_MUTED);
-    const char *hint = "menu: back";
+    /* Show PAUSED (accent) when suspended, else the back hint. */
+    const char *hint = player_paused() ? "paused" : "menu: back";
     int wh = text_width(hint, FONT_SMALL);
-    ui_text(LCD_WIDTH - 14 - wh, 208, hint, FONT_SMALL, LINEN_MUTED);
+    ui_text(LCD_WIDTH - 14 - wh, 208, hint, FONT_SMALL,
+            player_paused() ? LINEN_ACCENT : LINEN_MUTED);
 
     /* Volume overlay rides on top for ~1.5 s after a wheel adjustment. */
     if (mmio_read32(USEC_TIMER_ADDR) < g_vol_show_until) {
@@ -1052,6 +1055,21 @@ static void paint_current_screen(void)
     }
 }
 
+/* Quiesce and enter PMU deep-sleep standby (triggered by holding PLAY). Stops
+ * audio + the decode/disk feed, blanks the panel + backlight, then hands off to
+ * the PMU. Never returns — a button press wakes the device by re-running the
+ * boot path (a cold boot of the firmware, not a resume). */
+_Noreturn static void enter_standby(void)
+{
+    player_stop();
+    backlight_set(0);
+    console_clear(0x0000);
+    lcd_present_fb(console_framebuffer());
+    power_standby();                      /* PMU cuts power — does not return */
+    for (;;) {
+    }
+}
+
 /*
  * The UI: one event loop that pumps the background player every pass and
  * dispatches input to the current screen (Main menu / Music menu / Browser /
@@ -1086,6 +1104,8 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      hold_prev = clickwheel_hold() ? 1 : 0;  /* seed hold-edge detect    */
     int      ext_prev  = power_is_external() ? 1 : 0; /* seed plug-in edge detect */
     int      lock_flashing = 0;          /* a lock/unlock plate is on screen     */
+    int      play_held = 0;              /* PLAY currently down (long-press off)  */
+    uint32_t play_down_us = 0;           /* when PLAY went down                   */
     g_locked = hold_prev;
 
     /* Backlight inactivity: full -> dim -> off. Any input wakes to full; a press
@@ -1116,6 +1136,21 @@ _Noreturn static void run_ui(fat32_t *fs)
             dirty = 1;
         }
         ext_prev = ext;
+
+        /* Long-press PLAY (~2s) powers the device off (deep-sleep standby). Uses
+         * the LIVE button state so it tracks a continuous hold; a short PLAY tap
+         * is play/pause (handled on the down-edge below). Ignored while locked. */
+        if (!g_locked && (clickwheel_buttons() & WHEEL_BTN_PLAY)) {
+            uint32_t nowp = mmio_read32(USEC_TIMER_ADDR);
+            if (!play_held) {
+                play_held = 1;
+                play_down_us = nowp;
+            } else if ((uint32_t)(nowp - play_down_us) > 2000000u) {
+                enter_standby();          /* does not return */
+            }
+        } else {
+            play_held = 0;
+        }
 
         /* Auto-advance re-inits the codec (resetting its gain), so re-apply our
          * volume whenever the playing track changes. */
@@ -1156,6 +1191,12 @@ _Noreturn static void run_ui(fat32_t *fs)
                     ev.buttons = 0;
                     ev.wheel_delta = 0;
                 }
+            }
+            /* Play/Pause is global — the PLAY button toggles playback from any
+             * screen (like a real iPod). */
+            if ((ev.buttons & WHEEL_BTN_PLAY) && player_active()) {
+                player_toggle_pause();
+                dirty = 1;
             }
             switch (scr_cur()) {
             case SCR_MENU:

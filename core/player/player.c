@@ -304,8 +304,10 @@ static fat32_t       *g_pl_fs;
 static browse_entry_t g_queue[BROWSE_MAX];
 static int            g_queue_n;
 static int            g_queue_idx;
-static int            g_pl_active;        /* a track is decoding + DMA running   */
+static int            g_pl_active;        /* a track is loaded (playing OR paused) */
+static int            g_pl_paused;         /* DMA suspended, position held          */
 static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start    */
+static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (freezes clock) */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
 
@@ -362,8 +364,44 @@ static int player_open_current(void)
     g_pl_start_us = mmio_read32(USEC_TIMER_ADDR);
     g_pl_low_fill = RING_FRAMES;
     g_pl_active   = 1;
+    g_pl_paused   = 0;
     return 0;
 }
+
+/* Pause: suspend the DMA but keep the decoder, ring, and position — resume
+ * re-primes the DAC from the still-full ring. Freezes the elapsed clock. */
+void player_pause(void)
+{
+    if (!g_pl_active || g_pl_paused) {
+        return;
+    }
+    hal_audio_stop();
+    g_pl_pause_us = mmio_read32(USEC_TIMER_ADDR);
+    g_pl_paused   = 1;
+}
+
+/* Resume from pause: shift the track start forward by the paused duration so the
+ * elapsed clock is continuous, then restart the DAC (re-primes from the ring). */
+void player_resume(void)
+{
+    if (!g_pl_active || !g_pl_paused) {
+        return;
+    }
+    g_pl_start_us += mmio_read32(USEC_TIMER_ADDR) - g_pl_pause_us;
+    g_pl_paused    = 0;
+    hal_audio_start();
+}
+
+void player_toggle_pause(void)
+{
+    if (g_pl_paused) {
+        player_resume();
+    } else {
+        player_pause();
+    }
+}
+
+int player_paused(void) { return g_pl_paused; }
 
 /* Stop playback and release the decoder. */
 void player_stop(void)
@@ -372,6 +410,7 @@ void player_stop(void)
         return;
     }
     hal_audio_stop();
+    g_pl_paused = 0;
     /* NOTE: do NOT close the decoder here. Closing it MID-DECODE (song switch)
      * hard-freezes the device (marker 9), while closing at end-of-track
      * (auto-advance) is fine — a decode-in-progress teardown hazard. The next
@@ -430,8 +469,8 @@ void player_play_queue(const browse_entry_t *src, int n, int start,
  * main-loop pass, so audio runs in the background while the UI is elsewhere. */
 void player_pump(void)
 {
-    if (!g_pl_active) {
-        return;
+    if (!g_pl_active || g_pl_paused) {
+        return;                          /* paused: hold the ring + position     */
     }
     decode_step();
     /* Refill the anti-skip buffer in bounded bursts, but only while the PCM ring
@@ -459,7 +498,8 @@ uint32_t player_elapsed_s(void)
     if (!g_pl_active) {
         return 0;
     }
-    return (mmio_read32(USEC_TIMER_ADDR) - g_pl_start_us) / 1000000u;
+    uint32_t nowu = g_pl_paused ? g_pl_pause_us : mmio_read32(USEC_TIMER_ADDR);
+    return (nowu - g_pl_start_us) / 1000000u;
 }
 
 uint32_t player_total_s(void) { return g_pl_total_s; }

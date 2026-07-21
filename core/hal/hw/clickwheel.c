@@ -53,6 +53,7 @@ static volatile bool    s_touched;       /* last-sampled finger-touch state  */
 static volatile bool    s_hold_edge;     /* a hold transition is pending     */
 static volatile bool    s_hold_state;    /* hold state to report on that edge*/
 static volatile bool    s_armed;         /* service() is a no-op until init  */
+static volatile uint8_t s_btn_live;      /* current mapped buttons (held state) */
 
 /*
  * Tiny nestable critical section, mirroring kernel/irq.h
@@ -304,6 +305,7 @@ void clickwheel_service(void)
         s_pending_btn = 0;
         s_accum_delta = 0;
         s_touched     = false;
+        s_btn_live    = 0;
         s_hold_state  = hold;
         s_hold_edge   = true;
         return;
@@ -316,6 +318,7 @@ void clickwheel_service(void)
     if (!cw_read_sample(&s)) {
         return;
     }
+    s_btn_live = s.btn_map;      /* current held-button set (for long-press) */
 
     /* Latch. The sampler runs only in the timer ISR, so it cannot be
      * preempted by the main-loop drain; no critical section is needed on
@@ -366,4 +369,13 @@ bool clickwheel_get_event(wheel_event_t *ev)
     ev->touched     = touched;
     ev->hold        = false;
     return true;
+}
+
+/* Current held-button set (WHEEL_BTN_* bitmask), as of the last tick sample.
+ * Unlike clickwheel_get_event (which reports latched down-EDGES), this reports
+ * the live state — used for long-press detection (e.g. hold PLAY to power off).
+ * 0 while Hold is engaged or before bring-up. */
+uint8_t clickwheel_buttons(void)
+{
+    return s_btn_live;
 }
