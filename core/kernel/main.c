@@ -238,6 +238,22 @@ static void split_artist_album(const char *name, char *artist, char *album)
     copy_display_name(album, name + sep + 3, 0);
 }
 
+/* Strip a leading track-number prefix ("NN. " / "NN.") from a track filename so
+ * the tracklist shows a clean title (the row's own number gutter provides the
+ * index). Only a digits-then-'.' prefix is removed, so titles that merely start
+ * with a number ("99 Luftballons") are left alone. */
+static const char *track_display(const char *name)
+{
+    const char *p = name;
+    while (*p >= '0' && *p <= '9') p++;
+    if (p != name && *p == '.') {
+        p++;
+        while (*p == ' ') p++;
+        if (*p) return p;
+    }
+    return name;
+}
+
 /* MP3 playback is parked: dr_mp3's float synthesis can't hit real-time on this
  * FPU-less CPU (buffer starves -> stutter), and FLAC is lossless so there's no
  * quality reason to prefer it. The device is FLAC-only; a companion loader app
@@ -405,7 +421,8 @@ static void status_strip_render(void)
 {
     /* Left: playing track (or the wordmark when idle). Clipped by the right
      * cluster, which is painted over it. */
-    const char *left = player_active() ? player_track_name() : "CORE";
+    const char *left = player_active() ? track_display(player_track_name())
+                                       : "CORE";
     ui_text(12, STATUS_Y0 + 11, left, FONT_SMALL, LINEN_MUTED2);
 
     /* Clear a right-hand region so a long track name can't collide with it. */
@@ -668,8 +685,9 @@ static void detail_render(int sel)
         u32_to_dec(num, (unsigned)(idx + 1));
         int nw = text_width(num, FONT_SMALL);
         ui_text(30 - nw, ry + 15, num, FONT_SMALL, nc);
-        /* Title, indented past the number gutter. */
-        ui_text(38, ry + 15, e->name, is_sel ? FONT_HEADER : FONT_ROW, fg);
+        /* Title (clean — number gutter provides the index), indented past it. */
+        ui_text(38, ry + 15, track_display(e->name),
+                is_sel ? FONT_HEADER : FONT_ROW, fg);
         /* The playing track gets the animated bars on the right. */
         if (playing && !e->is_dir && name_eq_ci(e->name, playing)) {
             nowplaying_bars(LCD_WIDTH - 22, ry + 7,
@@ -1085,7 +1103,7 @@ static void queue_render(int sel)
         int idx = top + r;
         if (idx >= n) break;
         int is_sel = (idx == sel);
-        list_row(r, player_queue_name(idx), 0, 0, 0, is_sel,
+        list_row(r, track_display(player_queue_name(idx)), 0, 0, 0, is_sel,
                  player_queue_is_dir(idx), 0);
         if (idx == cur) {                 /* the currently-playing track */
             int ry = LIST_Y0 + r * ROW_H;
@@ -1235,7 +1253,7 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
 
     /* Track title from tags (falls back to the filename), + "artist · album". */
     const flac_meta_t *m = player_meta();
-    const char *title = (m->have && m->title[0]) ? m->title : name;
+    const char *title = (m->have && m->title[0]) ? m->title : track_display(name);
     ui_text(14, 148, title, FONT_TITLE, LINEN_INK);
     if (m->have && (m->artist[0] || m->album[0])) {
         char sub[136];
