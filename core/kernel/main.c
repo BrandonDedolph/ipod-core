@@ -29,6 +29,8 @@
 #include "cache.h"
 #include "console.h"
 #include "../ui/text.h"
+#include "../ui/thumb.h"
+#include "hw/volume.h"
 
 /*
  * Idle-task CPU sleep. Program the per-core countdown to wake this core
@@ -262,6 +264,21 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
  * Design-matched list chrome (menus.jsx): status strip, header, rows, scrollbar
  * ------------------------------------------------------------------------- */
 
+/* Hold-switch lock state. While g_locked, all wheel/button input is swallowed
+ * (playback keeps running); a brief plate flashes on the engage/disengage edge,
+ * and a small padlock stays in the status strip while held. */
+static int      g_locked;
+static uint32_t g_lock_flash_until;
+
+/* Small padlock glyph (system-screens.jsx corner lock): body + shackle. */
+static void draw_lock_glyph(int x, int y, uint16_t c)
+{
+    console_fill_rect(x,     y + 4, 8, 6, c);   /* body      */
+    console_fill_rect(x + 1, y,     2, 5, c);   /* left post */
+    console_fill_rect(x + 5, y,     2, 5, c);   /* right post*/
+    console_fill_rect(x + 1, y,     6, 2, c);   /* top arch  */
+}
+
 /* Cached battery/power readout. The gauge read is an I2C transaction (slow, and
  * shares the codec bus), so sample it a few seconds apart — NOT every present —
  * and hold the last value. mv/pct < 0 means the read failed / not yet sampled. */
@@ -318,8 +335,14 @@ static void status_strip_render(void)
     int bx = LCD_WIDTH - 12 - 19;             /* battery block (17 + 2 nub)        */
     draw_battery(bx, STATUS_Y0 + 3, g_bat_pct);
 
-    /* Raw mV to the left of the glyph (calibration aid). */
-    if (g_bat_mv > 0) {
+    /* Persistent padlock while Hold is engaged (design keeps it in the strip). */
+    if (g_locked) {
+        draw_lock_glyph(bx - 14, STATUS_Y0 + 3, LINEN_INK);
+    }
+
+    /* Raw mV to the left of the glyph (calibration aid). Hidden while locked so
+     * it doesn't collide with the padlock. */
+    if (g_bat_mv > 0 && !g_locked) {
         char mv[8];
         int v = g_bat_mv, i = 0;
         char tmp[8]; int t = 0;
@@ -348,13 +371,14 @@ static void header_render(const char *title, const char *right, int back)
     console_fill_rect(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, LINEN_BORDER);
 }
 
-/* One list row (menus.jsx Row). Selected = filled ink bar + light bold text;
- * greyed = muted (inactive menu item). Optional sub-line, right value, chevron,
- * and a leading 22x22 art chip (RGB565, or NULL). */
-static void list_row(int r, const char *text, const char *sub, const char *right,
-                     int chevron, int selected, int greyed, const uint16_t *chip)
+/* One list row (menus.jsx Row) at list origin `y0`. Selected = filled ink bar +
+ * light bold text; greyed = muted (inactive menu item). Optional sub-line, right
+ * value, chevron, and a leading 22x22 art chip (RGB565, or NULL). */
+static void list_row_at(int y0, int r, const char *text, const char *sub,
+                        const char *right, int chevron, int selected, int greyed,
+                        const uint16_t *chip)
 {
-    int ry = LIST_Y0 + r * ROW_H;
+    int ry = y0 + r * ROW_H;
     uint16_t fg, subc, rightc, chevc;
     if (selected) {
         console_fill_rect(6, ry + 1, LCD_WIDTH - 16, ROW_H - 2, LINEN_SEL_BG);
@@ -383,14 +407,22 @@ static void list_row(int r, const char *text, const char *sub, const char *right
     }
 }
 
-/* Slim right-edge scrollbar (menus.jsx Scrollbar); no-op when everything fits. */
-static void scrollbar_render(int top, int visible, int total)
+/* Convenience: a row in the default (full-height) list. */
+static void list_row(int r, const char *text, const char *sub, const char *right,
+                     int chevron, int selected, int greyed, const uint16_t *chip)
+{
+    list_row_at(LIST_Y0, r, text, sub, right, chevron, selected, greyed, chip);
+}
+
+/* Slim right-edge scrollbar (menus.jsx Scrollbar); no-op when everything fits.
+ * `y0` is the list origin (differs between the full list and the detail view). */
+static void scrollbar_render(int y0, int top, int visible, int total)
 {
     if (total <= visible) {
         return;
     }
-    int track_y = LIST_Y0;
-    int track_h = LCD_HEIGHT - LIST_Y0 - 4;
+    int track_y = y0;
+    int track_h = LCD_HEIGHT - y0 - 4;
     console_fill_rect(LCD_WIDTH - 4, track_y, 3, track_h, LINEN_SB_TRK);
     int thumb_h = (visible * track_h) / total;
     if (thumb_h < 16) thumb_h = 16;
@@ -400,40 +432,171 @@ static void scrollbar_render(int top, int visible, int total)
     console_fill_rect(LCD_WIDTH - 4, thumb_y, 3, thumb_h, LINEN_SB_THMB);
 }
 
-static void browse_render(int sel, int top)
+/* Windowed-list scroll origin (menus.jsx useScrollWindow): keep the selection
+ * about 1/3 from the top, clamped to the ends. Pure function — the browser
+ * derives the visible window from the selection each paint (no separate top
+ * state to keep in sync). */
+static int scroll_window(int sel, int total, int visible)
+{
+    if (total <= visible) return 0;
+    int start = sel - visible / 3;
+    if (start < 0) start = 0;
+    if (start > total - visible) start = total - visible;
+    return start;
+}
+
+/* Format "a / b" into dst (needs >= 12 bytes). */
+static void fmt_count(char *dst, int a, int b)
+{
+    int i = 0, v, t; char nb[6];
+    v = a; t = 0; do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
+    while (t > 0) dst[i++] = nb[--t];
+    dst[i++] = ' '; dst[i++] = '/'; dst[i++] = ' ';
+    v = b; t = 0; do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
+    while (t > 0) dst[i++] = nb[--t];
+    dst[i] = '\0';
+}
+
+/* ---------------------------------------------------------------------------
+ * Album detail view (collection-detail.jsx AlbumDetail): a 56x56 art hero with
+ * title + track count, then the folder's tracklist. Shown when you enter an
+ * album folder (browser depth > 0). The hero art is the entered folder's
+ * folder.art, downscaled on-device to 56x56 (thumb_downscale_rgb565).
+ * ------------------------------------------------------------------------- */
+#define DET_HERO_Y   42                   /* art hero top                         */
+#define DET_ART      56                   /* hero art dimension                   */
+#define DET_LIST_Y0  108                  /* tracklist first row top              */
+#define DET_ROWS     6                     /* visible track rows                   */
+
+#define ART_RAW_MAX  (12 + 120 * 120 * 2)  /* a full 120x120 CoreArt file          */
+static uint8_t  g_art_scratch[ART_RAW_MAX];      /* raw folder.art read buffer      */
+static uint16_t g_detail_art[DET_ART * DET_ART]; /* downscaled 56x56 hero           */
+static int      g_detail_art_ok;
+static char     g_album_title[NAME_MAX + 1];
+static int      g_album_track_n;                  /* playable files in the folder   */
+
+/* Read the current folder's folder.art (clus/size captured by browse_load) and
+ * downscale it to the 56x56 hero. Leaves g_detail_art_ok=0 if absent/malformed.
+ * Same CoreArt "CART" validation the player uses (player.c load_folder_art). */
+static void detail_art_load(fat32_t *fs)
+{
+    g_detail_art_ok = 0;
+    if (g_art_clus == 0 || g_art_size < 12 || g_art_size > sizeof g_art_scratch) {
+        return;
+    }
+    int32_t n = fat32_read_file(fs, g_art_clus, g_art_scratch, g_art_size);
+    if (n < 12) {
+        return;
+    }
+    if (g_art_scratch[0] != 'C' || g_art_scratch[1] != 'A' ||
+        g_art_scratch[2] != 'R' || g_art_scratch[3] != 'T') {
+        return;
+    }
+    int w = g_art_scratch[6] | (g_art_scratch[7] << 8);
+    int h = g_art_scratch[8] | (g_art_scratch[9] << 8);
+    if (w <= 0 || h <= 0 || w > 120 || h > 120) {
+        return;
+    }
+    if ((int32_t)(12 + w * h * 2) > n) {
+        return;
+    }
+    thumb_downscale_rgb565((const uint16_t *)(g_art_scratch + 12), w, h,
+                           g_detail_art, DET_ART, DET_ART);
+    g_detail_art_ok = 1;
+}
+
+/* Three-bar "now playing" glyph (collection-detail.jsx NowPlayingDot). */
+static void nowplaying_bars(int x, int y, uint16_t c)
+{
+    console_fill_rect(x,     y + 3, 2, 6, c);
+    console_fill_rect(x + 3, y,     2, 9, c);
+    console_fill_rect(x + 6, y + 4, 2, 5, c);
+}
+
+static void detail_render(int sel)
 {
     console_clear(LINEN_SURFACE);
     status_strip_render();
+    char right[12];
+    fmt_count(right, sel + 1, g_browse_n > 0 ? g_browse_n : 1);
+    header_render("Albums", right, 1);
 
+    /* Hero art (or a placeholder tile when the folder has no folder.art). */
+    if (g_detail_art_ok) {
+        console_blit565(12, DET_HERO_Y, DET_ART, DET_ART, g_detail_art);
+    } else {
+        console_fill_rect(12, DET_HERO_Y, DET_ART, DET_ART, LINEN_BORDER);
+    }
+    int tx = 12 + DET_ART + 12;
+    ui_text(tx, DET_HERO_Y + 18, g_album_title, FONT_HEADER, LINEN_INK);
+    char meta[24];
+    { int i = 0, v = g_album_track_n, t = 0; char nb[6];
+      do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
+      while (t > 0) meta[i++] = nb[--t];
+      for (const char *p = " tracks"; *p; p++) meta[i++] = *p;
+      meta[i] = '\0'; }
+    ui_text(tx, DET_HERO_Y + 40, meta, FONT_SMALL, LINEN_MUTED2);
+
+    console_fill_rect(12, DET_LIST_Y0 - 6, LCD_WIDTH - 24, 1, LINEN_BORDER);
+
+    if (g_browse_n == 0) {
+        ui_text(14, DET_LIST_Y0 + 14, "Empty folder", FONT_ROW, LINEN_MUTED);
+        return;
+    }
+    int top = scroll_window(sel, g_browse_n, DET_ROWS);
+    const char *playing = player_active() ? player_track_name() : 0;
+    for (int r = 0; r < DET_ROWS; r++) {
+        int idx = top + r;
+        if (idx >= g_browse_n) break;
+        const browse_entry_t *e = &g_browse[idx];
+        int is_sel = (idx == sel);
+        list_row_at(DET_LIST_Y0, r, e->name, 0, 0, 0, is_sel, 0, 0);
+        /* Mark the track that's currently playing with the three-bar glyph. */
+        if (playing && !e->is_dir && name_eq_ci(e->name, playing)) {
+            int ry = DET_LIST_Y0 + r * ROW_H;
+            nowplaying_bars(LCD_WIDTH - 22, ry + 7,
+                            is_sel ? LINEN_SEL_FG : LINEN_INK);
+        }
+    }
+    scrollbar_render(DET_LIST_Y0, top, DET_ROWS, g_browse_n);
+}
+
+/* Album LIST (browser depth 0): the folder list with the design chrome. Album
+ * art chips per row are deferred (they need a thumbnail cache preloaded off the
+ * audio path — see status_and_next); the hero art in detail_render lands first. */
+static void albumlist_render(int sel)
+{
+    console_clear(LINEN_SURFACE);
+    status_strip_render();
     char right[12];
     if (g_browse_n > 0) {
-        /* "sel+1 / n" position counter (design ScreenHeader right slot). */
-        int a = sel + 1, b = g_browse_n, i = 0;
-        char nb[6]; int t = 0, v = a;
-        do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
-        while (t > 0) right[i++] = nb[--t];
-        right[i++] = ' '; right[i++] = '/'; right[i++] = ' ';
-        t = 0; v = b;
-        do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
-        while (t > 0) right[i++] = nb[--t];
-        right[i] = '\0';
+        fmt_count(right, sel + 1, g_browse_n);
     } else {
         right[0] = '\0';
     }
-    header_render(g_dir_depth > 0 ? "Folder" : "Albums", right, 1);
+    header_render("Albums", right, 1);
 
     if (g_browse_n == 0) {
         ui_text(14, LIST_Y0 + 20, "Empty folder", FONT_ROW, LINEN_MUTED);
         return;
     }
+    int top = scroll_window(sel, g_browse_n, LIST_ROWS);
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
         if (idx >= g_browse_n) break;
         const browse_entry_t *e = &g_browse[idx];
-        /* Folders get a chevron; tracks are bare (no per-track duration yet). */
         list_row(r, e->name, 0, 0, e->is_dir, idx == sel, 0, 0);
     }
-    scrollbar_render(top, LIST_ROWS, g_browse_n);
+    scrollbar_render(LIST_Y0, top, LIST_ROWS, g_browse_n);
+}
+
+static void browse_render(int sel)
+{
+    if (g_dir_depth > 0) {
+        detail_render(sel);
+    } else {
+        albumlist_render(sel);
+    }
 }
 
 /* Boot splash: Nunito CORE branding on the Linen surface the moment the panel
@@ -458,6 +621,77 @@ static void fmt_time(char *buf, uint32_t s)
     buf[i++] = (char)('0' + ss / 10);
     buf[i++] = (char)('0' + ss % 10);
     buf[i]   = '\0';
+}
+
+/* Output volume (WM8758 codec gain, 0..100) + how long the on-screen overlay
+ * stays up after the last wheel tick (volume-demo.jsx: show ~1.5 s then fade). */
+static int      g_volume = 70;
+static uint32_t g_vol_show_until;
+
+/* Centered volume overlay plate (volume-demo.jsx VolumeOverlay): speaker glyph +
+ * ink fill bar + big percent, on a light near-surface plate. */
+static void volume_overlay_render(int vol)
+{
+    const int PX = 60, PY = 101, PW = 200, PH = 32;
+    console_fill_rect(PX, PY, PW, PH, 0xFFDEu);            /* light plate         */
+    console_fill_rect(PX, PY, PW, 1, LINEN_BORDER);        /* 1px border          */
+    console_fill_rect(PX, PY + PH - 1, PW, 1, LINEN_BORDER);
+    console_fill_rect(PX, PY, 1, PH, LINEN_BORDER);
+    console_fill_rect(PX + PW - 1, PY, 1, PH, LINEN_BORDER);
+
+    /* Minimal speaker glyph: a small box + a growing cone. */
+    int sx = PX + 14, sy = PY + PH / 2;
+    console_fill_rect(sx, sy - 3, 3, 6, LINEN_INK);
+    for (int k = 0; k < 5; k++) {
+        console_fill_rect(sx + 3 + k, sy - 1 - k, 1, 2 + 2 * k, LINEN_INK);
+    }
+
+    /* Fill bar. */
+    int bx = PX + 34, by = PY + PH / 2 - 3, bw = PW - 34 - 42, bh = 6;
+    console_fill_rect(bx, by, bw, bh, 0xDEFBu);            /* track rgba(ink,0.12) */
+    int fw = bw * vol / 100;
+    if (fw < 0) fw = 0;
+    if (fw > bw) fw = bw;
+    console_fill_rect(bx, by, fw, bh, LINEN_INK);
+
+    /* Percent, right-aligned. */
+    char p[5]; int i = 0, v = vol, t = 0; char nb[4];
+    do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 3);
+    while (t > 0) p[i++] = nb[--t];
+    p[i] = '\0';
+    int w = text_width(p, FONT_SUB);
+    ui_text(PX + PW - 14 - w, PY + PH / 2 + 4, p, FONT_SUB, LINEN_INK);
+}
+
+/* Bigger padlock for the lock/unlock plate: body + shackle (open leans/shifts). */
+static void draw_lock_icon(int cx, int cy, int open, uint16_t c)
+{
+    console_fill_rect(cx - 9, cy, 18, 14, c);        /* body            */
+    int s = open ? -3 : 0;                            /* open: shift arch */
+    console_fill_rect(cx - 6 + s, cy - 8, 2, 8, c);  /* left post       */
+    console_fill_rect(cx + 4 + s, cy - 8, 2, 8, c);  /* right post      */
+    console_fill_rect(cx - 6 + s, cy - 9, 12, 2, c); /* top arch        */
+}
+
+/* Centered lock/unlock plate (system-screens.jsx LockedScreen/UnlockedScreen):
+ * LOCKED = dark plate + light closed lock; UNLOCKED = light plate + dark open
+ * lock. Drawn over whatever screen is currently in the framebuffer. */
+static void lock_plate_render(int locked)
+{
+    const int PX = 70, PY = 65, PW = 180, PH = 110;
+    uint16_t plate = locked ? LINEN_INK : LINEN_SURFACE;
+    uint16_t fg    = locked ? LINEN_SURFACE : LINEN_INK;
+    console_fill_rect(PX, PY, PW, PH, plate);
+    if (!locked) {                                    /* border on the light plate */
+        console_fill_rect(PX, PY, PW, 1, LINEN_BORDER);
+        console_fill_rect(PX, PY + PH - 1, PW, 1, LINEN_BORDER);
+        console_fill_rect(PX, PY, 1, PH, LINEN_BORDER);
+        console_fill_rect(PX + PW - 1, PY, 1, PH, LINEN_BORDER);
+    }
+    draw_lock_icon(PX + PW / 2, PY + 34, !locked, fg);
+    const char *label = locked ? "LOCKED" : "UNLOCKED";
+    int w = text_width(label, FONT_HEADER);
+    ui_text(PX + (PW - w) / 2, PY + 84, label, FONT_HEADER, fg);
 }
 
 /* Now-playing (Linen): album art up top, track title + elapsed/total clock and
@@ -504,6 +738,11 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
     const char *hint = "menu: back";
     int wh = text_width(hint, FONT_SMALL);
     ui_text(LCD_WIDTH - 14 - wh, 208, hint, FONT_SMALL, LINEN_MUTED);
+
+    /* Volume overlay rides on top for ~1.5 s after a wheel adjustment. */
+    if (mmio_read32(USEC_TIMER_ADDR) < g_vol_show_until) {
+        volume_overlay_render(g_volume);
+    }
 }
 
 /* Now-playing animated strip: the album art (y 8..128) is static for a track,
@@ -592,7 +831,7 @@ static void      scr_pop(void)        { if (g_scr_n > 1) g_scr_n--; }
 static screen_t  scr_cur(void)        { return g_scr[g_scr_n - 1]; }
 
 /* Browser view state (was local to the old browse loop). */
-static int g_br_sel, g_br_top, g_br_accum;
+static int g_br_sel, g_br_accum;
 
 /* (Re)enumerate the directory at cluster `dir_clus` into g_browse. */
 static void browse_load(fat32_t *fs, uint32_t dir_clus)
@@ -602,6 +841,17 @@ static void browse_load(fat32_t *fs, uint32_t dir_clus)
     g_art_clus = 0;                      /* re-captured by browse_collect below */
     g_art_size = 0;
     fat32_readdir(fs, dir_clus, browse_collect, 0);
+}
+
+/* After entering an album folder: load its hero art + count its playable tracks
+ * (for the detail view's "N tracks" line). */
+static void detail_load_meta(fat32_t *fs)
+{
+    detail_art_load(fs);
+    g_album_track_n = 0;
+    for (int i = 0; i < g_browse_n; i++) {
+        if (!g_browse[i].is_dir) g_album_track_n++;
+    }
 }
 
 /* Apply a wheel event to a selection index in [0, count) with acceleration. */
@@ -619,6 +869,21 @@ static int wheel_move(int sel, int count, int8_t delta, int *accum)
     return sel;
 }
 
+/* Render whatever screen is on top of the stack into the framebuffer (no
+ * present) — used to paint context behind the lock/unlock plate. */
+static void paint_current_screen(void)
+{
+    switch (scr_cur()) {
+    case SCR_MENU:    main_menu_render();  break;
+    case SCR_MUSIC:   music_menu_render(); break;
+    case SCR_BROWSER: browse_render(g_br_sel); break;
+    case SCR_NOWPLAYING:
+        nowplaying_render(player_track_name(), player_elapsed_s(),
+                          player_total_s(), player_buf_pct());
+        break;
+    }
+}
+
 /*
  * The UI: one event loop that pumps the background player every pass and
  * dispatches input to the current screen (Main menu / Music menu / Browser /
@@ -630,9 +895,10 @@ _Noreturn static void run_ui(fat32_t *fs)
     clickwheel_init();
     player_init(fs);
     battery_refresh(1);                   /* prime the status-strip gauge         */
+    g_volume = hal_volume_get();          /* reflect the codec's default gain      */
     g_dir_depth = 0;
     g_browse_n  = 0;
-    g_br_sel = g_br_top = g_br_accum = 0;
+    g_br_sel = g_br_accum = 0;
     g_main_sel  = 0;
     g_music_sel = MU_ALBUMS;
     g_menu_accum = 0;
@@ -642,7 +908,11 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      dirty = 1;
     uint32_t np_last = 0xFFFFFFFFu;
     int      np_first = 1;
+    int      np_vol_prev = 0;            /* volume overlay was up last NP paint  */
     uint32_t last_present = 0;           /* rate-limit UI presents while playing */
+    int      hold_prev = clickwheel_hold() ? 1 : 0;  /* seed hold-edge detect    */
+    int      lock_flashing = 0;          /* a lock/unlock plate is on screen     */
+    g_locked = hold_prev;
 
     /* Backlight inactivity: full -> dim -> off. Any input wakes to full; a press
      * that wakes from fully-OFF is swallowed (it just lights the screen, the way
@@ -657,8 +927,24 @@ _Noreturn static void run_ui(fat32_t *fs)
         player_pump();
         battery_refresh(0);               /* self-throttled ~5s gauge resample     */
 
+        /* Hold-switch edge (a cheap GPIO read, independent of the wheel block
+         * which is gated off while held): flash the lock/unlock plate and toggle
+         * the input lock. Playback is untouched. */
+        int held = clickwheel_hold() ? 1 : 0;
+        if (held != hold_prev) {
+            hold_prev = held;
+            g_locked  = held;
+            g_lock_flash_until = mmio_read32(USEC_TIMER_ADDR) + 1000000u;
+            last_input = mmio_read32(USEC_TIMER_ADDR);   /* wake the backlight    */
+            if (bl_state != BL_FULL) {
+                backlight_set(BACKLIGHT_MAX);
+                bl_state = BL_FULL;
+            }
+            dirty = 1;
+        }
+
         wheel_event_t ev;
-        if (clickwheel_poll(&ev)) {
+        if (!g_locked && clickwheel_poll(&ev)) {
             last_input = mmio_read32(USEC_TIMER_ADDR);
             if (bl_state != BL_FULL) {
                 int was_off = (bl_state == BL_OFF);
@@ -701,7 +987,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                     if (g_music_sel == MU_ALBUMS) {
                         g_dir_depth = 0;
                         browse_load(fs, fs->root_clus);
-                        g_br_sel = g_br_top = g_br_accum = 0;
+                        g_br_sel = g_br_accum = 0;
                         scr_push(SCR_BROWSER);
                     }
                     /* other items are greyed: SELECT does nothing yet */
@@ -718,20 +1004,24 @@ _Noreturn static void run_ui(fat32_t *fs)
                 if (ev.wheel_delta && g_browse_n > 0) {
                     g_br_sel = wheel_move(g_br_sel, g_browse_n,
                                           ev.wheel_delta, &g_br_accum);
-                    if (g_br_sel < g_br_top)               g_br_top = g_br_sel;
-                    if (g_br_sel >= g_br_top + LIST_ROWS)  g_br_top = g_br_sel - (LIST_ROWS - 1);
-                    dirty = 1;
+                    dirty = 1;                    /* window derived at paint time  */
                 }
                 if ((ev.buttons & WHEEL_BTN_SELECT) && g_browse_n > 0) {
                     if (g_browse[g_br_sel].is_dir) {
                         if (g_dir_depth < DIR_STACK_MAX) {
+                            /* Capture the album name BEFORE browse_load overwrites
+                             * g_browse, then load its tracklist + hero art. */
+                            copy_display_name(g_album_title,
+                                              g_browse[g_br_sel].name, 0);
                             g_dir_stack[g_dir_depth++] = g_cur_dir;
                             browse_load(fs, g_browse[g_br_sel].clus);
-                            g_br_sel = g_br_top = g_br_accum = 0;
+                            detail_load_meta(fs);
+                            g_br_sel = g_br_accum = 0;
                         }
                     } else {
                         player_play_queue(g_browse, g_browse_n, g_br_sel,
                                           g_art_clus, g_art_size);
+                        hal_volume_set(g_volume);  /* re-apply over codec re-init */
                         scr_push(SCR_NOWPLAYING);
                         np_first = 1;
                     }
@@ -740,7 +1030,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                 if (ev.buttons & WHEEL_BTN_MENU) {
                     if (g_dir_depth > 0) {              /* up a directory */
                         browse_load(fs, g_dir_stack[--g_dir_depth]);
-                        g_br_sel = g_br_top = g_br_accum = 0;
+                        if (g_dir_depth > 0) {
+                            detail_load_meta(fs);       /* re-enter parent album  */
+                        }
+                        g_br_sel = g_br_accum = 0;
                     } else {                            /* back to the music menu */
                         scr_pop();
                     }
@@ -749,6 +1042,14 @@ _Noreturn static void run_ui(fat32_t *fs)
                 break;
 
             case SCR_NOWPLAYING:
+                if (ev.wheel_delta) {                    /* wheel = volume        */
+                    g_volume += ev.wheel_delta * 3;      /* ~3% per detent        */
+                    if (g_volume < 0)   g_volume = 0;
+                    if (g_volume > 100) g_volume = 100;
+                    hal_volume_set(g_volume);
+                    g_vol_show_until = mmio_read32(USEC_TIMER_ADDR) + 1500000u;
+                    dirty = 1;
+                }
                 if (ev.buttons & WHEEL_BTN_MENU) {
                     scr_pop();                          /* back, keep playing */
                     dirty = 1;
@@ -767,6 +1068,29 @@ _Noreturn static void run_ui(fat32_t *fs)
             bl_state = BL_OFF;
         }
 
+        /* Lock/unlock plate takes over the screen for ~1s on a Hold edge. Paint
+         * the context + plate once, hold it, then repaint underneath when it
+         * fades. Suppresses the normal render while up. */
+        uint32_t now_us = mmio_read32(USEC_TIMER_ADDR);
+        if (now_us < g_lock_flash_until) {
+            if (!lock_flashing && bl_state != BL_OFF) {
+                paint_current_screen();
+                lock_plate_render(g_locked);
+                lcd_present_fb(console_framebuffer());
+                dirty = 0;
+            }
+            lock_flashing = 1;
+            /* Only throttle when idle; keep audio paced while playing. */
+            if (!player_active()) {
+                for (volatile uint32_t d = 0; d < (1u << 15); d++) { }
+            }
+            continue;                     /* skip the normal render this pass      */
+        }
+        if (lock_flashing) {              /* plate just faded: repaint underneath  */
+            lock_flashing = 0;
+            dirty = 1;
+        }
+
         /* Render the current screen (skipped entirely when the screen is off —
          * saves the IRQ-masked present while music plays dark). Now Playing
          * repaints ~1/s for the clock; menus/browser only on change. */
@@ -774,10 +1098,14 @@ _Noreturn static void run_ui(fat32_t *fs)
             /* nothing to draw */
         } else if (scr_cur() == SCR_NOWPLAYING) {
             uint32_t elapsed = player_elapsed_s();
-            if (dirty || elapsed != np_last) {
+            /* The volume overlay straddles the static-art band, so a partial
+             * present can't clear it — force a full present while it's up (and
+             * for the one frame after it fades, to erase it). */
+            int vol_active = mmio_read32(USEC_TIMER_ADDR) < g_vol_show_until;
+            if (dirty || elapsed != np_last || vol_active || np_vol_prev) {
                 nowplaying_render(player_track_name(), elapsed,
                                   player_total_s(), player_buf_pct());
-                if (np_first || dirty) {
+                if (np_first || dirty || vol_active || np_vol_prev) {
                     lcd_present_fb(console_framebuffer());
                     np_first = 0;
                 } else {
@@ -785,6 +1113,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                                      0, NP_ANIM_Y, LCD_WIDTH, NP_ANIM_H);
                 }
                 np_last = elapsed;
+                np_vol_prev = vol_active;
                 player_note_presented();
                 dirty = 0;
             }
@@ -799,7 +1128,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                 switch (scr_cur()) {
                 case SCR_MENU:    main_menu_render();            break;
                 case SCR_MUSIC:   music_menu_render();           break;
-                case SCR_BROWSER: browse_render(g_br_sel, g_br_top); break;
+                case SCR_BROWSER: browse_render(g_br_sel); break;
                 default: break;                 /* NOWPLAYING handled above */
                 }
                 lcd_present_fb(console_framebuffer());
@@ -905,6 +1234,7 @@ _Noreturn void kernel_main(void) {
          * Bounded/idempotent — hal_audio_init re-inits it harmlessly per track. */
         i2c_init();
         battery_init();
+        hal_volume_init();               /* codec output gain -> safe default      */
 
         /* Paint the boot splash immediately, so the panel shows CORE branding
          * instead of the chainloader's leftover framebuffer (a blue field with
