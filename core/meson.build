@@ -178,6 +178,19 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Settings subsystem (ours): a data-driven settings_t model + a matching
+  # renderer for the Settings screens (design_reference menus.jsx + ThemePicker).
+  # settings.c is pure model logic (no framebuffer/hardware — the SAME source the
+  # host settings_test compiles); screen_settings.c draws it via the Nunito text
+  # renderer + console fill_rect. main.c owns the settings_t state + navigation
+  # and calls these generically. No libc/libm/malloc; relative includes only
+  # (settings.h, ui/text.h, ../kernel/console.h, ../hal/hal.h); stays -Werror.
+  settings_hw_lib = static_library(
+    'core_settings_hw',
+    sources: ['ui/settings.c', 'ui/screen_settings.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Background streaming playback engine (ours): the FLAC/MP3 decode path, the
   # SPSC PCM ring feeding the DMA DAC, the fat32 byte-source + read-ahead glue,
   # album art, and the queue/auto-advance player — extracted out of kernel/main.c
@@ -194,7 +207,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, player_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

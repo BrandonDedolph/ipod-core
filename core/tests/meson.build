@@ -101,6 +101,19 @@ if target == 'sim'
   )
   test('thumb', thumb_test, suite: 'unit')
 
+  # settings: the Settings state model (core/ui/settings.c) — the SAME source the
+  # ARM build links into core.elf. Pure model logic (no framebuffer/hardware), so
+  # it compiles with plain cc. Asserts defaults, that activate() toggles Shuffle
+  # and cycles Repeat OFF->ALL->ONE->OFF, that adjust() clamps Volume/Bass and
+  # Display Brightness to range, that Backlight cycles its discrete list, and that
+  # Root rows return the right ENTER_*/RESET action codes plus value/kind report.
+  settings_test = executable(
+    'settings_test',
+    sources: ['ui/settings_test.c', '../ui/settings.c'],
+    include_directories: include_directories('../ui'),
+  )
+  test('settings', settings_test, suite: 'unit')
+
   tag_mp3_test = executable(
     'tag_mp3_test',
     sources: ['tag_mp3_test.c'],
