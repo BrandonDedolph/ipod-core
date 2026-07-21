@@ -526,16 +526,24 @@ static int scroll_window(int sel, int total, int visible)
     return start;
 }
 
+/* Write unsigned `v` as decimal into `dst`, return the length. The one decimal
+ * writer — replaces the do/while digit-reversal that was open-coded ~8 times. */
+static int u32_to_dec(char *dst, unsigned v)
+{
+    char nb[10];
+    int t = 0;
+    do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v);
+    for (int i = 0; i < t; i++) dst[i] = nb[t - 1 - i];
+    dst[t] = '\0';
+    return t;
+}
+
 /* Format "a / b" into dst (needs >= 12 bytes). */
 static void fmt_count(char *dst, int a, int b)
 {
-    int i = 0, v, t; char nb[6];
-    v = a; t = 0; do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
-    while (t > 0) dst[i++] = nb[--t];
+    int i = u32_to_dec(dst, (unsigned)a);
     dst[i++] = ' '; dst[i++] = '/'; dst[i++] = ' ';
-    v = b; t = 0; do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
-    while (t > 0) dst[i++] = nb[--t];
-    dst[i] = '\0';
+    u32_to_dec(dst + i, (unsigned)b);
 }
 
 /* ---------------------------------------------------------------------------
@@ -630,11 +638,9 @@ static void detail_render(int sel)
         ui_text(tx, DET_HERO_Y + 31, g_album_artist, FONT_SUB, LINEN_MUTED_D);
     }
     char meta[24];
-    { int i = 0, v = g_album_track_n, t = 0; char nb[6];
-      do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
-      while (t > 0) meta[i++] = nb[--t];
-      for (const char *p = " tracks"; *p; p++) meta[i++] = *p;
-      meta[i] = '\0'; }
+    int mi = u32_to_dec(meta, (unsigned)g_album_track_n);
+    for (const char *p = " tracks"; *p; p++) meta[mi++] = *p;
+    meta[mi] = '\0';
     ui_text(tx, DET_HERO_Y + 47, meta, FONT_SMALL, LINEN_MUTED2);
 
     console_fill_rect(12, DET_LIST_Y0 - 6, LCD_WIDTH - 24, 1, LINEN_BORDER);
@@ -658,10 +664,8 @@ static void detail_render(int sel)
         uint16_t nc = is_sel ? LINEN_SEL_SUB : LINEN_MUTED2;
         /* Track number, right-aligned in a small left gutter (collection-detail
          * .jsx numbers the rows). */
-        char num[6]; int ni = 0, nv = idx + 1, nt = 0; char nb[6];
-        do { nb[nt++] = (char)('0' + nv % 10); nv /= 10; } while (nv && nt < 5);
-        while (nt > 0) num[ni++] = nb[--nt];
-        num[ni] = '\0';
+        char num[6];
+        u32_to_dec(num, (unsigned)(idx + 1));
         int nw = text_width(num, FONT_SMALL);
         ui_text(30 - nw, ry + 15, num, FONT_SMALL, nc);
         /* Title, indented past the number gutter. */
@@ -827,6 +831,7 @@ static int        g_songs_n;
 static uint16_t   g_song_sorted[LIB_MAX_SONGS];   /* song indices, title order  */
 static char       g_genres[LIB_MAX_GENRES][LIB_GENRE_MAX];
 static int        g_genres_n;
+static int        g_genre_count[LIB_MAX_GENRES]; /* songs per genre (precomputed) */
 static int        g_lib_scanned;
 
 /* Scan temporaries (kept off the browser's g_browse). */
@@ -937,6 +942,12 @@ static void library_scan(fat32_t *fs)
         }
         g_song_sorted[j + 1] = v;
     }
+    /* Precompute per-genre song counts (was O(n) per row per paint). */
+    for (int i = 0; i < g_genres_n; i++) g_genre_count[i] = 0;
+    for (int i = 0; i < g_songs_n; i++) {
+        int g = g_songs[i].genre;
+        if (g >= 0 && g < g_genres_n) g_genre_count[g]++;
+    }
     g_lib_scanned = 1;
 }
 
@@ -962,13 +973,6 @@ static void songview_build(int genre)
         }
     }
     g_song_sel = g_song_accum = 0;
-}
-
-static int genre_song_count(int g)
-{
-    int c = 0;
-    for (int i = 0; i < g_songs_n; i++) if (g_songs[i].genre == g) c++;
-    return c;
 }
 
 /* fat32 callback: collect a folder's playable files (+ its art) as a queue,
@@ -1048,10 +1052,7 @@ static void genres_render(int sel)
         int idx = top + r;
         if (idx >= g_genres_n) break;
         char cnt[8];
-        int c = genre_song_count(idx), k = 0, t = 0; char nb[6];
-        do { nb[t++] = (char)('0' + c % 10); c /= 10; } while (c && t < 5);
-        while (t > 0) cnt[k++] = nb[--t];
-        cnt[k] = '\0';
+        u32_to_dec(cnt, (unsigned)g_genre_count[idx]);
         list_row(r, g_genres[idx], 0, cnt, 0, idx == sel, 0, 0);
     }
     scrollbar_render(LIST_Y0, top, LIST_ROWS, g_genres_n);
@@ -1175,10 +1176,8 @@ static void volume_overlay_render(int vol)
     console_fill_rect(bx, by, fw, bh, LINEN_INK);
 
     /* Percent, right-aligned. */
-    char p[5]; int i = 0, v = vol, t = 0; char nb[4];
-    do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 3);
-    while (t > 0) p[i++] = nb[--t];
-    p[i] = '\0';
+    char p[5];
+    u32_to_dec(p, (unsigned)vol);
     int w = text_width(p, text_font_bold_11());       /* percent is 11/700       */
     ui_text(PX + PW - 14 - w, PY + PH / 2 + 4, p, text_font_bold_11(), LINEN_INK);
 }

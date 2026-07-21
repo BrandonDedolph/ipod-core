@@ -195,10 +195,16 @@ int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
                 uint8_t bg_lin = srgb6_to_linear[(bg >> 5)  & 0x3F];
                 uint8_t bb_lin = srgb5_to_linear[ bg        & 0x1F];
 
+                /* Exact floor(x/255) for x in [0,65025] via add-shift — avoids
+                 * three soft-divides (no HW divide on ARM7) per blended pixel,
+                 * the hottest UI inner loop. Bit-identical to `/255`. */
                 uint8_t inv = (uint8_t)(255 - alpha);
-                uint8_t r_lin = (uint8_t)(((uint16_t)ir_lin * alpha + (uint16_t)br_lin * inv) / 255);
-                uint8_t g_lin = (uint8_t)(((uint16_t)ig_lin * alpha + (uint16_t)bg_lin * inv) / 255);
-                uint8_t b_lin = (uint8_t)(((uint16_t)ib_lin * alpha + (uint16_t)bb_lin * inv) / 255);
+                unsigned xr = (unsigned)ir_lin * alpha + (unsigned)br_lin * inv;
+                unsigned xg = (unsigned)ig_lin * alpha + (unsigned)bg_lin * inv;
+                unsigned xb = (unsigned)ib_lin * alpha + (unsigned)bb_lin * inv;
+                uint8_t r_lin = (uint8_t)((xr + 1 + (xr >> 8)) >> 8);
+                uint8_t g_lin = (uint8_t)((xg + 1 + (xg >> 8)) >> 8);
+                uint8_t b_lin = (uint8_t)((xb + 1 + (xb >> 8)) >> 8);
 
                 uint8_t r5 = linear_to_srgb5[r_lin];
                 uint8_t g6 = linear_to_srgb6[g_lin];
