@@ -90,6 +90,13 @@ void clickwheel_init(void)
     if (!s_hold_old) {
         opto_power(true);
     }
+    /* Hard-mask the wheel's shared I2C IRQ (#40 = high-bank bit 8) at the
+     * core. We poll, so it must never reach the CPU — and poll() re-arms
+     * CTRLA (which re-arms that IRQ output) every call, so a button/wheel edge
+     * would otherwise assert #40 into a dispatcher that can't ack it and
+     * livelock the core. Masking it here makes the polled design airtight;
+     * irq_dispatch's reactive high-bank mask is the backstop. */
+    mmio_write32(CPU_HI_INT_DIS_ADDR, 1u << 8);
 }
 
 bool clickwheel_poll(wheel_event_t *ev)
@@ -119,6 +126,14 @@ bool clickwheel_poll(wheel_event_t *ev)
     /* Read + validate one status word. The header gate rejects stale or
      * partially-latched words (03-clickwheel.md, "Packet format"). */
     uint32_t st = mmio_read32(CLICKWHEEL_DATA_ADDR);
+    /* Acknowledge the controller so it latches the NEXT sample. Without this
+     * the OPTO block produces one packet and stalls with its IRQ asserted —
+     * the wheel/buttons read dead (Hold, a plain GPIO read, still works). Ack
+     * CTRLB + re-arm CTRLA every poll, valid data or not, mirroring what the
+     * IRQ path would do (03-clickwheel.md, "Servicing"). */
+    mmio_write32(CLICKWHEEL_CTRLB_ADDR,
+                 mmio_read32(CLICKWHEEL_CTRLB_ADDR) | CW_CTRLB_ACK);
+    mmio_write32(CLICKWHEEL_CTRLA_ADDR, CW_CTRLA_REARM);
     if ((st & CW_STAT_HEADER_MASK) != CW_STAT_HEADER_VALUE) {
         return false;
     }
