@@ -62,6 +62,20 @@ if target == 'sim'
   )
   test('readahead', readahead_test, suite: 'unit')
 
+  # text: the freestanding antialiased text renderer (core/ui/text.c) — the
+  # SAME source the ARM build links into core.elf. Renders "Ag" into a small
+  # RGB565 buffer over a known bg/ink and asserts width is positive+additive
+  # and matches the draw advance, that interior pixels blended toward the ink
+  # (incl. partial-coverage greys, proving the gamma blend ran), that pixels
+  # outside coverage are untouched, and that drawing off every edge writes no
+  # OOB (sentinel guard cells bracket the framebuffer). No MMIO, plain cc.
+  text_test = executable(
+    'text_test',
+    sources: ['ui/text_test.c', '../ui/text.c'],
+    include_directories: include_directories('../ui'),
+  )
+  test('text', text_test, suite: 'unit')
+
   # tcdb-reader: hand-rolls a minimal .tcdb byte string in memory
   # (using the same constants the parser reads) and verifies the
   # parser populates the public tagcache_* accessors correctly.

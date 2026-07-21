@@ -120,11 +120,23 @@ if target == 'hw'
     include_directories: codec_inc,
   )
 
+  # Freestanding antialiased text renderer (ours): draws Nunito type from the
+  # pre-rasterized atlas/*.h data into an RGB565 framebuffer with a gamma-correct
+  # integer blend — no libc/libm/malloc. Same text.c the host text_test compiles;
+  # links into core.elf so the on-device UI can draw real type. Uses only relative
+  # includes (../apps/ui/atlas.h -> ../../hal/hal.h), so no extra include dirs; stays
+  # under -Werror since we own it and it's warning-clean.
+  text_hw_lib = static_library(
+    'core_text_hw',
+    sources: ['ui/text.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   core_elf = executable(
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, text_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

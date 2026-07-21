@@ -1,0 +1,60 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/*
+ * core/ui/text.h — freestanding antialiased bitmap-font text renderer.
+ *
+ * Draws real Nunito type (gamma-correct grayscale AA) into an RGB565
+ * framebuffer. Backed by the pre-rasterized glyph atlases in
+ * core/apps/ui/atlas/ headers (our own data). Builds both host-side (sim
+ * test) and freestanding on bare-metal ARM (-DCORE_FREESTANDING): no
+ * libc, no libm, no malloc — the gamma blend uses static sRGB<->linear
+ * lookup tables, all integer math.
+ *
+ * Coordinate convention: matches the sim's atlas_render — the pen `y`
+ * is the text BASELINE (the bottom of non-descender glyphs), the
+ * standard typography origin. `x` is the left edge of the pen.
+ */
+
+#ifndef CORE_UI_TEXT_H
+#define CORE_UI_TEXT_H
+
+#include <stdint.h>
+
+/* An atlas font handle (opaque wrapper over the atlas.h data). */
+typedef struct text_font text_font_t;
+
+/* The built-in Nunito faces, backed by the atlas data. One getter
+ * per shipped atlas header (regular 9/11/13; bold 9/11/13/17 — there is
+ * no regular-17 atlas in the tree). Each returns a stable pointer to a
+ * .rodata-resident handle; never NULL. */
+const text_font_t *text_font_regular_9(void);
+const text_font_t *text_font_regular_11(void);
+const text_font_t *text_font_regular_13(void);
+const text_font_t *text_font_bold_9(void);
+const text_font_t *text_font_bold_11(void);
+const text_font_t *text_font_bold_13(void);
+const text_font_t *text_font_bold_17(void);
+
+/*
+ * Draw ASCII string `s` into a fb_w x fb_h RGB565 framebuffer (row-major
+ * uint16_t) at pen (x, y), where `y` is the text BASELINE, in colour
+ * `ink` (RGB565). Each glyph's coverage is gamma-correctly alpha-blended
+ * over whatever is already in the framebuffer. Clips to [0,fb_w)x[0,fb_h)
+ * — never writes out of bounds. Non-printable / out-of-range bytes are
+ * advanced by the space width and skipped.
+ *
+ * Returns the pen x after the string (x + sum of advances).
+ */
+int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+              const char *s, const text_font_t *font, uint16_t ink);
+
+/* Pixel width the string would advance, without drawing. */
+int text_width(const char *s, const text_font_t *font);
+
+/* Recommended row spacing (line height) for this face, in pixels. */
+int text_line_height(const text_font_t *font);
+
+/* Pixels above the baseline for this face (for top-origin layout:
+ * baseline_y = top_y + text_ascent(font)). */
+int text_ascent(const text_font_t *font);
+
+#endif /* CORE_UI_TEXT_H */
