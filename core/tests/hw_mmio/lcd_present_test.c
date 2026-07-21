@@ -164,12 +164,216 @@ static int test_lcd_present_subsequent(void)
     return trace_done(&tc);
 }
 
+/* Program the mock so a non-first-frame commit's wait-for-idle poll
+ * (bcm_read32(BCMA_COMMAND)) sees busy, busy-remnant, then idle. */
+static void program_idle_seq(void)
+{
+    mmio_mock_set_read(BCM_CONTROL_ADDR,
+                       BCM_CONTROL_WR_READY | BCM_CONTROL_RD_READY);
+    mmio_mock_set_read(BCM_RD_ADDR_ADDR, BCM_RD_ADDR_READY);
+    const uint32_t idle_seq[] = { BCMCMD_LCD_UPDATE, 0xFFFF, 0x00000000 };
+    mmio_mock_queue_read(BCM_DATA_ADDR, idle_seq, 3);
+}
+
+/* Emit the three wait-for-idle bcm_read32(BCMA_COMMAND) iterations that
+ * bcm_frame_commit runs (after the stream) on a non-first frame. */
+static void expect_wait_for_idle(trace_cursor *tc)
+{
+    for (int it = 0; it < 3; it++) {
+        expect_r(tc, 16, BCM_RD_ADDR_ADDR);            /* RD_ADDR_READY poll */
+        expect_w(tc, 32, BCM_RD_ADDR_ADDR, BCMA_COMMAND);
+        expect_r(tc, 16, BCM_CONTROL_ADDR);            /* RD_READY poll */
+        expect_r(tc, 32, BCM_DATA_ADDR);               /* status word */
+    }
+}
+
+/* Emit the shared LCD_UPDATE command + strobe that ends every present. */
+static void expect_command_strobe(trace_cursor *tc)
+{
+    expect_write_addr(tc, BCMA_COMMAND);
+    expect_w(tc, 32, BCM_DATA_ADDR, BCMCMD_LCD_UPDATE);
+    expect_w(tc, 16, BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
+}
+
+/*
+ * Full-width, partial-height rect (x=0, y=8, w=320, h=16) — the row-band
+ * case our UI hits most. Because it is full-width the rows are contiguous
+ * in BCM memory, so the grammar is: ONE write-addr at BCMA_CMDPARAM +
+ * y*stride, then exactly w*h/2 = 2560 packed words read at the RIGHT
+ * stride (source row y+r), then the shared idle-wait + command + strobe.
+ *
+ * Mutation guard: the expected words are computed from fb[(y+r)*W + c],
+ * so an implementation that ignored y (wrong stride / wrong source
+ * offset) or streamed the wrong pixel count would diverge from this
+ * golden trace and fail. An explicit first-word check pins the offset.
+ */
+static int test_lcd_present_rect_band(void)
+{
+    const int X = 0, Y = 8, W = 320, H = 16;
+    const uint32_t stride_bytes = (uint32_t)LCD_WIDTH * 2u;
+    const uint32_t rect_words = (uint32_t)(W * H) / 2u;   /* 2560 */
+
+    mmio_mock_reset();
+    program_idle_seq();
+    fill_pattern();
+    lcd_present_rect(g_fb, X, Y, W, H);
+
+    trace_cursor tc = trace_begin("lcd_present_rect_band");
+    /* single contiguous stream starting at row Y */
+    expect_write_addr(&tc, BCMA_CMDPARAM + (uint32_t)Y * stride_bytes);
+    for (uint32_t k = 0; k < rect_words; k++) {
+        const uint16_t *src = &g_fb[(uint32_t)Y * LCD_WIDTH];
+        uint32_t word = ((uint32_t)src[2u * k + 1u] << 16) | src[2u * k];
+        expect_w(&tc, 32, BCM_DATA_ADDR, word);
+    }
+    expect_wait_for_idle(&tc);
+    expect_command_strobe(&tc);
+    trace_expect_end(&tc);
+
+    int fails = trace_done(&tc);
+
+    /* Explicit stride pin on the first streamed word: must be
+     * (fb[Y*W+1] << 16) | fb[Y*W], NOT (fb[1]<<16)|fb[0] — the latter is
+     * what a stride-ignoring bug would emit. */
+    const mmio_event *log = mmio_mock_log();
+    size_t len = mmio_mock_log_len();
+    uint32_t first_data = 0;
+    int found = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (log[i].op == MMIO_OP_WRITE && log[i].width == 32 &&
+            log[i].addr == BCM_DATA_ADDR) {
+            first_data = log[i].value; found = 1; break;
+        }
+    }
+    uint32_t want = ((uint32_t)g_fb[(uint32_t)Y * LCD_WIDTH + 1u] << 16) |
+                    g_fb[(uint32_t)Y * LCD_WIDTH];
+    if (!found || first_data != want) {
+        fprintf(stderr,
+                "[lcd_present_rect_band] FAIL: first word = %08X, "
+                "expected %08X (fb[Y*W+1]<<16 | fb[Y*W])\n",
+                found ? first_data : 0u, want);
+        fails++;
+    }
+
+    /* Explicit pixel-count pin: data writes = rect words + 1 command. */
+    size_t pixel_writes = mmio_mock_count(MMIO_OP_WRITE, BCM_DATA_ADDR) - 1u;
+    if (pixel_writes != rect_words) {
+        fprintf(stderr,
+                "[lcd_present_rect_band] FAIL: %zu pixel writes, "
+                "expected %u\n", pixel_writes, rect_words);
+        fails++;
+    } else {
+        printf("[lcd_present_rect_band] %u pixel words at row-%d stride "
+               "(w*h/2)\n", rect_words, Y);
+    }
+    return fails;
+}
+
+/*
+ * Arbitrary (narrower-than-full) rect (x=4, y=8, w=8, h=4). Both x and w
+ * are already even, so no rounding. Grammar: per row, a write-addr at
+ * BCMA_CMDPARAM + (y+r)*stride + x*2, then w/2 = 4 words read at the
+ * per-row source offset (y+r)*W + x — proving BOTH the destination
+ * per-row re-address (the inter-row gap) AND the source stride.
+ */
+static int test_lcd_present_rect_arbitrary(void)
+{
+    const int X = 4, Y = 8, W = 8, H = 4;
+    const uint32_t stride_bytes = (uint32_t)LCD_WIDTH * 2u;
+    const uint32_t row_words = (uint32_t)W / 2u;          /* 4 */
+
+    mmio_mock_reset();
+    program_idle_seq();
+    fill_pattern();
+    lcd_present_rect(g_fb, X, Y, W, H);
+
+    trace_cursor tc = trace_begin("lcd_present_rect_arbitrary");
+    for (int r = 0; r < H; r++) {
+        uint32_t row = (uint32_t)(Y + r);
+        expect_write_addr(&tc,
+            BCMA_CMDPARAM + row * stride_bytes + (uint32_t)X * 2u);
+        const uint16_t *src = &g_fb[row * (uint32_t)LCD_WIDTH + (uint32_t)X];
+        for (uint32_t k = 0; k < row_words; k++) {
+            uint32_t word = ((uint32_t)src[2u * k + 1u] << 16) | src[2u * k];
+            expect_w(&tc, 32, BCM_DATA_ADDR, word);
+        }
+    }
+    expect_wait_for_idle(&tc);
+    expect_command_strobe(&tc);
+    trace_expect_end(&tc);
+
+    int fails = trace_done(&tc);
+
+    /* Pixel-count pin: 4 rows * 4 words + 1 command word. */
+    size_t pixel_writes = mmio_mock_count(MMIO_OP_WRITE, BCM_DATA_ADDR) - 1u;
+    if (pixel_writes != row_words * (uint32_t)H) {
+        fprintf(stderr,
+                "[lcd_present_rect_arbitrary] FAIL: %zu pixel writes, "
+                "expected %u\n", pixel_writes, row_words * (uint32_t)H);
+        fails++;
+    }
+    return fails;
+}
+
+/*
+ * A full-frame rect must reproduce the exact full-frame grammar — this is
+ * the guarantee that lets lcd_present_fb delegate to lcd_present_rect.
+ * Same golden trace as test_lcd_present_subsequent, but driven through
+ * the rect entry point.
+ */
+static int test_lcd_present_rect_fullframe(void)
+{
+    mmio_mock_reset();
+    program_idle_seq();
+    fill_pattern();
+    lcd_present_rect(g_fb, 0, 0, LCD_WIDTH, LCD_HEIGHT);
+
+    trace_cursor tc = trace_begin("lcd_present_rect_fullframe");
+    expect_write_addr(&tc, BCMA_CMDPARAM);
+    for (unsigned i = 0; i < FRAME_WORDS; i++) {
+        expect_w(&tc, 32, BCM_DATA_ADDR, expected_pair(i));
+    }
+    expect_wait_for_idle(&tc);
+    expect_command_strobe(&tc);
+    trace_expect_end(&tc);
+    return trace_done(&tc);
+}
+
+/* A zero-area / fully out-of-bounds rect must be a pure no-op: no BCM
+ * traffic at all (and it must NOT flip lcd_first_frame). */
+static int test_lcd_present_rect_noop(void)
+{
+    int fails = 0;
+
+    mmio_mock_reset();
+    program_idle_seq();
+    lcd_present_rect(g_fb, 10, 10, 0, 0);        /* zero area */
+    lcd_present_rect(g_fb, 400, 10, 20, 20);     /* fully right of panel */
+    lcd_present_rect(g_fb, -40, 10, 20, 20);     /* fully left of panel */
+    lcd_present_rect(g_fb, 10, 300, 20, 20);     /* fully below panel */
+
+    if (mmio_mock_log_len() != 0) {
+        fprintf(stderr,
+                "[lcd_present_rect_noop] FAIL: %zu bus events, expected 0\n",
+                mmio_mock_log_len());
+        fails++;
+    } else {
+        printf("[lcd_present_rect_noop] PASS (no BCM traffic)\n");
+    }
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
     /* order matters: the first present flips the file-static
-     * lcd_first_frame flag, so the first-frame case must run first. */
+     * lcd_first_frame flag, so the first-frame case must run first. All
+     * cases after it are non-first-frame (idle-seq programmed). */
     fails += test_lcd_present_first_frame();
     fails += test_lcd_present_subsequent();
+    fails += test_lcd_present_rect_band();
+    fails += test_lcd_present_rect_arbitrary();
+    fails += test_lcd_present_rect_fullframe();
+    fails += test_lcd_present_rect_noop();
     return fails == 0 ? 0 : 1;
 }

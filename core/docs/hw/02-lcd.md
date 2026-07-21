@@ -317,6 +317,54 @@ expected at `0xE00000` with unknown layout. That `0xE00000` figure
 survives only as unverified upstream speculation — the shipped
 ipodloader2 layout above is at `0xE0000`/`0xE0020`.)*
 
+### Partial present — what our driver actually does
+
+Our `lcd_present_rect(fb, x, y, w, h)` does **not** use
+`BCMCMD_LCD_UPDATERECT` (`BCM_CMD(5)`). It uses the safer, better-proven
+mechanism the Rockbox `lcd_update_rect` in "LCD update protocol" above
+uses: the BCM holds a **persistent** 320×240 framebuffer in its own
+SDRAM at `BCMA_CMDPARAM` (`0xE0000`), so we overwrite **only the changed
+pixels there**, at their normal full-frame stride offsets, then issue the
+ordinary full-frame `BCMCMD_LCD_UPDATE` (`BCM_CMD(0)`). The BCM scans out
+its whole framebuffer; the pixels we didn't touch keep last frame's
+values. This trims the ~150 KB pixel upload (the slow PP→BCM bus is the
+real cost) without a new, less-certain command, and it reuses our
+device-proven commit handshake (idle-wait **after** the stream, re-kick,
+`LCD_UPDATE`, `0x31` strobe) unchanged.
+
+Exact BCM traffic our `lcd_present_rect` emits (all addresses are
+BCM-internal; `stride = LCD_WIDTH*2 = 640` bytes):
+
+- **Full-width rect** (`w == LCD_WIDTH`, the common row-band case): the
+  rows are contiguous in BCM memory, so it is one address + one stream:
+  1. `bcm_write_addr(BCMA_CMDPARAM + y*stride)`
+  2. stream `w*h` pixels contiguously from `fb + y*LCD_WIDTH`, packed two
+     RGB565 per 32-bit store (low half = even/earlier pixel).
+- **Narrower rect** (`w < LCD_WIDTH`): each destination row is separated
+  by a full-width gap, so re-address per row:
+  - for `r` in `0..h-1`: `bcm_write_addr(BCMA_CMDPARAM + (y+r)*stride +
+    x*2)` then stream that row's `w` pixels from `fb + (y+r)*LCD_WIDTH +
+    x`.
+- then the shared commit: wait-for-idle (skipped on first frame),
+  `bcm_write32(BCMA_COMMAND, BCMCMD_LCD_UPDATE)`, strobe
+  `BCM_CONTROL = 0x31`.
+
+`x` and `w` are forced even before streaming (BCM bus alignment — a
+32-bit store pushes two pixels, so a row must start on an even column and
+span an even count): `w = (w + (x&1) + 1) & ~1; x &= ~1;` (`x` down, `w`
+up, so the rounded rect still covers the request), matching the
+"Constraints" rounding above. A full-frame rect
+(`x=0,y=0,w=LCD_WIDTH,h=LCD_HEIGHT`) reduces to offset 0 + a contiguous
+`LCD_WIDTH*LCD_HEIGHT` stream, i.e. **byte-identical** to the full-frame
+`lcd_present_fb` path — which is why `lcd_present_fb` just calls
+`lcd_present_rect(fb, 0, 0, LCD_WIDTH, LCD_HEIGHT)`.
+
+**Needs on-device visual confirmation** that the BCM framebuffer indeed
+persists untouched regions across a partial `LCD_UPDATE` (Rockbox relies
+on this, but our full-frame path has never depended on it). Source of the
+mechanism: `lcd_update_rect` / `lcd_unblock_and_update` in "LCD update
+protocol" above (Rockbox `lcd-video.c`, verified 2026-06-11).
+
 ## Tearing
 
 There is no vblank synchronization. The BCM may begin reading the

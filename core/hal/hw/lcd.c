@@ -204,6 +204,37 @@ static void bcm_frame_commit(void)
     mmio_write16(BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
 }
 
+/* Byte stride of one framebuffer row in BCM-internal memory: LCD_WIDTH
+ * RGB565 pixels, 2 bytes each (02-lcd.md, "Internal BCM addresses":
+ * pixel (x,y) at offset (LCD_WIDTH*2)*y + x*2 from BCMA_CMDPARAM). */
+#define BCM_ROW_STRIDE_BYTES  ((uint32_t)LCD_WIDTH * 2u)
+
+/*
+ * Stream a contiguous run of `pixels` RGB565 values from `src` to the
+ * BCM data port as packed 32-bit stores — two pixels per store, exactly
+ * the packing lcd_present_fb proved on real 5.5G silicon: the earlier
+ * pixel src[2k] (even, first 16-bit push) in the LOW half, the later
+ * src[2k+1] (odd, second push) in the HIGH half (02-lcd.md,
+ * "Memory-mapped BCM interface" — a 32-bit store is consumed as two
+ * consecutive 16-bit pushes to ascending BCM addresses, low half first
+ * on this little-endian bus). The caller must have already pointed the
+ * write port at the run's start with bcm_write_addr, and `pixels` MUST
+ * be even so the run is a whole number of 32-bit stores (guaranteed by
+ * the even-width rounding in lcd_present_rect and by W*H being even for
+ * a full frame). */
+static void bcm_stream_pixels(const uint16_t *src, uint32_t pixels)
+{
+    uint32_t words = pixels >> 1;
+    uint32_t k = 0;
+
+    while (k < words) {
+        const uint32_t pair = ((uint32_t)src[2u * k + 1u] << 16) |
+                              src[2u * k];
+        mmio_write32(BCM_DATA_ADDR, pair);
+        k++;
+    }
+}
+
 void lcd_fill(uint16_t rgb565)
 {
     /* Solid color: both packed halves are the same pixel, so the
@@ -232,37 +263,101 @@ void lcd_fill(uint16_t rgb565)
     LCD_IRQ_EXIT();
 }
 
-void lcd_present_fb(const uint16_t *fb)
+/*
+ * Present a sub-rectangle of a full-frame (LCD_WIDTH x LCD_HEIGHT,
+ * row-major RGB565) buffer `fb`, streaming only the rect's w*h pixels to
+ * the panel instead of the whole ~150 KB frame — the win for our
+ * row-based UI, which usually redraws one horizontal band.
+ *
+ * Mechanism (cleanroom from 02-lcd.md, "LCD update protocol" — the
+ * documented Rockbox lcd_update_rect, NOT the ipodloader2
+ * BCMCMD_LCD_UPDATERECT / BCM_CMD(5) header path): the BCM keeps a
+ * persistent 320x240 framebuffer in its own SDRAM at BCMA_CMDPARAM. We
+ * overwrite ONLY the changed pixels there — at their normal full-frame
+ * stride offsets — then issue the ordinary full-frame BCMCMD_LCD_UPDATE.
+ * The BCM scans out its whole framebuffer; the untouched regions keep
+ * last frame's pixels. This deliberately reuses the device-proven
+ * bcm_frame_commit() handshake verbatim (idle-wait AFTER the stream,
+ * re-kick, LCD_UPDATE, 0x31 strobe) — the ONLY things that differ from
+ * lcd_present_fb are the write-port start offset and, for a
+ * narrower-than-full rect, a per-row re-address to skip the gap between
+ * rows. We chose this over the UPDATERECT command because it (a) reuses
+ * the crown-jewel commit unchanged and (b) makes a full-frame rect
+ * byte-identical to the proven path, so lcd_present_fb can delegate.
+ *
+ * A fully out-of-bounds or zero-area rect is a safe no-op. x and width
+ * are rounded to even (BCM bus alignment: pixels stream two-per-32-bit-
+ * store, so a row must start on an even column and span an even count;
+ * 02-lcd.md, "LCD update protocol / Constraints" — x down, width up to
+ * still cover the requested region).
+ */
+void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h)
 {
-    uint32_t i = 0;
+    /* Validate + clamp to the panel. Trim a partially off-screen rect;
+     * bail on anything with no on-screen area. */
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (x >= LCD_WIDTH || y >= LCD_HEIGHT || x + w <= 0 || y + h <= 0) {
+        return;
+    }
+    if (x < 0) { w += x; x = 0; }           /* trim off-screen-left  */
+    if (y < 0) { h += y; y = 0; }           /* trim off-screen-above */
+    if (x + w > LCD_WIDTH)  { w = LCD_WIDTH  - x; }
+    if (y + h > LCD_HEIGHT) { h = LCD_HEIGHT - y; }
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    /* Even alignment: grow width to absorb an odd x (rounding x down
+     * adds a left column) and round the span up, then drop x to even.
+     * LCD_WIDTH is even and x is now even, so the re-clamp keeps w even. */
+    w = (w + (x & 1) + 1) & ~1;
+    x &= ~1;
+    if (x + w > LCD_WIDTH) { w = LCD_WIDTH - x; }
+    if (w <= 0 || h <= 0) {
+        return;
+    }
 
     /* Uninterrupted frame stream — see lcd_fill's LCD_IRQ_ENTER note. */
     LCD_IRQ_ENTER();
-    bcm_frame_begin();
 
-    /* (3) Stream the caller's framebuffer as 32-bit stores, two RGB565
-     * pixels per store — same fast path as lcd_fill, only the pixel
-     * source differs.
-     *
-     * Packing / half order (matching lcd_fill's (rgb<<16)|rgb): the BCM
-     * consumes each 32-bit store as two consecutive 16-bit pushes to
-     * ascending BCM-internal framebuffer addresses (02-lcd.md,
-     * "Memory-mapped BCM interface"), and on this little-endian bus the
-     * store's low 16 bits are the first push. Framebuffer offset
-     * ascends with x (02-lcd.md: pixel (x,y) at (LCD_WIDTH*2)*y+(x*2),
-     * RGB565 little-endian), so the earlier pixel fb[2*i] (even x) is
-     * the first push and MUST go in the LOW half, and the later pixel
-     * fb[2*i+1] (odd x) is the second push and goes in the HIGH half.
-     * For a solid frame fb[2*i]==fb[2*i+1], which collapses to exactly
-     * lcd_fill's (rgb<<16)|rgb — so a constant framebuffer streamed
-     * here is byte-identical to lcd_fill's output. */
-    while (i < BCM_FRAME_WORDS) {
-        const uint32_t pair = ((uint32_t)fb[2u * i + 1u] << 16) |
-                              fb[2u * i];
-        mmio_write32(BCM_DATA_ADDR, pair);
-        i++;
+    if (w == LCD_WIDTH) {
+        /* Full-width band: the rect's rows are contiguous in BCM memory
+         * (no inter-row gap), so a single write-addr + one contiguous
+         * stream covers them — exactly like lcd_present_fb. For a full
+         * frame (x=0,y=0,w=W,h=H) the offset is 0 and the pixel count is
+         * W*H, so this reproduces the proven path byte-for-byte. */
+        bcm_write_addr(BCMA_CMDPARAM + (uint32_t)y * BCM_ROW_STRIDE_BYTES);
+        bcm_stream_pixels(fb + (uint32_t)y * LCD_WIDTH,
+                          (uint32_t)w * (uint32_t)h);
+    } else {
+        /* Narrower rect: each destination row is separated by a
+         * full-width gap in BCM memory, so re-point the write port at the
+         * start of every row before streaming that row's w pixels. Source
+         * stride is the full framebuffer width; dest stride is one BCM
+         * row (02-lcd.md, "LCD update protocol", partial-width branch). */
+        for (int r = 0; r < h; r++) {
+            uint32_t row = (uint32_t)(y + r);
+            bcm_write_addr(BCMA_CMDPARAM + row * BCM_ROW_STRIDE_BYTES +
+                           (uint32_t)x * 2u);
+            bcm_stream_pixels(fb + row * (uint32_t)LCD_WIDTH + (uint32_t)x,
+                              (uint32_t)w);
+        }
     }
 
     bcm_frame_commit();
     LCD_IRQ_EXIT();
+}
+
+void lcd_present_fb(const uint16_t *fb)
+{
+    /* A full-frame present is just the whole-panel rectangle. This
+     * delegation is byte-identical to the former hand-written full-frame
+     * loop: lcd_present_rect's w==LCD_WIDTH branch with x=y=0 points the
+     * write port at BCMA_CMDPARAM, streams exactly BCM_FRAME_WORDS packed
+     * words in the same low=even/high=odd order, and commits through the
+     * same bcm_frame_commit() — verified by the hw-lcd-present /
+     * hw-lcd-trace golden traces, which are unchanged. */
+    lcd_present_rect(fb, 0, 0, LCD_WIDTH, LCD_HEIGHT);
 }

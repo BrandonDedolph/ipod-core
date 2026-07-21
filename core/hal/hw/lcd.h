@@ -42,4 +42,23 @@ void lcd_fill(uint16_t rgb565);
  * collide with hal.h (lcd.c includes both). */
 void lcd_present_fb(const uint16_t *fb);
 
+/* Present a sub-rectangle of a full-frame (LCD_WIDTH x LCD_HEIGHT,
+ * row-major RGB565) buffer `fb`, streaming only w*h pixels to the panel
+ * instead of the whole frame. (x,y) is the top-left corner and (w,h) the
+ * size, all in pixels; the rect is clamped/validated to the panel bounds
+ * and a fully out-of-bounds or zero-area rect is a safe no-op. Pixels are
+ * read from `fb` at the full-frame stride: rect-local row r, column c is
+ * fb[(y+r)*LCD_WIDTH + (x+c)].
+ *
+ * x and width are rounded to even (BCM bus alignment: pixels stream two
+ * per 32-bit store) — x down, width up, so the rounded rect still covers
+ * the requested region. Uses the same device-proven BCM handshake as
+ * lcd_present_fb: overwrite only the changed pixels in the BCM's
+ * persistent framebuffer, then the idle-wait-AFTER-stream + re-kick +
+ * BCMCMD_LCD_UPDATE + 0x31 strobe commit (bootloader variant, returns
+ * without waiting for completion). lcd_present_fb is exactly
+ * lcd_present_rect(fb, 0, 0, LCD_WIDTH, LCD_HEIGHT). Same lcd_init()
+ * powered gate applies. See core/docs/hw/02-lcd.md, "Partial present". */
+void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h);
+
 #endif /* CORE_HAL_HW_LCD_H */
