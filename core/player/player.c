@@ -589,3 +589,65 @@ void player_jump(int i)
         player_advance();                /* skip a broken pick */
     }
 }
+
+/* Manual skip to the next playable track. Ignores Repeat-One (a deliberate skip
+ * always moves) and wraps at the end. Shuffle picks a random track. */
+void player_next(void)
+{
+    if (g_queue_n == 0) {
+        return;
+    }
+    hal_audio_stop();
+    g_pl_active = 0;
+    for (int tries = 0; tries <= g_queue_n; tries++) {
+        int nxt = -1;
+        if (g_shuffle) {
+            nxt = queue_random_playable(g_queue_idx);
+        } else {
+            for (int j = g_queue_idx + 1; j < g_queue_n; j++) {
+                if (!g_queue[j].is_dir) { nxt = j; break; }
+            }
+            if (nxt < 0) {                               /* wrap to first */
+                for (int j = 0; j < g_queue_n; j++) {
+                    if (!g_queue[j].is_dir) { nxt = j; break; }
+                }
+            }
+        }
+        if (nxt < 0) return;
+        g_queue_idx = nxt;
+        if (player_open_current() == 0) return;
+    }
+}
+
+/* Manual skip to the previous track — or restart the current one if we're more
+ * than ~3s in (the familiar iPod behaviour). Wraps at the start. */
+void player_prev(void)
+{
+    if (g_queue_n == 0) {
+        return;
+    }
+    if (!g_shuffle && player_elapsed_s() > 3u) {         /* restart current */
+        player_jump(g_queue_idx);
+        return;
+    }
+    hal_audio_stop();
+    g_pl_active = 0;
+    for (int tries = 0; tries <= g_queue_n; tries++) {
+        int prv = -1;
+        if (g_shuffle) {
+            prv = queue_random_playable(g_queue_idx);
+        } else {
+            for (int j = g_queue_idx - 1; j >= 0; j--) {
+                if (!g_queue[j].is_dir) { prv = j; break; }
+            }
+            if (prv < 0) {                               /* wrap to last */
+                for (int j = g_queue_n - 1; j >= 0; j--) {
+                    if (!g_queue[j].is_dir) { prv = j; break; }
+                }
+            }
+        }
+        if (prv < 0) return;
+        g_queue_idx = prv;
+        if (player_open_current() == 0) return;
+    }
+}

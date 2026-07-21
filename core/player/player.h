@@ -89,6 +89,11 @@ const char *player_queue_name(int i);
 int         player_queue_is_dir(int i);
 void        player_jump(int i);
 
+/* Manual track skip (Prev/Next buttons). player_prev restarts the current track
+ * if >~3s in, else goes to the previous; both wrap and ignore Repeat-One. */
+void        player_next(void);
+void        player_prev(void);
+
 /* Album art accessors for the now-playing renderer (the PLAYING folder's art,
  * held across browsing elsewhere). player_art_pixels() is RGB565, w*h. */
 int             player_art_ok(void);

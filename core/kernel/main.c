@@ -1266,10 +1266,20 @@ _Noreturn static void run_ui(fat32_t *fs)
                     ev.wheel_delta = 0;
                 }
             }
-            /* Play/Pause is global — the PLAY button toggles playback from any
-             * screen (like a real iPod). */
+            /* Transport buttons are global (work from any screen while playing),
+             * like a real iPod: PLAY toggles pause, RIGHT/LEFT skip track. */
             if ((ev.buttons & WHEEL_BTN_PLAY) && player_active()) {
                 player_toggle_pause();
+                dirty = 1;
+            }
+            if ((ev.buttons & WHEEL_BTN_RIGHT) && player_active()) {
+                player_next();
+                hal_volume_set(g_volume);         /* re-apply over codec re-init */
+                dirty = 1;
+            }
+            if ((ev.buttons & WHEEL_BTN_LEFT) && player_active()) {
+                player_prev();
+                hal_volume_set(g_volume);
                 dirty = 1;
             }
             switch (scr_cur()) {
