@@ -663,14 +663,22 @@ static void volume_overlay_render(int vol)
     ui_text(PX + PW - 14 - w, PY + PH / 2 + 4, p, FONT_SUB, LINEN_INK);
 }
 
-/* Bigger padlock for the lock/unlock plate: body + shackle (open leans/shifts). */
+/* Bigger padlock for the lock/unlock plate: a body + shackle. Closed = the
+ * shackle sits on the body with both legs down; open = it's swung up-left so
+ * only the left leg meets the body and the right leg floats above it (the gap
+ * reads as unlatched). */
 static void draw_lock_icon(int cx, int cy, int open, uint16_t c)
 {
-    console_fill_rect(cx - 9, cy, 18, 14, c);        /* body            */
-    int s = open ? -3 : 0;                            /* open: shift arch */
-    console_fill_rect(cx - 6 + s, cy - 8, 2, 8, c);  /* left post       */
-    console_fill_rect(cx + 4 + s, cy - 8, 2, 8, c);  /* right post      */
-    console_fill_rect(cx - 6 + s, cy - 9, 12, 2, c); /* top arch        */
+    console_fill_rect(cx - 9, cy, 18, 14, c);            /* body */
+    if (open) {
+        console_fill_rect(cx - 9, cy - 12, 2, 12, c);    /* left leg -> body   */
+        console_fill_rect(cx - 9, cy - 13, 12, 2, c);    /* top arch           */
+        console_fill_rect(cx + 1, cy - 13, 2, 7, c);     /* right leg (floats) */
+    } else {
+        console_fill_rect(cx - 6, cy - 8, 2, 8, c);      /* left leg  */
+        console_fill_rect(cx + 4, cy - 8, 2, 8, c);      /* right leg */
+        console_fill_rect(cx - 6, cy - 9, 12, 2, c);     /* top arch  */
+    }
 }
 
 /* Centered lock/unlock plate (system-screens.jsx LockedScreen/UnlockedScreen):
@@ -1097,25 +1105,39 @@ _Noreturn static void run_ui(fat32_t *fs)
         if (bl_state == BL_OFF) {
             /* nothing to draw */
         } else if (scr_cur() == SCR_NOWPLAYING) {
+            uint32_t nowv    = mmio_read32(USEC_TIMER_ADDR);
             uint32_t elapsed = player_elapsed_s();
-            /* The volume overlay straddles the static-art band, so a partial
-             * present can't clear it — force a full present while it's up (and
-             * for the one frame after it fades, to erase it). */
-            int vol_active = mmio_read32(USEC_TIMER_ADDR) < g_vol_show_until;
-            if (dirty || elapsed != np_last || vol_active || np_vol_prev) {
-                nowplaying_render(player_track_name(), elapsed,
-                                  player_total_s(), player_buf_pct());
-                if (np_first || dirty || vol_active || np_vol_prev) {
+            int vol_active = nowv < g_vol_show_until;
+            int expiring   = np_vol_prev && !vol_active;   /* overlay just faded */
+
+            /* A FULL present is needed only on a real change (dirty) or to erase
+             * the fading volume overlay (it straddles the static-art band, so a
+             * partial present can't clear it). Cap those to ~6fps while playing:
+             * back-to-back full-frame, IRQ-masked pixel pushes were starving the
+             * audio DMA ISR (BUF dropping into the red on a volume sweep). The
+             * once-a-second clock rides the cheap partial present, unthrottled. */
+            int want_full = dirty || expiring;
+            if (want_full) {
+                if (np_first || (uint32_t)(nowv - last_present) >= 150000u) {
+                    nowplaying_render(player_track_name(), elapsed,
+                                      player_total_s(), player_buf_pct());
                     lcd_present_fb(console_framebuffer());
                     np_first = 0;
-                } else {
-                    lcd_present_rect(console_framebuffer(),
-                                     0, NP_ANIM_Y, LCD_WIDTH, NP_ANIM_H);
+                    np_last  = elapsed;
+                    np_vol_prev  = vol_active;
+                    last_present = nowv;
+                    player_note_presented();
+                    dirty = 0;
                 }
+                /* else: throttled — keep dirty set, present in the next window */
+            } else if (elapsed != np_last) {
+                nowplaying_render(player_track_name(), elapsed,
+                                  player_total_s(), player_buf_pct());
+                lcd_present_rect(console_framebuffer(),
+                                 0, NP_ANIM_Y, LCD_WIDTH, NP_ANIM_H);
                 np_last = elapsed;
                 np_vol_prev = vol_active;
                 player_note_presented();
-                dirty = 0;
             }
         } else if (dirty) {
             /* While a song plays, cap menu/browser repaints (~6 fps) so
