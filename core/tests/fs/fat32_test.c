@@ -5,8 +5,9 @@
  * Mounts the synthetic image built by tests/scripts/make_fat32_image.py
  * (BytesPerSector 2048, so sec_ratio = 4; a file spanning two clusters)
  * through a file-backed 512-byte block callback, then checks mount, the
- * 8.3 lookup (case-insensitive, hit + miss), and the file read (full and
- * partial). The image path is argv[1] (passed by meson).
+ * 8.3 lookup (case-insensitive, hit + miss), the VFAT long-name lookup
+ * (Intentions.flac, only findable by long name), and the file read (full
+ * and partial). The image path is argv[1] (passed by meson).
  */
 
 #include "fat32.h"
@@ -75,6 +76,40 @@ int main(int argc, char **argv)
     uint32_t c3, s3;
     fails += check("open NOPE.TXT returns -1",
                    fat32_open(&fs, "NOPE.TXT", &c3, &s3) == -1);
+
+    /* VFAT long name: "Intentions.flac" has a 4-char extension, so its short
+     * name is mangled (INTENT~1.FLA) and it can only be found by long name. */
+    uint32_t lc = 0, ls = 0;
+    fails += check("open Intentions.flac (long name) returns 0",
+                   fat32_open(&fs, "Intentions.flac", &lc, &ls) == 0);
+    fails += check("Intentions.flac first cluster = 5", lc == 5);
+    fails += check("Intentions.flac size = 500", ls == 500);
+
+    /* long-name match is case-insensitive */
+    uint32_t lc2 = 0, ls2 = 0;
+    fails += check("open intentions.FLAC (mixed case) returns 0",
+                   fat32_open(&fs, "intentions.FLAC", &lc2, &ls2) == 0 &&
+                   lc2 == 5 && ls2 == 500);
+
+    /* the mangled 8.3 short name still resolves via the fallback path */
+    uint32_t lc3 = 0, ls3 = 0;
+    fails += check("open INTENT~1.FLA (8.3 fallback) returns 0",
+                   fat32_open(&fs, "INTENT~1.FLA", &lc3, &ls3) == 0 &&
+                   lc3 == 5 && ls3 == 500);
+
+    /* the file's 500 bytes read back correctly (content follows LFN entries) */
+    static uint8_t lbuf[2048];
+    int32_t ln = fat32_read_file(&fs, lc, lbuf, ls);
+    int lfn_content_ok = (ln == 500);
+    for (int i = 0; i < 500 && lfn_content_ok; i++) {
+        lfn_content_ok = lbuf[i] == (uint8_t)((i ^ 0x5A) & 0xFF);
+    }
+    fails += check("Intentions.flac reads 500 correct bytes", lfn_content_ok);
+
+    /* a long name that isn't present still misses */
+    uint32_t c4, s4;
+    fails += check("open Nonexistent.flac returns -1",
+                   fat32_open(&fs, "Nonexistent.flac", &c4, &s4) == -1);
 
     /* full read: 3000 bytes of the i&0xFF pattern, spanning 2 clusters */
     static uint8_t buf[8192];

@@ -6,9 +6,10 @@
  * supplied block-read callback that reads 512-byte sectors, so the same
  * code host-tests against a synthetic image and drives ATA on device.
  * Scope is exactly what "play a file off the disk" needs: mount, find a
- * file by 8.3 name in the root directory, read its bytes. No writes, no
- * subdirectories, no long-filename decoding (LFN entries are skipped and
- * the short 8.3 name is matched).
+ * file in the root directory by name, read its bytes. No writes, no
+ * subdirectories. Lookup matches the VFAT long name (reassembled from the
+ * 0x0F LFN entries, ASCII, case-insensitive, up to a fixed cap) and falls
+ * back to the classic 8.3 short name.
  *
  * The volume's logical sector size (BytesPerSector, e.g. 2048 on the
  * stock iPod 80 GB) is taken from the BPB and translated to the 512-byte
@@ -47,9 +48,11 @@ typedef struct {
 int fat32_mount(fat32_t *fs, fat_read_fn read, void *ud, uint32_t part_lba);
 
 /*
- * Find `name` (an 8.3 name like "TEST.WAV", case-insensitive) in the root
- * directory. On success returns 0 and sets *first_clus and *size (bytes).
- * Returns -1 if not found, negative on a read error.
+ * Find `name` (case-insensitive ASCII) in the root directory. Matches either
+ * the file's VFAT long name (e.g. "Intentions.flac", whose 4-char extension
+ * won't fit 8.3) or its 8.3 short name (e.g. "TEST.WAV"). On success returns
+ * 0 and sets *first_clus and *size (bytes). Returns -1 if not found, negative
+ * on a read error.
  */
 int fat32_open(fat32_t *fs, const char *name,
                uint32_t *first_clus, uint32_t *size);

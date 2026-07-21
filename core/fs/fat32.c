@@ -86,6 +86,95 @@ static void make_83(const char *name, uint8_t out[11])
     }
 }
 
+/* ---- VFAT long-filename (LFN) reassembly ----------------------------- */
+/*
+ * A long name is stored in one or more 0x0F-attribute entries that PRECEDE
+ * the file's 8.3 entry, in reverse order (highest sequence first). Each LFN
+ * entry carries 13 UTF-16LE code units at byte offsets 1..10, 14..25, 28..31,
+ * a 1-based sequence number in byte 0 (bit 0x40 marks the last/first-logical
+ * piece), and the 8.3 checksum in byte 13. We accumulate the pieces by their
+ * sequence index into one flat ASCII buffer, then match the caller's ASCII
+ * name against it. Non-ASCII code points (> 0x7F) become a sentinel that can
+ * never match an ASCII request; names longer than the cap are marked unusable
+ * and simply fall back to the 8.3 match.
+ */
+#define FAT_LFN_MAX 64   /* longest long-name we reassemble (chars); plenty
+                          * for real track filenames, and the buffer stays
+                          * small for a freestanding build */
+
+/* Byte offset of each of the 13 chars inside a 32-byte LFN entry. */
+static const uint8_t lfn_pos[13] = {1,3,5,7,9,14,16,18,20,22,24,28,30};
+
+typedef struct {
+    char lfn[FAT_LFN_MAX];  /* assembled ASCII long name (not NUL-terminated) */
+    int  max_idx;           /* highest slot written, -1 if none               */
+    int  term;              /* terminator (0x0000) position, -1 if none       */
+    int  bad;               /* saw an out-of-range piece -> unusable          */
+} lfn_acc_t;
+
+static void lfn_reset(lfn_acc_t *a)
+{
+    a->max_idx = -1;
+    a->term    = -1;
+    a->bad     = 0;
+}
+
+/* Fold one 0x0F LFN entry into the accumulator. */
+static void lfn_add(lfn_acc_t *a, const uint8_t *e)
+{
+    uint32_t seq = (uint32_t)(e[0] & 0x3Fu);   /* strip the 0x40 last-marker */
+    if (seq == 0) {
+        a->bad = 1;                            /* not a valid sequence index */
+        return;
+    }
+    uint32_t base = (seq - 1u) * 13u;
+    for (int k = 0; k < 13; k++) {
+        uint16_t u   = rd16(&e[lfn_pos[k]]);
+        uint32_t idx = base + (uint32_t)k;
+        if (u == 0x0000) {                     /* name terminator */
+            if (a->term < 0 || (int)idx < a->term) {
+                a->term = (int)idx;
+            }
+        } else if (u == 0xFFFF) {
+            /* padding past the terminator: nothing to store */
+        } else if (idx >= FAT_LFN_MAX) {
+            a->bad = 1;                         /* longer than we handle */
+        } else {
+            a->lfn[idx] = (u > 0x7Fu) ? (char)0x01 : (char)u;
+            if ((int)idx > a->max_idx) {
+                a->max_idx = (int)idx;
+            }
+        }
+    }
+}
+
+/* Length of the assembled long name, or -1 if there isn't a usable one. */
+static int lfn_length(const lfn_acc_t *a)
+{
+    if (a->bad) {
+        return -1;
+    }
+    if (a->term >= 0) {
+        return a->term;
+    }
+    if (a->max_idx >= 0) {
+        return a->max_idx + 1;
+    }
+    return -1;
+}
+
+/* Case-insensitive ASCII compare of `name` against the first `len` chars of
+ * the assembled long name; both must end at the same place. */
+static int lfn_match(const char *name, const char *lfn, int len)
+{
+    for (int i = 0; i < len; i++) {
+        if (name[i] == '\0' || upcase(name[i]) != upcase(lfn[i])) {
+            return 0;
+        }
+    }
+    return name[len] == '\0';
+}
+
 /* ---- public API ------------------------------------------------------ */
 
 int fat32_mount(fat32_t *fs, fat_read_fn read, void *ud, uint32_t part_lba)
@@ -130,6 +219,10 @@ int fat32_open(fat32_t *fs, const char *name,
     uint8_t want[11];
     make_83(name, want);
 
+    /* Long-name pieces accumulate here until their 8.3 entry is reached. */
+    lfn_acc_t acc;
+    lfn_reset(&acc);
+
     uint32_t clus = fs->root_clus;
     while (clus >= 2 && clus < FAT_EOC) {
         uint32_t csec = cluster_fs_sector(fs, clus);
@@ -143,16 +236,31 @@ int fat32_open(fat32_t *fs, const char *name,
                     return -1;              /* end of directory */
                 }
                 if (e[0] == 0xE5) {
-                    continue;               /* deleted */
+                    lfn_reset(&acc);        /* deleted (drop any LFN run) */
+                    continue;
                 }
-                if ((e[11] & 0x0F) == 0x0F || (e[11] & 0x08) != 0) {
-                    continue;               /* LFN fragment or volume label */
+                if ((e[11] & 0x0F) == 0x0F) {
+                    lfn_add(&acc, e);       /* LFN fragment for the next 8.3 */
+                    continue;
                 }
-                int hit = 1;
-                for (int i = 0; i < 11; i++) {
-                    if (e[i] != want[i]) {
-                        hit = 0;
-                        break;
+                if ((e[11] & 0x08) != 0) {
+                    lfn_reset(&acc);        /* volume label */
+                    continue;
+                }
+                /* Real 8.3 entry: try the reassembled long name first, then
+                 * fall back to the classic 8.3 short-name match. */
+                int hit  = 0;
+                int llen = lfn_length(&acc);
+                if (llen >= 0) {
+                    hit = lfn_match(name, acc.lfn, llen);
+                }
+                if (!hit) {
+                    hit = 1;
+                    for (int i = 0; i < 11; i++) {
+                        if (e[i] != want[i]) {
+                            hit = 0;
+                            break;
+                        }
                     }
                 }
                 if (hit) {
@@ -160,6 +268,7 @@ int fat32_open(fat32_t *fs, const char *name,
                     *size = rd32(&e[28]);
                     return 0;
                 }
+                lfn_reset(&acc);            /* LFN run belongs only to this 8.3 */
             }
         }
         clus = next_cluster(fs, clus);
