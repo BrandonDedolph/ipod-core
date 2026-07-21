@@ -242,11 +242,13 @@ void lcd_fill(uint16_t rgb565)
     const uint32_t pair = ((uint32_t)rgb565 << 16) | rgb565;
     uint32_t n = BCM_FRAME_WORDS;
 
-    /* The BCM frame stream must not be interrupted: an ISR (e.g. the 46 ms
-     * audio DMA completion, which flushes the cache) stalling the pixel push
-     * long enough makes the BCM abort the frame — the "2nd present stalls
-     * once audio is running" bug. Present with IRQs masked; the whole frame
-     * is a few ms, well under the DMA buffer's 46 ms, so audio can't underrun. */
+    /* ONLY the pixel stream must be uninterrupted: an ISR stalling the push
+     * mid-stream makes the BCM abort the frame. So mask just the stream — NOT
+     * bcm_frame_commit()'s wait-for-idle spin, which polls the BCM and touches
+     * no pixels. Masking the spin (as the code once did) let a long spin during
+     * back-to-back presents starve the audio DMA ISR (glitches) and, worst case,
+     * stall the tick + audio long enough to hard-freeze mid-present. The audio
+     * ISR touches no BCM state, so it is safe to fire during the spin/commit. */
     LCD_IRQ_ENTER();
     bcm_frame_begin();
 
@@ -259,8 +261,8 @@ void lcd_fill(uint16_t rgb565)
         mmio_write32(BCM_DATA_ADDR, pair);
     }
 
+    LCD_IRQ_EXIT();                       /* unmask before the idle-wait spin */
     bcm_frame_commit();
-    LCD_IRQ_EXIT();
 }
 
 /*
@@ -319,7 +321,8 @@ void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h)
         return;
     }
 
-    /* Uninterrupted frame stream — see lcd_fill's LCD_IRQ_ENTER note. */
+    /* Mask ONLY the pixel stream (see lcd_fill's note); the wait-for-idle in
+     * bcm_frame_commit runs unmasked so the audio DMA ISR can preempt it. */
     LCD_IRQ_ENTER();
 
     if (w == LCD_WIDTH) {
@@ -346,8 +349,8 @@ void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h)
         }
     }
 
+    LCD_IRQ_EXIT();                       /* unmask before the idle-wait spin */
     bcm_frame_commit();
-    LCD_IRQ_EXIT();
 }
 
 void lcd_present_fb(const uint16_t *fb)
