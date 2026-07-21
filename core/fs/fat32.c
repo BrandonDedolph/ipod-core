@@ -86,6 +86,37 @@ static void make_83(const char *name, uint8_t out[11])
     }
 }
 
+/* Format a raw 11-byte on-disk 8.3 field into a NUL-terminated display name.
+ * The stored form is space-padded and split base(8)+ext(3) with no dot
+ * ("HELLO   TXT", "README     "); enumeration needs the human "NAME.EXT"
+ * form. Trailing spaces are trimmed from the base and the extension, and the
+ * '.' is inserted only when an extension actually survives — so a dotless
+ * name stays dotless. `out` must hold at least 13 bytes (8 + 1 + 3 + NUL). */
+static void fmt_83(const uint8_t raw[11], char *out)
+{
+    int o = 0;
+
+    int base_len = 8;
+    while (base_len > 0 && raw[base_len - 1] == ' ') {
+        base_len--;
+    }
+    for (int i = 0; i < base_len; i++) {
+        out[o++] = (char)raw[i];
+    }
+
+    int ext_len = 3;
+    while (ext_len > 0 && raw[8 + ext_len - 1] == ' ') {
+        ext_len--;
+    }
+    if (ext_len > 0) {
+        out[o++] = '.';
+        for (int i = 0; i < ext_len; i++) {
+            out[o++] = (char)raw[8 + i];
+        }
+    }
+    out[o] = '\0';
+}
+
 /* ---- VFAT long-filename (LFN) reassembly ----------------------------- */
 /*
  * A long name is stored in one or more 0x0F-attribute entries that PRECEDE
@@ -277,6 +308,77 @@ int fat32_open(fat32_t *fs, const char *name,
         }
     }
     return -1;   /* not found */
+}
+
+int fat32_readdir_root(fat32_t *fs, fat32_dir_cb cb, void *ud)
+{
+    /* Same root-directory walk as fat32_open — same cluster-chain follow, the
+     * same FS-sector reads, the same LFN reassembly — but instead of matching
+     * a target name we surface every real entry through the callback. The LFN
+     * run accumulates across the 0x0F fragments that precede each 8.3 entry;
+     * we reset it on anything that breaks a run (deleted slot, volume label)
+     * exactly as the lookup path does, so long names bind to the right file. */
+    lfn_acc_t acc;
+    lfn_reset(&acc);
+
+    uint32_t clus = fs->root_clus;
+    while (clus >= 2 && clus < FAT_EOC) {
+        uint32_t csec = cluster_fs_sector(fs, clus);
+        for (uint32_t s = 0; s < fs->sec_per_clus; s++) {
+            if (read_fs_sector(fs, csec + s, fat_scratch) != 0) {
+                return -2;
+            }
+            for (uint32_t o = 0; o + 32u <= fs->bytes_per_sec; o += 32u) {
+                const uint8_t *e = &fat_scratch[o];
+                if (e[0] == 0x00) {
+                    return 0;               /* end of directory: done */
+                }
+                if (e[0] == 0xE5) {
+                    lfn_reset(&acc);        /* deleted (drop any LFN run) */
+                    continue;
+                }
+                if ((e[11] & 0x0F) == 0x0F) {
+                    lfn_add(&acc, e);       /* LFN fragment for the next 8.3 */
+                    continue;
+                }
+                if ((e[11] & 0x08) != 0) {
+                    lfn_reset(&acc);        /* volume label: not a real entry */
+                    continue;
+                }
+
+                /* Real 8.3 entry: build the dirent. Prefer the reassembled
+                 * long name; fall back to the formatted 8.3 short name. The
+                 * name buffer lives in the caller's fat32_dirent_t (their
+                 * stack), and the long name is capped at FAT_LFN_MAX (< 256),
+                 * so it always fits with room for the terminator. */
+                fat32_dirent_t ent;
+                int llen = lfn_length(&acc);
+                if (llen >= 0) {
+                    int i;
+                    for (i = 0; i < llen; i++) {
+                        ent.name[i] = acc.lfn[i];
+                    }
+                    ent.name[i] = '\0';
+                } else {
+                    fmt_83(e, ent.name);
+                }
+                ent.is_dir     = (e[11] & 0x10) ? 1 : 0;
+                ent.first_clus = ((uint32_t)rd16(&e[20]) << 16) | rd16(&e[26]);
+                ent.size       = ent.is_dir ? 0u : rd32(&e[28]);
+
+                lfn_reset(&acc);            /* LFN run belonged to this entry */
+
+                if (cb(ud, &ent) != 0) {
+                    return 0;               /* caller asked to stop early */
+                }
+            }
+        }
+        clus = next_cluster(fs, clus);
+        if (clus == 0) {
+            return -2;
+        }
+    }
+    return 0;
 }
 
 int32_t fat32_read_file(fat32_t *fs, uint32_t clus, void *buf, uint32_t maxlen)

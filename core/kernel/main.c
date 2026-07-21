@@ -1,14 +1,13 @@
 /*
  * core/kernel/main.c — C entry point, called from boot/crt0.S.
  *
- * Phase 1 PR #3 brought up the SER0 debug UART (boot banner — the
- * out-of-band channel every later bring-up step reports through).
- * PR #4 added the first visible sign of life: BCM LCD init plus a
- * red → green → blue solid-fill cycle, narrated over the UART.
- * PR #5 (this one) stands up the cooperative scheduler: after the
- * bring-up narration, kernel_main hands control to a two-task set (a
- * one-shot demo task + an idle task) and never returns. The idle task
- * low-power sleeps the CPU via the per-core countdown between yields.
+ * Boot bring-up (proven on real 5.5G hardware): UART banner, 30 MHz clock,
+ * unified cache, 100 Hz tick + IRQs, then — if the BCM LCD is powered — the
+ * disk/audio stack. From there kernel_main runs the FILE BROWSER: it mounts
+ * the FAT32 volume, enumerates the root directory for playable tracks
+ * (FLAC/MP3), and hands control to a clickwheel-driven list UI. Selecting a
+ * track streams it off the disk through the read-ahead shim into the codec and
+ * out the DMA-fed DAC; MENU stops and returns to the list.
  */
 
 #include "hw/pp5022.h"
@@ -20,6 +19,7 @@
 #include "hw/i2s.h"
 #include "hw/audio.h"
 #include "hw/ata.h"
+#include "hw/clickwheel.h"
 #include "hal.h"
 #include "../fs/fat32.h"
 #include "sched.h"
@@ -31,6 +31,7 @@
 #include "pcm_ring.h"
 #include "../codecs/decoder.h"
 #include "../codecs/arena.h"
+#include "../codecs/readahead.h"
 #include "../codecs/dr_flac/flac.h"
 #include "../codecs/dr_mp3/mp3.h"
 
@@ -49,23 +50,22 @@ static void cpu_wait_ms(uint8_t ms) {
 }
 
 /*
- * Streaming FLAC playback. The drive can't sustain uncompressed PCM over PIO
- * (~172 KB/s needed, ~173 KB/s ceiling), so we stream the COMPRESSED FLAC
- * (~40 KB/s) and decode on the fly. The same SPSC ring decouples producer from
- * the DMA ISR — but the producer is now the decoder: flac_pump() decodes PCM
- * frames into the ring (dr_flac's own read callback pulls compressed bytes off
- * the disk via fat32_stream), and ring_source() (ISR) drains the ring to DMA.
- * dr_flac runs freestanding on a static arena — no libc. See codecs/.
+ * Streaming playback. The drive can't sustain uncompressed PCM over PIO
+ * (~172 KB/s needed, ~173 KB/s ceiling), so we stream the COMPRESSED file
+ * (FLAC ~40 KB/s, MP3 less) and decode on the fly. An SPSC ring decouples the
+ * producer (decode_pump, foreground) from the consumer (the DMA-completion
+ * ISR). dr_flac / dr_mp3 run freestanding on a static arena — no libc.
  */
 #define RING_FRAMES   (1u << 16)         /* 65536 frames = 256 KB ~ 1.49 s      */
 #define DECODE_FRAMES 4096u              /* frames per decode() call            */
-#define ARENA_BYTES   (128u * 1024u)     /* MP3 arena high-water ~96 KB (measured);
-                                            FLAC ~40 KB. Sized for the larger. This
-                                            raises .bss ~64 KB — fine on 64 MB SDRAM.*/
+#define ARENA_BYTES   (128u * 1024u)     /* MP3 arena high-water ~96 KB; FLAC   */
+                                         /* ~40 KB. Sized for the larger.       */
+#define RA_BYTES      (32u * 1024u)      /* read-ahead block buffer (see below) */
 
 static int16_t    ring_storage[RING_FRAMES * 2];
 static int16_t    decode_buf[DECODE_FRAMES * 2];        /* decoder output stage */
 static uint8_t    arena_buf[ARENA_BYTES] __attribute__((aligned(8)));
+static uint8_t    ra_buf[RA_BYTES]       __attribute__((aligned(8)));
 
 static pcm_ring_t g_ring;
 static decoder_t  g_dec;
@@ -74,7 +74,7 @@ static int        g_eos;                 /* decoder hit end of stream           
 /*
  * fat32-backed decoder_source_t: the decoder pulls its compressed input from a
  * file through this. fat32_stream is forward-only, so a backward seek re-opens
- * from the first cluster and skips forward — fine because dr_flac only seeks
+ * from the first cluster and skips forward — fine because the codecs only seek
  * during open() (to size the file / skip metadata), never in the decode loop.
  */
 typedef struct {
@@ -88,6 +88,16 @@ typedef struct {
 } fat_src_t;
 
 static fat_src_t g_fsrc;
+
+/* Long-lived source structs: the decoder borrows a POINTER to the source it is
+ * opened on (dr_flac/dr_mp3 stash it for their whole life), so these must
+ * outlive the decode loop — hence file statics, not play_file locals. The
+ * read-ahead shim (g_ra) wraps the raw fat_src source (g_file_src) and presents
+ * the buffered source (g_dec_src) the decoder actually reads through. */
+static decoder_source_t g_file_src;      /* raw fat_src bytes                    */
+static readahead_t      g_ra;            /* block-buffering shim                 */
+static decoder_source_t g_dec_src;       /* buffered source handed to the codec  */
+static decoder_arena_t  g_arena;
 
 static void fat_src_open(fat_src_t *s, fat32_t *fs, uint32_t clus, uint32_t sz)
 {
@@ -103,7 +113,7 @@ static void fat_src_open(fat_src_t *s, fat32_t *fs, uint32_t clus, uint32_t sz)
  * actually needs data there. Forward is a cheap FAT-walk skip; backward
  * re-opens from the start then skips. This is what makes dr_flac's open-time
  * seek-to-EOF (to size the file) free: it never reads at EOF, so we never
- * physically walk there — vs the old seek that read+discarded the whole file. */
+ * physically walk there. */
 static void fat_src_sync(fat_src_t *s)
 {
     if (s->pos < s->phys) {              /* rewind: re-open at 0                 */
@@ -158,8 +168,7 @@ static int ring_source(void *ud, int16_t *buf, int frames)
 
 /* Producer: decode (FLAC or MP3) into the ring until it's full or end-of-stream.
  * Codec-agnostic — it only calls g_dec.ops->decode, so the same loop drives
- * whichever decoder open() installed. Foreground only. decode() pulls compressed
- * bytes off the disk internally, so this both reads and decodes. */
+ * whichever decoder open() installed. Foreground only. */
 static void decode_pump(void)
 {
     while (!g_eos && pcm_ring_free(&g_ring) >= DECODE_FRAMES) {
@@ -179,22 +188,285 @@ static int disk_read(void *ud, uint32_t lba, uint32_t count, void *buf)
     return ata_read_sectors(lba, count, buf);
 }
 
-/* Per-task stacks (carved from .bss; the scheduler builds each task's
- * initial context frame at the top). 1 KB is ample for these leaf
- * narrators; real subsystem tasks size their own later. */
+/* ---------------------------------------------------------------------------
+ * File browser
+ * ------------------------------------------------------------------------- */
+
+#define BROWSE_MAX 128
+#define NAME_MAX   40                    /* one 40-cell console row             */
+
+typedef struct {
+    char     name[NAME_MAX + 1];         /* display name (uppercased, font-safe) */
+    uint32_t clus;
+    uint32_t size;
+    uint8_t  fmt;                        /* 0 = FLAC, 1 = MP3                    */
+} browse_entry_t;
+
+static browse_entry_t g_browse[BROWSE_MAX];
+static int            g_browse_n;
+
+/* Map a filename byte to a glyph the 8x8 font can draw: uppercase letters,
+ * digits, and the few name punctuation marks; everything else becomes a
+ * space. Keeps the list legible without a full ASCII font. */
+static char disp_char(char c)
+{
+    if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
+    if (c >= 'A' && c <= 'Z') return c;
+    if (c >= '0' && c <= '9') return c;
+    if (c == '.' || c == '_' || c == '-') return c;
+    return ' ';
+}
+
+/* Classify by extension: 0 = FLAC (.fla/.flac), 1 = MP3 (.mp3), -1 = skip. */
+static int classify_ext(const char *name)
+{
+    int dot = -1;
+    for (int i = 0; name[i]; i++) {
+        if (name[i] == '.') dot = i;
+    }
+    if (dot < 0) return -1;
+
+    char ext[5];
+    int n = 0;
+    for (const char *e = name + dot + 1; *e && n < 4; e++) {
+        char c = *e;
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        ext[n++] = c;
+    }
+    ext[n] = '\0';
+
+    if (n == 3 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A') return 0;
+    if (n == 4 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A' && ext[3] == 'C') return 0;
+    if (n == 3 && ext[0] == 'M' && ext[1] == 'P' && ext[2] == '3') return 1;
+    return -1;
+}
+
+/* fat32_readdir_root callback: collect playable files into g_browse. */
+static int browse_collect(void *ud, const fat32_dirent_t *e)
+{
+    (void)ud;
+    if (e->is_dir) return 0;
+    int fmt = classify_ext(e->name);
+    if (fmt < 0) return 0;
+    if (g_browse_n >= BROWSE_MAX) return 1;   /* array full: stop enumeration */
+
+    browse_entry_t *b = &g_browse[g_browse_n++];
+    int i = 0;
+    for (; e->name[i] && i < NAME_MAX; i++) {
+        b->name[i] = disp_char(e->name[i]);
+    }
+    b->name[i] = '\0';
+    b->clus = e->first_clus;
+    b->size = e->size;
+    b->fmt  = (uint8_t)fmt;
+    return 0;
+}
+
+#define LIST_TOP_ROW 2
+#define LIST_ROWS    26                  /* rows LIST_TOP_ROW .. 27              */
+
+/* Draw one list row as a full-width bar so the selected entry reads as a solid
+ * highlight (name padded with spaces to 40 cells). */
+static void draw_row(int row, const char *s, int selected, uint16_t bg)
+{
+    uint16_t fg = selected ? CON_BLACK : CON_WHITE;
+    uint16_t rb = selected ? CON_WHITE : bg;
+    char line[NAME_MAX + 1];
+    int i = 0;
+    for (; s[i] && i < NAME_MAX; i++) line[i] = s[i];
+    for (; i < NAME_MAX; i++)         line[i] = ' ';
+    line[NAME_MAX] = '\0';
+    console_str(0, row, line, fg, rb);
+}
+
+static void browse_render(int sel, int top, uint16_t bg)
+{
+    console_clear(bg);
+    console_str(2, 0, "CORE PLAYER", CON_CYAN, bg);
+
+    if (g_browse_n == 0) {
+        console_str(2, 4, "NO PLAYABLE FILES", CON_YELLOW, bg);
+        return;
+    }
+    for (int r = 0; r < LIST_ROWS; r++) {
+        int idx = top + r;
+        if (idx >= g_browse_n) break;
+        draw_row(LIST_TOP_ROW + r, g_browse[idx].name, idx == sel, bg);
+    }
+}
+
+/* Render two decimal digits at (col,row). */
+static void draw_dd(int col, int row, uint32_t v, uint16_t fg, uint16_t bg)
+{
+    console_char(col,     row, (char)('0' + (v / 10) % 10), fg, bg);
+    console_char(col + 1, row, (char)('0' + v % 10),        fg, bg);
+}
+
+/* Now-playing screen: title, track name, elapsed MM:SS / total MM:SS, and a
+ * '='-bar progress meter. Elapsed is wall-clock since play start (the fixed
+ * 1 MHz USEC_TIMER), which tracks the DAC closely enough for a UI. */
+static void nowplaying_render(const browse_entry_t *b, uint32_t elapsed_s,
+                              uint32_t total_s, uint16_t bg)
+{
+    console_clear(bg);
+    console_str(2, 0, "NOW PLAYING", CON_CYAN, bg);
+    console_str(2, 3, b->name, CON_WHITE, bg);
+    console_str(2, 5, b->fmt == 1 ? "MP3" : "FLAC", CON_GREEN, bg);
+
+    /* Clock line: "MM:SS / MM:SS" */
+    draw_dd(2,  7, elapsed_s / 60, CON_WHITE, bg);
+    console_char(4, 7, ':', CON_WHITE, bg);
+    draw_dd(5,  7, elapsed_s % 60, CON_WHITE, bg);
+    console_str(8, 7, "/", CON_WHITE, bg);
+    draw_dd(10, 7, total_s / 60, CON_WHITE, bg);
+    console_char(12, 7, ':', CON_WHITE, bg);
+    draw_dd(13, 7, total_s % 60, CON_WHITE, bg);
+
+    /* Progress bar over 36 cells. */
+    int width = 36;
+    int fill = (total_s > 0) ? (int)((elapsed_s * (uint32_t)width) / total_s) : 0;
+    if (fill > width) fill = width;
+    for (int i = 0; i < width; i++) {
+        console_char(2 + i, 9, i < fill ? '=' : '-',
+                     i < fill ? CON_GREEN : CON_WHITE, bg);
+    }
+    console_str(2, 12, "MENU = STOP", CON_YELLOW, bg);
+}
+
+/*
+ * Open, stream, and play one track. Returns when the track ends or the user
+ * presses MENU. Wraps the raw fat_src in the read-ahead shim so the codec's
+ * many small header/tag reads collapse into a few big disk reads (the fix for
+ * the ~27 s MP3 startup). Fixed 44.1 kHz / stereo DAC path; a track that opens
+ * as anything else is skipped (shown briefly, then return).
+ */
+static void play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
+{
+    /* Raw file source -> read-ahead shim -> codec. */
+    fat_src_open(&g_fsrc, fs, b->clus, b->size);
+    g_file_src.read = fat_src_read;
+    g_file_src.seek = fat_src_seek;
+    g_file_src.tell = fat_src_tell;
+    g_file_src.userdata = &g_fsrc;
+    readahead_init(&g_ra, &g_file_src, ra_buf, sizeof ra_buf);
+    readahead_as_source(&g_ra, &g_dec_src);
+
+    decoder_arena_init(&g_arena, arena_buf, sizeof arena_buf);
+    decoder_alloc_t alloc = decoder_arena_allocator(&g_arena);
+    int oc = (b->fmt == 1) ? mp3_open_stream(&g_dec, &g_dec_src, &alloc)
+                           : flac_open_stream(&g_dec, &g_dec_src, &alloc);
+    if (oc != 0) {
+        console_clear(CON_RED);
+        console_str(2, 3, "OPEN FAILED", CON_WHITE, CON_RED);
+        console_hex32(2, 5, (uint32_t)oc, CON_WHITE, CON_RED);
+        lcd_present_fb(console_framebuffer());
+        sleep_ms(1000);
+        return;
+    }
+    if (g_dec.sample_rate != 44100u || g_dec.channels != 2u) {
+        console_clear(CON_RED);
+        console_str(2, 3, "UNSUPPORTED RATE", CON_WHITE, CON_RED);
+        console_hex32(2, 5, g_dec.sample_rate, CON_WHITE, CON_RED);
+        lcd_present_fb(console_framebuffer());
+        sleep_ms(1000);
+        g_dec.ops->close(&g_dec);
+        return;
+    }
+
+    uint32_t total_s = (g_dec.total_frames > 0)
+                     ? (uint32_t)(g_dec.total_frames / 44100u) : 0;
+
+    /* Prime the ring, then start the DMA-fed DAC. */
+    pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
+    g_eos = 0;
+    decode_pump();
+
+    if (hal_audio_init(44100u, 2u) != 0) {
+        g_dec.ops->close(&g_dec);
+        return;
+    }
+    hal_audio_set_source(ring_source, 0);
+    hal_audio_start();
+    uint32_t start_us = mmio_read32(USEC_TIMER_ADDR);
+
+    /* Play loop: refill the ring, poll the wheel (MENU stops), and repaint the
+     * now-playing screen about twice a second. */
+    uint32_t last_shown = 0xFFFFFFFFu;
+    while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
+        decode_pump();
+
+        wheel_event_t ev;
+        if (clickwheel_poll(&ev)) {
+            if (ev.buttons & WHEEL_BTN_MENU) break;   /* stop -> back to list */
+        }
+
+        uint32_t elapsed_s = (mmio_read32(USEC_TIMER_ADDR) - start_us) / 1000000u;
+        if (elapsed_s != last_shown) {
+            nowplaying_render(b, elapsed_s, total_s, bg);
+            lcd_present_fb(console_framebuffer());
+            last_shown = elapsed_s;
+        }
+    }
+
+    sleep_ms(200);                       /* let the FIFO/DMA drain the tail */
+    hal_audio_stop();
+    g_dec.ops->close(&g_dec);
+}
+
+/*
+ * The browser: enumerate the root directory once, then loop forever painting
+ * the list and handling the wheel. Wheel scrolls the selection (keeping it on
+ * screen); SELECT plays the highlighted track, returning here when it ends or
+ * the user backs out. Never returns.
+ */
+_Noreturn static void browse_and_play(fat32_t *fs, uint16_t bg)
+{
+    g_browse_n = 0;
+    fat32_readdir_root(fs, browse_collect, 0);
+
+    clickwheel_init();
+    int sel = 0, top = 0;
+    browse_render(sel, top, bg);
+    lcd_present_fb(console_framebuffer());
+
+    for (;;) {
+        wheel_event_t ev;
+        int dirty = 0;
+        if (clickwheel_poll(&ev)) {
+            if (ev.wheel_delta && g_browse_n > 0) {
+                sel += ev.wheel_delta;
+                if (sel < 0)            sel = 0;
+                if (sel >= g_browse_n)  sel = g_browse_n - 1;
+                if (sel < top)              top = sel;
+                if (sel >= top + LIST_ROWS) top = sel - (LIST_ROWS - 1);
+                dirty = 1;
+            }
+            if ((ev.buttons & WHEEL_BTN_SELECT) && g_browse_n > 0) {
+                play_file(fs, &g_browse[sel], bg);
+                dirty = 1;               /* repaint the list after playback */
+            }
+        }
+        if (dirty) {
+            browse_render(sel, top, bg);
+            lcd_present_fb(console_framebuffer());
+        }
+        /* Light throttle so the idle browser doesn't spin the panel/CPU. */
+        for (volatile uint32_t d = 0; d < (1u << 16); d++) {
+        }
+    }
+}
+
+/* Per-task stack for the idle task (carved from .bss). Only reached if the LCD
+ * is unpowered or the disk won't mount — the browser above never returns. */
 #define TASK_STACK_SIZE 1024
-static uint8_t demo_stack[TASK_STACK_SIZE];
 static uint8_t idle_stack[TASK_STACK_SIZE];
 
-/* Disk scratch (uint16_t for the 2-byte alignment ata_read_sectors needs).
- * 1024 words = 2048 bytes = up to 4 logical sectors, enough to read a
- * whole physical sector at once. */
+/* Disk scratch (uint16_t for the 2-byte alignment ata_read_sectors needs). */
 static uint16_t mbr_sector[1024];
 
 /*
- * Idle task: never exits. Sleep the CPU for a short countdown, then
- * yield. Once the demo task has finished, this is the only runnable
- * task, so sched_yield() is a no-op and the loop just idles the core.
+ * Idle task: never exits. Sleep the CPU for a short countdown, then yield.
+ * The scheduler is only started on the no-LCD / mount-failure fallback path.
  */
 _Noreturn static void idle_task(void) {
     uart_puts("core: idle task entered\n");
@@ -204,55 +476,28 @@ _Noreturn static void idle_task(void) {
     }
 }
 
-/*
- * Demo task: proves the context switch actually runs a task, that a
- * task can yield and be resumed, and that a task which RETURNS from its
- * entry function lands cleanly in sched_task_exit (via the trampoline)
- * and is dropped from the round-robin. Runs once, yields to let idle
- * start, resumes, then returns.
- */
-static void demo_task(void) {
-    uart_puts("core: task A running\n");
-    uart_puts("core: task A yielding to idle\n");
-    sched_yield();
-    uart_puts("core: task A resumed, exiting\n");
-    /* falls off the end → task_trampoline's lr → sched_task_exit */
-}
-
 _Noreturn void kernel_main(void) {
     /* Free-running 1 MHz microsecond counter (USEC_TIMER, 01-soc-pp5022.md
-     * "Timers"). Sampled here at the very top so every later milestone can
-     * report elapsed-since-boot in real time, INDEPENDENT of the 100 Hz tick
-     * (which isn't armed until timer_init below). Powers the on-screen BTUS
-     * (boot -> diagnostic screen) and TFUS (boot -> first sound) counters,
-     * and their UART echoes. Wraps every ~71 min — boot is seconds, so no
-     * wrap concern; unsigned subtraction is wrap-safe regardless. */
+     * "Timers"), sampled at the very top so later milestones can report
+     * elapsed-since-boot in real time, INDEPENDENT of the 100 Hz tick. */
     uint32_t boot_us0 = mmio_read32(USEC_TIMER_ADDR);
 
     uart_init();
 
     uart_puts("core: kernel alive (iPod 5G/5.5G, PP5022)\n");
 
-    /* Hex-path self-test: a fixed pattern exercising every nibble
-     * position plus digits and letters. If the line below doesn't
-     * read 1234ABCD on the terminal, distrust every register dump
-     * that follows. */
+    /* Hex-path self-test: if this doesn't read 1234ABCD on the terminal,
+     * distrust every register dump that follows. */
     uart_puts("core: uart self-test ");
     uart_put_hex32(0x1234ABCD);
     uart_putc('\n');
 
-    /* First real register dump: which core are we? Expect the low
-     * byte to read PROC_ID_CPU = 0x55 (core/docs/hw/01-soc-pp5022.md,
-     * "Dual core: CPU and COP"). */
     uart_puts("core: PROCESSOR_ID ");
     uart_put_hex32(PROCESSOR_ID);
     uart_putc('\n');
 
-    /* Come off the 24 MHz boot clock up to CPUFREQ_NORMAL (30 MHz)
-     * before the rest of bring-up, so it runs at a sane speed (the
-     * boot-clock crawl is what made the LCD cycle take ~1 min/frame on
-     * the first hardware boot). Codec-heavy work later requests a
-     * further cpu_boost() to 80 MHz. */
+    /* Come off the 24 MHz boot clock up to CPUFREQ_NORMAL (30 MHz) before the
+     * rest of bring-up so it runs at a sane speed. */
     uart_puts("core: clock init -> 30 MHz\n");
     clock_init();
     uart_puts("core: cpu freq ");
@@ -260,28 +505,14 @@ _Noreturn void kernel_main(void) {
     uart_putc('\n');
 
     /* Turn on the unified cache now — decode is far too slow with it off.
-     * Write-back, so the audio DMA path flushes (cache_commit) before the
-     * DMA reads a freshly-filled buffer. */
+     * Write-back, so the audio DMA path flushes (cache_commit) before the DMA
+     * reads a freshly-filled buffer. */
     uart_puts("core: cache init\n");
     cache_init();
 
-    /* LCD bring-up: host-side port init, then probe the BCM power
-     * rail. After a chainload the BCM is already powered and idle
-     * (core/docs/hw/02-lcd.md, "Chainload handoff state"). If the
-     * probe reads unpowered we skip the fills entirely: Rockbox never
-     * touches the BCM ports of an unpowered BCM (it bootstraps
-     * first), and the clicky emulator (4G model, no BCM) raises a
-     * FatalMemException on any 0x3xxxxxxx access — gating on the
-     * probe keeps both the dead-BCM hardware case and the emulator
-     * smoke well-defined. */
-    /* Bring up the 100 Hz system tick and unmask IRQs at the core BEFORE
-     * the audio bring-up: continuous playback is DMA-driven and needs its
-     * completion interrupt (source 26) delivered, and sleep_ms below spins
-     * on the IRQ-fed tick. Prove the IRQ path first with the tick counter
-     * (with no scheduler yet sched_yield is a no-op): if the two readings
-     * differ by ~10 (100 Hz x 0.1 s), timer -> controller ->
-     * irq_vector_entry -> irq_dispatch -> timer_tick_isr -> sleep_ms all
-     * work. */
+    /* 100 Hz system tick + core IRQ unmask BEFORE audio: continuous playback is
+     * DMA-driven and needs its completion interrupt delivered, and sleep_ms
+     * spins on the IRQ-fed tick. */
     uart_puts("core: timer init @ 100 Hz, enabling IRQs\n");
     timer_init();
     arch_irq_enable();
@@ -294,224 +525,75 @@ _Noreturn void kernel_main(void) {
     uart_put_hex32(current_tick());
     uart_puts(" (post-sleep, ~+10)\n");
 
-    /* LCD + AUDIO. Probe the BCM power rail: nonzero => real hardware. The
-     * clicky emulator has no BCM (lcd_init() false there), so this whole
-     * block — every I2S/DAC/DMA access — is skipped, keeping the emulator
-     * smoke green; the audio register grammar is proven host-side by the
-     * mock-bus trace tests. We run the audio chain first, then report the
-     * result in a SINGLE framebuffer present (lcd_present_fb is only
-     * silicon-proven for the first frame; a second present stalls in the
-     * BCM wait-for-idle poll). GREEN bg = PLL locked. */
+    /* LCD probe gates the whole disk/audio/UI stack: nonzero BCM power => real
+     * hardware. The clicky emulator has no BCM (lcd_init() false there), so
+     * this block is skipped, keeping the emulator smoke green; the register
+     * grammar is proven host-side by the mock-bus trace tests. */
     if (lcd_init()) {
-        /* Capture the GREEN/RED background BEFORE boosting: green means
-         * clock_init's 30 MHz PLL locked (cpu_frequency() still reads
-         * CPUFREQ_NORMAL here). cpu_boost() below moves us to 80 MHz, so this
-         * must be sampled first or the "PLL locked" proof would always read
-         * red. */
-        uint16_t bg = (cpu_frequency() == CPUFREQ_NORMAL) ? CON_GREEN
-                                                          : CON_RED;
-
-        /* Boost to 80 MHz up front, bracketing the ENTIRE open path (ATA
-         * init, MBR read, FAT mount, TEST.FLAC open + album-art skip) and the
-         * decode prime — not just playback. Song-open is partly CPU-bound (FAT
-         * chain walks, the dr_flac header parse), so the higher clock cuts
-         * time-to-first-sound, not only decode headroom. Correctness is
-         * unaffected: clock rate never changes the decoded PCM. Tradeoff: the
-         * sub-second open path now draws 80 MHz power instead of 30 MHz —
-         * negligible battery cost, and cpu_unboost() at the end of this block
-         * drops back to 30 MHz on every exit path (playable or not). The timer
-         * is a fixed 1 MHz source, so BTUS/TFUS/DTKS stay comparable across
-         * clocks. */
+        /* Boost to 80 MHz for the whole disk/decode path. The UI runs here too;
+         * we never drop back because the browser never returns (fine for
+         * bring-up — the device is on a cable during testing). */
         cpu_boost();
 
-        /* Read the MBR, find the FAT32 data partition (type 0B/0C), mount
-         * it, open TEST.WAV and preload it to RAM — then play it through
-         * the DMA-fed hal_audio backend. Audio and the disk reader are each
-         * proven separately; this is the payoff path. */
+        /* Read the MBR, find the FAT32 data partition (type 0B/0C), mount it. */
         uint8_t *mbr = (uint8_t *)mbr_sector;
-        int      rd_rc = -1;
         uint32_t sig = 0, fat_lba = 0;
-        if (ata_init() == 0) {
-            rd_rc = ata_read_sectors(0, 1, mbr);
-            if (rd_rc == 0) {
-                sig = (uint32_t)mbr[510] | ((uint32_t)mbr[511] << 8);
-                for (int p = 0; p < 4; p++) {
-                    const uint8_t *e = &mbr[0x1BE + 16 * p];
-                    if (e[4] == 0x0B || e[4] == 0x0C) {
-                        fat_lba = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
-                                  ((uint32_t)e[10] << 16) |
-                                  ((uint32_t)e[11] << 24);
-                        break;
-                    }
+        int      mnt = -1;
+        fat32_t  fs;
+        if (ata_init() == 0 && ata_read_sectors(0, 1, mbr) == 0) {
+            sig = (uint32_t)mbr[510] | ((uint32_t)mbr[511] << 8);
+            for (int p = 0; p < 4; p++) {
+                const uint8_t *e = &mbr[0x1BE + 16 * p];
+                if (e[4] == 0x0B || e[4] == 0x0C) {
+                    fat_lba = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
+                              ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+                    break;
                 }
             }
         }
-
-        /* These outlive the decode loop: dr_flac keeps pointers to the byte
-         * source and the allocation callbacks for the decoder's whole life. */
-        fat32_t          fs;
-        decoder_source_t src;
-        decoder_arena_t  arena;
-        decoder_alloc_t  alloc;
-        int      mnt = -1, op = -1, oc = -1;
-        int      fmt = -1;               /* which codec opened: 0=FLAC, 1=MP3    */
-        uint32_t fclus = 0, fsize = 0, arate = 0, achan = 0;
-        uint32_t awater = 0, dtks = 0;
         if (sig == 0xAA55u && fat_lba != 0) {
-            uart_puts("core: [fat32] mount + probe TEST.FLA / TEST.MP3\n");
-            /* The MBR partition-start LBA may be in the disk's native
-             * 512-byte units OR (on the stock 80 GB, whose FAT uses
-             * 2048-byte sectors) in 2048-byte units. Try as-is first, then
-             * x4; fat32_mount validates the boot signature + BPB. */
+            /* The MBR start-LBA may be in native 512-byte units OR (stock 80 GB,
+             * 2048-byte FAT sectors) in 2048-byte units. Try as-is, then x4;
+             * fat32_mount validates the boot signature + BPB. */
             mnt = fat32_mount(&fs, disk_read, 0, fat_lba);
             if (mnt != 0) {
                 mnt = fat32_mount(&fs, disk_read, 0, fat_lba * 4u);
             }
-            if (mnt == 0) {
-                /* Format probe: TEST.FLA (FLAC) wins if present, else TEST.MP3
-                 * (MP3). fat32_open now matches VFAT long names too (LFN landed),
-                 * but we keep the simple fixed-name probe for bring-up. NOTE on
-                 * 8.3: a 4-char extension like ".FLAC" has no valid short name and
-                 * is mangled on disk (TEST~1.FLA); the 3-char TEST.FLA/TEST.MP3
-                 * names always resolve, so we stick with those here. */
-                op = fat32_open(&fs, "TEST.FLA", &fclus, &fsize);
-                if (op == 0) {
-                    fmt = 0;             /* FLAC */
-                } else {
-                    op = fat32_open(&fs, "TEST.MP3", &fclus, &fsize);
-                    if (op == 0) {
-                        fmt = 1;         /* MP3 */
-                    }
-                }
-            }
-            if (op == 0) {
-                /* Open as a stream: the decoder pulls compressed bytes off the
-                 * disk through fat_src_*, decoding on a static arena (no libc).
-                 * Only the header is read here. The fat_src source, arena, ring,
-                 * pump loop, ISR and DMA are all codec-agnostic — only THIS
-                 * open() call differs between FLAC and MP3. */
-                fat_src_open(&g_fsrc, &fs, fclus, fsize);
-                src.read = fat_src_read;
-                src.seek = fat_src_seek;
-                src.tell = fat_src_tell;
-                src.userdata = &g_fsrc;
-                decoder_arena_init(&arena, arena_buf, sizeof arena_buf);
-                alloc = decoder_arena_allocator(&arena);
-                oc = (fmt == 1) ? mp3_open_stream(&g_dec, &src, &alloc)
-                                : flac_open_stream(&g_dec, &src, &alloc);
-                if (oc == 0) {
-                    arate = g_dec.sample_rate;
-                    achan = g_dec.channels;
-                }
-                awater = (uint32_t)arena.high_water;
-            }
         }
 
-        /* If it opened at 44.1k stereo, prime the ring by DECODING and time
-         * it: DTKS = ticks to decode ~1.49 s of audio (the whole ring). If
-         * DTKS < ~0x95 (149 ticks = 1.49 s) the decoder beats real time at
-         * this CPU clock — playback will be clean; larger means too slow
-         * (a case for the 80 MHz boost). */
-        int      playable = (oc == 0 && arate == 44100u && achan == 2u);
-        int      started  = 0;   /* audio DMA actually running               */
-        uint32_t tfus     = 0;   /* boot -> first sound, microseconds        */
-        if (playable) {
-            /* Already at 80 MHz (boosted up front). Prime the ring and time
-             * it: DTKS = ticks to decode ~1.49 s of audio at 80 MHz, cache on.
-             * The timer runs off a fixed 1 MHz source, so DTKS stays
-             * comparable across CPU clocks. */
-            pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
-            g_eos = 0;
-            uint32_t t0 = current_tick();
-            decode_pump();               /* decode-prime the ring */
-            dtks   = current_tick() - t0;
-            awater = (uint32_t)arena.high_water;
-
-            /* Start audio BEFORE the diagnostic present so the on-screen TFUS
-             * reflects the true time-to-first-sound. hal_audio_start() primes
-             * both DMA buffers and kicks channel 0, then returns (non-
-             * blocking) — sound is live from here. The single BCM present that
-             * follows streams in a few ms while the DMA drains the 1.49 s
-             * ring, so the ring cannot underrun before the play loop below
-             * resumes refilling. */
-            uart_puts(fmt == 1 ? "core: playing TEST.MP3\n"
-                               : "core: playing TEST.FLAC\n");
-            if (hal_audio_init(44100u, 2u) == 0) {
-                hal_audio_set_source(ring_source, 0);
-                hal_audio_start();
-                tfus    = mmio_read32(USEC_TIMER_ADDR) - boot_us0;
-                started = 1;
-            }
-        }
-
-        /* Boot -> here, microseconds. Sampled just before the present, so it
-         * measures our whole boot + open + prime path (excludes the present
-         * itself). With audio already started above, TFUS <= BTUS + a few ms. */
         uint32_t btus = mmio_read32(USEC_TIMER_ADDR) - boot_us0;
-
-        /* One diagnostic screen (single silicon-proven present):
-         *   SIG=MBR sig(AA55). MNT/OP=mount/open rc(0). OPN=flac open rc(0).
-         *   RATE=sample rate(AC44). AWTR=arena bytes used(<0x10000).
-         *   DTKS=decode-prime ticks — <~0x95 => real-time.
-         *   BTUS=boot->screen microseconds. TFUS=boot->first-sound us.
-         *   FMT=active codec: 0=FLAC, 1=MP3 (FFFFFFFF => neither opened). */
-        console_clear(bg);
-        console_str  (2, 3, "SIG",  CON_WHITE, bg);
-        console_hex32(8, 3, sig,               CON_WHITE, bg);
-        console_str  (2, 5, "MNT",  CON_WHITE, bg);
-        console_hex32(8, 5, (uint32_t)mnt,     CON_WHITE, bg);
-        console_str  (2, 7, "OP",   CON_WHITE, bg);
-        console_hex32(8, 7, (uint32_t)op,      CON_WHITE, bg);
-        console_str  (2, 9, "OPN",  CON_WHITE, bg);
-        console_hex32(8, 9, (uint32_t)oc,      CON_WHITE, bg);
-        console_str  (2, 11, "RATE", CON_WHITE, bg);
-        console_hex32(8, 11, arate,            CON_WHITE, bg);
-        console_str  (2, 13, "AWTR", CON_WHITE, bg);
-        console_hex32(8, 13, awater,           CON_WHITE, bg);
-        console_str  (2, 15, "DTKS", CON_WHITE, bg);
-        console_hex32(8, 15, dtks,             CON_WHITE, bg);
-        console_str  (2, 17, "BTUS", CON_WHITE, bg);
-        console_hex32(8, 17, btus,             CON_WHITE, bg);
-        console_str  (2, 19, "TFUS", CON_WHITE, bg);
-        console_hex32(8, 19, tfus,             CON_WHITE, bg);
-        console_str  (2, 21, "FMT",  CON_WHITE, bg);
-        console_hex32(8, 21, (uint32_t)fmt,    CON_WHITE, bg);
-        lcd_present_fb(console_framebuffer());
-        uart_puts("core: diagnostic screen presented BTUS ");
+        uart_puts("core: mount rc ");
+        uart_put_hex32((uint32_t)mnt);
+        uart_puts(" BTUS ");
         uart_put_hex32(btus);
-        uart_puts(" TFUS ");
-        uart_put_hex32(tfus);
         uart_putc('\n');
 
-        /* Play: decode into the ring while the DMA ISR drains it. The ring is
-         * already primed and audio is running; keep decoding until end-of-
-         * stream AND the ring is empty. */
-        if (started) {
-            while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
-                decode_pump();
-                sleep_ms(20);
-            }
-            sleep_ms(200);               /* let the FIFO/DMA drain the tail */
-            hal_audio_stop();
+        if (mnt == 0) {
+            uart_puts("core: entering browser\n");
+            browse_and_play(&fs, CON_BLACK);   /* never returns */
         }
-        if (playable) {
-            g_dec.ops->close(&g_dec);
-            uart_puts("core: playback done\n");
-        }
-        /* Drop back to 30 MHz on EVERY exit of the boosted block (matches the
-         * single cpu_boost() up front), so we never idle the core at 80 MHz. */
+
+        /* Mount failed: show a diagnostic error screen and fall through to the
+         * idle scheduler so the device isn't a black brick. */
+        console_clear(CON_RED);
+        console_str  (2, 3, "MOUNT FAILED", CON_WHITE, CON_RED);
+        console_str  (2, 6, "SIG",  CON_WHITE, CON_RED);
+        console_hex32(8, 6, sig,               CON_WHITE, CON_RED);
+        console_str  (2, 8, "MNT",  CON_WHITE, CON_RED);
+        console_hex32(8, 8, (uint32_t)mnt,     CON_WHITE, CON_RED);
+        console_str  (2, 10, "PART", CON_WHITE, CON_RED);
+        console_hex32(8, 10, fat_lba,          CON_WHITE, CON_RED);
+        lcd_present_fb(console_framebuffer());
         cpu_unboost();
     } else {
-        uart_puts("core: lcd bcm NOT powered, skipping audio + screen\n");
+        uart_puts("core: lcd bcm NOT powered, skipping disk + UI\n");
     }
 
-    /* Hand off to the cooperative scheduler. Demo task is added first
-     * so it runs first; it finishes and drops out, leaving the idle
-     * task to low-power the core. sched_start never returns. */
-    uart_puts("core: sched init\n");
+    /* Fallback only (no LCD or mount failure): idle the core under the
+     * cooperative scheduler. sched_start never returns. */
+    uart_puts("core: sched init (idle fallback)\n");
     sched_init();
-    if (sched_add_task(demo_task, demo_stack, sizeof demo_stack, "demoA") < 0 ||
-        sched_add_task(idle_task, idle_stack, sizeof idle_stack, "idle") < 0) {
+    if (sched_add_task(idle_task, idle_stack, sizeof idle_stack, "idle") < 0) {
         uart_puts("core: FATAL sched_add_task failed\n");
         for (;;) {
         }

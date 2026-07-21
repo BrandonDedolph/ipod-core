@@ -109,11 +109,22 @@ if target == 'hw'
     override_options: ['werror=false'],
   )
 
+  # Read-ahead byte-source shim (ours, not vendored): collapses a decoder's
+  # many tiny reads into a few large disk reads. Built freestanding so it pulls
+  # lib/mem.h's memcpy (via CORE_FREESTANDING); stays under -Werror since we own
+  # it and it's warning-clean.
+  readahead_hw_lib = static_library(
+    'core_readahead_hw',
+    sources: ['codecs/readahead.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+    include_directories: codec_inc,
+  )
+
   core_elf = executable(
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

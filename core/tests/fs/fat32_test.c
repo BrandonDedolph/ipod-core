@@ -32,6 +32,24 @@ static int img_read(void *ud, uint32_t lba, uint32_t count, void *buf)
     return 0;
 }
 
+/* readdir callback: append each surfaced entry to a fixed-size collector. */
+static int dir_collect(void *ud, const fat32_dirent_t *ent)
+{
+    struct { fat32_dirent_t v[8]; int n; } *c = ud;
+    if (c->n < (int)(sizeof c->v / sizeof c->v[0])) {
+        c->v[c->n++] = *ent;
+    }
+    return 0;   /* keep going */
+}
+
+/* readdir callback: count one entry, then ask to stop (nonzero return). */
+static int dir_stop_first(void *ud, const fat32_dirent_t *ent)
+{
+    (void)ent;
+    (*(int *)ud)++;
+    return 1;   /* stop after the first entry */
+}
+
 static int check(const char *label, int cond)
 {
     printf("[%s] %s\n", label, cond ? "PASS" : "FAIL");
@@ -200,6 +218,53 @@ int main(int argc, char **argv)
     }
     fails += check("stream aligned 2048 + 952 tail crosses cluster cleanly",
                    aligned_ok);
+
+    /* ---- root-directory enumeration ----
+     * The synthetic image's root holds exactly two real entries: the 8.3 file
+     * HELLO.TXT (cluster 3, 3000 bytes) and the long-named Intentions.flac
+     * (cluster 5, 500 bytes). No volume label and no "." / ".." (FAT32 root
+     * dirs have none). Collect every emitted entry and check them all. */
+    struct { fat32_dirent_t v[8]; int n; } coll = { .n = 0 };
+    fails += check("readdir_root returns 0",
+                   fat32_readdir_root(&fs, dir_collect, &coll) == 0);
+    fails += check("readdir_root emits exactly 2 entries", coll.n == 2);
+
+    /* Locate each expected entry by name (order is disk order, but assert by
+     * name so the test doesn't over-specify the traversal). */
+    const fat32_dirent_t *hello = NULL, *intent = NULL;
+    for (int i = 0; i < coll.n; i++) {
+        if (strcmp(coll.v[i].name, "HELLO.TXT") == 0)       hello  = &coll.v[i];
+        if (strcmp(coll.v[i].name, "Intentions.flac") == 0) intent = &coll.v[i];
+    }
+    fails += check("readdir emits HELLO.TXT (8.3 formatted)", hello != NULL);
+    fails += check("readdir emits Intentions.flac (LFN reassembled)",
+                   intent != NULL);
+
+    /* No volume-label / dot entries leaked in under any other name. */
+    int only_expected = 1;
+    for (int i = 0; i < coll.n; i++) {
+        if (strcmp(coll.v[i].name, "HELLO.TXT") != 0 &&
+            strcmp(coll.v[i].name, "Intentions.flac") != 0) {
+            only_expected = 0;
+        }
+    }
+    fails += check("readdir emits no label/dot/extra entries", only_expected);
+
+    /* size + is_dir correctness for a known file. */
+    fails += check("HELLO.TXT: is_dir=0, size=3000, clus=3",
+                   hello && hello->is_dir == 0 && hello->size == 3000 &&
+                   hello->first_clus == 3);
+    fails += check("Intentions.flac: is_dir=0, size=500, clus=5",
+                   intent && intent->is_dir == 0 && intent->size == 500 &&
+                   intent->first_clus == 5);
+
+    /* Early-stop: a callback that returns nonzero on the first entry stops the
+     * walk immediately, and the whole call still reports success (0). */
+    int stop_count = 0;
+    fails += check("readdir early-stop returns 0",
+                   fat32_readdir_root(&fs, dir_stop_first, &stop_count) == 0);
+    fails += check("readdir early-stop invoked cb exactly once",
+                   stop_count == 1);
 
     fclose(g_img);
     if (fails == 0) {

@@ -50,6 +50,18 @@ if target == 'sim'
   )
   test('mp3-freestanding', mp3_fs_test, args: [vectors_dir], suite: 'unit')
 
+  # readahead: the block-buffering shim (codecs/readahead.c) that collapses a
+  # decoder's many tiny reads into a few large backing reads — the fix for the
+  # ~27 s on-device MP3 startup. Backed by an instrumented in-RAM source that
+  # counts backing reads, so the test proves both byte-exactness and coalescing.
+  # Same readahead.c the ARM build compiles.
+  readahead_test = executable(
+    'readahead_test',
+    sources: ['codecs/readahead_test.c', '../codecs/readahead.c'],
+    include_directories: include_directories('../codecs'),
+  )
+  test('readahead', readahead_test, suite: 'unit')
+
   # tcdb-reader: hand-rolls a minimal .tcdb byte string in memory
   # (using the same constants the parser reads) and verifies the
   # parser populates the public tagcache_* accessors correctly.

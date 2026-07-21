@@ -57,6 +57,29 @@ int fat32_mount(fat32_t *fs, fat_read_fn read, void *ud, uint32_t part_lba);
 int fat32_open(fat32_t *fs, const char *name,
                uint32_t *first_clus, uint32_t *size);
 
+/* One directory entry surfaced by enumeration. */
+typedef struct {
+    char     name[256];   /* NUL-terminated. VFAT long name if present, else 8.3 (e.g. "TEST.FLA"). */
+    uint32_t first_clus;  /* first cluster of the file/dir */
+    uint32_t size;        /* file size in bytes; 0 for directories */
+    uint8_t  is_dir;      /* 1 if subdirectory, else 0 */
+} fat32_dirent_t;
+
+/* Callback invoked once per real entry. Return 0 to continue, nonzero to stop early. */
+typedef int (*fat32_dir_cb)(void *ud, const fat32_dirent_t *ent);
+
+/*
+ * Enumerate the ROOT directory, invoking cb(ud, &ent) for each real entry.
+ * Skips: the volume-label entry (attr & 0x08), LFN staging entries (attr==0x0F),
+ * deleted slots (name[0]==0xE5), and the 0x00 end-of-directory terminator (stop).
+ * Reassembles VFAT long names from the 0x0F LFN entries the same way fat32_open
+ * already does (ASCII, keep it simple; if a long name is absent use the 8.3 name
+ * with the standard "NAME.EXT" formatting — trailing spaces trimmed, '.' inserted
+ * only when an extension exists). Returns 0 on success (including early stop),
+ * negative on a disk read error.
+ */
+int fat32_readdir_root(fat32_t *fs, fat32_dir_cb cb, void *ud);
+
 /*
  * Read up to `maxlen` bytes of the file beginning at cluster `first_clus`
  * into `buf`, following the cluster chain. Returns the number of bytes
