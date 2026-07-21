@@ -6,8 +6,9 @@
  * supplied block-read callback that reads 512-byte sectors, so the same
  * code host-tests against a synthetic image and drives ATA on device.
  * Scope is exactly what "play a file off the disk" needs: mount, find a
- * file in the root directory by name, read its bytes. No writes, no
- * subdirectories. Lookup matches the VFAT long name (reassembled from the
+ * file in the root directory by name, read its bytes, and enumerate any
+ * directory (root or a subdirectory by cluster) so a browser can descend.
+ * No writes. Lookup matches the VFAT long name (reassembled from the
  * 0x0F LFN entries, ASCII, case-insensitive, up to a fixed cap) and falls
  * back to the classic 8.3 short name.
  *
@@ -69,14 +70,24 @@ typedef struct {
 typedef int (*fat32_dir_cb)(void *ud, const fat32_dirent_t *ent);
 
 /*
- * Enumerate the ROOT directory, invoking cb(ud, &ent) for each real entry.
- * Skips: the volume-label entry (attr & 0x08), LFN staging entries (attr==0x0F),
- * deleted slots (name[0]==0xE5), and the 0x00 end-of-directory terminator (stop).
- * Reassembles VFAT long names from the 0x0F LFN entries the same way fat32_open
- * already does (ASCII, keep it simple; if a long name is absent use the 8.3 name
- * with the standard "NAME.EXT" formatting — trailing spaces trimmed, '.' inserted
- * only when an extension exists). Returns 0 on success (including early stop),
- * negative on a disk read error.
+ * Enumerate the directory whose first cluster is `dir_clus`, invoking
+ * cb(ud, &ent) for each real entry (files AND subdirectories, is_dir set
+ * accordingly). Pass fs->root_clus to enumerate the root. Skips: the
+ * volume-label entry (attr & 0x08), LFN staging entries (attr==0x0F), deleted
+ * slots (name[0]==0xE5), the 0x00 end-of-directory terminator (stop), PLUS the
+ * "." / ".." self/parent links (any 8.3 entry whose raw name[0] is '.') so a
+ * browser sees only real children. Reassembles VFAT long names from the 0x0F
+ * LFN entries the same way fat32_open does (ASCII; if a long name is absent use
+ * the 8.3 name with the standard "NAME.EXT" formatting — trailing spaces
+ * trimmed, '.' inserted only when an extension exists). Returns 0 on success
+ * (including early stop when cb returns nonzero), negative on a disk read error.
+ */
+int fat32_readdir(fat32_t *fs, uint32_t dir_clus, fat32_dir_cb cb, void *ud);
+
+/*
+ * Enumerate the ROOT directory. Thin wrapper over fat32_readdir with
+ * dir_clus == fs->root_clus; same skip rules and long-name handling.
+ * Returns 0 on success (including early stop), negative on a disk read error.
  */
 int fat32_readdir_root(fat32_t *fs, fat32_dir_cb cb, void *ud);
 

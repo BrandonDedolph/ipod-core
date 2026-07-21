@@ -218,11 +218,19 @@ typedef struct {
     char     name[NAME_MAX + 1];         /* display name (uppercased, font-safe) */
     uint32_t clus;
     uint32_t size;
-    uint8_t  fmt;                        /* 0 = FLAC, 1 = MP3                    */
+    uint8_t  fmt;                        /* 0 = FLAC, 1 = MP3 (only when !is_dir) */
+    uint8_t  is_dir;                     /* 1 = subdirectory                     */
 } browse_entry_t;
 
 static browse_entry_t g_browse[BROWSE_MAX];
 static int            g_browse_n;
+
+/* Directory navigation: the cluster of the directory currently listed, plus a
+ * stack of parent clusters so MENU can climb back up. Depth 0 == the root. */
+#define DIR_STACK_MAX 12
+static uint32_t g_cur_dir;
+static uint32_t g_dir_stack[DIR_STACK_MAX];
+static int      g_dir_depth;
 
 /* Map a filename byte to a glyph the 8x8 font can draw: uppercase letters,
  * digits, and the few name punctuation marks; everything else becomes a
@@ -260,24 +268,41 @@ static int classify_ext(const char *name)
     return -1;
 }
 
-/* fat32_readdir_root callback: collect playable files into g_browse. */
+/* fat32_readdir callback: collect subdirectories + playable files into
+ * g_browse. Directories are shown with a leading '>' marker (and rendered in
+ * cyan); non-playable files are skipped. */
 static int browse_collect(void *ud, const fat32_dirent_t *e)
 {
     (void)ud;
-    if (e->is_dir) return 0;
-    int fmt = classify_ext(e->name);
-    if (fmt < 0) return 0;
     if (g_browse_n >= BROWSE_MAX) return 1;   /* array full: stop enumeration */
 
+    if (e->is_dir) {
+        browse_entry_t *b = &g_browse[g_browse_n++];
+        int i = 0;
+        b->name[i++] = '>';                   /* dir marker glyph */
+        for (const char *p = e->name; *p && i < NAME_MAX; p++) {
+            b->name[i++] = disp_char(*p);
+        }
+        b->name[i] = '\0';
+        b->clus   = e->first_clus;
+        b->size   = 0;
+        b->fmt    = 0;
+        b->is_dir = 1;
+        return 0;
+    }
+
+    int fmt = classify_ext(e->name);
+    if (fmt < 0) return 0;
     browse_entry_t *b = &g_browse[g_browse_n++];
     int i = 0;
     for (; e->name[i] && i < NAME_MAX; i++) {
         b->name[i] = disp_char(e->name[i]);
     }
     b->name[i] = '\0';
-    b->clus = e->first_clus;
-    b->size = e->size;
-    b->fmt  = (uint8_t)fmt;
+    b->clus   = e->first_clus;
+    b->size   = e->size;
+    b->fmt    = (uint8_t)fmt;
+    b->is_dir = 0;
     return 0;
 }
 
@@ -285,10 +310,12 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
 #define LIST_ROWS    26                  /* rows LIST_TOP_ROW .. 27              */
 
 /* Draw one list row as a full-width bar so the selected entry reads as a solid
- * highlight (name padded with spaces to 40 cells). */
-static void draw_row(int row, const char *s, int selected, uint16_t bg)
+ * highlight (name padded with spaces to 40 cells). `fg_unsel` colours the row
+ * when it isn't the selection (dirs cyan, files white). */
+static void draw_row(int row, const char *s, int selected,
+                     uint16_t fg_unsel, uint16_t bg)
 {
-    uint16_t fg = selected ? CON_BLACK : CON_WHITE;
+    uint16_t fg = selected ? CON_BLACK : fg_unsel;
     uint16_t rb = selected ? CON_WHITE : bg;
     char line[NAME_MAX + 1];
     int i = 0;
@@ -302,15 +329,20 @@ static void browse_render(int sel, int top, uint16_t bg)
 {
     console_clear(bg);
     console_str(2, 0, "CORE PLAYER", CON_CYAN, bg);
+    if (g_dir_depth > 0) {
+        console_str(28, 0, "MENU:UP", CON_YELLOW, bg);   /* not at root */
+    }
 
     if (g_browse_n == 0) {
-        console_str(2, 4, "NO PLAYABLE FILES", CON_YELLOW, bg);
+        console_str(2, 4, "EMPTY FOLDER", CON_YELLOW, bg);
         return;
     }
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
         if (idx >= g_browse_n) break;
-        draw_row(LIST_TOP_ROW + r, g_browse[idx].name, idx == sel, bg);
+        const browse_entry_t *e = &g_browse[idx];
+        uint16_t fg = e->is_dir ? CON_CYAN : CON_WHITE;
+        draw_row(LIST_TOP_ROW + r, e->name, idx == sel, fg, bg);
     }
 }
 
@@ -363,13 +395,14 @@ static void nowplaying_render(const browse_entry_t *b, uint32_t elapsed_s,
 }
 
 /*
- * Open, stream, and play one track. Returns when the track ends or the user
- * presses MENU. Wraps the raw fat_src in the read-ahead shim so the codec's
- * many small header/tag reads collapse into a few big disk reads (the fix for
- * the ~27 s MP3 startup). Fixed 44.1 kHz / stereo DAC path; a track that opens
- * as anything else is skipped (shown briefly, then return).
+ * Open, stream, and play one track. Returns 1 if the user pressed MENU to stop,
+ * 0 if the track played to its end (or failed to open) — the browser uses that
+ * to decide whether to auto-advance to the next track. Wraps the raw fat_src in
+ * the read-ahead shim so the codec's many small header/tag reads collapse into
+ * a few big disk reads (the fix for the ~27 s MP3 startup). Fixed 44.1 kHz /
+ * stereo DAC path; a track that opens as anything else is skipped.
  */
-static void play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
+static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
 {
     /* Raw file source -> read-ahead shim -> codec. */
     fat_src_open(&g_fsrc, fs, b->clus, b->size);
@@ -390,7 +423,7 @@ static void play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
         console_hex32(2, 5, (uint32_t)oc, CON_WHITE, CON_RED);
         lcd_present_fb(console_framebuffer());
         sleep_ms(1000);
-        return;
+        return 0;
     }
     if (g_dec.sample_rate != 44100u || g_dec.channels != 2u) {
         console_clear(CON_RED);
@@ -399,7 +432,7 @@ static void play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
         lcd_present_fb(console_framebuffer());
         sleep_ms(1000);
         g_dec.ops->close(&g_dec);
-        return;
+        return 0;
     }
 
     uint32_t total_s = (g_dec.total_frames > 0)
@@ -412,11 +445,12 @@ static void play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
 
     if (hal_audio_init(44100u, 2u) != 0) {
         g_dec.ops->close(&g_dec);
-        return;
+        return 0;
     }
     hal_audio_set_source(ring_source, 0);
     hal_audio_start();
     uint32_t start_us = mmio_read32(USEC_TIMER_ADDR);
+    int stopped = 0;                     /* set when the user presses MENU */
 
     /* Play loop: decode ONE bounded chunk per pass (so a slow codec can't
      * freeze the UI), poll the wheel (MENU stops), and repaint the now-playing
@@ -434,7 +468,10 @@ static void play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
 
         wheel_event_t ev;
         if (clickwheel_poll(&ev)) {
-            if (ev.buttons & WHEEL_BTN_MENU) break;   /* stop -> back to list */
+            if (ev.buttons & WHEEL_BTN_MENU) {        /* stop -> back to list */
+                stopped = 1;
+                break;
+            }
         }
 
         uint32_t elapsed_s = (mmio_read32(USEC_TIMER_ADDR) - start_us) / 1000000u;
@@ -450,20 +487,52 @@ static void play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
     sleep_ms(200);                       /* let the FIFO/DMA drain the tail */
     hal_audio_stop();
     g_dec.ops->close(&g_dec);
+    return stopped;
+}
+
+/* (Re)enumerate the directory at cluster `dir_clus` into g_browse. */
+static void browse_load(fat32_t *fs, uint32_t dir_clus)
+{
+    g_cur_dir  = dir_clus;
+    g_browse_n = 0;
+    fat32_readdir(fs, dir_clus, browse_collect, 0);
+}
+
+/* Play the file at index `start`, then auto-advance through the following FILES
+ * in the current listing until the user presses MENU or the folder runs out.
+ * Directories are skipped by auto-advance. Returns the index of the last track
+ * touched so the caller can leave the selection there. */
+static int play_from(fat32_t *fs, int start, uint16_t bg)
+{
+    int i = start;
+    for (;;) {
+        int stopped = play_file(fs, &g_browse[i], bg);
+        if (stopped) {
+            return i;                    /* user backed out here */
+        }
+        int nxt = -1;                    /* next non-dir entry after i */
+        for (int j = i + 1; j < g_browse_n; j++) {
+            if (!g_browse[j].is_dir) { nxt = j; break; }
+        }
+        if (nxt < 0) {
+            return i;                    /* end of folder */
+        }
+        i = nxt;
+    }
 }
 
 /*
- * The browser: enumerate the root directory once, then loop forever painting
- * the list and handling the wheel. Wheel scrolls the selection (keeping it on
- * screen); SELECT plays the highlighted track, returning here when it ends or
- * the user backs out. Never returns.
+ * The browser: list the current directory and handle the wheel. Wheel scrolls
+ * the selection; SELECT descends into a highlighted folder or plays a
+ * highlighted track (auto-advancing to the rest of the folder); MENU climbs
+ * back up a directory. Starts at the root and never returns.
  */
 _Noreturn static void browse_and_play(fat32_t *fs, uint16_t bg)
 {
-    g_browse_n = 0;
-    fat32_readdir_root(fs, browse_collect, 0);
-
     clickwheel_init();
+    g_dir_depth = 0;
+    browse_load(fs, fs->root_clus);
+
     int sel = 0, top = 0;
     browse_render(sel, top, bg);
     lcd_present_fb(console_framebuffer());
@@ -481,8 +550,28 @@ _Noreturn static void browse_and_play(fat32_t *fs, uint16_t bg)
                 dirty = 1;
             }
             if ((ev.buttons & WHEEL_BTN_SELECT) && g_browse_n > 0) {
-                play_file(fs, &g_browse[sel], bg);
-                dirty = 1;               /* repaint the list after playback */
+                if (g_browse[sel].is_dir) {
+                    /* Descend, remembering the parent so MENU can return. */
+                    if (g_dir_depth < DIR_STACK_MAX) {
+                        g_dir_stack[g_dir_depth++] = g_cur_dir;
+                        browse_load(fs, g_browse[sel].clus);
+                        sel = 0;
+                        top = 0;
+                    }
+                } else {
+                    sel = play_from(fs, sel, bg);
+                    if (sel >= top + LIST_ROWS) top = sel - (LIST_ROWS - 1);
+                }
+                dirty = 1;               /* repaint the list afterwards */
+            }
+            if (ev.buttons & WHEEL_BTN_MENU) {
+                /* Climb back up a directory (no-op at the root). */
+                if (g_dir_depth > 0) {
+                    browse_load(fs, g_dir_stack[--g_dir_depth]);
+                    sel = 0;
+                    top = 0;
+                    dirty = 1;
+                }
             }
         }
         if (dirty) {

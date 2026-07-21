@@ -310,18 +310,21 @@ int fat32_open(fat32_t *fs, const char *name,
     return -1;   /* not found */
 }
 
-int fat32_readdir_root(fat32_t *fs, fat32_dir_cb cb, void *ud)
+int fat32_readdir(fat32_t *fs, uint32_t dir_clus, fat32_dir_cb cb, void *ud)
 {
-    /* Same root-directory walk as fat32_open — same cluster-chain follow, the
-     * same FS-sector reads, the same LFN reassembly — but instead of matching
-     * a target name we surface every real entry through the callback. The LFN
-     * run accumulates across the 0x0F fragments that precede each 8.3 entry;
-     * we reset it on anything that breaks a run (deleted slot, volume label)
-     * exactly as the lookup path does, so long names bind to the right file. */
+    /* Same directory walk as fat32_open — same cluster-chain follow, the same
+     * FS-sector reads, the same LFN reassembly — but instead of matching a
+     * target name we surface every real entry (files AND subdirectories)
+     * through the callback. The walk is parameterized by `dir_clus`, so it
+     * enumerates any directory; pass fs->root_clus for the root. The LFN run
+     * accumulates across the 0x0F fragments that precede each 8.3 entry; we
+     * reset it on anything that breaks a run (deleted slot, volume label, a
+     * "."/".." link) exactly as the lookup path does, so long names bind to
+     * the right entry. */
     lfn_acc_t acc;
     lfn_reset(&acc);
 
-    uint32_t clus = fs->root_clus;
+    uint32_t clus = dir_clus;
     while (clus >= 2 && clus < FAT_EOC) {
         uint32_t csec = cluster_fs_sector(fs, clus);
         for (uint32_t s = 0; s < fs->sec_per_clus; s++) {
@@ -343,6 +346,14 @@ int fat32_readdir_root(fat32_t *fs, fat32_dir_cb cb, void *ud)
                 }
                 if ((e[11] & 0x08) != 0) {
                     lfn_reset(&acc);        /* volume label: not a real entry */
+                    continue;
+                }
+                if (e[0] == '.') {
+                    /* "." (self) and ".." (parent) links inside a subdirectory:
+                     * any 8.3 entry whose raw name starts with '.'. A browser
+                     * wants only real children, so drop these (and any LFN run,
+                     * though these never carry one). */
+                    lfn_reset(&acc);
                     continue;
                 }
 
@@ -379,6 +390,12 @@ int fat32_readdir_root(fat32_t *fs, fat32_dir_cb cb, void *ud)
         }
     }
     return 0;
+}
+
+int fat32_readdir_root(fat32_t *fs, fat32_dir_cb cb, void *ud)
+{
+    /* Thin wrapper: the root is just the directory at fs->root_clus. */
+    return fat32_readdir(fs, fs->root_clus, cb, ud);
 }
 
 int32_t fat32_read_file(fat32_t *fs, uint32_t clus, void *buf, uint32_t maxlen)

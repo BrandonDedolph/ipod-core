@@ -50,6 +50,87 @@ static int dir_stop_first(void *ud, const fat32_dirent_t *ent)
     return 1;   /* stop after the first entry */
 }
 
+/* ---- second, in-RAM image: a root with a subdirectory to descend into ----
+ * The meson-generated image has no subdirectory, so to prove fat32_readdir
+ * enumerates a NON-root directory (and correctly hides "." / "..") we hand-
+ * build a tiny FAT32 volume here and serve it through a memory-backed block
+ * callback. BytesPerSector 512 (sec_ratio 1) keeps the layout arithmetic
+ * plain: with RSVD=1, one FAT of one sector, data_start is FS-sector 2, so
+ * cluster N lands on FS-sector N. Root (clus 2) holds one subdir "MUSIC"
+ * (clus 3); MUSIC holds "." / ".." plus the real child "SONG.TXT" (clus 4). */
+#define MEM_BPS   512u
+#define MEM_SECS  8u
+static uint8_t g_mem[MEM_SECS * MEM_BPS];
+
+static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+/* Write one 32-byte directory entry: 11-byte raw 8.3 field, attr, cluster,
+ * size. `raw` must be exactly 11 bytes (space-padded, no dot). */
+static void put_dirent(uint8_t *e, const char *raw, uint8_t attr,
+                       uint32_t clus, uint32_t size)
+{
+    memset(e, 0, 32);
+    memcpy(e, raw, 11);
+    e[11] = attr;
+    put16(&e[20], (uint16_t)(clus >> 16));
+    put16(&e[26], (uint16_t)(clus & 0xFFFF));
+    put32(&e[28], size);
+}
+
+static void build_subdir_image(void)
+{
+    memset(g_mem, 0, sizeof g_mem);
+
+    /* boot sector / BPB */
+    uint8_t *bs = g_mem;
+    bs[0] = 0xEB; bs[1] = 0x58; bs[2] = 0x90;
+    memcpy(&bs[3], "MSDOS5.0", 8);
+    put16(&bs[11], MEM_BPS);     /* BytesPerSec */
+    bs[13] = 1;                  /* SecPerClus  */
+    put16(&bs[14], 1);           /* RsvdSecCnt  */
+    bs[16] = 1;                  /* NumFATs     */
+    bs[21] = 0xF8;               /* media       */
+    put32(&bs[36], 1);           /* FATSz32     */
+    put32(&bs[44], 2);           /* RootClus    */
+    bs[510] = 0x55; bs[511] = 0xAA;
+
+    /* FAT (FS-sector 1): mark every used cluster as a single-cluster chain. */
+    uint8_t *fat = &g_mem[1 * MEM_BPS];
+    put32(&fat[0 * 4], 0x0FFFFFF8u);   /* media    */
+    put32(&fat[1 * 4], 0x0FFFFFFFu);   /* reserved */
+    put32(&fat[2 * 4], 0x0FFFFFFFu);   /* root  (clus 2) EOC */
+    put32(&fat[3 * 4], 0x0FFFFFFFu);   /* MUSIC (clus 3) EOC */
+    put32(&fat[4 * 4], 0x0FFFFFFFu);   /* SONG  (clus 4) EOC */
+
+    /* Root directory (cluster 2 == FS-sector 2): one subdirectory. */
+    uint8_t *root = &g_mem[2 * MEM_BPS];
+    put_dirent(&root[0], "MUSIC      ", 0x10, 3, 0);  /* on-disk size is 0 */
+    /* root[32..] stays 0x00 => end of directory */
+
+    /* MUSIC subdirectory (cluster 3 == FS-sector 3): "." / ".." + one child. */
+    uint8_t *sub = &g_mem[3 * MEM_BPS];
+    put_dirent(&sub[0],  ".          ", 0x10, 3, 0);  /* self   */
+    put_dirent(&sub[32], "..         ", 0x10, 2, 0);  /* parent */
+    put_dirent(&sub[64], "SONG    TXT", 0x20, 4, 100);
+    /* sub[96..] stays 0x00 => end of directory */
+}
+
+/* Memory-backed 512-byte block read over g_mem (part_lba 0). */
+static int mem_read(void *ud, uint32_t lba, uint32_t count, void *buf)
+{
+    (void)ud;
+    if ((lba + count) * 512u > sizeof g_mem) {
+        return -1;
+    }
+    memcpy(buf, &g_mem[lba * 512u], count * 512u);
+    return 0;
+}
+
 static int check(const char *label, int cond)
 {
     printf("[%s] %s\n", label, cond ? "PASS" : "FAIL");
@@ -266,7 +347,72 @@ int main(int argc, char **argv)
     fails += check("readdir early-stop invoked cb exactly once",
                    stop_count == 1);
 
+    /* ---- fat32_readdir(root) parity with fat32_readdir_root ----
+     * Enumerating fs->root_clus explicitly must yield byte-for-byte the same
+     * entries the root wrapper does (the wrapper is now a thin call into it). */
+    struct { fat32_dirent_t v[8]; int n; } rc = { .n = 0 };
+    fails += check("fat32_readdir(root_clus) returns 0",
+                   fat32_readdir(&fs, fs.root_clus, dir_collect, &rc) == 0);
+    fails += check("fat32_readdir(root_clus) emits same count as _root",
+                   rc.n == coll.n);
+    int parity_ok = (rc.n == coll.n);
+    for (int i = 0; i < rc.n && parity_ok; i++) {
+        /* order is identical (same walk), so compare position-for-position */
+        parity_ok = strcmp(rc.v[i].name, coll.v[i].name) == 0 &&
+                    rc.v[i].first_clus == coll.v[i].first_clus &&
+                    rc.v[i].size == coll.v[i].size &&
+                    rc.v[i].is_dir == coll.v[i].is_dir;
+    }
+    fails += check("fat32_readdir(root_clus) entries identical to _root",
+                   parity_ok);
+
     fclose(g_img);
+
+    /* ---- descent into a subdirectory (in-RAM image) ----
+     * The meson image has no subdir, so exercise fat32_readdir on a non-root
+     * directory against a hand-built volume: root -> MUSIC/ -> SONG.TXT. */
+    build_subdir_image();
+    fat32_t mfs;
+    fails += check("mem-image mount returns 0",
+                   fat32_mount(&mfs, mem_read, NULL, 0) == 0);
+
+    /* Root enumeration surfaces the subdirectory with is_dir=1 and its
+     * on-disk cluster; size is forced to 0 for a directory. */
+    struct { fat32_dirent_t v[8]; int n; } mroot = { .n = 0 };
+    fails += check("mem readdir(root) returns 0",
+                   fat32_readdir(&mfs, mfs.root_clus, dir_collect, &mroot) == 0);
+    fails += check("mem root emits exactly 1 entry", mroot.n == 1);
+    const fat32_dirent_t *music =
+        (mroot.n == 1 && strcmp(mroot.v[0].name, "MUSIC") == 0)
+            ? &mroot.v[0] : NULL;
+    fails += check("mem root emits MUSIC as a directory",
+                   music && music->is_dir == 1);
+    fails += check("MUSIC: is_dir=1, size=0, clus=3",
+                   music && music->is_dir == 1 && music->size == 0 &&
+                   music->first_clus == 3);
+
+    /* Descend: enumerate MUSIC by its first cluster. "." and ".." must NOT be
+     * emitted; only the real child SONG.TXT (a file) is. */
+    struct { fat32_dirent_t v[8]; int n; } msub = { .n = 0 };
+    uint32_t music_clus = music ? music->first_clus : 0;
+    fails += check("mem readdir(MUSIC) returns 0",
+                   fat32_readdir(&mfs, music_clus, dir_collect, &msub) == 0);
+    fails += check("MUSIC emits exactly 1 real child (no . / ..)",
+                   msub.n == 1);
+    int no_dots = 1;
+    for (int i = 0; i < msub.n; i++) {
+        if (msub.v[i].name[0] == '.') {
+            no_dots = 0;
+        }
+    }
+    fails += check("MUSIC never emits a '.' or '..' entry", no_dots);
+    const fat32_dirent_t *song =
+        (msub.n == 1 && strcmp(msub.v[0].name, "SONG.TXT") == 0)
+            ? &msub.v[0] : NULL;
+    fails += check("MUSIC/SONG.TXT: is_dir=0, size=100, clus=4",
+                   song && song->is_dir == 0 && song->size == 100 &&
+                   song->first_clus == 4);
+
     if (fails == 0) {
         printf("ALL PASS\n");
     } else {
