@@ -181,6 +181,25 @@ static void decode_pump(void)
     }
 }
 
+/* Decode at most ONE chunk into the ring, then return. Used inside the play
+ * loop so decoding never monopolizes the loop: however slow the codec is (a
+ * soft-float MP3 frame can take many ms), the loop still gets back to polling
+ * the wheel and repainting each pass, so the UI never appears frozen. Returns
+ * the frames decoded this step (0 at EOS or when the ring is already full). */
+static int decode_step(void)
+{
+    if (g_eos || pcm_ring_free(&g_ring) < DECODE_FRAMES) {
+        return 0;
+    }
+    int got = g_dec.ops->decode(&g_dec, decode_buf, (int)DECODE_FRAMES);
+    if (got <= 0) {
+        g_eos = 1;
+        return 0;
+    }
+    pcm_ring_write(&g_ring, decode_buf, (uint32_t)got);
+    return got;
+}
+
 /* FAT32 block callback: read absolute 512-byte LBAs off the disk. */
 static int disk_read(void *ud, uint32_t lba, uint32_t count, void *buf)
 {
@@ -306,7 +325,7 @@ static void draw_dd(int col, int row, uint32_t v, uint16_t fg, uint16_t bg)
  * '='-bar progress meter. Elapsed is wall-clock since play start (the fixed
  * 1 MHz USEC_TIMER), which tracks the DAC closely enough for a UI. */
 static void nowplaying_render(const browse_entry_t *b, uint32_t elapsed_s,
-                              uint32_t total_s, uint16_t bg)
+                              uint32_t total_s, uint32_t buf_pct, uint16_t bg)
 {
     console_clear(bg);
     console_str(2, 0, "NOW PLAYING", CON_CYAN, bg);
@@ -330,7 +349,17 @@ static void nowplaying_render(const browse_entry_t *b, uint32_t elapsed_s,
         console_char(2 + i, 9, i < fill ? '=' : '-',
                      i < fill ? CON_GREEN : CON_WHITE, bg);
     }
-    console_str(2, 12, "MENU = STOP", CON_YELLOW, bg);
+
+    /* Buffer health: the ring's low-water fill % since the last repaint. Near
+     * 100% => the decoder is comfortably ahead of the DAC (clean audio). If it
+     * dips toward 0 the codec can't keep real-time => stutter (soft-float MP3).
+     * Red once it drops under 20%. */
+    console_str(2, 11, "BUF", buf_pct < 20u ? CON_RED : CON_GREEN, bg);
+    draw_dd(6, 11, buf_pct > 99u ? 99u : buf_pct,
+            buf_pct < 20u ? CON_RED : CON_GREEN, bg);
+    console_char(8, 11, '_', buf_pct < 20u ? CON_RED : CON_GREEN, bg); /* '%' n/a */
+
+    console_str(2, 13, "MENU = STOP", CON_YELLOW, bg);
 }
 
 /*
@@ -389,11 +418,19 @@ static void play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
     hal_audio_start();
     uint32_t start_us = mmio_read32(USEC_TIMER_ADDR);
 
-    /* Play loop: refill the ring, poll the wheel (MENU stops), and repaint the
-     * now-playing screen about twice a second. */
+    /* Play loop: decode ONE bounded chunk per pass (so a slow codec can't
+     * freeze the UI), poll the wheel (MENU stops), and repaint the now-playing
+     * screen once a second. Track the ring's low-water fill between repaints so
+     * the BUF% readout exposes whether the decoder is keeping real-time. */
     uint32_t last_shown = 0xFFFFFFFFu;
+    uint32_t low_fill   = RING_FRAMES;   /* min ring fill seen since last repaint */
     while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
-        decode_pump();
+        decode_step();
+
+        uint32_t fill = pcm_ring_fill(&g_ring);
+        if (fill < low_fill) {
+            low_fill = fill;
+        }
 
         wheel_event_t ev;
         if (clickwheel_poll(&ev)) {
@@ -402,9 +439,11 @@ static void play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
 
         uint32_t elapsed_s = (mmio_read32(USEC_TIMER_ADDR) - start_us) / 1000000u;
         if (elapsed_s != last_shown) {
-            nowplaying_render(b, elapsed_s, total_s, bg);
+            uint32_t buf_pct = (low_fill * 100u) / RING_FRAMES;
+            nowplaying_render(b, elapsed_s, total_s, buf_pct, bg);
             lcd_present_fb(console_framebuffer());
             last_shown = elapsed_s;
+            low_fill   = fill;           /* reset low-water for the next second */
         }
     }
 
