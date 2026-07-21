@@ -461,6 +461,77 @@
 #define I2C_DATA_ADDR(n)   (I2C_DATA0_ADDR + 4u * (uintptr_t)(n))
 #endif
 
+/* ---------- Clickwheel / OPTO controller (0x7000C100) ----------------
+ * core/docs/hw/03-clickwheel.md. The capacitive wheel AND all five face
+ * buttons arrive as one 32-bit status word at CLICKWHEEL_DATA — there are
+ * no dedicated GPIO lines for Menu/Play/Prev/Next/Select. The hold switch
+ * IS a plain GPIO (GPIOA_INPUT_VAL bit 5, active-low). This block sits in
+ * the same 0x7000Cxxx page as the I2C controller above but is distinct.
+ * Power/reset via DEV_OPTO (0x00010000, defined in the audio block above)
+ * in DEV_EN/DEV_RS; button-latch logic via INIT_BUTTONS in DEV_INIT1.
+ * Shares I2C_IRQ (#40, high bank) — but the Phase 1 driver is POLLED, so
+ * no IRQ wiring. 32-bit registers; use mmio_*32 / PP_REG32.
+ */
+#define CLICKWHEEL_CTRLA_ADDR   0x7000C100  /* config + IRQ enable/arm       */
+#define CLICKWHEEL_CTRLB_ADDR   0x7000C104  /* IRQ pending / acknowledge     */
+#define CLICKWHEEL_DATA_ADDR    0x7000C140  /* status word (bit 31 = valid)  */
+
+/* CTRLA/CTRLB "magic" words. Rockbox writes them as raw literals with no
+ * field decode, so we transcribe verbatim (03-clickwheel.md, "Init" + the
+ * ISR ack/re-arm). The only structure we assert: the 0x0A1F00 config body
+ * is shared between the init and re-arm CTRLA words (top nibble 0xC vs
+ * 0x4). Used by the IRQ path; the polled driver writes CW_CTRLA_INIT +
+ * CW_CTRLB_CLEAR at bring-up only. */
+#define CW_CTRLA_INIT           0xC00A1F00  /* CTRLA: config + IRQ enable    */
+#define CW_CTRLA_REARM          0x400A1F00  /* CTRLA: config + IRQ re-arm    */
+#define CW_CTRLB_CLEAR          0x01000000  /* CTRLB: clear pending at init  */
+#define CW_CTRLB_ACK            0x0C000000  /* CTRLB: OR to ack IRQ (bits 27:26) */
+
+/* CLICKWHEEL_DATA status-word fields (03-clickwheel.md, "Packet format").
+ * Valid gate is bit 31 set AND low byte == 0x1A: (w & MASK) == VALUE. */
+#define CW_STAT_VALID           0x80000000  /* bit 31: status valid          */
+#define CW_STAT_TOUCH           0x40000000  /* bit 30: finger on the wheel   */
+#define CW_STAT_HEADER_MASK     0x800000FF  /* valid gate mask               */
+#define CW_STAT_HEADER_VALUE    0x8000001A  /* valid gate value (header 0x1A)*/
+#define CW_POS_SHIFT            16          /* position in bits 22:16        */
+#define CW_POS_MASK             0x7F        /* (w >> 16) & 0x7F, 0..0x5F     */
+
+/* Button bits inside the status word (03-clickwheel.md, "Button bits"). */
+#define CW_BTN_SELECT           0x00000100  /* bit 8:  center / select       */
+#define CW_BTN_RIGHT            0x00000200  /* bit 9:  next / ffwd           */
+#define CW_BTN_LEFT             0x00000400  /* bit 10: prev / rew            */
+#define CW_BTN_PLAY             0x00000800  /* bit 11: play / pause          */
+#define CW_BTN_MENU             0x00001000  /* bit 12: menu                  */
+#define CW_BTN_ALL              0x00001F00  /* all five button bits          */
+
+/* Software quadrature (03-clickwheel.md, "Quadrature / wheel-delta"). The
+ * wheel reports ABSOLUTE position; relative motion = differenced position
+ * with wrap at half a rotation, gated at the sensitivity threshold. */
+#define CW_CLICKS_PER_ROT       96          /* full circle, in steps         */
+#define CW_WHEEL_SENSITIVITY    4           /* min |delta| to emit (Video/5G)*/
+
+/* DEV_INIT1 (0x70000010) bit 18: enable the button-latch logic
+ * (03-clickwheel.md, "Initialization"). DEV_OPTO lives in the audio
+ * block above (0x00010000, DEV_EN/DEV_RS bit 16). */
+#define INIT_BUTTONS            0x00040000
+
+/* Hold switch: GPIOA_INPUT_VAL bit 5, active-low (03-clickwheel.md, "Hold
+ * switch"). GPIO ports A-D base 0x6000D000; the read/input slot sits at
+ * per-port +0x30 (Rockbox pp5020.h, consistent with the GPIOC pair above). */
+#define GPIOA_INPUT_VAL_ADDR    0x6000D030
+#define CW_HOLD_BIT             0x20        /* bit 5; clear = held (active-low) */
+
+/* Wheel/OPTO shares I2C_IRQ (#40, high bank bit 8) — recorded for a
+ * future IRQ path; the Phase 1 driver polls (01-soc-pp5022.md, IRQ tbl). */
+#define CW_IRQ                  40
+
+#ifndef __ASSEMBLER__
+#define CLICKWHEEL_CTRLA  PP_REG32(CLICKWHEEL_CTRLA_ADDR)
+#define CLICKWHEEL_CTRLB  PP_REG32(CLICKWHEEL_CTRLB_ADDR)
+#define CLICKWHEEL_DATA   PP_REG32(CLICKWHEEL_DATA_ADDR)
+#define GPIOA_INPUT_VAL   PP_REG32(GPIOA_INPUT_VAL_ADDR)
+#endif
+
 /* ---------- On-SoC I2S serializer / FIFO (0x70002800) ---------------
  * core/docs/hw/05-audio.md, "SoC I2S block" + "i2s_reset() config
  * sequence". 32-bit registers, absolute addresses (no base-relative

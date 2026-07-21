@@ -220,6 +220,22 @@ if target == 'sim'
   )
   test('hw-console', console_test, suite: 'unit')
 
+  # hw-clickwheel: the click-wheel/button/hold decode, host-side under
+  # -DMMIO_MOCK. The status-word decode is pure integer math, so the mock
+  # bus feeds synthetic 32-bit words (CLICKWHEEL_DATA) and a scripted hold
+  # GPIO into the real clickwheel_poll() and asserts button decode, the
+  # sensitivity-gated wheel delta (incl. sub-threshold accumulation and
+  # wrap through 0x5F<->0x00), the valid-gate rejection, and the hold edge.
+  clickwheel_test = executable(
+    'clickwheel_test',
+    sources: ['hw_clickwheel/clickwheel_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/clickwheel.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+  )
+  test('hw-clickwheel', clickwheel_test, suite: 'unit')
+
   # hw-lcd-present: lcd_present() streams a caller framebuffer over the
   # BCM (same path as lcd_fill) — asserts the exact 38400-word grammar
   # and pixel packing against the recording mock bus.

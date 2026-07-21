@@ -25,7 +25,7 @@ Source: `firmware/target/arm/ipod/button-clickwheel.c` lines 54–60.
 Each 32-bit word read from `CLICKWHEEL_DATA`:
 
 ```
- 31     30     21:16     12:8       7:0
+ 31     30     22:16     12:8       7:0
  ┌───┬─────┬──────────┬─────────┬────────┐
  │ V │  T  │ position │ buttons │ flags  │
  └───┴─────┴──────────┴─────────┴────────┘
@@ -33,7 +33,9 @@ Each 32-bit word read from `CLICKWHEEL_DATA`:
 
 - Bit 31 (V) — valid (always set on real packets).
 - Bit 30 (T) — touch present (finger on wheel).
-- Bits 21–16 — absolute angular position, 0–0x5F (96 steps full circle).
+- Bits 22–16 — absolute angular position, masked `(status >> 16) & 0x7F`.
+  The extracted mask is 7 bits; live values never exceed 0x5F (96 steps
+  full circle), so the field reads 0–0x5F in practice.
 - Bits 12–8 — button state bitmap (see below).
 - Bits 7–0 — flags / packet type. Valid header check on PP5020:
   `(status & 0x800000FF) == 0x8000001A`.
@@ -163,11 +165,23 @@ outl(0xC00A1F00, 0x7000C100);   // control A — config + IRQ enable
 outl(0x01000000, 0x7000C104);   // control B — clear pending IRQ
 ```
 
-After reading a packet in the ISR, ack the interrupt:
+The ISR masks the shared wheel/I2C IRQ on entry and unmasks it on exit —
+it disables `I2C_MASK` in `CPU_HI_INT_DIS` before touching the block, and
+re-enables it in `CPU_HI_INT_EN` after re-arming. Between the two it waits
+~50 µs, then reads `CLICKWHEEL_DATA`:
+
+```c
+CPU_HI_INT_DIS = I2C_MASK;        // mask the wheel IRQ during service
+udelay(50);                       // empirical settle before the read
+status = CLICKWHEEL_DATA;         // read + decode the packet
+```
+
+After reading a packet in the ISR, ack the interrupt and unmask:
 
 ```c
 outl(inl(0x7000C104) | 0x0C000000, 0x7000C104);
 outl(0x400A1F00, 0x7000C100);    // re-arm IRQ (note 0x4 vs 0xC top nibble)
+CPU_HI_INT_EN = I2C_MASK;         // unmask the wheel IRQ
 ```
 
 ## IRQ wiring
