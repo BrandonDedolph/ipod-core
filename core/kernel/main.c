@@ -97,6 +97,33 @@ static void ui_text_centered(int y, const char *s, const text_font_t *font,
     ui_text((LCD_WIDTH - w) / 2, y, s, font, ink);
 }
 
+/* Filled rounded rectangle (radius `r`) — the design's selection bars (r=4) and
+ * plates (r=6) are rounded, not square; this replaces the hard console_fill_rect
+ * at those spots. Each corner row is inset along a quarter-circle. */
+static int isqrt_i(int v)
+{
+    int r = 0;
+    while ((r + 1) * (r + 1) <= v) r++;
+    return r;
+}
+
+static void fill_round_rect(int x, int y, int w, int h, int r, uint16_t c)
+{
+    if (r < 1) { console_fill_rect(x, y, w, h, c); return; }
+    if (2 * r > w) r = w / 2;
+    if (2 * r > h) r = h / 2;
+    for (int ry = 0; ry < h; ry++) {
+        int inset = 0, k = -1;
+        if (ry < r)            k = ry;
+        else if (ry >= h - r)  k = h - 1 - ry;
+        if (k >= 0) {
+            int dy = r - k;
+            inset = r - isqrt_i(r * r - dy * dy);
+        }
+        console_fill_rect(x + inset, y + ry, w - 2 * inset, 1, c);
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * File / album browser
  *
@@ -392,9 +419,11 @@ static void status_strip_render(void)
         draw_lock_glyph(bx - 14, STATUS_Y0 + 3, LINEN_INK);
     }
 
-    /* Raw mV to the left of the glyph (calibration aid). Hidden while locked so
-     * it doesn't collide with the padlock. */
-    if (g_bat_mv > 0 && !g_locked) {
+    /* Raw mV to the left of the glyph — a device-gated CALIBRATION aid, not part
+     * of the design. Off for the shipping look; flip SHOW_BATTERY_MV to 1 to
+     * read the millivolts and calibrate battery.c's %-curve (see battery.h). */
+#define SHOW_BATTERY_MV 0
+    if (SHOW_BATTERY_MV && g_bat_mv > 0 && !g_locked) {
         char mv[8];
         int v = g_bat_mv, i = 0;
         char tmp[8]; int t = 0;
@@ -433,7 +462,7 @@ static void list_row_at(int y0, int r, const char *text, const char *sub,
     int ry = y0 + r * ROW_H;
     uint16_t fg, subc, rightc, chevc;
     if (selected) {
-        console_fill_rect(6, ry + 1, LCD_WIDTH - 16, ROW_H - 2, LINEN_SEL_BG);
+        fill_round_rect(6, ry + 1, LCD_WIDTH - 16, ROW_H - 2, 4, LINEN_SEL_BG);
         fg = LINEN_SEL_FG; subc = LINEN_SEL_SUB; rightc = LINEN_SEL_SUB;
         chevc = LINEN_SEL_SUB;
     } else {
@@ -452,8 +481,8 @@ static void list_row_at(int y0, int r, const char *text, const char *sub,
         ui_text(tx, ry + 21, sub, FONT_SMALL, subc);
     }
     if (right && right[0]) {
-        int w = text_width(right, FONT_SUB);
-        ui_text(LCD_WIDTH - 16 - w, ry + 15, right, FONT_SUB, rightc);
+        int w = text_width(right, text_font_bold_11());   /* right values 10/600 */
+        ui_text(LCD_WIDTH - 16 - w, ry + 15, right, text_font_bold_11(), rightc);
     } else if (chevron) {
         ui_text(LCD_WIDTH - 18, ry + 15, ">", FONT_ROW, chevc);
     }
@@ -621,10 +650,24 @@ static void detail_render(int sel)
         if (idx >= g_browse_n) break;
         const browse_entry_t *e = &g_browse[idx];
         int is_sel = (idx == sel);
-        list_row_at(DET_LIST_Y0, r, e->name, 0, 0, 0, is_sel, 0, 0);
-        /* Mark the track that's currently playing with the animated bars. */
+        int ry = DET_LIST_Y0 + r * ROW_H;
+        if (is_sel) {
+            fill_round_rect(6, ry + 1, LCD_WIDTH - 16, ROW_H - 2, 4, LINEN_SEL_BG);
+        }
+        uint16_t fg = is_sel ? LINEN_SEL_FG : LINEN_INK;
+        uint16_t nc = is_sel ? LINEN_SEL_SUB : LINEN_MUTED2;
+        /* Track number, right-aligned in a small left gutter (collection-detail
+         * .jsx numbers the rows). */
+        char num[6]; int ni = 0, nv = idx + 1, nt = 0; char nb[6];
+        do { nb[nt++] = (char)('0' + nv % 10); nv /= 10; } while (nv && nt < 5);
+        while (nt > 0) num[ni++] = nb[--nt];
+        num[ni] = '\0';
+        int nw = text_width(num, FONT_SMALL);
+        ui_text(30 - nw, ry + 15, num, FONT_SMALL, nc);
+        /* Title, indented past the number gutter. */
+        ui_text(38, ry + 15, e->name, is_sel ? FONT_HEADER : FONT_ROW, fg);
+        /* The playing track gets the animated bars on the right. */
         if (playing && !e->is_dir && name_eq_ci(e->name, playing)) {
-            int ry = DET_LIST_Y0 + r * ROW_H;
             nowplaying_bars(LCD_WIDTH - 22, ry + 7,
                             is_sel ? LINEN_SEL_FG : LINEN_INK,
                             mmio_read32(USEC_TIMER_ADDR));
@@ -1114,11 +1157,7 @@ static void fmt_time(char *buf, uint32_t s)
 static void volume_overlay_render(int vol)
 {
     const int PX = 60, PY = 101, PW = 200, PH = 32;
-    console_fill_rect(PX, PY, PW, PH, 0xFFDEu);            /* light plate         */
-    console_fill_rect(PX, PY, PW, 1, LINEN_BORDER);        /* 1px border          */
-    console_fill_rect(PX, PY + PH - 1, PW, 1, LINEN_BORDER);
-    console_fill_rect(PX, PY, 1, PH, LINEN_BORDER);
-    console_fill_rect(PX + PW - 1, PY, 1, PH, LINEN_BORDER);
+    fill_round_rect(PX, PY, PW, PH, 6, 0xF7BEu);           /* warm cream plate, r6 */
 
     /* Minimal speaker glyph: a small box + a growing cone. */
     int sx = PX + 14, sy = PY + PH / 2;
@@ -1140,8 +1179,8 @@ static void volume_overlay_render(int vol)
     do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 3);
     while (t > 0) p[i++] = nb[--t];
     p[i] = '\0';
-    int w = text_width(p, FONT_SUB);
-    ui_text(PX + PW - 14 - w, PY + PH / 2 + 4, p, FONT_SUB, LINEN_INK);
+    int w = text_width(p, text_font_bold_11());       /* percent is 11/700       */
+    ui_text(PX + PW - 14 - w, PY + PH / 2 + 4, p, text_font_bold_11(), LINEN_INK);
 }
 
 /* Bigger padlock for the lock/unlock plate: a body + shackle. Closed = the
@@ -1170,13 +1209,10 @@ static void lock_plate_render(int locked)
     const int PX = 70, PY = 65, PW = 180, PH = 110;
     uint16_t plate = locked ? LINEN_INK : LINEN_SURFACE;
     uint16_t fg    = locked ? LINEN_SURFACE : LINEN_INK;
-    console_fill_rect(PX, PY, PW, PH, plate);
-    if (!locked) {                                    /* border on the light plate */
-        console_fill_rect(PX, PY, PW, 1, LINEN_BORDER);
-        console_fill_rect(PX, PY + PH - 1, PW, 1, LINEN_BORDER);
-        console_fill_rect(PX, PY, 1, PH, LINEN_BORDER);
-        console_fill_rect(PX + PW - 1, PY, 1, PH, LINEN_BORDER);
+    if (!locked) {                                    /* light plate: draw a ring */
+        fill_round_rect(PX - 1, PY - 1, PW + 2, PH + 2, 7, LINEN_BORDER);
     }
+    fill_round_rect(PX, PY, PW, PH, 6, plate);
     draw_lock_icon(PX + PW / 2, PY + 34, !locked, fg);
     const char *label = locked ? "LOCKED" : "UNLOCKED";
     int w = text_width(label, FONT_HEADER);

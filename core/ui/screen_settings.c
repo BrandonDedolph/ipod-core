@@ -38,8 +38,9 @@
 #define S_SEL_FG  S_SURFACE    /* selection text = surface                    */
 #define S_SEL_SUB 0xB595u      /* sub / right text ON a selected row          */
 #define S_CHEVRON 0xB575u      /* > chevron, rgba(ink,0.3) on surface         */
-#define S_TRK     0xE73Cu      /* slider track, rgba(ink,0.06)                */
-#define S_PILL_OFF 0xCED6u     /* toggle pill OFF fill (light grey)           */
+#define S_TRK     0xDEDAu      /* slider track, rgba(ink,0.10)                */
+#define S_SEL_TRK 0x41E7u      /* slider track on a SELECTED (dark) row       */
+#define S_PILL_OFF 0xCE58u     /* toggle pill OFF fill (18% ink)              */
 
 /* Nunito faces (see ui/text.h). */
 #define F_HEADER text_font_bold_13()
@@ -88,11 +89,28 @@ static void header_render(const char *title, const char *right, int back)
     console_fill_rect(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, S_BORDER);
 }
 
-/* The dark-ink selection bar behind row `r` (menus.jsx selected Row). */
+/* Filled rounded rect (radius rr) — the design rounds selection bars (4) and
+ * pills (end-caps). Each corner row is inset along a quarter-circle. */
+static int st_isqrt(int v) { int q = 0; while ((q + 1) * (q + 1) <= v) q++; return q; }
+static void st_round_rect(int x, int y, int w, int h, int rr, uint16_t c)
+{
+    if (rr < 1) { console_fill_rect(x, y, w, h, c); return; }
+    if (2 * rr > w) rr = w / 2;
+    if (2 * rr > h) rr = h / 2;
+    for (int yy = 0; yy < h; yy++) {
+        int inset = 0, k = -1;
+        if (yy < rr)           k = yy;
+        else if (yy >= h - rr) k = h - 1 - yy;
+        if (k >= 0) { int dy = rr - k; inset = rr - st_isqrt(rr * rr - dy * dy); }
+        console_fill_rect(x + inset, y + yy, w - 2 * inset, 1, c);
+    }
+}
+
+/* The dark-ink selection bar behind row `r` (menus.jsx selected Row, radius 4). */
 static void sel_bar(int y0, int rowh, int r)
 {
     int ry = y0 + r * rowh;
-    console_fill_rect(6, ry + 1, LCD_WIDTH - 16, rowh - 2, S_SEL_BG);
+    st_round_rect(6, ry + 1, LCD_WIDTH - 16, rowh - 2, 4, S_SEL_BG);
 }
 
 /* Toggle pill (menus.jsx SettingsPlayback toggle): a 22x12 track with a 9x9
@@ -107,9 +125,9 @@ static void draw_toggle(int ry, int selected, int on)
                         : (selected ? S_SEL_SUB : S_PILL_OFF);
     uint16_t knob  = on ? (selected ? S_INK : S_SURFACE)
                         : (selected ? S_SURFACE : S_SURFACE);
-    console_fill_rect(px, py, pw, ph, track);
+    st_round_rect(px, py, pw, ph, ph / 2, track);      /* rounded pill end-caps */
     int kx = on ? px + pw - 2 - 9 : px + 2;
-    console_fill_rect(kx, py + 2, 9, 9, knob);
+    st_round_rect(kx, py + 2, 9, 9, 4, knob);          /* round knob            */
 }
 
 /* Slider fill bar for a value fraction num/den (menus.jsx SettingsSound bar):
@@ -117,7 +135,7 @@ static void draw_toggle(int ry, int selected, int on)
 static void draw_slider(int ry, int selected, int num, int den)
 {
     int bx = 14, bw = LCD_WIDTH - 16 - bx, by = ry + 17, bh = 3;
-    uint16_t trackc = selected ? S_SEL_SUB : S_TRK;
+    uint16_t trackc = selected ? S_SEL_TRK : S_TRK;
     uint16_t fillc  = selected ? S_SEL_FG  : S_INK;
     console_fill_rect(bx, by, bw, bh, trackc);
     if (den > 0) {
