@@ -25,13 +25,15 @@
 #include "../../kernel/cache.h"   /* cache_commit(): flush before DMA reads */
 
 /*
- * Ping-pong PCM buffers. 4096 frames = ~93 ms at 44.1 kHz, 16 KB each — under
+ * Ping-pong PCM buffers. 8192 frames = ~186 ms at 44.1 kHz, 32 KB each — under
  * the DMA byte-count limit (16-bit field, max 65536 bytes = 16384 frames), and
- * long enough that the ISR can be delayed ~90 ms without the DAC underrunning.
+ * long enough that the ISR can be delayed ~180 ms without the DAC underrunning.
  * That headroom matters: the LCD present runs in an IRQ-masked critical section
  * (an ISR mid-pixel-stream aborts the BCM frame), and its wait-for-idle spin can
- * hold IRQs long enough to occasionally starve the audio ISR at 2048 frames —
- * heard as random twitches during playback. Interleaved int16 [L,R,L,R,...]:
+ * hold IRQs long enough to starve the audio ISR — worst during FAST scrolling,
+ * where back-to-back full-frame presents keep the BCM busy so each idle-wait
+ * runs near its limit. 186 ms absorbs a run of those (the UI already caps
+ * repaints to ~14 fps while playing). Interleaved int16 [L,R,L,R,...]:
  * read by the DMA as 32-bit words, and on little-endian ARM the pair [L,R] in
  * memory IS (R<<16)|L, which is exactly the I2S FIFO packing — so the buffer
  * feeds the FIFO directly with no repack.

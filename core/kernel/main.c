@@ -576,7 +576,6 @@ static browse_entry_t g_queue[BROWSE_MAX];
 static int            g_queue_n;
 static int            g_queue_idx;
 static int            g_pl_active;        /* a track is decoding + DMA running   */
-static int            g_audio_inited;      /* hal_audio_init done once this session*/
 static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start    */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
@@ -613,18 +612,12 @@ static int player_open_current(void)
     g_eos = 0;
     decode_pump();                       /* prime */
 
-    /* Init the audio HAL (I2C/I2S/codec/DMA) ONCE for the whole session — not
-     * per track. Re-running the full codec+I2S bring-up while the DMA was
-     * actively draining (as happens selecting a new song mid-playback) wedged
-     * the audio path (froze + silence). Track changes just stop then restart the
-     * DMA (hal_audio_stop masks the completion IRQ; hal_audio_start re-primes,
-     * re-unmasks it, and re-kicks channel 0). */
-    if (!g_audio_inited) {
-        if (hal_audio_init(44100u, 2u) != 0) {
-            g_dec.ops->close(&g_dec);
-            return -1;
-        }
-        g_audio_inited = 1;
+    /* Full audio bring-up per track (proven by the old sequential player):
+     * player_stop() has already cleanly stopped any previous track, so re-init
+     * here is over a quiescent HAL. */
+    if (hal_audio_init(44100u, 2u) != 0) {
+        g_dec.ops->close(&g_dec);
+        return -1;
     }
     hal_audio_set_source(ring_source, 0);
     hal_audio_start();
@@ -650,9 +643,15 @@ static void player_stop(void)
  * fail to open). Marks the player idle when the queue is exhausted. */
 static void player_advance(void)
 {
-    hal_audio_stop();
-    g_dec.ops->close(&g_dec);
-    g_pl_active = 0;
+    /* Close only a validly-open decoder. player_advance is also called after a
+     * FAILED open (from player_play_queue), where g_dec was never opened — an
+     * unconditional g_dec.ops->close() there dereferenced a NULL/stale ops and
+     * hard-froze the device. g_pl_active is the "decoder open + running" flag. */
+    if (g_pl_active) {
+        hal_audio_stop();
+        g_dec.ops->close(&g_dec);
+        g_pl_active = 0;
+    }
     for (;;) {
         int nxt = -1;
         for (int j = g_queue_idx + 1; j < g_queue_n; j++) {
