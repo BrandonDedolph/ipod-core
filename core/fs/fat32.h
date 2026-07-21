@@ -94,4 +94,12 @@ void fat32_stream_open(fat32_stream_t *st, fat32_t *fs,
  */
 int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len);
 
+/*
+ * Advance the cursor forward by up to `n` bytes WITHOUT returning data —
+ * walking the cluster chain (reading only FAT entries, never cluster data),
+ * so skipping a large region (e.g. an embedded-art metadata block) is cheap.
+ * Returns the number of bytes actually skipped (< n only at end-of-file).
+ */
+uint32_t fat32_stream_skip(fat32_stream_t *st, uint32_t n);
+
 #endif /* CORE_FS_FAT32_H */

@@ -304,3 +304,34 @@ int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len)
     }
     return (int32_t)total;
 }
+
+uint32_t fat32_stream_skip(fat32_stream_t *st, uint32_t n)
+{
+    fat32_t *fs   = st->fs;
+    uint32_t done = 0;
+
+    while (n > 0 && st->remaining > 0 &&
+           st->clus >= 2 && st->clus < FAT_EOC) {
+        /* Skip within the current cluster by just moving the cursor — no data
+         * read. Only the FAT is touched, when we step to the next cluster. */
+        uint32_t clus_left = fs->clus_bytes - st->clus_off;
+        uint32_t take      = n < clus_left ? n : clus_left;
+        if (take > st->remaining) {
+            take = st->remaining;
+        }
+
+        st->clus_off  += take;
+        st->remaining -= take;
+        done          += take;
+        n             -= take;
+
+        if (st->clus_off == fs->clus_bytes && st->remaining > 0) {
+            st->clus     = next_cluster(fs, st->clus);
+            st->clus_off = 0;
+            if (st->clus == 0) {
+                break;      /* FAT read error — stop, report what we skipped */
+            }
+        }
+    }
+    return done;
+}

@@ -96,9 +96,8 @@ if target == 'hw'
 
   core_elf = executable(
     'core.elf',
-    boot_sources + kernel_sources + fs_sources + lib_sources
-      + files('codecs/arena.c'),
-    dependencies: [hal_dep],     # hal/hw: SER0 debug UART
+    boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
+    dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
     link_with: [flac_hw_lib],
     include_directories: codec_inc,
     link_args: [
