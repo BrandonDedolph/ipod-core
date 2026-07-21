@@ -143,6 +143,29 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Full-screen "charging" battery view (ours): renders design_reference's
+  # ChargingScreen into the RGB565 console framebuffer with fill_rect shapes +
+  # the Nunito text renderer. Pure integer rendering — no libc/libm/malloc, no
+  # hardware access. Relative includes only (ui/text.h, ../kernel/console.h,
+  # ../hal/hal.h), so no extra include dirs; stays under -Werror.
+  screen_charging_hw_lib = static_library(
+    'core_screen_charging_hw',
+    sources: ['ui/screen_charging.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
+  # Freestanding incremental album-art thumbnail cache (ours): loads AT MOST one
+  # album cover per pump() call and pre-shrinks it to a 22x22 list chip, spreading
+  # the disk I/O across many main-loop passes so scrolling the album list never
+  # stalls the audio decode/DMA loop. Uses thumb.c to downscale and fat32 to read;
+  # no libc/libm/malloc, no allocation. Reaches fat32.h + thumb.h via relative
+  # includes (no extra include dirs); stays under -Werror since we own it.
+  artcache_hw_lib = static_library(
+    'core_artcache_hw',
+    sources: ['ui/artcache.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Background streaming playback engine (ours): the FLAC/MP3 decode path, the
   # SPSC PCM ring feeding the DMA DAC, the fat32 byte-source + read-ahead glue,
   # album art, and the queue/auto-advance player — extracted out of kernel/main.c
@@ -159,7 +182,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, text_hw_lib, thumb_hw_lib, player_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

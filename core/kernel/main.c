@@ -30,6 +30,8 @@
 #include "console.h"
 #include "../ui/text.h"
 #include "../ui/thumb.h"
+#include "../ui/artcache.h"
+#include "../ui/screen_charging.h"
 #include "hw/volume.h"
 
 /*
@@ -287,16 +289,18 @@ static int      g_bat_pct = -1;
 static int      g_bat_ext = 0;               /* external power present            */
 static uint32_t g_bat_last_us;
 
-static void battery_refresh(int force)
+/* Returns 1 if it actually resampled this call (so a live screen can repaint). */
+static int battery_refresh(int force)
 {
     uint32_t now = mmio_read32(USEC_TIMER_ADDR);
     if (!force && (uint32_t)(now - g_bat_last_us) < 5000000u) {
-        return;
+        return 0;
     }
     g_bat_last_us = now;
     g_bat_mv  = battery_millivolts();
     g_bat_pct = battery_percent();
     g_bat_ext = power_is_external();
+    return 1;
 }
 
 /* Small battery glyph: outline + nub + a fill proportional to `pct` (terracotta
@@ -577,9 +581,32 @@ static void detail_render(int sel)
     scrollbar_render(DET_LIST_Y0, top, DET_ROWS, g_browse_n);
 }
 
-/* Album LIST (browser depth 0): the folder list with the design chrome. Album
- * art chips per row are deferred (they need a thumbnail cache preloaded off the
- * audio path — see status_and_next); the hero art in detail_render lands first. */
+/* A neutral tile shown in a row's chip slot until its real cover loads, so the
+ * text doesn't shift right when the thumbnail pops in. Filled once at startup. */
+static uint16_t g_chip_ph[ARTCACHE_DIM * ARTCACHE_DIM];
+
+static void chip_placeholder_init(void)
+{
+    for (int i = 0; i < ARTCACHE_DIM * ARTCACHE_DIM; i++) {
+        g_chip_ph[i] = LINEN_BORDER;
+    }
+}
+
+/* Queue every album row's cover into the incremental thumbnail cache. Called
+ * when the album list is (re)entered; artcache_pump loads them a few frames
+ * apart off the audio path. */
+static void albumlist_queue_chips(void)
+{
+    artcache_reset();
+    for (int i = 0; i < g_browse_n && i < ARTCACHE_SLOTS; i++) {
+        if (g_browse[i].is_dir) {
+            artcache_queue(i, g_browse[i].clus);
+        }
+    }
+}
+
+/* Album LIST (browser depth 0): the folder list with the design chrome, each
+ * album row carrying a 22x22 cover chip (or a placeholder until it loads). */
 static void albumlist_render(int sel)
 {
     console_clear(LINEN_SURFACE);
@@ -601,7 +628,12 @@ static void albumlist_render(int sel)
         int idx = top + r;
         if (idx >= g_browse_n) break;
         const browse_entry_t *e = &g_browse[idx];
-        list_row(r, e->name, 0, 0, e->is_dir, idx == sel, 0, 0);
+        const uint16_t *chip = 0;
+        if (e->is_dir) {                       /* albums get a cover chip           */
+            chip = (idx < ARTCACHE_SLOTS) ? artcache_get(idx) : 0;
+            if (!chip) chip = g_chip_ph;       /* reserve the space meanwhile       */
+        }
+        list_row(r, e->name, 0, 0, e->is_dir, idx == sel, 0, chip);
     }
     scrollbar_render(LIST_Y0, top, LIST_ROWS, g_browse_n);
 }
@@ -845,7 +877,8 @@ static void music_menu_render(void)
 /* ---------------------------------------------------------------------------
  * Screen stack
  * ------------------------------------------------------------------------- */
-typedef enum { SCR_MENU, SCR_MUSIC, SCR_BROWSER, SCR_NOWPLAYING } screen_t;
+typedef enum { SCR_MENU, SCR_MUSIC, SCR_BROWSER, SCR_NOWPLAYING,
+               SCR_CHARGING } screen_t;
 #define SCR_STACK_MAX 8
 static screen_t g_scr[SCR_STACK_MAX];
 static int      g_scr_n;
@@ -905,6 +938,9 @@ static void paint_current_screen(void)
         nowplaying_render(player_track_name(), player_elapsed_s(),
                           player_total_s(), player_buf_pct());
         break;
+    case SCR_CHARGING:
+        screen_charging_render(g_bat_pct, power_is_charging(), power_is_external());
+        break;
     }
 }
 
@@ -918,6 +954,7 @@ _Noreturn static void run_ui(fat32_t *fs)
 {
     clickwheel_init();
     player_init(fs);
+    chip_placeholder_init();
     battery_refresh(1);                   /* prime the status-strip gauge         */
     g_volume = hal_volume_get();          /* reflect the codec's default gain      */
     g_dir_depth = 0;
@@ -935,7 +972,9 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      np_vol_prev = 0;            /* volume overlay was up last NP paint  */
     uint32_t last_present = 0;           /* rate-limit UI presents while playing */
     uint32_t last_bars = 0;              /* rate-limit the now-playing bar anim  */
+    uint32_t last_chip = 0;              /* rate-limit album-cover chip loads    */
     int      hold_prev = clickwheel_hold() ? 1 : 0;  /* seed hold-edge detect    */
+    int      ext_prev  = power_is_external() ? 1 : 0; /* seed plug-in edge detect */
     int      lock_flashing = 0;          /* a lock/unlock plate is on screen     */
     g_locked = hold_prev;
 
@@ -951,7 +990,22 @@ _Noreturn static void run_ui(fat32_t *fs)
     const char *last_tn = 0;              /* re-apply volume on track change       */
     for (;;) {
         player_pump();
-        battery_refresh(0);               /* self-throttled ~5s gauge resample     */
+        if (battery_refresh(0) && scr_cur() == SCR_CHARGING) {
+            dirty = 1;                    /* refresh the % on the charging screen  */
+        }
+
+        /* Charging screen: pop up on a plug-IN edge (not if already powered at
+         * boot, so it won't spuriously appear), auto-dismiss when unplugged. Any
+         * button also dismisses it (handled in the input switch below). */
+        int ext = power_is_external() ? 1 : 0;
+        if (ext && !ext_prev && scr_cur() != SCR_CHARGING) {
+            scr_push(SCR_CHARGING);
+            dirty = 1;
+        } else if (!ext && scr_cur() == SCR_CHARGING) {
+            scr_pop();
+            dirty = 1;
+        }
+        ext_prev = ext;
 
         /* Auto-advance re-inits the codec (resetting its gain), so re-apply our
          * volume whenever the playing track changes. */
@@ -1021,6 +1075,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                     if (g_music_sel == MU_ALBUMS) {
                         g_dir_depth = 0;
                         browse_load(fs, fs->root_clus);
+                        albumlist_queue_chips();       /* start loading covers   */
                         g_br_sel = g_br_accum = 0;
                         scr_push(SCR_BROWSER);
                     }
@@ -1066,6 +1121,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                         browse_load(fs, g_dir_stack[--g_dir_depth]);
                         if (g_dir_depth > 0) {
                             detail_load_meta(fs);       /* re-enter parent album  */
+                        } else {
+                            albumlist_queue_chips();    /* back at the album list */
                         }
                         g_br_sel = g_br_accum = 0;
                     } else {                            /* back to the music menu */
@@ -1090,6 +1147,13 @@ _Noreturn static void run_ui(fat32_t *fs)
                 }
                 if (ev.buttons & WHEEL_BTN_MENU) {
                     scr_pop();                          /* back, keep playing */
+                    dirty = 1;
+                }
+                break;
+
+            case SCR_CHARGING:
+                if (ev.buttons) {                       /* any press dismisses */
+                    scr_pop();
                     dirty = 1;
                 }
                 break;
@@ -1180,7 +1244,11 @@ _Noreturn static void run_ui(fat32_t *fs)
                 switch (scr_cur()) {
                 case SCR_MENU:    main_menu_render();            break;
                 case SCR_MUSIC:   music_menu_render();           break;
-                case SCR_BROWSER: browse_render(g_br_sel); break;
+                case SCR_BROWSER: browse_render(g_br_sel);       break;
+                case SCR_CHARGING:
+                    screen_charging_render(g_bat_pct, power_is_charging(),
+                                           power_is_external());
+                    break;
                 default: break;                 /* NOWPLAYING handled above */
                 }
                 lcd_present_fb(console_framebuffer());
@@ -1214,6 +1282,18 @@ _Noreturn static void run_ui(fat32_t *fs)
                     break;
                 }
                 last_bars = nowb;
+            }
+        }
+
+        /* Load one album cover every ~120ms while on the album list (spreads the
+         * chip I/O so it can't starve decode); repaint when one lands. */
+        if (scr_cur() == SCR_BROWSER && g_dir_depth == 0) {
+            uint32_t nowc = mmio_read32(USEC_TIMER_ADDR);
+            if ((uint32_t)(nowc - last_chip) >= 120000u) {
+                if (artcache_pump(fs)) {
+                    dirty = 1;
+                }
+                last_chip = nowc;
             }
         }
 
