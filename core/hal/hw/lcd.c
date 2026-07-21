@@ -11,9 +11,16 @@
  * handoff state") guarantees the Apple flash ROM already powered the
  * BCM and uploaded its firmware, and ipodloader2 finished its last
  * frame synchronously — the BCM arrives powered, awake and idle. We
- * use the Rockbox-BOOTLOADER update variant: wait for idle BEFORE
- * issuing (skipped on the first frame), stream params/data, write the
- * command, strobe, and return without a completion wait.
+ * use the Rockbox-BOOTLOADER update variant: point the write port at
+ * the framebuffer, stream params/data, THEN wait for the previous
+ * update to retire (skipped on the first frame), write the command,
+ * strobe, and return without a completion wait. Waiting AFTER the
+ * ~150 KB pixel stream — not before it — matches Rockbox's ordering
+ * (the stream is the completion delay) and is what lets repeated
+ * presents work: polling right after the previous strobe hits the BCM
+ * at peak-busy and spins its whole budget (the "second present stalls"
+ * bug). A re-kick re-issues the update if the BCM latches busy past a
+ * bounded poll budget (analog of Rockbox's 50 ms BCM_UPDATE_TIMEOUT).
  *
  * Freestanding-clean: no libc, fixed-width types from <stdint.h> only
  * (via pp5022.h); LCD_WIDTH/LCD_HEIGHT from the portable hal.h
@@ -44,6 +51,17 @@
  * just proceed — issuing over a busy BCM beats hanging.
  */
 #define BCM_IDLE_SPIN_LIMIT  (1u << 16)
+
+/*
+ * Poll-count budget before we re-kick a BCM that is still reading the
+ * busy pattern. Rockbox re-issues LCD_UPDATE + strobe if an update
+ * hasn't retired within HZ/20 (~50 ms) to unstick a latched-busy BCM;
+ * lacking a tick clock here we approximate that timeout as a fraction
+ * of the idle-spin budget. In the healthy case the ~150 KB pixel
+ * stream has already given the previous update ample time to retire, so
+ * the idle poll returns on its first read and this budget is never hit.
+ */
+#define BCM_REKICK_TRIPS     (BCM_IDLE_SPIN_LIMIT >> 4)
 
 /* First-frame flag: the chainload handoff guarantees an idle BCM, so
  * the initial lcd_fill skips the wait-for-idle read entirely. */
@@ -116,41 +134,61 @@ int lcd_init(void)
 #define BCM_FRAME_WORDS  ((LCD_WIDTH * LCD_HEIGHT) / 2u)
 
 /*
- * Shared full-frame update preamble (steps 1-2, identical for
- * lcd_fill and lcd_present):
+ * Shared full-frame update preamble (step 2, identical for lcd_fill and
+ * lcd_present): point the BCM write port at the framebuffer / command
+ * parameter region so the caller can stream pixel data.
  *
- *  (1) Wait for idle, unless this is the first frame after the
- *      chainload handoff (guaranteed idle). The BCM is busy while
- *      BCMA_COMMAND still reads the in-flight LCD_UPDATE code
- *      (0xFFFF0000) or its half-consumed remnant 0xFFFF (02-lcd.md,
- *      "LCD update protocol"; verified against Rockbox lcd-video.c,
- *      2026-06-11). On timeout, proceed anyway.
- *  (2) Point the BCM write port at the framebuffer / command
- *      parameter region so the caller can stream pixel data.
+ * The wait-for-idle deliberately does NOT live here. Polling right
+ * after the previous frame's strobe — before any pixels stream — hits
+ * the BCM at peak busy and never sees idle within budget (the "second
+ * present stalls" hang). It runs in bcm_frame_commit instead, after the
+ * full pixel stream has given the previous update time to retire.
  */
 static void bcm_frame_begin(void)
 {
-    if (!lcd_first_frame) {
-        uint32_t spin = BCM_IDLE_SPIN_LIMIT;
-        uint32_t stat;
-
-        do {
-            stat = bcm_read32(BCMA_COMMAND);
-        } while ((stat == BCMCMD_LCD_UPDATE || stat == 0xFFFF) &&
-                 --spin != 0);
-    }
-    lcd_first_frame = 0;
-
     bcm_write_addr(BCMA_CMDPARAM);
 }
 
 /*
- * Shared full-frame update commit (steps 4-5, identical for lcd_fill
- * and lcd_present): queue the full-frame update command, then strobe
- * execute. Bootloader variant: return without a completion wait.
+ * Shared full-frame update commit (steps 1, 4-5, identical for lcd_fill
+ * and lcd_present):
+ *
+ *  (1) Wait for the previous update to retire, unless this is the first
+ *      frame after the chainload handoff (guaranteed idle). The BCM is
+ *      busy while BCMA_COMMAND still reads the in-flight LCD_UPDATE code
+ *      (0xFFFF0000) or its half-consumed remnant 0xFFFF (02-lcd.md,
+ *      "LCD update protocol"; verified against Rockbox lcd-video.c,
+ *      2026-06-11). By the time we get here the caller has streamed the
+ *      whole frame, so a healthy BCM has long since gone idle and the
+ *      poll returns on its first read. If it is still busy past
+ *      BCM_REKICK_TRIPS polls it may have latched — re-issue the command
+ *      and re-strobe to unstick it (Rockbox's 50 ms re-kick analog). On
+ *      exhausting the full spin budget, proceed anyway.
+ *  (4) Queue the full-frame update command.
+ *  (5) Strobe execute. Bootloader variant: return without a completion
+ *      wait; the next frame's pre-stream wait catches any overrun.
  */
 static void bcm_frame_commit(void)
 {
+    if (!lcd_first_frame) {
+        uint32_t spin = BCM_IDLE_SPIN_LIMIT;
+        uint32_t kick = BCM_REKICK_TRIPS;
+        uint32_t stat = bcm_read32(BCMA_COMMAND);
+
+        while ((stat == BCMCMD_LCD_UPDATE || stat == 0xFFFF) &&
+               --spin != 0) {
+            if (--kick == 0) {
+                /* Still busy far too long: the update likely latched.
+                 * Re-issue LCD_UPDATE + strobe to unstick the BCM. */
+                bcm_write32(BCMA_COMMAND, BCMCMD_LCD_UPDATE);
+                mmio_write16(BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
+                kick = BCM_REKICK_TRIPS;
+            }
+            stat = bcm_read32(BCMA_COMMAND);
+        }
+    }
+    lcd_first_frame = 0;
+
     bcm_write32(BCMA_COMMAND, BCMCMD_LCD_UPDATE);
     mmio_write16(BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
 }

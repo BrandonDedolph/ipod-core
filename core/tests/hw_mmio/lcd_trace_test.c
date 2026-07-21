@@ -12,8 +12,11 @@
  *   - lcd_fill streams exactly (W*H)/2 = 38400 32-bit data words, each
  *     the two-pixel packing (rgb<<16)|rgb (count + endianness), then
  *     the LCD_UPDATE command (0xFFFF0000) and the 0x31 strobe;
- *   - on a non-first frame, the wait-for-idle read handshake runs until
- *     BCMA_COMMAND reads idle before the new frame is streamed.
+ *   - on a non-first frame, the frame streams FIRST, then the
+ *     wait-for-idle read handshake runs until BCMA_COMMAND reads idle,
+ *     then the command + strobe issue. The wait lives in the commit
+ *     (after the stream), not the begin (before it) — the ordering that
+ *     fixes the "second present stalls" hang.
  *
  * The lcd_first_frame flag is a file-static that the first fill flips,
  * so the fill cases run first-frame-then-subsequent in main() on
@@ -127,9 +130,11 @@ static int test_lcd_fill_first_frame(void)
     return trace_done(&tc);
 }
 
-/* Non-first frame: wait-for-idle polls BCMA_COMMAND via bcm_read32
- * until it reads idle (programmed busy, busy-remnant, then idle), then
- * the normal stream follows. */
+/* Non-first frame: the frame streams FIRST, then wait-for-idle polls
+ * BCMA_COMMAND via bcm_read32 until it reads idle (programmed busy,
+ * busy-remnant, then idle) — AFTER the pixel stream, BEFORE the command
+ * + strobe. This ordering is the "second present stalls" fix: the wait
+ * moved out of bcm_frame_begin and into bcm_frame_commit. */
 static int test_lcd_fill_subsequent(void)
 {
     mmio_mock_reset();
@@ -144,18 +149,19 @@ static int test_lcd_fill_subsequent(void)
     lcd_fill(rgb);
 
     trace_cursor tc = trace_begin("lcd_fill_subsequent");
-    /* three wait-for-idle bcm_read32(BCMA_COMMAND) iterations */
+    /* the stream comes first, identical to the first-frame path */
+    expect_write_addr(&tc, BCMA_CMDPARAM);
+    for (uint32_t i = 0; i < (LCD_WIDTH * LCD_HEIGHT) / 2u; i++) {
+        expect_w(&tc, 32, BCM_DATA_ADDR, pair);
+    }
+    /* then three wait-for-idle bcm_read32(BCMA_COMMAND) iterations */
     for (int it = 0; it < 3; it++) {
         expect_r(&tc, 16, BCM_RD_ADDR_ADDR);           /* RD_ADDR_READY poll */
         expect_w(&tc, 32, BCM_RD_ADDR_ADDR, BCMA_COMMAND);
         expect_r(&tc, 16, BCM_CONTROL_ADDR);           /* RD_READY poll */
         expect_r(&tc, 32, BCM_DATA_ADDR);              /* status word */
     }
-    /* then the identical stream as the first-frame path */
-    expect_write_addr(&tc, BCMA_CMDPARAM);
-    for (uint32_t i = 0; i < (LCD_WIDTH * LCD_HEIGHT) / 2u; i++) {
-        expect_w(&tc, 32, BCM_DATA_ADDR, pair);
-    }
+    /* finally the command + strobe */
     expect_write_addr(&tc, BCMA_COMMAND);
     expect_w(&tc, 32, BCM_DATA_ADDR, BCMCMD_LCD_UPDATE);
     expect_w(&tc, 16, BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);

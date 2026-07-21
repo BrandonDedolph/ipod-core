@@ -209,11 +209,23 @@ the backlight **on** when booting a non-Apple image. (Verified against
 ipodloader2 `fb.c`, 2026-06-11.)
 
 Rockbox's `BOOTLOADER` build exploits the same guarantee with a
-simplified update variant: wait for BCM idle **before** issuing
+simplified update variant: stream this frame's params/data first, wait
+for the *previous* update to go idle **before issuing the command**
 (skippable on the very first frame, since handoff guarantees idle),
-then write params/data, write the command, strobe `0x31`, and return
-**without** waiting for completion. Our Phase-1 driver follows this
-bootloader variant.
+write the command, strobe `0x31`, and return **without** waiting for
+completion. Our Phase-1 driver follows this bootloader variant.
+
+**Ordering matters — the wait goes AFTER the pixel stream, not before
+it.** In Rockbox the ~150 KB stream (`lcd_update_rect`) runs before the
+idle poll (`lcd_unblock_and_update`), so by the time it polls, the prior
+update has retired and the poll returns on its first read. Polling right
+after the previous strobe — before streaming — instead hits the BCM at
+peak busy and spins its whole budget, which on real 5.5G hardware
+presents as the "second present stalls" hang (only the first frame ever
+shows). Our driver keeps the wait in `bcm_frame_commit` (after the
+caller's stream), and re-issues `LCD_UPDATE` + strobe if the BCM is
+still busy past a bounded poll budget — the analog of Rockbox's 50 ms
+`BCM_UPDATE_TIMEOUT` re-kick for a latched-busy BCM.
 
 ## LCD update protocol
 

@@ -126,9 +126,11 @@ static int test_lcd_present_first_frame(void)
     return fails;
 }
 
-/* Non-first frame: wait-for-idle polls BCMA_COMMAND via bcm_read32
- * until it reads idle (programmed busy, busy-remnant, then idle), then
- * the identical stream follows. */
+/* Non-first frame: the frame streams FIRST, then wait-for-idle polls
+ * BCMA_COMMAND via bcm_read32 until it reads idle (programmed busy,
+ * busy-remnant, then idle) — AFTER the pixel stream, BEFORE the command
+ * + strobe. This ordering is the "second present stalls" fix: the wait
+ * moved out of bcm_frame_begin and into bcm_frame_commit. */
 static int test_lcd_present_subsequent(void)
 {
     mmio_mock_reset();
@@ -142,18 +144,19 @@ static int test_lcd_present_subsequent(void)
     lcd_present_fb(g_fb);
 
     trace_cursor tc = trace_begin("lcd_present_subsequent");
-    /* three wait-for-idle bcm_read32(BCMA_COMMAND) iterations */
+    /* the stream comes first, identical to the first-frame path */
+    expect_write_addr(&tc, BCMA_CMDPARAM);
+    for (unsigned i = 0; i < FRAME_WORDS; i++) {
+        expect_w(&tc, 32, BCM_DATA_ADDR, expected_pair(i));
+    }
+    /* then three wait-for-idle bcm_read32(BCMA_COMMAND) iterations */
     for (int it = 0; it < 3; it++) {
         expect_r(&tc, 16, BCM_RD_ADDR_ADDR);           /* RD_ADDR_READY poll */
         expect_w(&tc, 32, BCM_RD_ADDR_ADDR, BCMA_COMMAND);
         expect_r(&tc, 16, BCM_CONTROL_ADDR);           /* RD_READY poll */
         expect_r(&tc, 32, BCM_DATA_ADDR);              /* status word */
     }
-    /* then the identical stream as the first-frame path */
-    expect_write_addr(&tc, BCMA_CMDPARAM);
-    for (unsigned i = 0; i < FRAME_WORDS; i++) {
-        expect_w(&tc, 32, BCM_DATA_ADDR, expected_pair(i));
-    }
+    /* finally the command + strobe */
     expect_write_addr(&tc, BCMA_COMMAND);
     expect_w(&tc, 32, BCM_DATA_ADDR, BCMCMD_LCD_UPDATE);
     expect_w(&tc, 16, BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
