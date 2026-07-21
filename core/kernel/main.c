@@ -466,7 +466,7 @@ static void fmt_count(char *dst, int a, int b)
 #define DET_HERO_Y   42                   /* art hero top                         */
 #define DET_ART      56                   /* hero art dimension                   */
 #define DET_LIST_Y0  108                  /* tracklist first row top              */
-#define DET_ROWS     6                     /* visible track rows                   */
+#define DET_ROWS     5                     /* visible rows: (240-108)/24 = 5 fit   */
 
 #define ART_RAW_MAX  (12 + 120 * 120 * 2)  /* a full 120x120 CoreArt file          */
 static uint8_t  g_art_scratch[ART_RAW_MAX];      /* raw folder.art read buffer      */
