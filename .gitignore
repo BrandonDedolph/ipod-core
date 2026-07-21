@@ -12,3 +12,6 @@ build/headless/
 *.o
 .scratch/
 tools/.venv/
+
+.claude/
+build/

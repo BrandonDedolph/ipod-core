@@ -132,11 +132,23 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Background streaming playback engine (ours): the FLAC/MP3 decode path, the
+  # SPSC PCM ring feeding the DMA DAC, the fat32 byte-source + read-ahead glue,
+  # album art, and the queue/auto-advance player — extracted out of kernel/main.c
+  # into core/player/. Freestanding (its struct-copy lowers to lib/mem.c's memcpy,
+  # resolved at the final link against mem_dep). Needs the hal include dir for
+  # hw/*.h + hal.h; codec/kernel/fs headers are reached via relative includes.
+  player_hw_lib = static_library(
+    'core_player_hw',
+    sources: ['player/player.c'],
+    include_directories: include_directories('hal', 'codecs', 'codecs/dr_flac', 'codecs/dr_mp3'),
+  )
+
   core_elf = executable(
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, text_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, text_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

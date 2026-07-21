@@ -387,6 +387,25 @@
 #define GPIOL_OUTPUT_EN_ADDR  0x6000D11C
 #define GPIOL_OUTPUT_VAL_ADDR 0x6000D12C
 
+/* GPIO port INPUT_VAL registers (read the live pin state). Same bank
+ * layout as the ENABLE/OUTPUT_EN/OUTPUT_VAL groups above: INPUT_VAL sits
+ * at the per-port +0x30 group (Rockbox pp5020.h GPIO_x_INPUT_VAL,
+ * consistent with GPIOA_INPUT_VAL @0x6000D030 in the clickwheel block and
+ * the GPIOC pair — verified 2026-07-21). GPIOB = A-D base 0x6000D000 +
+ * 0x30 + port-B 0x04; GPIOL = I-L base 0x6000D100 + 0x30 + port-L 0x0C.
+ * Used by battery.c for the charger/charging power-state bits:
+ *   - GPIOL bit 3 (0x08): main charger present (active-LOW)
+ *   - GPIOL bit 4 (0x10): USB charger present (active-HIGH)
+ *   - GPIOB bit 0 (0x01): currently charging   (active-LOW)
+ */
+#define GPIOB_INPUT_VAL_ADDR  0x6000D034
+#define GPIOL_INPUT_VAL_ADDR  0x6000D13C
+
+#ifndef __ASSEMBLER__
+#define GPIOB_INPUT_VAL   PP_REG32(GPIOB_INPUT_VAL_ADDR)
+#define GPIOL_INPUT_VAL   PP_REG32(GPIOL_INPUT_VAL_ADDR)
+#endif
+
 /* Atomic bit set/clear alias. Each GPIO register has a shadow 0x800
  * bytes higher that performs a masked update in a SINGLE 32-bit write —
  * no read-modify-write, so it is safe against a concurrent ISR touching

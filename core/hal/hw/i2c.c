@@ -1,11 +1,14 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
- * core/hal/hw/i2c.c — PP502x on-SoC I2C master, polled write path.
+ * core/hal/hw/i2c.c — PP502x on-SoC I2C master, polled write + read.
  *
  * Implements core/docs/hw/09-i2c.md. Byte-wide register file at
  * 0x7000C000; a transaction is "load address, load <=4 data bytes, set
- * count, strobe". The only Phase 1 consumer is the WM8758 codec control
- * port (see wm8758.c), which is write-only, so no read path is built.
+ * count, strobe". The original Phase 1 consumer is the WM8758 codec
+ * control port (see wm8758.c), which is write-only. The register-pointer
+ * READ path (i2c_read) was added for the PCF50605 PMU battery gauge
+ * (see battery.c) — write the register address, turn the bus around,
+ * read N result bytes.
  */
 
 #include "pp5022.h"
@@ -100,5 +103,66 @@ int i2c_send(uint8_t dev, const uint8_t *bytes, int len)
      * transaction"). */
     mmio_write8(I2C_CTRL_ADDR,
                 (uint8_t)(mmio_read8(I2C_CTRL_ADDR) | I2C_SEND));
+    return 0;
+}
+
+int i2c_read(uint8_t dev, uint8_t reg, uint8_t *buf, int n)
+{
+    if (n < 1 || n > I2C_MAX_BYTES || buf == 0) {
+        return -1;
+    }
+
+    /*
+     * Phase 1 — set the register pointer. The PMU is a register-pointer
+     * device: a 1-byte write of the target register loads its internal
+     * address pointer (which then auto-increments across the read). This
+     * is exactly a 1-byte i2c_send, so reuse the audited write path
+     * rather than re-open-code the addr/count/strobe dance.
+     */
+    int rc = i2c_send(dev, &reg, 1);
+    if (rc != 0) {
+        return rc;
+    }
+
+    /*
+     * The write path polls completion lazily (it lets the NEXT
+     * transaction's leading wait cover it). A read must not — we are
+     * about to turn the bus around, so the pointer write has to have
+     * actually landed first. Block for it here.
+     */
+    if (i2c_wait_idle() != 0) {
+        return -2;
+    }
+
+    /* Phase 2 — read transaction. Device address with the R/W bit SET. */
+    mmio_write8(I2C_ADDR_ADDR,
+                (uint8_t)(((dev & 0x7F) << 1) | I2C_ADDR_RW));
+
+    /*
+     * Select read mode AND set the byte count (n-1) in CTRL bits 2:1 in
+     * one write. (The write path clears I2C_READ at its own start, so we
+     * needn't restore write-mode here for the next caller.)
+     */
+    mmio_write8(I2C_CTRL_ADDR,
+                (uint8_t)((mmio_read8(I2C_CTRL_ADDR) & ~I2C_COUNT_MASK)
+                          | I2C_READ
+                          | (uint8_t)((n - 1) << 1)));
+
+    /* Strobe: begin the read. */
+    mmio_write8(I2C_CTRL_ADDR,
+                (uint8_t)(mmio_read8(I2C_CTRL_ADDR) | I2C_SEND));
+
+    /*
+     * Unlike a write, the result registers are NOT valid until the
+     * transaction completes — block for BUSY to clear before latching.
+     */
+    if (i2c_wait_idle() != 0) {
+        return -2;
+    }
+
+    /* Latch the result bytes DATA0..DATA(n-1). */
+    for (int i = 0; i < n; i++) {
+        buf[i] = mmio_read8(I2C_DATA_ADDR(i));
+    }
     return 0;
 }

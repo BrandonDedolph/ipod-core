@@ -278,4 +278,26 @@ if target == 'sim'
     c_args: ['-DMMIO_MOCK'],
   )
   test('hw-backlight', backlight_trace_test, suite: 'unit')
+
+  # hw-battery: the battery gauge (PCF50605 PMU ADC over I2C) + power-state
+  # (GPIO input bits), host-side under -DMMIO_MOCK. There is no clicky PMU
+  # model and the device needs a logic analyzer, so this is the only
+  # automated check of the battery read grammar. It exercises the new
+  # i2c.c register-pointer READ path end-to-end: asserts battery_millivolts
+  # emits the exact channel-select write (ADCC1=0x05) + 2-byte result read
+  # (ADCS1/ADCS2) transaction stream and returns the seeded raw's mV, and
+  # that power_is_external/charging read the right GPIO input reg/width and
+  # decode the right bit + polarity. Scaling + %-curve are DEVICE-GATED
+  # (calibrate against the real cell); the test pins the transaction shape,
+  # not the on-cell accuracy.
+  battery_trace_test = executable(
+    'battery_trace_test',
+    sources: ['hw_mmio/battery_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/battery.c',
+              '../hal/hw/i2c.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+  )
+  test('hw-battery', battery_trace_test, suite: 'unit')
 endif
