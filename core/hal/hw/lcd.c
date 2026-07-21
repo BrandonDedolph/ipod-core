@@ -31,6 +31,17 @@
 #include "mmio.h"
 #include "lcd.h"
 #include "hal.h"
+#ifndef MMIO_MOCK
+#include "../../kernel/irq.h"   /* arch_irq_save/restore: present is a critical
+                                 * section (real build only; the host trace
+                                 * tests compile this file with -DMMIO_MOCK and
+                                 * the ARM CPSR asm can't build there). */
+#define LCD_IRQ_ENTER()  uint32_t lcd_irq_saved_ = arch_irq_save()
+#define LCD_IRQ_EXIT()   arch_irq_restore(lcd_irq_saved_)
+#else
+#define LCD_IRQ_ENTER()  ((void)0)
+#define LCD_IRQ_EXIT()   ((void)0)
+#endif
 
 /*
  * Upper bounds on the BCM handshake polls so a wedged or absent BCM
@@ -200,6 +211,12 @@ void lcd_fill(uint16_t rgb565)
     const uint32_t pair = ((uint32_t)rgb565 << 16) | rgb565;
     uint32_t n = BCM_FRAME_WORDS;
 
+    /* The BCM frame stream must not be interrupted: an ISR (e.g. the 46 ms
+     * audio DMA completion, which flushes the cache) stalling the pixel push
+     * long enough makes the BCM abort the frame — the "2nd present stalls
+     * once audio is running" bug. Present with IRQs masked; the whole frame
+     * is a few ms, well under the DMA buffer's 46 ms, so audio can't underrun. */
+    LCD_IRQ_ENTER();
     bcm_frame_begin();
 
     /* (3) Stream the full 320x240 frame as 32-bit stores, two RGB565
@@ -212,12 +229,15 @@ void lcd_fill(uint16_t rgb565)
     }
 
     bcm_frame_commit();
+    LCD_IRQ_EXIT();
 }
 
 void lcd_present_fb(const uint16_t *fb)
 {
     uint32_t i = 0;
 
+    /* Uninterrupted frame stream — see lcd_fill's LCD_IRQ_ENTER note. */
+    LCD_IRQ_ENTER();
     bcm_frame_begin();
 
     /* (3) Stream the caller's framebuffer as 32-bit stores, two RGB565
@@ -244,4 +264,5 @@ void lcd_present_fb(const uint16_t *fb)
     }
 
     bcm_frame_commit();
+    LCD_IRQ_EXIT();
 }

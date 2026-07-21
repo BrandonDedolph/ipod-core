@@ -46,4 +46,34 @@ static inline void arch_irq_disable(void)
         : "cc", "memory");
 }
 
+/* Mask IRQs and return the prior I-bit, for a nestable critical section.
+ * Pair with arch_irq_restore() so a section entered with IRQs already masked
+ * leaves them masked. */
+static inline uint32_t arch_irq_save(void)
+{
+    uint32_t cpsr, tmp;
+    __asm__ volatile(
+        "mrs %0, cpsr\n\t"
+        "orr %1, %0, %2\n\t"
+        "msr cpsr_c, %1\n\t"
+        : "=&r"(cpsr), "=&r"(tmp)
+        : "i"(CPSR_I_BIT)
+        : "cc", "memory");
+    return cpsr & CPSR_I_BIT;   /* prior I-bit: 0 = IRQs were enabled */
+}
+
+/* Restore the I-bit captured by arch_irq_save(). */
+static inline void arch_irq_restore(uint32_t saved)
+{
+    uint32_t cpsr, tmp;
+    __asm__ volatile(
+        "mrs %0, cpsr\n\t"
+        "bic %1, %0, %3\n\t"
+        "orr %1, %1, %2\n\t"
+        "msr cpsr_c, %1\n\t"
+        : "=&r"(cpsr), "=&r"(tmp)
+        : "r"(saved), "i"(CPSR_I_BIT)
+        : "cc", "memory");
+}
+
 #endif /* KERNEL_IRQ_H */

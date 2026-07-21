@@ -159,6 +159,13 @@
 #define CPU_INT_DIS_ADDR      0x60004028  /* write 1<<N to disable IRQ N */
 #define CPU_INT_PRIORITY_ADDR 0x6000402C
 
+/* High interrupt bank (sources 32..63), mirroring the low bank at +0x100.
+ * The clickwheel/I2C IRQ (#40) lives here. We handle no high-bank source
+ * yet, so irq_dispatch just masks any that assert — otherwise an un-acked
+ * high-bank IRQ (e.g. an armed wheel) livelocks the core. */
+#define CPU_HI_INT_STAT_ADDR  0x60004100
+#define CPU_HI_INT_DIS_ADDR   0x60004128
+
 #define TIMER1_IRQ          0             /* low bank, 1<<0 (01-soc, IRQ #) */
 #define TIMER2_IRQ          1             /* low bank, 1<<1 */
 

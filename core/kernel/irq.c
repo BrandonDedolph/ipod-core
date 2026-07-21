@@ -45,4 +45,15 @@ void irq_dispatch(void)
     if (unhandled) {
         mmio_write32(CPU_INT_DIS_ADDR, unhandled);
     }
+
+    /* Same guard for the HIGH bank (sources 32..63). We handle none of these
+     * yet, so mask any that assert — critically the clickwheel/I2C IRQ (#40),
+     * which the polled wheel driver can arm at the controller. Without this,
+     * a high-bank IRQ is invisible to the low-bank read above, never acked,
+     * and re-enters us forever the instant CPSR unmasks — a hard livelock
+     * (the "wheel freezes the whole player" bug). */
+    uint32_t hi_pending = mmio_read32(CPU_HI_INT_STAT_ADDR);
+    if (hi_pending) {
+        mmio_write32(CPU_HI_INT_DIS_ADDR, hi_pending);
+    }
 }
