@@ -233,30 +233,56 @@ int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len)
            st->clus >= 2 && st->clus < FAT_EOC) {
         uint32_t sec_in_clus = st->clus_off / fs->bytes_per_sec;
         uint32_t off_in_sec  = st->clus_off % fs->bytes_per_sec;
-        uint32_t fs_sec      = cluster_fs_sector(fs, st->clus) + sec_in_clus;
+        uint32_t base_sec    = cluster_fs_sector(fs, st->clus) + sec_in_clus;
 
-        /* How much this iteration can copy: bounded by the request, what's
-         * left of the file, and what's left in the current FS-sector. */
+        /* How much this iteration can copy: bounded by the request and by
+         * what's left of the file. */
         uint32_t want = len - total;
         if (want > st->remaining) {
             want = st->remaining;
         }
-        uint32_t sec_avail = fs->bytes_per_sec - off_in_sec;
-        uint32_t take      = want < sec_avail ? want : sec_avail;
 
-        if (off_in_sec == 0 && take == fs->bytes_per_sec) {
-            /* Whole aligned FS-sector straight into the caller's buffer. */
-            if (read_fs_sector(fs, fs_sec, out) != 0) {
-                return -1;
-            }
-        } else {
-            /* Partial sector (head, tail, or sub-sector chunk): stage via
-             * the scratch sector so we copy out exactly `take` bytes. */
-            if (read_fs_sector(fs, fs_sec, fat_scratch) != 0) {
+        uint32_t take;
+        if (off_in_sec != 0) {
+            /* Unaligned head: copy the tail of one FS-sector via scratch. */
+            uint32_t sec_avail = fs->bytes_per_sec - off_in_sec;
+            take = want < sec_avail ? want : sec_avail;
+            if (read_fs_sector(fs, base_sec, fat_scratch) != 0) {
                 return -1;
             }
             for (uint32_t i = 0; i < take; i++) {
                 out[i] = fat_scratch[off_in_sec + i];
+            }
+        } else {
+            /* Sector-aligned: read as many WHOLE contiguous FS-sectors as
+             * fit — bounded by the request and the cluster boundary — in ONE
+             * bulk fs->read straight into the caller buffer. This is what
+             * keeps throughput up: one large aligned block read instead of a
+             * per-sector read that ata_read_sectors would inflate to a full
+             * physical sector each (4x amplification when the FS sector is
+             * smaller than the drive's physical sector). Matches the
+             * whole-cluster path in fat32_read_file. */
+            uint32_t secs_left = fs->sec_per_clus - sec_in_clus;
+            uint32_t whole     = want / fs->bytes_per_sec;
+            if (whole > secs_left) {
+                whole = secs_left;
+            }
+            if (whole > 0) {
+                take = whole * fs->bytes_per_sec;
+                if (fs->read(fs->ud, fs->part_lba + base_sec * fs->sec_ratio,
+                             whole * fs->sec_ratio, out) != 0) {
+                    return -1;
+                }
+            } else {
+                /* Less than one FS-sector left to satisfy (partial tail at
+                 * end of file): copy via scratch. */
+                take = want;
+                if (read_fs_sector(fs, base_sec, fat_scratch) != 0) {
+                    return -1;
+                }
+                for (uint32_t i = 0; i < take; i++) {
+                    out[i] = fat_scratch[i];
+                }
             }
         }
 
