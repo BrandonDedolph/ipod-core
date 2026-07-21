@@ -17,6 +17,8 @@
 #include "hw/ata.h"
 #include "hw/clickwheel.h"
 #include "hw/backlight.h"
+#include "hw/battery.h"
+#include "hw/i2c.h"
 #include "hal.h"
 #include "../fs/fat32.h"
 #include "../player/player.h"
@@ -52,8 +54,19 @@ static void cpu_wait_ms(uint8_t ms) {
 #define LINEN_SURFACE 0xF79Du            /* #f4f1ec warm off-white               */
 #define LINEN_INK     0x18A2u            /* #1a1714 near-black text              */
 #define LINEN_MUTED   0x7B8Du            /* #7a7068 secondary text               */
-#define LINEN_ACCENT  0xC348u            /* terracotta accent / selection        */
+#define LINEN_ACCENT  0xC348u            /* terracotta accent (progress/low-batt)*/
 #define LINEN_BORDER  0xE71Bu            /* subtle divider line                  */
+
+/* Design-list tones (menus.jsx): the selection is a DARK ink bar with light
+ * text (NOT a terracotta bar); sub-lines + right values use two muted greys. */
+#define LINEN_SEL_BG  LINEN_INK          /* selection bar = dark ink             */
+#define LINEN_SEL_FG  LINEN_SURFACE      /* selection text = surface             */
+#define LINEN_MUTED2  0x9C70u            /* #9a8e80 lighter muted (subs/strip)   */
+#define LINEN_MUTED_D 0x5A89u            /* #5a5048 deep muted (right values)    */
+#define LINEN_SEL_SUB 0xB595u            /* sub/right text ON a selected row      */
+#define LINEN_CHEVRON 0xB575u            /* › chevron, rgba(ink,0.3) on surface   */
+#define LINEN_SB_TRK  0xE73Cu            /* scrollbar track, rgba(ink,0.06)       */
+#define LINEN_SB_THMB 0xAD34u            /* scrollbar thumb,  rgba(ink,0.35)      */
 
 /* Nunito faces (freestanding renderer, core/ui/text.h). */
 #define FONT_HEADER   text_font_bold_13()
@@ -228,9 +241,15 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
     return 0;
 }
 
-#define LIST_Y0   34                     /* first row top (below header+divider) */
-#define ROW_H     22                     /* px per list row (design: 22-24px)    */
-#define LIST_ROWS 9                       /* visible rows: (240-34)/22 ~= 9       */
+/* Vertical layout (menus.jsx): a status strip up top, a titled header with a
+ * divider, then the scrolling list. */
+#define STATUS_Y0  0                      /* status strip band (battery/track)    */
+#define STATUS_H   15                     /* strip height                         */
+#define HDR_BASE   30                     /* header title text baseline           */
+#define HDR_DIV_Y  38                     /* header divider row                    */
+#define LIST_Y0    42                     /* first list row top                   */
+#define ROW_H      24                     /* px per list row (design: 22-24px)    */
+#define LIST_ROWS  8                       /* visible rows: (240-42)/24 ~= 8       */
 
 /* Wheel scroll feel. The driver reports the raw differenced detent count (up to
  * ~half a rotation per poll), so adding it straight to the selection flung the
@@ -239,31 +258,169 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
 #define WHEEL_CLICKS_PER_ITEM 3          /* higher = less sensitive             */
 #define WHEEL_MAX_DELTA       6          /* max raw detents honoured per event  */
 
-/* Draw one Nunito list row. The selection is a filled terracotta bar with light
- * text; folders are accent-coloured, files ink. */
-static void draw_row(int r, const browse_entry_t *e, int selected)
+/* ---------------------------------------------------------------------------
+ * Design-matched list chrome (menus.jsx): status strip, header, rows, scrollbar
+ * ------------------------------------------------------------------------- */
+
+/* Cached battery/power readout. The gauge read is an I2C transaction (slow, and
+ * shares the codec bus), so sample it a few seconds apart — NOT every present —
+ * and hold the last value. mv/pct < 0 means the read failed / not yet sampled. */
+static int      g_bat_mv  = -1;
+static int      g_bat_pct = -1;
+static int      g_bat_ext = 0;               /* external power present            */
+static uint32_t g_bat_last_us;
+
+static void battery_refresh(int force)
 {
-    int ry       = LIST_Y0 + r * ROW_H;
-    int baseline = ry + 16;
-    uint16_t ink;
-    if (selected) {
-        console_fill_rect(6, ry, LCD_WIDTH - 12, ROW_H - 2, LINEN_ACCENT);
-        ink = LINEN_SURFACE;
-    } else {
-        ink = e->is_dir ? LINEN_ACCENT : LINEN_INK;
+    uint32_t now = mmio_read32(USEC_TIMER_ADDR);
+    if (!force && (uint32_t)(now - g_bat_last_us) < 5000000u) {
+        return;
     }
-    ui_text(14, baseline, e->name, FONT_ROW, ink);
+    g_bat_last_us = now;
+    g_bat_mv  = battery_millivolts();
+    g_bat_pct = battery_percent();
+    g_bat_ext = power_is_external();
+}
+
+/* Small battery glyph: outline + nub + a fill proportional to `pct` (terracotta
+ * when low, ink otherwise). Drawn at top-left (x,y), ~20px wide incl. the nub. */
+static void draw_battery(int x, int y, int pct)
+{
+    const int w = 17, h = 9;
+    console_fill_rect(x, y, w, 1, LINEN_MUTED2);           /* top    */
+    console_fill_rect(x, y + h - 1, w, 1, LINEN_MUTED2);   /* bottom */
+    console_fill_rect(x, y, 1, h, LINEN_MUTED2);           /* left   */
+    console_fill_rect(x + w - 1, y, 1, h, LINEN_MUTED2);   /* right  */
+    console_fill_rect(x + w, y + 3, 2, h - 6, LINEN_MUTED2); /* nub   */
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    int fw = ((w - 4) * pct) / 100;
+    if (fw > 0) {
+        console_fill_rect(x + 2, y + 2, fw, h - 4,
+                          pct <= 20 ? LINEN_ACCENT : LINEN_INK);
+    }
+}
+
+/* The top status strip: the now-playing track name on the left (so you always
+ * see what's playing while browsing), battery on the right. During bring-up the
+ * right side also shows raw millivolts (to calibrate the %-curve; see
+ * battery.h "DEVICE-GATED CALIBRATION"). */
+static void status_strip_render(void)
+{
+    /* Left: playing track (or the wordmark when idle). Clipped by the right
+     * cluster, which is painted over it. */
+    const char *left = player_active() ? player_track_name() : "CORE";
+    ui_text(12, STATUS_Y0 + 11, left, FONT_SMALL, LINEN_MUTED2);
+
+    /* Clear a right-hand region so a long track name can't collide with it. */
+    console_fill_rect(LCD_WIDTH - 70, STATUS_Y0, 70, STATUS_H, LINEN_SURFACE);
+
+    int bx = LCD_WIDTH - 12 - 19;             /* battery block (17 + 2 nub)        */
+    draw_battery(bx, STATUS_Y0 + 3, g_bat_pct);
+
+    /* Raw mV to the left of the glyph (calibration aid). */
+    if (g_bat_mv > 0) {
+        char mv[8];
+        int v = g_bat_mv, i = 0;
+        char tmp[8]; int t = 0;
+        if (v > 9999) v = 9999;
+        do { tmp[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 7);
+        while (t > 0) mv[i++] = tmp[--t];
+        mv[i] = '\0';
+        int w = text_width(mv, FONT_SMALL);
+        ui_text(bx - 5 - w, STATUS_Y0 + 11, mv, FONT_SMALL, LINEN_MUTED2);
+    }
+}
+
+/* Titled header with an optional back chevron and a right-aligned count/value,
+ * plus the divider under it (menus.jsx ScreenHeader). */
+static void header_render(const char *title, const char *right, int back)
+{
+    int x = 12;
+    if (back) {
+        x = ui_text(x, HDR_BASE, "<", FONT_HEADER, LINEN_MUTED2) + 4;
+    }
+    ui_text(x, HDR_BASE, title, FONT_HEADER, LINEN_INK);
+    if (right && right[0]) {
+        int w = text_width(right, FONT_SMALL);
+        ui_text(LCD_WIDTH - 12 - w, HDR_BASE - 1, right, FONT_SMALL, LINEN_MUTED2);
+    }
+    console_fill_rect(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, LINEN_BORDER);
+}
+
+/* One list row (menus.jsx Row). Selected = filled ink bar + light bold text;
+ * greyed = muted (inactive menu item). Optional sub-line, right value, chevron,
+ * and a leading 22x22 art chip (RGB565, or NULL). */
+static void list_row(int r, const char *text, const char *sub, const char *right,
+                     int chevron, int selected, int greyed, const uint16_t *chip)
+{
+    int ry = LIST_Y0 + r * ROW_H;
+    uint16_t fg, subc, rightc, chevc;
+    if (selected) {
+        console_fill_rect(6, ry + 1, LCD_WIDTH - 16, ROW_H - 2, LINEN_SEL_BG);
+        fg = LINEN_SEL_FG; subc = LINEN_SEL_SUB; rightc = LINEN_SEL_SUB;
+        chevc = LINEN_SEL_SUB;
+    } else {
+        fg = greyed ? LINEN_MUTED : LINEN_INK;
+        subc = LINEN_MUTED2; rightc = LINEN_MUTED_D; chevc = LINEN_CHEVRON;
+    }
+
+    int tx = 14;
+    if (chip) {
+        console_blit565(12, ry + (ROW_H - 22) / 2, 22, 22, chip);
+        tx = 12 + 22 + 8;
+    }
+    int base = sub ? ry + 11 : ry + 15;       /* lift the title when a sub is shown */
+    ui_text(tx, base, text, selected ? FONT_HEADER : FONT_ROW, fg);
+    if (sub) {
+        ui_text(tx, ry + 21, sub, FONT_SMALL, subc);
+    }
+    if (right && right[0]) {
+        int w = text_width(right, FONT_SUB);
+        ui_text(LCD_WIDTH - 16 - w, ry + 15, right, FONT_SUB, rightc);
+    } else if (chevron) {
+        ui_text(LCD_WIDTH - 18, ry + 15, ">", FONT_ROW, chevc);
+    }
+}
+
+/* Slim right-edge scrollbar (menus.jsx Scrollbar); no-op when everything fits. */
+static void scrollbar_render(int top, int visible, int total)
+{
+    if (total <= visible) {
+        return;
+    }
+    int track_y = LIST_Y0;
+    int track_h = LCD_HEIGHT - LIST_Y0 - 4;
+    console_fill_rect(LCD_WIDTH - 4, track_y, 3, track_h, LINEN_SB_TRK);
+    int thumb_h = (visible * track_h) / total;
+    if (thumb_h < 16) thumb_h = 16;
+    int denom = total - visible;
+    if (denom < 1) denom = 1;
+    int thumb_y = track_y + (top * (track_h - thumb_h)) / denom;
+    console_fill_rect(LCD_WIDTH - 4, thumb_y, 3, thumb_h, LINEN_SB_THMB);
 }
 
 static void browse_render(int sel, int top)
 {
     console_clear(LINEN_SURFACE);
-    ui_text(14, 20, g_dir_depth > 0 ? "Folder" : "Albums",
-            FONT_HEADER, LINEN_INK);
-    const char *hint = "menu: back";
-    int w = text_width(hint, FONT_SMALL);
-    ui_text(LCD_WIDTH - 14 - w, 19, hint, FONT_SMALL, LINEN_MUTED);
-    console_fill_rect(14, 27, LCD_WIDTH - 28, 1, LINEN_BORDER);
+    status_strip_render();
+
+    char right[12];
+    if (g_browse_n > 0) {
+        /* "sel+1 / n" position counter (design ScreenHeader right slot). */
+        int a = sel + 1, b = g_browse_n, i = 0;
+        char nb[6]; int t = 0, v = a;
+        do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
+        while (t > 0) right[i++] = nb[--t];
+        right[i++] = ' '; right[i++] = '/'; right[i++] = ' ';
+        t = 0; v = b;
+        do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
+        while (t > 0) right[i++] = nb[--t];
+        right[i] = '\0';
+    } else {
+        right[0] = '\0';
+    }
+    header_render(g_dir_depth > 0 ? "Folder" : "Albums", right, 1);
 
     if (g_browse_n == 0) {
         ui_text(14, LIST_Y0 + 20, "Empty folder", FONT_ROW, LINEN_MUTED);
@@ -272,11 +429,11 @@ static void browse_render(int sel, int top)
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
         if (idx >= g_browse_n) break;
-        draw_row(r, &g_browse[idx], idx == sel);
+        const browse_entry_t *e = &g_browse[idx];
+        /* Folders get a chevron; tracks are bare (no per-track duration yet). */
+        list_row(r, e->name, 0, 0, e->is_dir, idx == sel, 0, 0);
     }
-    /* TODO(art): the design shows 22x22 album-art chips beside each album row.
-     * Deferred — chips need a per-album thumbnail sidecar pipeline (tools/
-     * coreart.py emits one full-size folder.art today). Shipping the text list. */
+    scrollbar_render(top, LIST_ROWS, g_browse_n);
 }
 
 /* Boot splash: Nunito CORE branding on the Linen surface the moment the panel
@@ -397,35 +554,29 @@ static int g_music_sel;
 /* Shared wheel accumulator for the menu screens. */
 static int g_menu_accum;
 
-/* Generic menu renderer over a {label, active} list. */
+/* Generic menu renderer over a {label, active} list. `back` draws the header
+ * back chevron (off for the root menu). */
 static void menu_render_list(const char *title, const menu_item_t *items,
-                             int n, int sel)
+                             int n, int sel, int back)
 {
     console_clear(LINEN_SURFACE);
-    ui_text(14, 20, title, FONT_HEADER, LINEN_INK);
-    console_fill_rect(14, 27, LCD_WIDTH - 28, 1, LINEN_BORDER);
+    status_strip_render();
+    header_render(title, "", back);
     for (int i = 0; i < n && i < LIST_ROWS; i++) {
-        int ry = LIST_Y0 + i * ROW_H;
-        uint16_t ink;
-        if (i == sel) {
-            console_fill_rect(6, ry, LCD_WIDTH - 12, ROW_H - 2, LINEN_ACCENT);
-            ink = LINEN_SURFACE;
-        } else {
-            ink = items[i].active ? LINEN_INK : LINEN_MUTED;   /* greyed if inactive */
-        }
-        ui_text(14, ry + 16, items[i].label, FONT_ROW, ink);
+        list_row(i, items[i].label, 0, 0, 1 /*chevron*/, i == sel,
+                 !items[i].active /*greyed*/, 0);
     }
 }
 
 static void main_menu_render(void)
 {
     g_main_menu[MM_NOWPLAYING].active = (uint8_t)player_active();
-    menu_render_list("Core", g_main_menu, MM_COUNT, g_main_sel);
+    menu_render_list("Core", g_main_menu, MM_COUNT, g_main_sel, 0);
 }
 
 static void music_menu_render(void)
 {
-    menu_render_list("Music", g_music_menu, MU_COUNT, g_music_sel);
+    menu_render_list("Music", g_music_menu, MU_COUNT, g_music_sel, 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -478,6 +629,7 @@ _Noreturn static void run_ui(fat32_t *fs)
 {
     clickwheel_init();
     player_init(fs);
+    battery_refresh(1);                   /* prime the status-strip gauge         */
     g_dir_depth = 0;
     g_browse_n  = 0;
     g_br_sel = g_br_top = g_br_accum = 0;
@@ -503,6 +655,7 @@ _Noreturn static void run_ui(fat32_t *fs)
 
     for (;;) {
         player_pump();
+        battery_refresh(0);               /* self-throttled ~5s gauge resample     */
 
         wheel_event_t ev;
         if (clickwheel_poll(&ev)) {
@@ -746,6 +899,12 @@ _Noreturn void kernel_main(void) {
         /* Backlight to full (GPIO charge-pump dimmer) so the splash + UI are lit;
          * run_ui dims then turns it off after inactivity. */
         backlight_init();
+
+        /* Bring up the I2C control bus now (not just at first-song hal_audio_init)
+         * so the status strip can read the PCF50605 battery gauge from the menu.
+         * Bounded/idempotent — hal_audio_init re-inits it harmlessly per track. */
+        i2c_init();
+        battery_init();
 
         /* Paint the boot splash immediately, so the panel shows CORE branding
          * instead of the chainloader's leftover framebuffer (a blue field with
