@@ -215,11 +215,17 @@ static int decode_step(void)
 static int disk_read(void *ud, uint32_t lba, uint32_t count, void *buf)
 {
     (void)ud;
-    for (int attempt = 0; attempt < 4; attempt++) {
+    for (int attempt = 0; attempt < 6; attempt++) {
         if (ata_read_sectors(lba, count, buf) == 0) {
             return 0;
         }
-        sleep_ms(120);                   /* give a spun-down drive time to wake */
+        /* Immediate retries clear a transient PIO glitch with no audible stall
+         * (a sleep here would freeze the decode mid-playback). Only escalate to
+         * a wait after a few fast retries fail — that's the spun-down-drive case
+         * at open time, where the ring isn't yet feeding audio. */
+        if (attempt >= 2) {
+            sleep_ms(60);
+        }
     }
     return -1;
 }

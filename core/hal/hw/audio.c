@@ -25,14 +25,18 @@
 #include "../../kernel/cache.h"   /* cache_commit(): flush before DMA reads */
 
 /*
- * Ping-pong PCM buffers. 2048 frames = ~46 ms at 44.1 kHz, 8 KB each — well
- * under the DMA byte-count limit (16-bit field, max 65536), and long enough
- * that the ISR has tens of ms to refill. Interleaved int16 [L,R,L,R,...]: read by
- * the DMA as 32-bit words, and on little-endian ARM the pair [L,R] in
- * memory IS (R<<16)|L, which is exactly the I2S FIFO packing — so the
- * buffer feeds the FIFO directly with no repack.
+ * Ping-pong PCM buffers. 4096 frames = ~93 ms at 44.1 kHz, 16 KB each — under
+ * the DMA byte-count limit (16-bit field, max 65536 bytes = 16384 frames), and
+ * long enough that the ISR can be delayed ~90 ms without the DAC underrunning.
+ * That headroom matters: the LCD present runs in an IRQ-masked critical section
+ * (an ISR mid-pixel-stream aborts the BCM frame), and its wait-for-idle spin can
+ * hold IRQs long enough to occasionally starve the audio ISR at 2048 frames —
+ * heard as random twitches during playback. Interleaved int16 [L,R,L,R,...]:
+ * read by the DMA as 32-bit words, and on little-endian ARM the pair [L,R] in
+ * memory IS (R<<16)|L, which is exactly the I2S FIFO packing — so the buffer
+ * feeds the FIFO directly with no repack.
  */
-#define AUDIO_FRAMES_PER_BUF 2048u
+#define AUDIO_FRAMES_PER_BUF 4096u
 #define AUDIO_BUF_BYTES      (AUDIO_FRAMES_PER_BUF * 4u)   /* 4 bytes/frame */
 
 static int16_t          audio_buf[2][AUDIO_FRAMES_PER_BUF * 2u];
