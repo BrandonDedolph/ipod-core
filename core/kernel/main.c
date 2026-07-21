@@ -117,6 +117,11 @@ static int      g_dir_depth;
  * folder; handed to player_play_queue so the player owns/validates it. */
 static uint32_t g_art_clus, g_art_size;
 
+/* When set, the album list (depth 0) only shows folders whose "Artist - Album"
+ * name has this artist prefix — the Artists → one-artist's-albums drill-down.
+ * Empty means the plain "Albums" list (every folder). */
+static char g_artist_filter[NAME_MAX + 1];
+
 /* Case-insensitive ASCII match of a dirent name against a literal. */
 static int name_eq_ci(const char *a, const char *b)
 {
@@ -174,6 +179,31 @@ static void copy_display_name(char *dst, const char *src, int drop_ext)
     dst[i] = '\0';
 }
 
+/* Split a "Artist - Album" folder name on its first " - " separator (the loader
+ * names album folders this way). No separator -> artist empty, album = whole
+ * name. Both outputs NAME_MAX-bounded + printable-ASCII (copy_display_name). */
+static void split_artist_album(const char *name, char *artist, char *album)
+{
+    int sep = -1;
+    for (int i = 0; name[i]; i++) {
+        if (name[i] == ' ' && name[i + 1] == '-' && name[i + 2] == ' ') {
+            sep = i;
+            break;
+        }
+    }
+    if (sep < 0) {
+        artist[0] = '\0';
+        copy_display_name(album, name, 0);
+        return;
+    }
+    char tmp[NAME_MAX + 1];
+    int n = (sep < NAME_MAX) ? sep : NAME_MAX;
+    for (int i = 0; i < n; i++) tmp[i] = name[i];
+    tmp[n] = '\0';
+    copy_display_name(artist, tmp, 0);
+    copy_display_name(album, name + sep + 3, 0);
+}
+
 /* MP3 playback is parked: dr_mp3's float synthesis can't hit real-time on this
  * FPU-less CPU (buffer starves -> stutter), and FLAC is lossless so there's no
  * quality reason to prefer it. The device is FLAC-only; a companion loader app
@@ -225,6 +255,13 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
 
     if (e->is_dir) {
         if (is_junk_dir(e->name)) return 0;       /* skip system/Apple folders */
+        /* Artists drill-down: at the album-list level, keep only this artist's
+         * folders (name "Artist - Album"). */
+        if (g_dir_depth == 0 && g_artist_filter[0]) {
+            char a[NAME_MAX + 1], b2[NAME_MAX + 1];
+            split_artist_album(e->name, a, b2);
+            if (!name_eq_ci(a, g_artist_filter)) return 0;
+        }
         browse_entry_t *b = &g_browse[g_browse_n++];
         copy_display_name(b->name, e->name, 0);   /* keep folder name as-is */
         b->clus   = e->first_clus;
@@ -233,6 +270,10 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
         b->is_dir = 1;
         return 0;
     }
+
+    /* The album/artist lists (depth 0) show only folders — hide loose files at
+     * the root (leftover TEST.*, stray downloads) so they don't clutter it. */
+    if (g_dir_depth == 0) return 0;
 
     int fmt = classify_ext(e->name);
     if (fmt < 0) return 0;
@@ -476,7 +517,8 @@ static void fmt_count(char *dst, int a, int b)
 static uint8_t  g_art_scratch[ART_RAW_MAX];      /* raw folder.art read buffer      */
 static uint16_t g_detail_art[DET_ART * DET_ART]; /* downscaled 56x56 hero           */
 static int      g_detail_art_ok;
-static char     g_album_title[NAME_MAX + 1];
+static char     g_album_title[NAME_MAX + 1];     /* album part of "Artist - Album" */
+static char     g_album_artist[NAME_MAX + 1];    /* artist part (empty if none)    */
 static int      g_album_track_n;                  /* playable files in the folder   */
 
 /* Read the current folder's folder.art (clus/size captured by browse_load) and
@@ -547,14 +589,17 @@ static void detail_render(int sel)
         console_fill_rect(12, DET_HERO_Y, DET_ART, DET_ART, LINEN_BORDER);
     }
     int tx = 12 + DET_ART + 12;
-    ui_text(tx, DET_HERO_Y + 18, g_album_title, FONT_HEADER, LINEN_INK);
+    ui_text(tx, DET_HERO_Y + 15, g_album_title, FONT_HEADER, LINEN_INK);
+    if (g_album_artist[0]) {
+        ui_text(tx, DET_HERO_Y + 31, g_album_artist, FONT_SUB, LINEN_MUTED_D);
+    }
     char meta[24];
     { int i = 0, v = g_album_track_n, t = 0; char nb[6];
       do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v && t < 5);
       while (t > 0) meta[i++] = nb[--t];
       for (const char *p = " tracks"; *p; p++) meta[i++] = *p;
       meta[i] = '\0'; }
-    ui_text(tx, DET_HERO_Y + 40, meta, FONT_SMALL, LINEN_MUTED2);
+    ui_text(tx, DET_HERO_Y + 47, meta, FONT_SMALL, LINEN_MUTED2);
 
     console_fill_rect(12, DET_LIST_Y0 - 6, LCD_WIDTH - 24, 1, LINEN_BORDER);
 
@@ -617,7 +662,8 @@ static void albumlist_render(int sel)
     } else {
         right[0] = '\0';
     }
-    header_render("Albums", right, 1);
+    /* Header title = the artist when drilled in from Artists, else "Albums". */
+    header_render(g_artist_filter[0] ? g_artist_filter : "Albums", right, 1);
 
     if (g_browse_n == 0) {
         ui_text(14, LIST_Y0 + 20, "Empty folder", FONT_ROW, LINEN_MUTED);
@@ -633,9 +679,70 @@ static void albumlist_render(int sel)
             chip = (idx < ARTCACHE_SLOTS) ? artcache_get(idx) : 0;
             if (!chip) chip = g_chip_ph;       /* reserve the space meanwhile       */
         }
-        list_row(r, e->name, 0, 0, e->is_dir, idx == sel, 0, chip);
+        /* Show "Album" as the title and the artist as a sub-line (parsed from the
+         * "Artist - Album" folder name). In an artist's own list the artist sub
+         * is redundant, so drop it there. */
+        char artist[NAME_MAX + 1], album[NAME_MAX + 1];
+        split_artist_album(e->name, artist, album);
+        const char *sub = (!g_artist_filter[0] && artist[0]) ? artist : 0;
+        list_row(r, album, sub, 0, e->is_dir, idx == sel, 0, chip);
     }
     scrollbar_render(LIST_Y0, top, LIST_ROWS, g_browse_n);
+}
+
+/* ---------------------------------------------------------------------------
+ * Artists (menus.jsx ArtistsList): a list of the unique artist prefixes parsed
+ * from the "Artist - Album" folder names. Selecting one filters the album list
+ * (g_artist_filter) to just that artist's albums.
+ * ------------------------------------------------------------------------- */
+#define ARTISTS_MAX 96
+static char g_artists[ARTISTS_MAX][NAME_MAX + 1];
+static int  g_artists_n;
+static int  g_artist_sel, g_artist_accum;
+
+/* Build the unique, de-duplicated artist list from the currently-loaded root
+ * folder listing (g_browse must hold the UNFILTERED album list). */
+static void build_artists(void)
+{
+    g_artists_n = 0;
+    for (int i = 0; i < g_browse_n; i++) {
+        if (!g_browse[i].is_dir) continue;
+        char artist[NAME_MAX + 1], album[NAME_MAX + 1];
+        split_artist_album(g_browse[i].name, artist, album);
+        if (!artist[0]) continue;                 /* no "Artist - " prefix        */
+        int found = 0;
+        for (int j = 0; j < g_artists_n; j++) {
+            if (name_eq_ci(g_artists[j], artist)) { found = 1; break; }
+        }
+        if (!found && g_artists_n < ARTISTS_MAX) {
+            int k = 0;
+            for (; artist[k] && k < NAME_MAX; k++) g_artists[g_artists_n][k] = artist[k];
+            g_artists[g_artists_n][k] = '\0';
+            g_artists_n++;
+        }
+    }
+}
+
+static void artists_render(int sel)
+{
+    console_clear(LINEN_SURFACE);
+    status_strip_render();
+    char right[12];
+    if (g_artists_n > 0) fmt_count(right, sel + 1, g_artists_n);
+    else                 right[0] = '\0';
+    header_render("Artists", right, 1);
+
+    if (g_artists_n == 0) {
+        ui_text(14, LIST_Y0 + 20, "No artists", FONT_ROW, LINEN_MUTED);
+        return;
+    }
+    int top = scroll_window(sel, g_artists_n, LIST_ROWS);
+    for (int r = 0; r < LIST_ROWS; r++) {
+        int idx = top + r;
+        if (idx >= g_artists_n) break;
+        list_row(r, g_artists[idx], 0, 0, 1, idx == sel, 0, 0);
+    }
+    scrollbar_render(LIST_Y0, top, LIST_ROWS, g_artists_n);
 }
 
 static void browse_render(int sel)
@@ -837,7 +944,7 @@ enum { MU_PLAYLISTS, MU_ARTISTS, MU_ALBUMS, MU_SONGS, MU_GENRES, MU_COMPOSERS,
        MU_AUDIOBOOKS, MU_COUNT };
 static const menu_item_t g_music_menu[MU_COUNT] = {
     { "Playlists",  0 },
-    { "Artists",    0 },
+    { "Artists",    1 },
     { "Albums",     1 },
     { "Songs",      0 },
     { "Genres",     0 },
@@ -877,7 +984,7 @@ static void music_menu_render(void)
 /* ---------------------------------------------------------------------------
  * Screen stack
  * ------------------------------------------------------------------------- */
-typedef enum { SCR_MENU, SCR_MUSIC, SCR_BROWSER, SCR_NOWPLAYING,
+typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_BROWSER, SCR_NOWPLAYING,
                SCR_CHARGING } screen_t;
 #define SCR_STACK_MAX 8
 static screen_t g_scr[SCR_STACK_MAX];
@@ -933,6 +1040,7 @@ static void paint_current_screen(void)
     switch (scr_cur()) {
     case SCR_MENU:    main_menu_render();  break;
     case SCR_MUSIC:   music_menu_render(); break;
+    case SCR_ARTISTS: artists_render(g_artist_sel); break;
     case SCR_BROWSER: browse_render(g_br_sel); break;
     case SCR_NOWPLAYING:
         nowplaying_render(player_track_name(), player_elapsed_s(),
@@ -963,6 +1071,8 @@ _Noreturn static void run_ui(fat32_t *fs)
     g_main_sel  = 0;
     g_music_sel = MU_ALBUMS;
     g_menu_accum = 0;
+    g_artist_filter[0] = '\0';
+    g_artist_sel = g_artist_accum = 0;
     g_scr_n = 0;
     scr_push(SCR_MENU);
 
@@ -1074,10 +1184,18 @@ _Noreturn static void run_ui(fat32_t *fs)
                 if (ev.buttons & WHEEL_BTN_SELECT) {
                     if (g_music_sel == MU_ALBUMS) {
                         g_dir_depth = 0;
+                        g_artist_filter[0] = '\0';     /* all albums             */
                         browse_load(fs, fs->root_clus);
                         albumlist_queue_chips();       /* start loading covers   */
                         g_br_sel = g_br_accum = 0;
                         scr_push(SCR_BROWSER);
+                    } else if (g_music_sel == MU_ARTISTS) {
+                        g_artist_filter[0] = '\0';     /* load ALL to derive list */
+                        g_dir_depth = 0;
+                        browse_load(fs, fs->root_clus);
+                        build_artists();
+                        g_artist_sel = g_artist_accum = 0;
+                        scr_push(SCR_ARTISTS);
                     }
                     /* other items are greyed: SELECT does nothing yet */
                     dirty = 1;
@@ -1085,6 +1203,32 @@ _Noreturn static void run_ui(fat32_t *fs)
                 if (ev.buttons & WHEEL_BTN_MENU) {
                     scr_pop();                          /* back to main menu */
                     g_menu_accum = 0;
+                    dirty = 1;
+                }
+                break;
+
+            case SCR_ARTISTS:
+                if (ev.wheel_delta && g_artists_n > 0) {
+                    g_artist_sel = wheel_move(g_artist_sel, g_artists_n,
+                                              ev.wheel_delta, &g_artist_accum);
+                    dirty = 1;
+                }
+                if ((ev.buttons & WHEEL_BTN_SELECT) && g_artists_n > 0) {
+                    /* Filter the album list to the chosen artist's folders. */
+                    int k = 0;
+                    for (; g_artists[g_artist_sel][k] && k < NAME_MAX; k++) {
+                        g_artist_filter[k] = g_artists[g_artist_sel][k];
+                    }
+                    g_artist_filter[k] = '\0';
+                    g_dir_depth = 0;
+                    browse_load(fs, fs->root_clus);
+                    albumlist_queue_chips();
+                    g_br_sel = g_br_accum = 0;
+                    scr_push(SCR_BROWSER);
+                    dirty = 1;
+                }
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    scr_pop();                          /* back to Music menu */
                     dirty = 1;
                 }
                 break;
@@ -1098,10 +1242,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                 if ((ev.buttons & WHEEL_BTN_SELECT) && g_browse_n > 0) {
                     if (g_browse[g_br_sel].is_dir) {
                         if (g_dir_depth < DIR_STACK_MAX) {
-                            /* Capture the album name BEFORE browse_load overwrites
-                             * g_browse, then load its tracklist + hero art. */
-                            copy_display_name(g_album_title,
-                                              g_browse[g_br_sel].name, 0);
+                            /* Capture the album/artist BEFORE browse_load
+                             * overwrites g_browse, then load tracklist + art. */
+                            split_artist_album(g_browse[g_br_sel].name,
+                                               g_album_artist, g_album_title);
                             g_dir_stack[g_dir_depth++] = g_cur_dir;
                             browse_load(fs, g_browse[g_br_sel].clus);
                             detail_load_meta(fs);
@@ -1244,6 +1388,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                 switch (scr_cur()) {
                 case SCR_MENU:    main_menu_render();            break;
                 case SCR_MUSIC:   music_menu_render();           break;
+                case SCR_ARTISTS: artists_render(g_artist_sel);  break;
                 case SCR_BROWSER: browse_render(g_br_sel);       break;
                 case SCR_CHARGING:
                     screen_charging_render(g_bat_pct, power_is_charging(),
