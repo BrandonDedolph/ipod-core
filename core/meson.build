@@ -120,6 +120,18 @@ if target == 'hw'
     include_directories: codec_inc,
   )
 
+  # Anti-skip disk buffer (ours, not vendored): a MB-scale watermarked buffer
+  # that reads ahead in bursts so the drive head parks between refills instead of
+  # streaming continuously (the "constant arm movement" fix). Sits under the
+  # read-ahead shim. Freestanding (CORE_FREESTANDING → lib/mem.h memcpy);
+  # warning-clean under -Werror. Same diskbuf.c the host diskbuf_test compiles.
+  diskbuf_hw_lib = static_library(
+    'core_diskbuf_hw',
+    sources: ['codecs/diskbuf.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+    include_directories: codec_inc,
+  )
+
   # Freestanding antialiased text renderer (ours): draws Nunito type from the
   # pre-rasterized atlas/*.h data into an RGB565 framebuffer with a gamma-correct
   # integer blend — no libc/libm/malloc. Same text.c the host text_test compiles;
@@ -182,7 +194,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, player_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

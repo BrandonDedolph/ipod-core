@@ -26,6 +26,7 @@
 #include "../codecs/decoder.h"
 #include "../codecs/arena.h"
 #include "../codecs/readahead.h"
+#include "../codecs/diskbuf.h"
 #include "../codecs/dr_flac/flac.h"
 #include "../codecs/dr_mp3/mp3.h"
 
@@ -46,10 +47,36 @@
                                          /* ~40 KB. Sized for the larger.       */
 #define RA_BYTES      (32u * 1024u)      /* read-ahead block buffer (see below) */
 
+/*
+ * Anti-skip disk buffer (see codecs/diskbuf.h). The drive can't idle with only
+ * the 32 KB read-ahead: the decoder drains ~110 KB/s (FLAC) so a fresh ~32 KB
+ * PIO read fires several times a second, the whole track — the "constant arm
+ * movement" heard on hardware. This large watermarked buffer instead reads
+ * MEGABYTES ahead in a burst, then lets the head sit idle for tens of seconds.
+ *
+ * Sizing (4 MB): at ~110 KB/s that is ~37 s of compressed audio. Filling from
+ * DISK_LOW up to DISK_HIGH bursts ~3.5 MB, then the drive is idle until the
+ * decoder drains back to DISK_LOW (~30 s) — so the head reads in bursts a few
+ * times a MINUTE instead of a few times a SECOND. DISK_LOW (~512 KB ≈ 4.6 s)
+ * is the safety margin: the decoder keeps feeding audio out of the buffer for
+ * ~4.6 s while a refill burst is in flight, far longer than one bounded chunk
+ * read. .bss cost is 4 MB; the low-32 MB image had <1 MB in use. */
+#define DISK_BUF_BYTES (4u * 1024u * 1024u)
+#define DISK_LOW       (512u * 1024u)    /* refill starts below this bytes-ahead */
+#define DISK_HIGH      (DISK_BUF_BYTES - 64u * 1024u)  /* ...and tops out here   */
+#define DISK_CHUNK     (32u * 1024u)     /* max bytes per pump (== RA block; the */
+                                         /* proven per-read PIO stall, no worse) */
+/* Only spend time on a (blocking) disk chunk when the PCM ring has healthy
+ * headroom, so a refill burst can never drain the ring: when the ring dips
+ * below half, the pump backs off and lets decode catch up first. Half the ring
+ * (~0.75 s) dwarfs one DISK_CHUNK read (~0.1 s), so audio can't underrun. */
+#define RING_DISK_GATE (RING_FRAMES / 2u)
+
 static int16_t    ring_storage[RING_FRAMES * 2];
 static int16_t    decode_buf[DECODE_FRAMES * 2];        /* decoder output stage */
 static uint8_t    arena_buf[ARENA_BYTES] __attribute__((aligned(8)));
 static uint8_t    ra_buf[RA_BYTES]       __attribute__((aligned(8)));
+static uint8_t    disk_buf[DISK_BUF_BYTES] __attribute__((aligned(8)));
 
 static pcm_ring_t g_ring;
 static decoder_t  g_dec;
@@ -76,9 +103,16 @@ static fat_src_t g_fsrc;
 /* Long-lived source structs: the decoder borrows a POINTER to the source it is
  * opened on (dr_flac/dr_mp3 stash it for their whole life), so these must
  * outlive the decode loop — hence file statics, not play_file locals. The
- * read-ahead shim (g_ra) wraps the raw fat_src source (g_file_src) and presents
- * the buffered source (g_dec_src) the decoder actually reads through. */
+ * source chain (each layer wraps the one before, decoder reads through the last):
+ *   g_file_src  raw fat_src bytes off the disk
+ *   g_dbuf      MB-scale anti-skip buffer (bursty read-ahead; g_disk_src)
+ *   g_ra        32 KB read-ahead shim collapsing the codec's tiny reads (g_dec_src)
+ * The anti-skip buffer sits UNDER the read-ahead shim so the shim (and its
+ * proven behaviour + host test) is untouched — only its backing source changed
+ * from the raw disk to the RAM buffer. */
 static decoder_source_t g_file_src;      /* raw fat_src bytes                    */
+static diskbuf_t        g_dbuf;          /* MB-scale anti-skip disk buffer        */
+static decoder_source_t g_disk_src;      /* g_dbuf as a source (ra's backing)     */
 static readahead_t      g_ra;            /* block-buffering shim                 */
 static decoder_source_t g_dec_src;       /* buffered source handed to the codec  */
 static decoder_arena_t  g_arena;
@@ -290,7 +324,11 @@ static int player_open_current(void)
     g_file_src.seek = fat_src_seek;
     g_file_src.tell = fat_src_tell;
     g_file_src.userdata = &g_fsrc;
-    readahead_init(&g_ra, &g_file_src, ra_buf, sizeof ra_buf);
+    /* Anti-skip buffer over the raw disk, then the read-ahead shim over that. */
+    diskbuf_init(&g_dbuf, &g_file_src, disk_buf, DISK_BUF_BYTES,
+                 DISK_LOW, DISK_HIGH);
+    diskbuf_as_source(&g_dbuf, &g_disk_src);
+    readahead_init(&g_ra, &g_disk_src, ra_buf, sizeof ra_buf);
     readahead_as_source(&g_ra, &g_dec_src);
 
     decoder_arena_init(&g_arena, arena_buf, sizeof arena_buf);
@@ -396,6 +434,13 @@ void player_pump(void)
         return;
     }
     decode_step();
+    /* Refill the anti-skip buffer in bounded bursts, but only while the PCM ring
+     * has healthy headroom — so the (blocking) chunk read can't starve audio.
+     * When the buffer is above its high watermark the pump does nothing and the
+     * drive head sits idle; see codecs/diskbuf.h. */
+    if (pcm_ring_fill(&g_ring) >= RING_DISK_GATE) {
+        diskbuf_pump(&g_dbuf, DISK_CHUNK);
+    }
     uint32_t fill = pcm_ring_fill(&g_ring);
     if (fill < g_pl_low_fill) {
         g_pl_low_fill = fill;

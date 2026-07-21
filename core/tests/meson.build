@@ -62,6 +62,18 @@ if target == 'sim'
   )
   test('readahead', readahead_test, suite: 'unit')
 
+  # diskbuf: the MB-scale anti-skip buffer (codecs/diskbuf.c) that reads ahead in
+  # bursts so the drive head parks between refills (the "constant arm movement"
+  # fix). Backed by the same instrumented in-RAM source; asserts byte-exactness
+  # across reads/seeks AND that the pump is bursty (fills to high, idles, refills
+  # below low). Same diskbuf.c the ARM build compiles.
+  diskbuf_test = executable(
+    'diskbuf_test',
+    sources: ['codecs/diskbuf_test.c', '../codecs/diskbuf.c'],
+    include_directories: include_directories('../codecs'),
+  )
+  test('diskbuf', diskbuf_test, suite: 'unit')
+
   # text: the freestanding antialiased text renderer (core/ui/text.c) — the
   # SAME source the ARM build links into core.elf. Renders "Ag" into a small
   # RGB565 buffer over a known bg/ink and asserts width is positive+additive
