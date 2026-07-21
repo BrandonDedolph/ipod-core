@@ -576,6 +576,7 @@ static browse_entry_t g_queue[BROWSE_MAX];
 static int            g_queue_n;
 static int            g_queue_idx;
 static int            g_pl_active;        /* a track is decoding + DMA running   */
+static int            g_audio_inited;      /* hal_audio_init done once this session*/
 static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start    */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
@@ -612,9 +613,18 @@ static int player_open_current(void)
     g_eos = 0;
     decode_pump();                       /* prime */
 
-    if (hal_audio_init(44100u, 2u) != 0) {
-        g_dec.ops->close(&g_dec);
-        return -1;
+    /* Init the audio HAL (I2C/I2S/codec/DMA) ONCE for the whole session — not
+     * per track. Re-running the full codec+I2S bring-up while the DMA was
+     * actively draining (as happens selecting a new song mid-playback) wedged
+     * the audio path (froze + silence). Track changes just stop then restart the
+     * DMA (hal_audio_stop masks the completion IRQ; hal_audio_start re-primes,
+     * re-unmasks it, and re-kicks channel 0). */
+    if (!g_audio_inited) {
+        if (hal_audio_init(44100u, 2u) != 0) {
+            g_dec.ops->close(&g_dec);
+            return -1;
+        }
+        g_audio_inited = 1;
     }
     hal_audio_set_source(ring_source, 0);
     hal_audio_start();
@@ -776,6 +786,7 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      dirty = 1;
     uint32_t np_last = 0xFFFFFFFFu;
     int      np_first = 1;
+    uint32_t last_present = 0;           /* rate-limit UI presents while playing */
 
     /* Backlight inactivity: full -> dim -> off. Any input wakes to full; a press
      * that wakes from fully-OFF is swallowed (it just lights the screen, the way
@@ -896,10 +907,19 @@ _Noreturn static void run_ui(fat32_t *fs)
                 dirty = 0;
             }
         } else if (dirty) {
-            if (scr_cur() == SCR_MENU) menu_render();
-            else                       browse_render(g_br_sel, g_br_top);
-            lcd_present_fb(console_framebuffer());
-            dirty = 0;
+            /* While a song plays, cap menu/browser repaints (~14 fps) so
+             * back-to-back full-frame presents during rapid scrolling don't keep
+             * IRQs masked long enough to starve the audio DMA ISR. Idle → present
+             * immediately for a snappy UI. `dirty` stays set until we present, so
+             * the latest scroll position is what lands. */
+            uint32_t now = mmio_read32(USEC_TIMER_ADDR);
+            if (!g_pl_active || (now - last_present) >= 70000u) {
+                if (scr_cur() == SCR_MENU) menu_render();
+                else                       browse_render(g_br_sel, g_br_top);
+                lcd_present_fb(console_framebuffer());
+                dirty = 0;
+                last_present = now;
+            }
         }
 
         /* Only throttle when idle; while playing, decode_step paces the loop and
