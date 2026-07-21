@@ -23,6 +23,19 @@ if target == 'sim'
        args: [vectors_dir],
        suite: 'unit')
 
+  # flac-freestanding: the STREAMING FLAC decode path used on hw — open a
+  # FLAC through flac_open_stream (a decoder_source_t pull source) with the
+  # static arena instead of libc malloc, decode every frame, bit-compare to
+  # the reference PCM, and assert the arena never OOM'd. Same flac.c + arena.c
+  # the ARM build compiles; only the byte source differs (memory vs disk).
+  flac_fs_test = executable(
+    'flac_freestanding_test',
+    sources: ['codecs/flac_freestanding_test.c', '../codecs/arena.c'],
+    dependencies: [flac_dep],
+    include_directories: include_directories('../codecs', '../codecs/dr_flac'),
+  )
+  test('flac-freestanding', flac_fs_test, args: [vectors_dir], suite: 'unit')
+
   # tcdb-reader: hand-rolls a minimal .tcdb byte string in memory
   # (using the same constants the parser reads) and verifies the
   # parser populates the public tagcache_* accessors correctly.

@@ -63,6 +63,34 @@ typedef struct decoder_alloc {
     void *userdata;
 } decoder_alloc_t;
 
+/* Seek origins for decoder_source_t.seek (mirror C's SEEK_SET/CUR/END). END
+ * matters: dr_flac seeks to the end at open() to learn the file size, so a
+ * source that can't honour END makes it misjudge the length and refuse. */
+enum {
+    DECODER_SEEK_SET = 0,   /* offset from the start of the stream   */
+    DECODER_SEEK_CUR = 1,   /* offset from the current position      */
+    DECODER_SEEK_END = 2,   /* offset from the end of the stream     */
+};
+
+/*
+ * decoder_source_t — a pull byte source for STREAMING opens, so a codec reads
+ * its compressed input incrementally instead of needing the whole file in RAM
+ * (essential on hw: a FLAC is tens of MB). Wrappers adapt these to the
+ * underlying lib's stream callbacks (dr_flac's onRead/onSeek/onTell).
+ *
+ *   read: fill up to `bytes`; return bytes read (0 = end of stream).
+ *   seek: reposition; origin is DECODER_SEEK_SET/CUR; return 1 ok / 0 fail.
+ *         Backward seeks may be O(n) but happen only at open() — playback is
+ *         forward-only.
+ *   tell: current absolute byte position, or -1 if unknown.
+ */
+typedef struct decoder_source {
+    size_t  (*read)(void *userdata, void *buf, size_t bytes);
+    int     (*seek)(void *userdata, int offset, int origin);
+    int64_t (*tell)(void *userdata);
+    void     *userdata;
+} decoder_source_t;
+
 /*
  * decoder_t — open instance of a decoder. Lives on the caller's stack
  * or in a long-lived buffer; the codec wrapper stashes its private

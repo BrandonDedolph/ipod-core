@@ -73,11 +73,34 @@ if target == 'hw'
   subdir('boot')
   subdir('kernel')
   subdir('fs')
+  subdir('lib')
+
+  # FLAC decoder (dr_flac) built freestanding for the target: no libc — a
+  # static arena backs allocation and our lib/mem.c provides memcpy/memset
+  # (see codecs/dr_flac/flac.c's CORE_FREESTANDING block). Warnings are
+  # suppressed and werror disabled for the vendored single-header source,
+  # which we don't own; arena.c + mem.c are ours and stay under -Werror.
+  codec_warn_suppress = [
+    '-Wno-unused-parameter', '-Wno-unused-function', '-Wno-unused-variable',
+    '-Wno-sign-compare', '-Wno-shadow', '-Wno-undef', '-Wno-cast-align',
+    '-Wno-implicit-fallthrough', '-Wno-misleading-indentation',
+  ]
+  codec_inc = include_directories('codecs', 'codecs/dr_flac', 'lib')
+  flac_hw_lib = static_library(
+    'core_codec_flac_hw',
+    sources: ['codecs/dr_flac/flac.c'],
+    c_args: ['-DCORE_FREESTANDING'] + codec_warn_suppress,
+    include_directories: codec_inc,
+    override_options: ['werror=false'],
+  )
 
   core_elf = executable(
     'core.elf',
-    boot_sources + kernel_sources + fs_sources,
+    boot_sources + kernel_sources + fs_sources + lib_sources
+      + files('codecs/arena.c'),
     dependencies: [hal_dep],     # hal/hw: SER0 debug UART
+    link_with: [flac_hw_lib],
+    include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),
       '-Wl,-Map=core.map',

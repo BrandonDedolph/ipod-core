@@ -24,6 +24,24 @@
 #define DR_FLAC_IMPLEMENTATION
 #define DR_FLAC_NO_STDIO          /* no fopen / fread paths */
 #define DR_FLAC_NO_OGG            /* skip Ogg-FLAC for now; can re-enable */
+
+/*
+ * Freestanding build (bare-metal ARM, -DCORE_FREESTANDING): route dr_flac's
+ * config hooks away from libc. Assertions compile out; the default MALLOC/
+ * REALLOC/FREE become NULL/no-op because we ALWAYS pass allocation callbacks
+ * (the static arena) so the defaults are never taken; memory ops go through
+ * our word-optimised memcpy/memset. FLAC decode is pure integer, so no libm.
+ */
+#ifdef CORE_FREESTANDING
+#include "../../lib/mem.h"
+#define DRFLAC_ASSERT(expr)            ((void)0)
+#define DRFLAC_MALLOC(sz)             ((void *)0)
+#define DRFLAC_REALLOC(p, sz)         ((void *)0)
+#define DRFLAC_FREE(p)                 ((void)0)
+#define DRFLAC_COPY_MEMORY(dst, src, sz) memcpy((dst), (src), (sz))
+#define DRFLAC_ZERO_MEMORY(p, sz)        memset((p), 0, (sz))
+#endif
+
 #include "dr_flac.h"
 
 #include "flac.h"
@@ -84,6 +102,70 @@ static int flac_open(decoder_t *d, const void *src, size_t src_len,
     d->channels        = (uint16_t)f->channels;
     d->bits_per_sample = (uint16_t)f->bitsPerSample;
     d->total_frames    = f->totalPCMFrameCount;
+    return DECODER_OK;
+}
+
+/* ---------- Streaming open (decoder_source_t -> dr_flac procs) ------ */
+
+static size_t flac_on_read(void *ud, void *buf, size_t bytes) {
+    decoder_source_t *s = (decoder_source_t *)ud;
+    return s->read(s->userdata, buf, bytes);
+}
+static drflac_bool32 flac_on_seek(void *ud, int offset,
+                                  drflac_seek_origin origin) {
+    decoder_source_t *s = (decoder_source_t *)ud;
+    int org;
+    if (origin == DRFLAC_SEEK_SET) {
+        org = DECODER_SEEK_SET;
+    } else if (origin == DRFLAC_SEEK_END) {
+        org = DECODER_SEEK_END;
+    } else {
+        org = DECODER_SEEK_CUR;
+    }
+    return s->seek(s->userdata, offset, org) ? DRFLAC_TRUE : DRFLAC_FALSE;
+}
+static drflac_bool32 flac_on_tell(void *ud, drflac_int64 *cursor) {
+    decoder_source_t *s = (decoder_source_t *)ud;
+    int64_t p = s->tell(s->userdata);
+    if (p < 0) {
+        return DRFLAC_FALSE;
+    }
+    *cursor = (drflac_int64)p;
+    return DRFLAC_TRUE;
+}
+
+int flac_open_stream(decoder_t *d, decoder_source_t *src,
+                     const decoder_alloc_t *alloc) {
+    if (!d || !src || !src->read || !src->seek || !src->tell) {
+        return DECODER_ERR_INVALID;
+    }
+
+    drflac_allocation_callbacks cb;
+    const drflac_allocation_callbacks *pcb = NULL;
+    if (alloc && alloc->alloc && alloc->realloc && alloc->free) {
+        cb.pUserData = (void *)alloc;
+        cb.onMalloc  = flac_malloc_thunk;
+        cb.onRealloc = flac_realloc_thunk;
+        cb.onFree    = flac_free_thunk;
+        pcb = &cb;
+    }
+
+    drflac *f = drflac_open(flac_on_read, flac_on_seek, flac_on_tell,
+                            src, pcb);
+    if (!f) {
+        return DECODER_ERR_INVALID;
+    }
+    if (f->channels > 2) {
+        drflac_close(f);
+        return DECODER_ERR_UNSUPPORTED;
+    }
+
+    d->opaque          = f;
+    d->sample_rate     = f->sampleRate;
+    d->channels        = (uint16_t)f->channels;
+    d->bits_per_sample = (uint16_t)f->bitsPerSample;
+    d->total_frames    = f->totalPCMFrameCount;
+    d->ops             = flac_decoder_ops();
     return DECODER_OK;
 }
 
