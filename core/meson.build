@@ -120,6 +120,20 @@ if target == 'hw'
     include_directories: codec_inc,
   )
 
+  # FLAC metadata reader (ours, not vendored): parses a FLAC's STREAMINFO +
+  # VORBIS_COMMENT blocks up front so the UI can show real title/artist/album/
+  # genre/track#/year + duration without decoding audio. Pulls bytes through a
+  # decoder_source_t (same fat_src + read-ahead path as the streaming decoder).
+  # Freestanding (no libc/libm/malloc — all buffers are stack/struct); reaches
+  # decoder.h via a relative include (no extra dirs). Same flac_meta.c the host
+  # flac_meta_test compiles; stays under -Werror since we own it.
+  flac_meta_hw_lib = static_library(
+    'core_flac_meta_hw',
+    sources: ['codecs/flac_meta.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+    include_directories: codec_inc,
+  )
+
   # Anti-skip disk buffer (ours, not vendored): a MB-scale watermarked buffer
   # that reads ahead in bursts so the drive head parks between refills instead of
   # streaming continuously (the "constant arm movement" fix). Sits under the
@@ -207,7 +221,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

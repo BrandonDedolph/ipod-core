@@ -62,6 +62,21 @@ if target == 'sim'
   )
   test('readahead', readahead_test, suite: 'unit')
 
+  # flac-meta: the FLAC metadata reader (codecs/flac_meta.c) — the SAME source
+  # the ARM build links into core.elf. Backs a decoder_source_t with an in-RAM
+  # buffer and asserts: the committed KAT vector parses to sample_rate 44100 /
+  # 1 s duration (its VORBIS_COMMENT has no tags), a synthetic FLAC we build in
+  # RAM round-trips a full tag set (title/artist/ALBUMARTIST fallback/album/
+  # genre/"7/12" track/"2021-05-01" date) with UTF-8 stripped, and malformed /
+  # hostile inputs return -1 or bail without overrunning. Takes the fixture dir
+  # as argv[1] to find the KAT flac.
+  flac_meta_test = executable(
+    'flac_meta_test',
+    sources: ['codecs/flac_meta_test.c', '../codecs/flac_meta.c'],
+    include_directories: include_directories('../codecs'),
+  )
+  test('flac-meta', flac_meta_test, args: [vectors_dir], suite: 'unit')
+
   # diskbuf: the MB-scale anti-skip buffer (codecs/diskbuf.c) that reads ahead in
   # bursts so the drive head parks between refills (the "constant arm movement"
   # fix). Backed by the same instrumented in-RAM source; asserts byte-exactness
