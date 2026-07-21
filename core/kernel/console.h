@@ -29,6 +29,10 @@ const uint16_t *console_framebuffer(void);
 /* Fill the whole framebuffer with one color. */
 void console_clear(uint16_t rgb565);
 
+/* Blit a w*h block of RGB565 pixels (row-major) into the framebuffer at pixel
+ * (x,y), clipped to the panel. Used for pre-scaled album art. */
+void console_blit565(int x, int y, int w, int h, const uint16_t *src);
+
 /* Draw one character at character-cell (col,row) [col 0..39, row 0..29]
  * with fg/bg colors. Supported glyphs: '0'-'9', 'A'-'F' (hex), space,
  * and the uppercase letters used for labels: at minimum

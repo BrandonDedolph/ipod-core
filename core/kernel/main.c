@@ -244,6 +244,58 @@ static uint32_t g_cur_dir;
 static uint32_t g_dir_stack[DIR_STACK_MAX];
 static int      g_dir_depth;
 
+/* Album art for the current folder. Each album folder carries a pre-scaled
+ * "folder.art" sidecar (host tools/coreart.py): a CoreArt RGB565 bitmap the
+ * device blits straight onto the now-playing screen — no on-device JPEG decode
+ * or scaling. g_art_clus/size are captured while enumerating the folder;
+ * load_folder_art() reads + validates it into g_art_raw once per play. */
+#define ART_MAX_DIM  120
+#define ART_HDR_LEN  12                  /* "CART" + u16 ver/w/h/reserved        */
+static uint32_t g_art_clus, g_art_size;  /* folder.art location in the cur dir   */
+static uint8_t  g_art_raw[ART_HDR_LEN + ART_MAX_DIM * ART_MAX_DIM * 2];
+static int      g_art_ok, g_art_w, g_art_h;
+
+/* Case-insensitive ASCII match of a dirent name against a literal. */
+static int name_eq_ci(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        char ca = *a, cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
+        if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
+        if (ca != cb) return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* Read + validate the captured folder.art into g_art_raw; sets g_art_ok/w/h. */
+static void load_folder_art(fat32_t *fs)
+{
+    g_art_ok = 0;
+    if (g_art_clus == 0 || g_art_size < ART_HDR_LEN ||
+        g_art_size > sizeof g_art_raw) {
+        return;
+    }
+    int32_t n = fat32_read_file(fs, g_art_clus, g_art_raw, g_art_size);
+    if (n < (int32_t)ART_HDR_LEN) {
+        return;
+    }
+    if (g_art_raw[0] != 'C' || g_art_raw[1] != 'A' ||
+        g_art_raw[2] != 'R' || g_art_raw[3] != 'T') {
+        return;
+    }
+    int w = g_art_raw[6] | (g_art_raw[7] << 8);
+    int h = g_art_raw[8] | (g_art_raw[9] << 8);
+    if (w <= 0 || h <= 0 || w > ART_MAX_DIM || h > ART_MAX_DIM) {
+        return;
+    }
+    if ((int32_t)(ART_HDR_LEN + w * h * 2) > n) {
+        return;
+    }
+    g_art_w = w;
+    g_art_h = h;
+    g_art_ok = 1;
+}
+
 /* Map a filename byte to a glyph the 8x8 font can draw: uppercase letters,
  * digits, and the few name punctuation marks; everything else becomes a
  * space. Keeps the list legible without a full ASCII font. */
@@ -295,6 +347,14 @@ static int classify_ext(const char *name)
 static int browse_collect(void *ud, const fat32_dirent_t *e)
 {
     (void)ud;
+
+    /* Capture the folder's album-art sidecar (not shown as a list row). */
+    if (!e->is_dir && name_eq_ci(e->name, "folder.art")) {
+        g_art_clus = e->first_clus;
+        g_art_size = e->size;
+        return 0;
+    }
+
     if (g_browse_n >= BROWSE_MAX) return 1;   /* array full: stop enumeration */
 
     if (e->is_dir) {
@@ -399,38 +459,45 @@ static void nowplaying_render(const browse_entry_t *b, uint32_t elapsed_s,
                               uint32_t total_s, uint32_t buf_pct, uint16_t bg)
 {
     console_clear(bg);
-    console_str(2, 0, "NOW PLAYING", CON_CYAN, bg);
-    console_str(2, 3, b->name, CON_WHITE, bg);
-    console_str(2, 5, b->fmt == 1 ? "MP3" : "FLAC", CON_GREEN, bg);
+
+    /* Pre-scaled album art (folder.art), centred near the top. Falls back to a
+     * text header when the folder has no art sidecar. */
+    if (g_art_ok) {
+        int ax = (LCD_WIDTH - g_art_w) / 2;
+        console_blit565(ax, 8, g_art_w, g_art_h,
+                        (const uint16_t *)(g_art_raw + ART_HDR_LEN));
+    } else {
+        console_str(2, 1, "NOW PLAYING", CON_CYAN, bg);
+    }
+
+    /* Track name + metadata below the art (rows 17..25 clear the 120px art). */
+    console_str(2, 17, b->name, CON_WHITE, bg);
 
     /* Clock line: "MM:SS / MM:SS" */
-    draw_dd(2,  7, elapsed_s / 60, CON_WHITE, bg);
-    console_char(4, 7, ':', CON_WHITE, bg);
-    draw_dd(5,  7, elapsed_s % 60, CON_WHITE, bg);
-    console_str(8, 7, "/", CON_WHITE, bg);
-    draw_dd(10, 7, total_s / 60, CON_WHITE, bg);
-    console_char(12, 7, ':', CON_WHITE, bg);
-    draw_dd(13, 7, total_s % 60, CON_WHITE, bg);
+    draw_dd(2,  19, elapsed_s / 60, CON_WHITE, bg);
+    console_char(4, 19, ':', CON_WHITE, bg);
+    draw_dd(5,  19, elapsed_s % 60, CON_WHITE, bg);
+    console_str(8, 19, "/", CON_WHITE, bg);
+    draw_dd(10, 19, total_s / 60, CON_WHITE, bg);
+    console_char(12, 19, ':', CON_WHITE, bg);
+    draw_dd(13, 19, total_s % 60, CON_WHITE, bg);
 
     /* Progress bar over 36 cells. */
     int width = 36;
     int fill = (total_s > 0) ? (int)((elapsed_s * (uint32_t)width) / total_s) : 0;
     if (fill > width) fill = width;
     for (int i = 0; i < width; i++) {
-        console_char(2 + i, 9, i < fill ? '=' : '-',
+        console_char(2 + i, 21, i < fill ? '=' : '-',
                      i < fill ? CON_GREEN : CON_WHITE, bg);
     }
 
     /* Buffer health: the ring's low-water fill % since the last repaint. Near
-     * 100% => the decoder is comfortably ahead of the DAC (clean audio). If it
-     * dips toward 0 the codec can't keep real-time => stutter (soft-float MP3).
-     * Red once it drops under 20%. */
-    console_str(2, 11, "BUF", buf_pct < 20u ? CON_RED : CON_GREEN, bg);
-    draw_dd(6, 11, buf_pct > 99u ? 99u : buf_pct,
+     * 100% => the decoder is comfortably ahead of the DAC. */
+    console_str(2, 23, "BUF", buf_pct < 20u ? CON_RED : CON_GREEN, bg);
+    draw_dd(6, 23, buf_pct > 99u ? 99u : buf_pct,
             buf_pct < 20u ? CON_RED : CON_GREEN, bg);
-    console_char(8, 11, '_', buf_pct < 20u ? CON_RED : CON_GREEN, bg); /* '%' n/a */
 
-    console_str(2, 13, "MENU = STOP", CON_YELLOW, bg);
+    console_str(2, 25, "MENU = STOP", CON_YELLOW, bg);
 }
 
 /*
@@ -477,6 +544,10 @@ static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
     uint32_t total_s = (g_dec.total_frames > 0)
                      ? (uint32_t)(g_dec.total_frames / 44100u) : 0;
 
+    /* Load this folder's pre-scaled album art (captured during enumeration)
+     * into RAM once, so the now-playing screen can blit it every frame. */
+    load_folder_art(fs);
+
     /* Prime the ring, then start the DMA-fed DAC. */
     pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
     g_eos = 0;
@@ -496,17 +567,13 @@ static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
      * screen once a second. Track the ring's low-water fill between repaints so
      * the BUF% readout exposes whether the decoder is keeping real-time.
      *
-     * Present cost: the first paint is a full frame; each per-second update
-     * only pushes the dynamic band (clock / progress / BUF, rows 6..12) via
-     * lcd_present_rect — the static title/name/format/hint above and below it
-     * persist in the BCM framebuffer. This cuts the IRQ-masked pixel upload
-     * ~5x during playback (helps decode timing). NP_BAND covers only the rows
-     * nowplaying_render animates. */
-    #define NP_BAND_Y 48                 /* row 6 * 8px                          */
-    #define NP_BAND_H 56                 /* rows 6..12 (clock 7 / bar 9 / BUF 11) */
+     * Present: repaint + full present once a second. The now-playing screen
+     * blits the 120px album art (which overlaps the animated rows), so we push
+     * the whole frame rather than a partial band — art re-blits each frame and
+     * stays correct regardless of BCM persistence. (Partial present is kept for
+     * views without a full-height changing element.) */
     uint32_t last_shown = 0xFFFFFFFFu;
     uint32_t low_fill   = RING_FRAMES;   /* min ring fill seen since last repaint */
-    int      first_paint = 1;
     while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
         decode_step();
 
@@ -527,13 +594,7 @@ static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
         if (elapsed_s != last_shown) {
             uint32_t buf_pct = (low_fill * 100u) / RING_FRAMES;
             nowplaying_render(b, elapsed_s, total_s, buf_pct, bg);
-            if (first_paint) {
-                lcd_present_fb(console_framebuffer());   /* whole screen once */
-                first_paint = 0;
-            } else {
-                lcd_present_rect(console_framebuffer(),
-                                 0, NP_BAND_Y, LCD_WIDTH, NP_BAND_H);
-            }
+            lcd_present_fb(console_framebuffer());
             last_shown = elapsed_s;
             low_fill   = fill;           /* reset low-water for the next second */
         }
@@ -550,6 +611,8 @@ static void browse_load(fat32_t *fs, uint32_t dir_clus)
 {
     g_cur_dir  = dir_clus;
     g_browse_n = 0;
+    g_art_clus = 0;                      /* re-captured by browse_collect below */
+    g_art_size = 0;
     fat32_readdir(fs, dir_clus, browse_collect, 0);
 }
 
