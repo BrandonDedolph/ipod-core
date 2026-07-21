@@ -310,6 +310,44 @@ static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start  
 static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (freezes clock) */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
+static int            g_shuffle;          /* pick the next track at random         */
+static int            g_repeat;           /* 0 off, 1 all (loop queue), 2 one       */
+static uint32_t       g_rng = 0x2545F491u;/* LCG state for shuffle (varies w/ USEC) */
+
+void player_set_shuffle(int on)   { g_shuffle = on ? 1 : 0; }
+void player_set_repeat(int mode)  { g_repeat  = mode; }
+
+/* Count playable (non-dir) entries in the queue. */
+static int queue_playable_count(void)
+{
+    int c = 0;
+    for (int i = 0; i < g_queue_n; i++) {
+        if (!g_queue[i].is_dir) c++;
+    }
+    return c;
+}
+
+/* Pick a random playable index, preferring one != `avoid` when possible. */
+static int queue_random_playable(int avoid)
+{
+    int n = queue_playable_count();
+    if (n <= 0) return -1;
+    g_rng = g_rng * 1103515245u + 12345u + mmio_read32(USEC_TIMER_ADDR);
+    int target = (int)((g_rng >> 8) % (uint32_t)n);      /* 0..n-1 among playable  */
+    int pick = -1, seen = 0;
+    for (int i = 0; i < g_queue_n; i++) {
+        if (g_queue[i].is_dir) continue;
+        if (seen == target) { pick = i; break; }
+        seen++;
+    }
+    if (n > 1 && pick == avoid) {                         /* avoid an immediate repeat */
+        for (int i = 1; i < g_queue_n; i++) {
+            int j = (pick + i) % g_queue_n;
+            if (!g_queue[j].is_dir) { pick = j; break; }
+        }
+    }
+    return pick;
+}
 
 void player_init(fat32_t *fs)
 {
@@ -432,10 +470,27 @@ static void player_advance(void)
         hal_audio_stop();
         g_pl_active = 0;                  /* no close: next open resets the arena */
     }
-    for (;;) {
+    /* Repeat One: replay the same track (return early — no skip loop, so a lone
+     * broken track can't spin forever). */
+    if (g_repeat == 2) {
+        if (player_open_current() == 0) {
+            return;
+        }
+        /* fall through to normal selection if the replay somehow fails */
+    }
+    for (int tries = 0; tries <= g_queue_n; tries++) {
         int nxt = -1;
-        for (int j = g_queue_idx + 1; j < g_queue_n; j++) {
-            if (!g_queue[j].is_dir) { nxt = j; break; }
+        if (g_shuffle) {
+            nxt = queue_random_playable(g_queue_idx);
+        } else {
+            for (int j = g_queue_idx + 1; j < g_queue_n; j++) {
+                if (!g_queue[j].is_dir) { nxt = j; break; }
+            }
+            if (nxt < 0 && g_repeat == 1) {   /* Repeat All: wrap to the first */
+                for (int j = 0; j < g_queue_n; j++) {
+                    if (!g_queue[j].is_dir) { nxt = j; break; }
+                }
+            }
         }
         if (nxt < 0) {
             return;                      /* queue done → idle */
@@ -444,7 +499,7 @@ static void player_advance(void)
         if (player_open_current() == 0) {
             return;                      /* next track playing */
         }
-        /* else: broken track, loop to skip it */
+        /* else: broken track, loop to skip it (bounded by `tries`) */
     }
 }
 
@@ -507,3 +562,30 @@ uint32_t player_total_s(void) { return g_pl_total_s; }
 uint32_t player_buf_pct(void) { return (g_pl_low_fill * 100u) / RING_FRAMES; }
 
 void player_note_presented(void) { g_pl_low_fill = pcm_ring_fill(&g_ring); }
+
+/* ---- Queue inspection + jump (the "Now Playing" queue view) --------------- */
+int player_queue_len(void)      { return g_queue_n; }
+int player_queue_current(void)  { return g_queue_idx; }
+
+const char *player_queue_name(int i)
+{
+    return (i >= 0 && i < g_queue_n) ? g_queue[i].name : "";
+}
+
+int player_queue_is_dir(int i)
+{
+    return (i >= 0 && i < g_queue_n) ? g_queue[i].is_dir : 0;
+}
+
+/* Jump to queue entry `i` and play it (no-op for a folder / out-of-range). */
+void player_jump(int i)
+{
+    if (i < 0 || i >= g_queue_n || g_queue[i].is_dir) {
+        return;
+    }
+    player_stop();
+    g_queue_idx = i;
+    if (player_open_current() != 0) {
+        player_advance();                /* skip a broken pick */
+    }
+}

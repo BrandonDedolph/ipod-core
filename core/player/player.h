@@ -62,6 +62,12 @@ void player_resume(void);
 void player_toggle_pause(void);
 int  player_paused(void);              /* 1 while paused */
 
+/* Playback order/looping (driven by Settings). shuffle: pick the next track at
+ * random. repeat: 0 = off (stop at queue end), 1 = all (loop the queue), 2 = one
+ * (replay the current track). */
+void player_set_shuffle(int on);
+void player_set_repeat(int mode);
+
 /* 1 while a track is loaded (playing OR paused). */
 int  player_active(void);
 
@@ -74,6 +80,14 @@ uint32_t    player_buf_pct(void);
 /* Reset the ring low-water mark; the now-playing renderer calls this once per
  * present so the buffer-health readout tracks the last frame's low point. */
 void player_note_presented(void);
+
+/* The playback queue (the folder a track was launched from), for the queue view.
+ * player_jump switches to entry `i` and plays it (no-op for folders/out-of-range). */
+int         player_queue_len(void);
+int         player_queue_current(void);
+const char *player_queue_name(int i);
+int         player_queue_is_dir(int i);
+void        player_jump(int i);
 
 /* Album art accessors for the now-playing renderer (the PLAYING folder's art,
  * held across browsing elsewhere). player_art_pixels() is RGB565, w*h. */
