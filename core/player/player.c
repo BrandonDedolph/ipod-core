@@ -557,6 +557,21 @@ const char *player_track_name(void) { return g_queue[g_queue_idx].name; }
 
 const flac_meta_t *player_meta(void) { return &g_cur_meta; }
 
+/* Probe a file's tags/duration WITHOUT disturbing playback — a throwaway
+ * fat-source on the stack (used by the library scan for Songs/Genres). Returns
+ * 0 on success (out->have==1), -1 on not-a-FLAC. */
+int player_probe_meta(uint32_t clus, uint32_t size, flac_meta_t *out)
+{
+    fat_src_t s;
+    decoder_source_t src;
+    fat_src_open(&s, g_pl_fs, clus, size);
+    src.read = fat_src_read;
+    src.seek = fat_src_seek;
+    src.tell = fat_src_tell;
+    src.userdata = &s;
+    return flac_meta_read(&src, out);
+}
+
 uint32_t player_elapsed_s(void)
 {
     if (!g_pl_active) {

@@ -124,6 +124,11 @@ static uint32_t g_art_clus, g_art_size;
  * Empty means the plain "Albums" list (every folder). */
 static char g_artist_filter[NAME_MAX + 1];
 
+/* Output volume (WM8758 codec gain, 0..100) + how long the on-screen volume
+ * overlay stays up after the last wheel tick (volume-demo.jsx: ~1.5 s then fade). */
+static int      g_volume = 70;
+static uint32_t g_vol_show_until;
+
 /* Case-insensitive ASCII match of a dirent name against a literal. */
 static int name_eq_ci(const char *a, const char *b)
 {
@@ -757,6 +762,259 @@ static void browse_render(int sel)
 }
 
 /* ---------------------------------------------------------------------------
+ * Library index (Songs / Genres): a one-time tag scan of every FLAC in the
+ * library into RAM. The anti-skip buffer (~30 s) covers playback while the scan
+ * hits the disk, so it can run without dropouts. Rebuilt only once per session.
+ * ------------------------------------------------------------------------- */
+#define LIB_MAX_SONGS  384
+#define LIB_MAX_GENRES 32
+#define LIB_TITLE_MAX  48
+#define LIB_GENRE_MAX  24
+
+typedef struct {
+    char     title[LIB_TITLE_MAX];
+    uint32_t file_clus, file_size;
+    uint32_t dir_clus;                    /* album folder (queue context)       */
+    uint32_t art_clus, art_size;          /* its folder.art                     */
+    int16_t  genre;                       /* index into g_genres, -1 = none     */
+} lib_song_t;
+
+static lib_song_t g_songs[LIB_MAX_SONGS];
+static int        g_songs_n;
+static uint16_t   g_song_sorted[LIB_MAX_SONGS];   /* song indices, title order  */
+static char       g_genres[LIB_MAX_GENRES][LIB_GENRE_MAX];
+static int        g_genres_n;
+static int        g_lib_scanned;
+
+/* Scan temporaries (kept off the browser's g_browse). */
+static uint32_t   g_scan_dirs[BROWSE_MAX];
+static int        g_scan_dirs_n;
+typedef struct { char name[NAME_MAX + 1]; uint32_t clus, size; } scan_file_t;
+static scan_file_t g_scan_files[BROWSE_MAX];
+static int         g_scan_files_n;
+static uint32_t    g_scan_art_clus, g_scan_art_size;
+
+/* Filtered, on-screen song list (all songs, or one genre's). */
+static uint16_t   g_songview[LIB_MAX_SONGS];
+static int        g_songview_n;
+static int        g_song_sel, g_song_accum;
+static int        g_genre_sel, g_genre_accum;
+
+/* Case-insensitive title compare (for the sort). */
+static int title_cmp(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        char ca = *a, cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
+        if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
+        if (ca != cb) return (int)ca - (int)cb;
+    }
+    return (int)*a - (int)*b;
+}
+
+static int16_t genre_intern(const char *g)
+{
+    if (!g[0]) return -1;
+    for (int i = 0; i < g_genres_n; i++) {
+        if (name_eq_ci(g_genres[i], g)) return (int16_t)i;
+    }
+    if (g_genres_n < LIB_MAX_GENRES) {
+        int k = 0;
+        for (; g[k] && k < LIB_GENRE_MAX - 1; k++) g_genres[g_genres_n][k] = g[k];
+        g_genres[g_genres_n][k] = '\0';
+        return (int16_t)g_genres_n++;
+    }
+    return -1;
+}
+
+static int scan_dirs_cb(void *ud, const fat32_dirent_t *e)
+{
+    (void)ud;
+    if (!e->is_dir || is_junk_dir(e->name)) return 0;
+    if (g_scan_dirs_n < BROWSE_MAX) g_scan_dirs[g_scan_dirs_n++] = e->first_clus;
+    return 0;
+}
+
+static int scan_files_cb(void *ud, const fat32_dirent_t *e)
+{
+    (void)ud;
+    if (!e->is_dir && name_eq_ci(e->name, "folder.art")) {
+        g_scan_art_clus = e->first_clus;
+        g_scan_art_size = e->size;
+        return 0;
+    }
+    if (e->is_dir || classify_ext(e->name) < 0) return 0;   /* playable files */
+    if (g_scan_files_n < BROWSE_MAX) {
+        scan_file_t *f = &g_scan_files[g_scan_files_n++];
+        copy_display_name(f->name, e->name, 1);
+        f->clus = e->first_clus;
+        f->size = e->size;
+    }
+    return 0;
+}
+
+/* Walk root → album folders → FLAC files, probing each file's tags. */
+static void library_scan(fat32_t *fs)
+{
+    if (g_lib_scanned) return;
+    g_songs_n = g_genres_n = g_scan_dirs_n = 0;
+    fat32_readdir(fs, fs->root_clus, scan_dirs_cb, 0);
+    for (int d = 0; d < g_scan_dirs_n && g_songs_n < LIB_MAX_SONGS; d++) {
+        g_scan_files_n = 0;
+        g_scan_art_clus = g_scan_art_size = 0;
+        fat32_readdir(fs, g_scan_dirs[d], scan_files_cb, 0);
+        for (int i = 0; i < g_scan_files_n && g_songs_n < LIB_MAX_SONGS; i++) {
+            player_pump();                 /* keep audio fed during the scan     */
+            flac_meta_t m;
+            int ok = (player_probe_meta(g_scan_files[i].clus,
+                                        g_scan_files[i].size, &m) == 0);
+            lib_song_t *s = &g_songs[g_songs_n++];
+            const char *t = (ok && m.have && m.title[0]) ? m.title
+                                                         : g_scan_files[i].name;
+            int k = 0;
+            for (; t[k] && k < LIB_TITLE_MAX - 1; k++) s->title[k] = t[k];
+            s->title[k] = '\0';
+            s->file_clus = g_scan_files[i].clus;
+            s->file_size = g_scan_files[i].size;
+            s->dir_clus  = g_scan_dirs[d];
+            s->art_clus  = g_scan_art_clus;
+            s->art_size  = g_scan_art_size;
+            s->genre     = (ok && m.have) ? genre_intern(m.genre) : -1;
+        }
+    }
+    /* Title-sort an index array (insertion sort — one-time, bounded). */
+    for (int i = 0; i < g_songs_n; i++) g_song_sorted[i] = (uint16_t)i;
+    for (int i = 1; i < g_songs_n; i++) {
+        uint16_t v = g_song_sorted[i];
+        int j = i - 1;
+        while (j >= 0 && title_cmp(g_songs[g_song_sorted[j]].title,
+                                   g_songs[v].title) > 0) {
+            g_song_sorted[j + 1] = g_song_sorted[j];
+            j--;
+        }
+        g_song_sorted[j + 1] = v;
+    }
+    g_lib_scanned = 1;
+}
+
+/* Show a "building library" splash then scan (blocks; anti-skip covers audio). */
+static void library_ensure(fat32_t *fs)
+{
+    if (g_lib_scanned) return;
+    console_clear(LINEN_SURFACE);
+    ui_text_centered(118, "Building Library", FONT_TITLE, LINEN_INK);
+    ui_text_centered(140, "reading tags", FONT_SUB, LINEN_MUTED);
+    lcd_present_fb(console_framebuffer());
+    library_scan(fs);
+}
+
+/* Populate g_songview with the songs to show (genre < 0 = all), title-ordered. */
+static void songview_build(int genre)
+{
+    g_songview_n = 0;
+    for (int i = 0; i < g_songs_n; i++) {
+        int si = g_song_sorted[i];
+        if (genre < 0 || g_songs[si].genre == genre) {
+            g_songview[g_songview_n++] = (uint16_t)si;
+        }
+    }
+    g_song_sel = g_song_accum = 0;
+}
+
+static int genre_song_count(int g)
+{
+    int c = 0;
+    for (int i = 0; i < g_songs_n; i++) if (g_songs[i].genre == g) c++;
+    return c;
+}
+
+/* fat32 callback: collect a folder's playable files (+ its art) as a queue,
+ * unfiltered — used to launch a Song/Genre pick in its album context. */
+static int queue_collect(void *ud, const fat32_dirent_t *e)
+{
+    (void)ud;
+    if (!e->is_dir && name_eq_ci(e->name, "folder.art")) {
+        g_art_clus = e->first_clus;
+        g_art_size = e->size;
+        return 0;
+    }
+    if (e->is_dir) return 0;
+    int fmt = classify_ext(e->name);
+    if (fmt < 0) return 0;
+    if (g_browse_n >= BROWSE_MAX) return 1;
+    browse_entry_t *b = &g_browse[g_browse_n++];
+    copy_display_name(b->name, e->name, 1);
+    b->clus = e->first_clus;
+    b->size = e->size;
+    b->fmt  = (uint8_t)fmt;
+    b->is_dir = 0;
+    return 0;
+}
+
+/* Launch a library song in its album's queue (so Next/Prev walk the album). */
+static void library_play_song(fat32_t *fs, int songview_idx)
+{
+    if (songview_idx < 0 || songview_idx >= g_songview_n) return;
+    lib_song_t *s = &g_songs[g_songview[songview_idx]];
+    g_browse_n = 0;
+    g_art_clus = g_art_size = 0;
+    fat32_readdir(fs, s->dir_clus, queue_collect, 0);
+    int start = 0;
+    for (int i = 0; i < g_browse_n; i++) {
+        if (g_browse[i].clus == s->file_clus) { start = i; break; }
+    }
+    player_play_queue(g_browse, g_browse_n, start, g_art_clus, g_art_size);
+    hal_volume_set(g_volume);
+}
+
+static void songs_render(int sel)
+{
+    console_clear(LINEN_SURFACE);
+    status_strip_render();
+    char right[12];
+    if (g_songview_n > 0) fmt_count(right, sel + 1, g_songview_n);
+    else                  right[0] = '\0';
+    header_render("Songs", right, 1);
+    if (g_songview_n == 0) {
+        ui_text(14, LIST_Y0 + 20, "No songs", FONT_ROW, LINEN_MUTED);
+        return;
+    }
+    int top = scroll_window(sel, g_songview_n, LIST_ROWS);
+    for (int r = 0; r < LIST_ROWS; r++) {
+        int idx = top + r;
+        if (idx >= g_songview_n) break;
+        list_row(r, g_songs[g_songview[idx]].title, 0, 0, 0, idx == sel, 0, 0);
+    }
+    scrollbar_render(LIST_Y0, top, LIST_ROWS, g_songview_n);
+}
+
+static void genres_render(int sel)
+{
+    console_clear(LINEN_SURFACE);
+    status_strip_render();
+    char right[12];
+    if (g_genres_n > 0) fmt_count(right, sel + 1, g_genres_n);
+    else                right[0] = '\0';
+    header_render("Genres", right, 1);
+    if (g_genres_n == 0) {
+        ui_text(14, LIST_Y0 + 20, "No genres", FONT_ROW, LINEN_MUTED);
+        return;
+    }
+    int top = scroll_window(sel, g_genres_n, LIST_ROWS);
+    for (int r = 0; r < LIST_ROWS; r++) {
+        int idx = top + r;
+        if (idx >= g_genres_n) break;
+        char cnt[8];
+        int c = genre_song_count(idx), k = 0, t = 0; char nb[6];
+        do { nb[t++] = (char)('0' + c % 10); c /= 10; } while (c && t < 5);
+        while (t > 0) cnt[k++] = nb[--t];
+        cnt[k] = '\0';
+        list_row(r, g_genres[idx], 0, cnt, 0, idx == sel, 0, 0);
+    }
+    scrollbar_render(LIST_Y0, top, LIST_ROWS, g_genres_n);
+}
+
+/* ---------------------------------------------------------------------------
  * Queue view: the tracks queued in the current playback (the folder a track was
  * launched from). The playing track carries the animated now-playing bars;
  * SELECT jumps to a track. Reached via SELECT on the Now Playing screen.
@@ -801,11 +1059,6 @@ static void queue_render(int sel)
  * entry. Slider rows use a brief edit mode (SELECT toggles it, then the wheel
  * adjusts) so the wheel can still move the selection otherwise.
  * ------------------------------------------------------------------------- */
-/* Output volume (WM8758 codec gain, 0..100) + how long the on-screen overlay
- * stays up after the last wheel tick (volume-demo.jsx: show ~1.5 s then fade). */
-static int      g_volume = 70;
-static uint32_t g_vol_show_until;
-
 static settings_t g_settings;
 static int g_set_screen;                  /* current settings_screen_t          */
 static int g_set_sel;                     /* selection within g_set_screen      */
@@ -1034,8 +1287,8 @@ static const menu_item_t g_music_menu[MU_COUNT] = {
     { "Playlists",  0 },
     { "Artists",    1 },
     { "Albums",     1 },
-    { "Songs",      0 },
-    { "Genres",     0 },
+    { "Songs",      1 },
+    { "Genres",     1 },
     { "Composers",  0 },
     { "Audiobooks", 0 },
 };
@@ -1072,8 +1325,9 @@ static void music_menu_render(void)
 /* ---------------------------------------------------------------------------
  * Screen stack
  * ------------------------------------------------------------------------- */
-typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_BROWSER, SCR_NOWPLAYING,
-               SCR_QUEUE, SCR_SETTINGS, SCR_CHARGING } screen_t;
+typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_SONGS, SCR_GENRES,
+               SCR_BROWSER, SCR_NOWPLAYING, SCR_QUEUE, SCR_SETTINGS,
+               SCR_CHARGING } screen_t;
 #define SCR_STACK_MAX 8
 static screen_t g_scr[SCR_STACK_MAX];
 static int      g_scr_n;
@@ -1129,6 +1383,8 @@ static void paint_current_screen(void)
     case SCR_MENU:    main_menu_render();  break;
     case SCR_MUSIC:   music_menu_render(); break;
     case SCR_ARTISTS: artists_render(g_artist_sel); break;
+    case SCR_SONGS:   songs_render(g_song_sel);     break;
+    case SCR_GENRES:  genres_render(g_genre_sel);   break;
     case SCR_BROWSER: browse_render(g_br_sel); break;
     case SCR_QUEUE:   queue_render(g_queue_sel); break;
     case SCR_SETTINGS: settings_render_cur(); break;
@@ -1342,6 +1598,14 @@ _Noreturn static void run_ui(fat32_t *fs)
                         build_artists();
                         g_artist_sel = g_artist_accum = 0;
                         scr_push(SCR_ARTISTS);
+                    } else if (g_music_sel == MU_SONGS) {
+                        library_ensure(fs);
+                        songview_build(-1);            /* all songs             */
+                        scr_push(SCR_SONGS);
+                    } else if (g_music_sel == MU_GENRES) {
+                        library_ensure(fs);
+                        g_genre_sel = g_genre_accum = 0;
+                        scr_push(SCR_GENRES);
                     }
                     /* other items are greyed: SELECT does nothing yet */
                     dirty = 1;
@@ -1371,6 +1635,41 @@ _Noreturn static void run_ui(fat32_t *fs)
                     albumlist_queue_chips();
                     g_br_sel = g_br_accum = 0;
                     scr_push(SCR_BROWSER);
+                    dirty = 1;
+                }
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    scr_pop();                          /* back to Music menu */
+                    dirty = 1;
+                }
+                break;
+
+            case SCR_SONGS:
+                if (ev.wheel_delta && g_songview_n > 0) {
+                    g_song_sel = wheel_move(g_song_sel, g_songview_n,
+                                            ev.wheel_delta, &g_song_accum);
+                    dirty = 1;
+                }
+                if ((ev.buttons & WHEEL_BTN_SELECT) && g_songview_n > 0) {
+                    library_play_song(fs, g_song_sel);
+                    scr_push(SCR_NOWPLAYING);
+                    np_first = 1;
+                    dirty = 1;
+                }
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    scr_pop();                          /* back (Music or Genres) */
+                    dirty = 1;
+                }
+                break;
+
+            case SCR_GENRES:
+                if (ev.wheel_delta && g_genres_n > 0) {
+                    g_genre_sel = wheel_move(g_genre_sel, g_genres_n,
+                                             ev.wheel_delta, &g_genre_accum);
+                    dirty = 1;
+                }
+                if ((ev.buttons & WHEEL_BTN_SELECT) && g_genres_n > 0) {
+                    songview_build(g_genre_sel);        /* this genre's songs */
+                    scr_push(SCR_SONGS);
                     dirty = 1;
                 }
                 if (ev.buttons & WHEEL_BTN_MENU) {
@@ -1635,6 +1934,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                 case SCR_MENU:    main_menu_render();            break;
                 case SCR_MUSIC:   music_menu_render();           break;
                 case SCR_ARTISTS: artists_render(g_artist_sel);  break;
+                case SCR_SONGS:   songs_render(g_song_sel);      break;
+                case SCR_GENRES:  genres_render(g_genre_sel);    break;
                 case SCR_BROWSER: browse_render(g_br_sel);       break;
                 case SCR_QUEUE:   queue_render(g_queue_sel);     break;
                 case SCR_SETTINGS: settings_render_cur();        break;

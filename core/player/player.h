@@ -76,6 +76,9 @@ int  player_active(void);
  * tag is absent — fall back to the filename). */
 const flac_meta_t *player_meta(void);
 
+/* Probe an arbitrary file's tags without touching playback (library scan). */
+int player_probe_meta(uint32_t clus, uint32_t size, flac_meta_t *out);
+
 /* Now-playing readouts (valid while active; elapsed/buf return 0 otherwise). */
 const char *player_track_name(void);
 uint32_t    player_elapsed_s(void);
