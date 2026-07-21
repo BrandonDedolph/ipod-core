@@ -33,6 +33,7 @@
 #include "../ui/thumb.h"
 #include "../ui/artcache.h"
 #include "../ui/screen_charging.h"
+#include "../ui/settings.h"
 #include "hw/volume.h"
 
 /*
@@ -755,6 +756,82 @@ static void browse_render(int sel)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Queue view: the tracks queued in the current playback (the folder a track was
+ * launched from). The playing track carries the animated now-playing bars;
+ * SELECT jumps to a track. Reached via SELECT on the Now Playing screen.
+ * ------------------------------------------------------------------------- */
+static int g_queue_sel, g_queue_accum;
+
+static void queue_render(int sel)
+{
+    console_clear(LINEN_SURFACE);
+    status_strip_render();
+    int n   = player_queue_len();
+    int cur = player_queue_current();
+    char right[12];
+    if (n > 0) fmt_count(right, cur + 1, n);
+    else       right[0] = '\0';
+    header_render("Now Playing", right, 1);
+
+    if (n == 0) {
+        ui_text(14, LIST_Y0 + 20, "Queue empty", FONT_ROW, LINEN_MUTED);
+        return;
+    }
+    int top = scroll_window(sel, n, LIST_ROWS);
+    for (int r = 0; r < LIST_ROWS; r++) {
+        int idx = top + r;
+        if (idx >= n) break;
+        int is_sel = (idx == sel);
+        list_row(r, player_queue_name(idx), 0, 0, 0, is_sel,
+                 player_queue_is_dir(idx), 0);
+        if (idx == cur) {                 /* the currently-playing track */
+            int ry = LIST_Y0 + r * ROW_H;
+            nowplaying_bars(LCD_WIDTH - 22, ry + 7,
+                            is_sel ? LINEN_SEL_FG : LINEN_INK,
+                            mmio_read32(USEC_TIMER_ADDR));
+        }
+    }
+    scrollbar_render(LIST_Y0, top, LIST_ROWS, n);
+}
+
+/* ---------------------------------------------------------------------------
+ * Settings (core/ui/settings.h data-driven model). g_settings holds the state;
+ * g_set_screen tracks the current sub-screen within the one SCR_SETTINGS stack
+ * entry. Slider rows use a brief edit mode (SELECT toggles it, then the wheel
+ * adjusts) so the wheel can still move the selection otherwise.
+ * ------------------------------------------------------------------------- */
+/* Output volume (WM8758 codec gain, 0..100) + how long the on-screen overlay
+ * stays up after the last wheel tick (volume-demo.jsx: show ~1.5 s then fade). */
+static int      g_volume = 70;
+static uint32_t g_vol_show_until;
+
+static settings_t g_settings;
+static int g_set_screen;                  /* current settings_screen_t          */
+static int g_set_sel;                     /* selection within g_set_screen      */
+static int g_set_root_sel;                /* saved ROOT selection               */
+static int g_set_accum;                   /* wheel accumulator                  */
+static int g_set_editing;                 /* editing a slider row               */
+
+/* Push the FUNCTIONAL settings out to the subsystems. Cosmetic fields are a
+ * no-op. The backlight timeout/brightness are read live by the loop. */
+static void settings_apply(void)
+{
+    player_set_shuffle(g_settings.shuffle);
+    player_set_repeat((int)g_settings.repeat);
+    g_volume = g_settings.volume;
+    hal_volume_set(g_volume);
+}
+
+static void settings_render_cur(void)
+{
+    if (g_set_screen == SETTINGS_ABOUT) {
+        settings_about_render(g_bat_pct, g_bat_mv, 0, 0, g_artists_n);
+    } else {
+        settings_render(g_set_screen, &g_settings, g_set_sel);
+    }
+}
+
 /* Boot splash: Nunito CORE branding on the Linen surface the moment the panel
  * is ours, so the disk-spin-up / mount delay reads as "loading" rather than the
  * leftover chainloader framebuffer. */
@@ -778,11 +855,6 @@ static void fmt_time(char *buf, uint32_t s)
     buf[i++] = (char)('0' + ss % 10);
     buf[i]   = '\0';
 }
-
-/* Output volume (WM8758 codec gain, 0..100) + how long the on-screen overlay
- * stays up after the last wheel tick (volume-demo.jsx: show ~1.5 s then fade). */
-static int      g_volume = 70;
-static uint32_t g_vol_show_until;
 
 /* Centered volume overlay plate (volume-demo.jsx VolumeOverlay): speaker glyph +
  * ink fill bar + big percent, on a light near-surface plate. */
@@ -937,7 +1009,7 @@ static menu_item_t g_main_menu[MM_COUNT] = {
     { "Playlists",   0 },
     { "Podcasts",    0 },
     { "Audiobooks",  0 },
-    { "Settings",    0 },
+    { "Settings",    1 },
     { "Now Playing", 1 },
 };
 static int g_main_sel;
@@ -988,7 +1060,7 @@ static void music_menu_render(void)
  * Screen stack
  * ------------------------------------------------------------------------- */
 typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_BROWSER, SCR_NOWPLAYING,
-               SCR_CHARGING } screen_t;
+               SCR_QUEUE, SCR_SETTINGS, SCR_CHARGING } screen_t;
 #define SCR_STACK_MAX 8
 static screen_t g_scr[SCR_STACK_MAX];
 static int      g_scr_n;
@@ -1045,6 +1117,8 @@ static void paint_current_screen(void)
     case SCR_MUSIC:   music_menu_render(); break;
     case SCR_ARTISTS: artists_render(g_artist_sel); break;
     case SCR_BROWSER: browse_render(g_br_sel); break;
+    case SCR_QUEUE:   queue_render(g_queue_sel); break;
+    case SCR_SETTINGS: settings_render_cur(); break;
     case SCR_NOWPLAYING:
         nowplaying_render(player_track_name(), player_elapsed_s(),
                           player_total_s(), player_buf_pct());
@@ -1091,6 +1165,8 @@ _Noreturn static void run_ui(fat32_t *fs)
     g_menu_accum = 0;
     g_artist_filter[0] = '\0';
     g_artist_sel = g_artist_accum = 0;
+    settings_defaults(&g_settings);
+    settings_apply();                     /* push shuffle/repeat/volume defaults  */
     g_scr_n = 0;
     scr_push(SCR_MENU);
 
@@ -1114,8 +1190,6 @@ _Noreturn static void run_ui(fat32_t *fs)
     enum { BL_OFF, BL_DIM, BL_FULL };
     int      bl_state   = BL_FULL;
     uint32_t last_input = mmio_read32(USEC_TIMER_ADDR);
-    const uint32_t BL_DIM_US = 15u * 1000000u;
-    const uint32_t BL_OFF_US = 30u * 1000000u;
 
     const char *last_tn = 0;              /* re-apply volume on track change       */
     for (;;) {
@@ -1170,7 +1244,7 @@ _Noreturn static void run_ui(fat32_t *fs)
             g_lock_flash_until = mmio_read32(USEC_TIMER_ADDR) + 1000000u;
             last_input = mmio_read32(USEC_TIMER_ADDR);   /* wake the backlight    */
             if (bl_state != BL_FULL) {
-                backlight_set(BACKLIGHT_MAX);
+                backlight_set(g_settings.backlight_bright);
                 bl_state = BL_FULL;
             }
             dirty = 1;
@@ -1184,7 +1258,7 @@ _Noreturn static void run_ui(fat32_t *fs)
             last_input = mmio_read32(USEC_TIMER_ADDR);
             if (bl_state != BL_FULL) {
                 int was_off = (bl_state == BL_OFF);
-                backlight_set(BACKLIGHT_MAX);
+                backlight_set(g_settings.backlight_bright);
                 bl_state = BL_FULL;
                 dirty = 1;                    /* repaint anything drawn while off */
                 if (was_off) {                /* swallow the wake press */
@@ -1213,6 +1287,11 @@ _Noreturn static void run_ui(fat32_t *fs)
                     } else if (g_main_sel == MM_NOWPLAYING && player_active()) {
                         scr_push(SCR_NOWPLAYING);
                         np_first = 1;
+                    } else if (g_main_sel == MM_SETTINGS) {
+                        g_set_screen = SETTINGS_ROOT;
+                        g_set_sel = g_set_root_sel = g_set_accum = 0;
+                        g_set_editing = 0;
+                        scr_push(SCR_SETTINGS);
                     }
                     /* other items are greyed: SELECT does nothing yet */
                     dirty = 1;
@@ -1332,7 +1411,14 @@ _Noreturn static void run_ui(fat32_t *fs)
                     if (g_volume < 0)   g_volume = 0;
                     if (g_volume > 100) g_volume = 100;
                     hal_volume_set(g_volume);
+                    g_settings.volume = g_volume;         /* keep Settings in sync */
                     g_vol_show_until = mmio_read32(USEC_TIMER_ADDR) + 1500000u;
+                    dirty = 1;
+                }
+                if ((ev.buttons & WHEEL_BTN_SELECT) && player_active()) {
+                    g_queue_sel = player_queue_current();  /* open the queue view */
+                    g_queue_accum = 0;
+                    scr_push(SCR_QUEUE);
                     dirty = 1;
                 }
                 if (ev.buttons & WHEEL_BTN_MENU) {
@@ -1340,6 +1426,87 @@ _Noreturn static void run_ui(fat32_t *fs)
                     dirty = 1;
                 }
                 break;
+
+            case SCR_QUEUE:
+                if (ev.wheel_delta && player_queue_len() > 0) {
+                    g_queue_sel = wheel_move(g_queue_sel, player_queue_len(),
+                                             ev.wheel_delta, &g_queue_accum);
+                    dirty = 1;
+                }
+                if ((ev.buttons & WHEEL_BTN_SELECT) && player_queue_len() > 0) {
+                    if (!player_queue_is_dir(g_queue_sel)) {
+                        player_jump(g_queue_sel);          /* play the chosen track */
+                        hal_volume_set(g_volume);          /* re-apply over re-init */
+                        scr_pop();                          /* back to Now Playing  */
+                    }
+                    dirty = 1;
+                }
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    scr_pop();
+                    dirty = 1;
+                }
+                break;
+
+            case SCR_SETTINGS: {
+                int scount = settings_count(g_set_screen);
+                int slider = (settings_kind(g_set_screen, g_set_sel)
+                              == SETTINGS_KIND_SLIDER);
+                if (ev.wheel_delta) {
+                    if (g_set_editing && slider) {         /* adjust the value  */
+                        int dd = ev.wheel_delta;
+                        if (dd >  4) dd =  4;
+                        if (dd < -4) dd = -4;
+                        settings_adjust(g_set_screen, &g_settings, g_set_sel, dd);
+                        settings_apply();                  /* live volume/etc.  */
+                    } else if (scount > 0) {               /* move selection    */
+                        g_set_sel = wheel_move(g_set_sel, scount,
+                                               ev.wheel_delta, &g_set_accum);
+                    }
+                    dirty = 1;
+                }
+                if (ev.buttons & WHEEL_BTN_SELECT) {
+                    if (slider) {
+                        g_set_editing = !g_set_editing;    /* enter/exit edit   */
+                    } else {
+                        int act = settings_activate(g_set_screen, &g_settings,
+                                                    g_set_sel);
+                        int target = -1;
+                        switch (act) {
+                        case SETTINGS_ENTER_PLAYBACK: target = SETTINGS_PLAYBACK; break;
+                        case SETTINGS_ENTER_SOUND:    target = SETTINGS_SOUND;    break;
+                        case SETTINGS_ENTER_DISPLAY:  target = SETTINGS_DISPLAY;  break;
+                        case SETTINGS_ENTER_ABOUT:    target = SETTINGS_ABOUT;    break;
+                        case SETTINGS_ENTER_THEME:    target = SETTINGS_THEME;    break;
+                        default: break;
+                        }
+                        if (target >= 0) {                 /* descend a screen  */
+                            g_set_root_sel = g_set_sel;
+                            g_set_screen = target;
+                            g_set_sel = g_set_accum = 0;
+                            g_set_editing = 0;
+                        } else if (act == SETTINGS_ACTION_RESET) {
+                            settings_defaults(&g_settings);
+                            settings_apply();
+                        } else {                           /* toggled/cycled    */
+                            settings_apply();
+                        }
+                    }
+                    dirty = 1;
+                }
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    if (g_set_editing) {
+                        g_set_editing = 0;                 /* exit edit, stay   */
+                    } else if (g_set_screen != SETTINGS_ROOT) {
+                        g_set_screen = SETTINGS_ROOT;      /* back to root      */
+                        g_set_sel = g_set_root_sel;
+                        g_set_accum = 0;
+                    } else {
+                        scr_pop();                          /* leave Settings    */
+                    }
+                    dirty = 1;
+                }
+                break;
+            }
 
             case SCR_CHARGING:
                 if (ev.buttons) {                       /* any press dismisses */
@@ -1350,12 +1517,22 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
         }
 
-        /* Idle-timeout backlight: dim, then off. Playback keeps running. */
+        /* Idle-timeout backlight: dim, then off — timeout from Settings (0 =
+         * never), brightness from Settings. Playback keeps running. */
+        uint32_t dim_us, off_us;
+        if (g_settings.backlight_secs <= 0) {
+            dim_us = off_us = 0xFFFFFFFFu;      /* never dim/off               */
+        } else {
+            dim_us = (uint32_t)g_settings.backlight_secs * 1000000u;
+            off_us = dim_us + 15u * 1000000u;
+        }
+        int dim_level = g_settings.backlight_bright / 4;
+        if (dim_level < 1) dim_level = 1;
         uint32_t idle = mmio_read32(USEC_TIMER_ADDR) - last_input;
-        if (bl_state == BL_FULL && idle > BL_DIM_US) {
-            backlight_set(BACKLIGHT_MAX / 4);
+        if (bl_state == BL_FULL && idle > dim_us) {
+            backlight_set(dim_level);
             bl_state = BL_DIM;
-        } else if (bl_state == BL_DIM && idle > BL_OFF_US) {
+        } else if (bl_state == BL_DIM && idle > off_us) {
             backlight_set(0);
             bl_state = BL_OFF;
         }
@@ -1436,6 +1613,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                 case SCR_MUSIC:   music_menu_render();           break;
                 case SCR_ARTISTS: artists_render(g_artist_sel);  break;
                 case SCR_BROWSER: browse_render(g_br_sel);       break;
+                case SCR_QUEUE:   queue_render(g_queue_sel);     break;
+                case SCR_SETTINGS: settings_render_cur();        break;
                 case SCR_CHARGING:
                     screen_charging_render(g_bat_pct, power_is_charging(),
                                            power_is_external());
@@ -1471,6 +1650,28 @@ _Noreturn static void run_ui(fat32_t *fs)
                     lcd_present_rect(console_framebuffer(),
                                      bx, by, NP_BARS_W + 1, NP_BARS_H);
                     break;
+                }
+                last_bars = nowb;
+            }
+        }
+
+        /* Same animated bars on the queue view (the currently-playing row). */
+        if (bl_state != BL_OFF && scr_cur() == SCR_QUEUE && player_active()) {
+            uint32_t nowb = mmio_read32(USEC_TIMER_ADDR);
+            if ((uint32_t)(nowb - last_bars) >= 110000u) {
+                int n = player_queue_len();
+                int cur = player_queue_current();
+                int top = scroll_window(g_queue_sel, n, LIST_ROWS);
+                int r = cur - top;
+                if (cur < n && r >= 0 && r < LIST_ROWS) {
+                    int ry = LIST_Y0 + r * ROW_H;
+                    int bx = LCD_WIDTH - 22, by = ry + 7;
+                    int is_sel = (cur == g_queue_sel);
+                    console_fill_rect(bx, by, NP_BARS_W, NP_BARS_H,
+                                      is_sel ? LINEN_SEL_BG : LINEN_SURFACE);
+                    nowplaying_bars(bx, by, is_sel ? LINEN_SEL_FG : LINEN_INK, nowb);
+                    lcd_present_rect(console_framebuffer(),
+                                     bx, by, NP_BARS_W + 1, NP_BARS_H);
                 }
                 last_bars = nowb;
             }
