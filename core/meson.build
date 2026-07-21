@@ -85,7 +85,7 @@ if target == 'hw'
     '-Wno-sign-compare', '-Wno-shadow', '-Wno-undef', '-Wno-cast-align',
     '-Wno-implicit-fallthrough', '-Wno-misleading-indentation',
   ]
-  codec_inc = include_directories('codecs', 'codecs/dr_flac', 'lib')
+  codec_inc = include_directories('codecs', 'codecs/dr_flac', 'codecs/dr_mp3', 'lib')
   flac_hw_lib = static_library(
     'core_codec_flac_hw',
     sources: ['codecs/dr_flac/flac.c'],
@@ -94,11 +94,26 @@ if target == 'hw'
     override_options: ['werror=false'],
   )
 
+  # MP3 decoder (dr_mp3) built freestanding, same recipe as flac_hw_lib.
+  # Unlike FLAC, MP3's synthesis filter is floating point, but dr_mp3 calls
+  # no libm — the float ops lower to libgcc soft-float (__aeabi_*), already
+  # linked via -lgcc below. Vendored source: warnings suppressed, werror off;
+  # sign-compare/type-limits are extra for dr_mp3 (mirrors codecs/meson.build).
+  mp3_hw_lib = static_library(
+    'core_codec_mp3_hw',
+    sources: ['codecs/dr_mp3/mp3.c'],
+    c_args: ['-DCORE_FREESTANDING'] + codec_warn_suppress + [
+      '-Wno-sign-compare', '-Wno-type-limits',
+    ],
+    include_directories: codec_inc,
+    override_options: ['werror=false'],
+  )
+
   core_elf = executable(
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

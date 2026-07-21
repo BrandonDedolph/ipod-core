@@ -36,6 +36,20 @@ if target == 'sim'
   )
   test('flac-freestanding', flac_fs_test, args: [vectors_dir], suite: 'unit')
 
+  # mp3-freestanding: the STREAMING MP3 decode path used on hw — mirror of
+  # flac-freestanding. Open the MP3 through mp3_open_stream (a decoder_source_t
+  # pull source) with the static arena instead of libc malloc, decode every
+  # frame, bit-compare to the reference PCM (dr_mp3's own captured output, the
+  # KAT truth for a lossy codec), and assert the arena never OOM'd. Same mp3.c +
+  # arena.c the ARM build compiles; only the byte source differs (memory vs disk).
+  mp3_fs_test = executable(
+    'mp3_freestanding_test',
+    sources: ['codecs/mp3_freestanding_test.c', '../codecs/arena.c'],
+    dependencies: [mp3_dep],
+    include_directories: include_directories('../codecs', '../codecs/dr_mp3'),
+  )
+  test('mp3-freestanding', mp3_fs_test, args: [vectors_dir], suite: 'unit')
+
   # tcdb-reader: hand-rolls a minimal .tcdb byte string in memory
   # (using the same constants the parser reads) and verifies the
   # parser populates the public tagcache_* accessors correctly.

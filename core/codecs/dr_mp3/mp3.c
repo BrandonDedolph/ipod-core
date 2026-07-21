@@ -28,6 +28,31 @@
 
 #define DR_MP3_IMPLEMENTATION
 #define DR_MP3_NO_STDIO           /* no fopen / fread paths */
+
+/*
+ * Freestanding build (bare-metal ARM, -DCORE_FREESTANDING): route dr_mp3's
+ * config hooks away from libc. Assertions compile out; the default MALLOC/
+ * REALLOC/FREE become NULL/no-op because we ALWAYS pass allocation callbacks
+ * (the static arena) so the defaults are never taken; memory ops go through
+ * our word-optimised memcpy/memset/memmove.
+ *
+ * MP3's synthesis filter is floating point, unlike FLAC's pure-integer path.
+ * dr_mp3 uses only plain float arithmetic (multiply/add over precomputed
+ * tables) — it includes no <math.h> and calls no libm function — so the
+ * compiler lowers those ops to libgcc's soft-float runtime (__aeabi_fmul,
+ * __aeabi_fadd, __aeabi_f2iz, …), which links via -lgcc. No libm, no libc.
+ */
+#ifdef CORE_FREESTANDING
+#include "../../lib/mem.h"
+#define DRMP3_ASSERT(expr)               ((void)0)
+#define DRMP3_MALLOC(sz)                 ((void *)0)
+#define DRMP3_REALLOC(p, sz)             ((void *)0)
+#define DRMP3_FREE(p)                    ((void)0)
+#define DRMP3_COPY_MEMORY(dst, src, sz)  memcpy((dst), (src), (sz))
+#define DRMP3_MOVE_MEMORY(dst, src, sz)  memmove((dst), (src), (sz))
+#define DRMP3_ZERO_MEMORY(p, sz)         memset((p), 0, (sz))
+#endif
+
 #include "dr_mp3.h"
 
 #include "mp3.h"
@@ -35,8 +60,12 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
+#ifdef CORE_FREESTANDING
+#include "../../lib/mem.h"       /* memset for the wrapper's own zeroing */
+#else
+#include <stdlib.h>             /* malloc/free fallback (sim only) */
+#include <string.h>             /* memset */
+#endif
 
 /* ---------- Allocator translation ---------------------------------- */
 
@@ -71,16 +100,24 @@ static void *mp3_state_alloc(const decoder_alloc_t *alloc) {
     if (alloc && alloc->alloc) {
         return alloc->alloc(alloc->userdata, sizeof(mp3_state_t));
     }
+#ifdef CORE_FREESTANDING
+    /* No libc heap on hw; the audio engine always supplies an allocator. */
+    return NULL;
+#else
     return malloc(sizeof(mp3_state_t));
+#endif
 }
 
 static void mp3_state_free(mp3_state_t *s) {
     if (!s) return;
     if (s->alloc && s->alloc->free) {
         s->alloc->free(s->alloc->userdata, s);
-    } else {
+    }
+#ifndef CORE_FREESTANDING
+    else {
         free(s);
     }
+#endif
 }
 
 static int mp3_open(decoder_t *d, const void *src, size_t src_len,
@@ -132,6 +169,87 @@ static int mp3_open(decoder_t *d, const void *src, size_t src_len,
     d->channels        = (uint16_t)s->decoder.channels;
     d->bits_per_sample = 16;          /* dr_mp3 emits s16 directly */
     d->total_frames    = (uint64_t)pcm_frames;
+    return DECODER_OK;
+}
+
+/* ---------- Streaming open (decoder_source_t -> dr_mp3 procs) ------ */
+
+static size_t mp3_on_read(void *ud, void *buf, size_t bytes) {
+    decoder_source_t *s = (decoder_source_t *)ud;
+    return s->read(s->userdata, buf, bytes);
+}
+static drmp3_bool32 mp3_on_seek(void *ud, int offset, drmp3_seek_origin origin) {
+    decoder_source_t *s = (decoder_source_t *)ud;
+    int org;
+    if (origin == DRMP3_SEEK_SET) {
+        org = DECODER_SEEK_SET;
+    } else if (origin == DRMP3_SEEK_END) {
+        /* dr_mp3 seeks to END at init() to probe for ID3v1/APE trailer
+         * tags, so the source MUST honour END or init misjudges the
+         * stream layout. (Same requirement dr_flac has for sizing.) */
+        org = DECODER_SEEK_END;
+    } else {
+        org = DECODER_SEEK_CUR;
+    }
+    return s->seek(s->userdata, offset, org) ? DRMP3_TRUE : DRMP3_FALSE;
+}
+static drmp3_bool32 mp3_on_tell(void *ud, drmp3_int64 *cursor) {
+    decoder_source_t *s = (decoder_source_t *)ud;
+    int64_t p = s->tell(s->userdata);
+    if (p < 0) {
+        return DRMP3_FALSE;
+    }
+    *cursor = (drmp3_int64)p;
+    return DRMP3_TRUE;
+}
+
+int mp3_open_stream(decoder_t *d, decoder_source_t *src,
+                    const decoder_alloc_t *alloc) {
+    if (!d || !src || !src->read || !src->seek || !src->tell) {
+        return DECODER_ERR_INVALID;
+    }
+
+    mp3_state_t *s = mp3_state_alloc(alloc);
+    if (!s) return DECODER_ERR_INTERNAL;
+    memset(s, 0, sizeof(*s));
+    s->alloc = alloc;
+
+    drmp3_allocation_callbacks *pcb = NULL;
+    if (alloc && alloc->alloc && alloc->realloc && alloc->free) {
+        s->cb_storage.pUserData = (void *)alloc;
+        s->cb_storage.onMalloc  = mp3_malloc_thunk;
+        s->cb_storage.onRealloc = mp3_realloc_thunk;
+        s->cb_storage.onFree    = mp3_free_thunk;
+        pcb = &s->cb_storage;
+    }
+
+    /* dr_mp3's streaming init takes an extra onMeta callback (NULL = we
+     * don't want ID3/APE metadata here) and the source as pUserData; the
+     * source must outlive the decoder — we borrow, we don't copy. */
+    if (!drmp3_init(&s->decoder, mp3_on_read, mp3_on_seek, mp3_on_tell,
+                    NULL, src, pcb)) {
+        mp3_state_free(s);
+        return DECODER_ERR_INVALID;
+    }
+
+    if (s->decoder.channels > 2) {
+        drmp3_uninit(&s->decoder);
+        mp3_state_free(s);
+        return DECODER_ERR_UNSUPPORTED;
+    }
+
+    /* See mp3_open() for the total_frames scan rationale. On a streaming
+     * source this walks the file once and seeks back to the start; the
+     * source must support backward seek (ours do — it only happens here at
+     * open, never during forward playback). */
+    drmp3_uint64 pcm_frames = drmp3_get_pcm_frame_count(&s->decoder);
+
+    d->opaque          = s;
+    d->sample_rate     = s->decoder.sampleRate;
+    d->channels        = (uint16_t)s->decoder.channels;
+    d->bits_per_sample = 16;          /* dr_mp3 emits s16 directly */
+    d->total_frames    = (uint64_t)pcm_frames;
+    d->ops             = mp3_decoder_ops();
     return DECODER_OK;
 }
 
