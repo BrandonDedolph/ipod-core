@@ -473,9 +473,19 @@ static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
     /* Play loop: decode ONE bounded chunk per pass (so a slow codec can't
      * freeze the UI), poll the wheel (MENU stops), and repaint the now-playing
      * screen once a second. Track the ring's low-water fill between repaints so
-     * the BUF% readout exposes whether the decoder is keeping real-time. */
+     * the BUF% readout exposes whether the decoder is keeping real-time.
+     *
+     * Present cost: the first paint is a full frame; each per-second update
+     * only pushes the dynamic band (clock / progress / BUF, rows 6..12) via
+     * lcd_present_rect — the static title/name/format/hint above and below it
+     * persist in the BCM framebuffer. This cuts the IRQ-masked pixel upload
+     * ~5x during playback (helps decode timing). NP_BAND covers only the rows
+     * nowplaying_render animates. */
+    #define NP_BAND_Y 48                 /* row 6 * 8px                          */
+    #define NP_BAND_H 56                 /* rows 6..12 (clock 7 / bar 9 / BUF 11) */
     uint32_t last_shown = 0xFFFFFFFFu;
     uint32_t low_fill   = RING_FRAMES;   /* min ring fill seen since last repaint */
+    int      first_paint = 1;
     while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
         decode_step();
 
@@ -496,7 +506,13 @@ static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
         if (elapsed_s != last_shown) {
             uint32_t buf_pct = (low_fill * 100u) / RING_FRAMES;
             nowplaying_render(b, elapsed_s, total_s, buf_pct, bg);
-            lcd_present_fb(console_framebuffer());
+            if (first_paint) {
+                lcd_present_fb(console_framebuffer());   /* whole screen once */
+                first_paint = 0;
+            } else {
+                lcd_present_rect(console_framebuffer(),
+                                 0, NP_BAND_Y, LCD_WIDTH, NP_BAND_H);
+            }
             last_shown = elapsed_s;
             low_fill   = fill;           /* reset low-water for the next second */
         }
