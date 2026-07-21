@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include "../fs/fat32.h"
+#include "../codecs/flac_meta.h"
 
 /* Max entries in a browse listing / playback queue. Bounds both the UI's
  * g_browse[] and the player's own queue copy. */
@@ -70,6 +71,10 @@ void player_set_repeat(int mode);
 
 /* 1 while a track is loaded (playing OR paused). */
 int  player_active(void);
+
+/* Tags + duration of the current track (parsed at open; fields empty/0 when a
+ * tag is absent — fall back to the filename). */
+const flac_meta_t *player_meta(void);
 
 /* Now-playing readouts (valid while active; elapsed/buf return 0 otherwise). */
 const char *player_track_name(void);

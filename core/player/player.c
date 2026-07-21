@@ -27,6 +27,7 @@
 #include "../codecs/arena.h"
 #include "../codecs/readahead.h"
 #include "../codecs/diskbuf.h"
+#include "../codecs/flac_meta.h"
 #include "../codecs/dr_flac/flac.h"
 #include "../codecs/dr_mp3/mp3.h"
 
@@ -312,6 +313,7 @@ static uint32_t       g_pl_total_s;       /* current track length, seconds      
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
 static int            g_shuffle;          /* pick the next track at random         */
 static int            g_repeat;           /* 0 off, 1 all (loop queue), 2 one       */
+static flac_meta_t    g_cur_meta;         /* tags/duration of the current track     */
 static uint32_t       g_rng = 0x2545F491u;/* LCG state for shuffle (varies w/ USEC) */
 
 void player_set_shuffle(int on)   { g_shuffle = on ? 1 : 0; }
@@ -364,6 +366,11 @@ static int player_open_current(void)
     g_file_src.seek = fat_src_seek;
     g_file_src.tell = fat_src_tell;
     g_file_src.userdata = &g_fsrc;
+    /* Read tags + duration up front through the raw source (header only, cheap).
+     * Harmless on non-FLAC (returns -1 / have=0). diskbuf_init below starts fresh
+     * (inner_pos=-1) and re-seeks the source to 0 on its first read, undoing the
+     * position this advanced. */
+    flac_meta_read(&g_file_src, &g_cur_meta);
     /* Anti-skip buffer over the raw disk, then the read-ahead shim over that. */
     diskbuf_init(&g_dbuf, &g_file_src, disk_buf, DISK_BUF_BYTES,
                  DISK_LOW, DISK_HIGH);
@@ -547,6 +554,8 @@ void player_pump(void)
 int player_active(void) { return g_pl_active; }
 
 const char *player_track_name(void) { return g_queue[g_queue_idx].name; }
+
+const flac_meta_t *player_meta(void) { return &g_cur_meta; }
 
 uint32_t player_elapsed_s(void)
 {

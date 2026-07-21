@@ -945,8 +945,21 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
         console_blit565(ax, 8, aw, ah, player_art_pixels());
     }
 
-    /* Track title (extension already trimmed at collect time). */
-    ui_text(14, 150, name, FONT_TITLE, LINEN_INK);
+    /* Track title from tags (falls back to the filename), + "artist · album". */
+    const flac_meta_t *m = player_meta();
+    const char *title = (m->have && m->title[0]) ? m->title : name;
+    ui_text(14, 148, title, FONT_TITLE, LINEN_INK);
+    if (m->have && (m->artist[0] || m->album[0])) {
+        char sub[136];
+        int i = 0;
+        for (const char *p = m->artist; *p && i < 60; p++) sub[i++] = *p;
+        if (m->artist[0] && m->album[0]) {         /* " - " separator (ASCII) */
+            sub[i++] = ' '; sub[i++] = '-'; sub[i++] = ' ';
+        }
+        for (const char *p = m->album; *p && i < 132; p++) sub[i++] = *p;
+        sub[i] = '\0';
+        ui_text(14, 166, sub, FONT_SUB, LINEN_MUTED_D);
+    }
 
     /* Clock: elapsed left, total right. */
     char te[12], tt[12];
