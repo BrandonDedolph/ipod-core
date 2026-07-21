@@ -505,12 +505,27 @@ static void detail_art_load(fat32_t *fs)
     g_detail_art_ok = 1;
 }
 
-/* Three-bar "now playing" glyph (collection-detail.jsx NowPlayingDot). */
-static void nowplaying_bars(int x, int y, uint16_t c)
+/* Animated three-bar "now playing" glyph (collection-detail.jsx NowPlayingDot).
+ * Each bar bounces on a triangle wave with its own phase; bottom-anchored at
+ * y+9, heights 3..9. `t_us` is the free-running microsecond clock. */
+#define NP_BARS_W  9                          /* bounding box width  (x..x+8)      */
+#define NP_BARS_H  9                          /* bounding box height (y..y+8)      */
+
+static int nowplaying_bar_h(uint32_t t_ms, int phase)
 {
-    console_fill_rect(x,     y + 3, 2, 6, c);
-    console_fill_rect(x + 3, y,     2, 9, c);
-    console_fill_rect(x + 6, y + 4, 2, 5, c);
+    uint32_t p = (t_ms + (uint32_t)phase) % 760u;      /* period 760 ms          */
+    int tri = (p < 380u) ? (int)p : (int)(760u - p);   /* 0..380..0 triangle     */
+    return 3 + (tri * 6) / 380;                          /* 3..9 px               */
+}
+
+static void nowplaying_bars(int x, int y, uint16_t c, uint32_t t_us)
+{
+    uint32_t ms = t_us / 1000u;
+    static const int ph[3] = { 0, 250, 500 };
+    for (int i = 0; i < 3; i++) {
+        int h = nowplaying_bar_h(ms, ph[i]);
+        console_fill_rect(x + i * 3, y + (NP_BARS_H - h), 2, h, c);
+    }
 }
 
 static void detail_render(int sel)
@@ -551,11 +566,12 @@ static void detail_render(int sel)
         const browse_entry_t *e = &g_browse[idx];
         int is_sel = (idx == sel);
         list_row_at(DET_LIST_Y0, r, e->name, 0, 0, 0, is_sel, 0, 0);
-        /* Mark the track that's currently playing with the three-bar glyph. */
+        /* Mark the track that's currently playing with the animated bars. */
         if (playing && !e->is_dir && name_eq_ci(e->name, playing)) {
             int ry = DET_LIST_Y0 + r * ROW_H;
             nowplaying_bars(LCD_WIDTH - 22, ry + 7,
-                            is_sel ? LINEN_SEL_FG : LINEN_INK);
+                            is_sel ? LINEN_SEL_FG : LINEN_INK,
+                            mmio_read32(USEC_TIMER_ADDR));
         }
     }
     scrollbar_render(DET_LIST_Y0, top, DET_ROWS, g_browse_n);
@@ -918,6 +934,7 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      np_first = 1;
     int      np_vol_prev = 0;            /* volume overlay was up last NP paint  */
     uint32_t last_present = 0;           /* rate-limit UI presents while playing */
+    uint32_t last_bars = 0;              /* rate-limit the now-playing bar anim  */
     int      hold_prev = clickwheel_hold() ? 1 : 0;  /* seed hold-edge detect    */
     int      lock_flashing = 0;          /* a lock/unlock plate is on screen     */
     g_locked = hold_prev;
@@ -931,9 +948,18 @@ _Noreturn static void run_ui(fat32_t *fs)
     const uint32_t BL_DIM_US = 15u * 1000000u;
     const uint32_t BL_OFF_US = 30u * 1000000u;
 
+    const char *last_tn = 0;              /* re-apply volume on track change       */
     for (;;) {
         player_pump();
         battery_refresh(0);               /* self-throttled ~5s gauge resample     */
+
+        /* Auto-advance re-inits the codec (resetting its gain), so re-apply our
+         * volume whenever the playing track changes. */
+        const char *tn = player_active() ? player_track_name() : 0;
+        if (tn && tn != last_tn) {
+            hal_volume_set(g_volume);
+        }
+        last_tn = tn;
 
         /* Hold-switch edge (a cheap GPIO read, independent of the wheel block
          * which is gated off while held): flash the lock/unlock plate and toggle
@@ -1051,7 +1077,11 @@ _Noreturn static void run_ui(fat32_t *fs)
 
             case SCR_NOWPLAYING:
                 if (ev.wheel_delta) {                    /* wheel = volume        */
-                    g_volume += ev.wheel_delta * 3;      /* ~3% per detent        */
+                    /* 1% per detent (clamp a fast flick so it can't teleport). */
+                    int d = ev.wheel_delta;
+                    if (d >  WHEEL_MAX_DELTA) d =  WHEEL_MAX_DELTA;
+                    if (d < -WHEEL_MAX_DELTA) d = -WHEEL_MAX_DELTA;
+                    g_volume += d;
                     if (g_volume < 0)   g_volume = 0;
                     if (g_volume > 100) g_volume = 100;
                     hal_volume_set(g_volume);
@@ -1156,6 +1186,34 @@ _Noreturn static void run_ui(fat32_t *fs)
                 lcd_present_fb(console_framebuffer());
                 dirty = 0;
                 last_present = now;
+            }
+        }
+
+        /* Animate the now-playing 3-bar indicator in the album detail: redraw
+         * only its ~10px box and partial-present just that, ~9fps. A tiny pixel
+         * push (unlike a full repaint) so it can't starve the audio DMA. */
+        if (bl_state != BL_OFF && scr_cur() == SCR_BROWSER && g_dir_depth > 0
+            && player_active()) {
+            uint32_t nowb = mmio_read32(USEC_TIMER_ADDR);
+            if ((uint32_t)(nowb - last_bars) >= 110000u) {
+                int top = scroll_window(g_br_sel, g_browse_n, DET_ROWS);
+                const char *pn = player_track_name();
+                for (int r = 0; r < DET_ROWS; r++) {
+                    int idx = top + r;
+                    if (idx >= g_browse_n) break;
+                    const browse_entry_t *e = &g_browse[idx];
+                    if (e->is_dir || !name_eq_ci(e->name, pn)) continue;
+                    int ry = DET_LIST_Y0 + r * ROW_H;
+                    int bx = LCD_WIDTH - 22, by = ry + 7;
+                    int is_sel = (idx == g_br_sel);
+                    console_fill_rect(bx, by, NP_BARS_W, NP_BARS_H,
+                                      is_sel ? LINEN_SEL_BG : LINEN_SURFACE);
+                    nowplaying_bars(bx, by, is_sel ? LINEN_SEL_FG : LINEN_INK, nowb);
+                    lcd_present_rect(console_framebuffer(),
+                                     bx, by, NP_BARS_W + 1, NP_BARS_H);
+                    break;
+                }
+                last_bars = nowb;
             }
         }
 
