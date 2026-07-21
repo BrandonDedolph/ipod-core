@@ -200,11 +200,23 @@ static int decode_step(void)
     return got;
 }
 
-/* FAT32 block callback: read absolute 512-byte LBAs off the disk. */
+/* FAT32 block callback: read absolute 512-byte LBAs off the disk.
+ *
+ * Retries a few times with a short wait: the drive spins down during a browse
+ * idle, and the first PIO read after spin-down can error/time out while the
+ * platter comes back up — which showed up as an intermittent "OPEN FAILED
+ * FFFFFFFF" when starting a song after sitting in the list. A wait + retry
+ * rides over the spin-up; a genuinely bad read still fails after all tries. */
 static int disk_read(void *ud, uint32_t lba, uint32_t count, void *buf)
 {
     (void)ud;
-    return ata_read_sectors(lba, count, buf);
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (ata_read_sectors(lba, count, buf) == 0) {
+            return 0;
+        }
+        sleep_ms(120);                   /* give a spun-down drive time to wake */
+    }
+    return -1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -244,6 +256,13 @@ static char disp_char(char c)
     return ' ';
 }
 
+/* MP3 playback is parked: dr_mp3's float synthesis can't hit real-time on this
+ * FPU-less CPU (buffer starves -> stutter), and FLAC is lossless so there's no
+ * quality reason to prefer it. The device is FLAC-only; a companion loader app
+ * ensures music lands as FLAC. Flip to 1 to re-surface MP3 files (they'll open
+ * but stutter) once a fixed-point/COP decoder exists. */
+#define CORE_ENABLE_MP3 0
+
 /* Classify by extension: 0 = FLAC (.fla/.flac), 1 = MP3 (.mp3), -1 = skip. */
 static int classify_ext(const char *name)
 {
@@ -264,7 +283,9 @@ static int classify_ext(const char *name)
 
     if (n == 3 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A') return 0;
     if (n == 4 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A' && ext[3] == 'C') return 0;
+#if CORE_ENABLE_MP3
     if (n == 3 && ext[0] == 'M' && ext[1] == 'P' && ext[2] == '3') return 1;
+#endif
     return -1;
 }
 
