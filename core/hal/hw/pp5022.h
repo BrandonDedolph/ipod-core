@@ -113,6 +113,40 @@
 #define COP_CTL         PP_REG32(COP_CTL_ADDR)
 #endif
 
+/* ---------- Unified cache (8 KB, 16-byte lines) ----------------------
+ * core/docs/hw/01-soc-pp5022.md, "Cache". Write-back; init does NOT set
+ * VECT_REMAP so the vectors stay at 0x0. A DMA agent reading CPU-written
+ * memory must be preceded by a FLUSH (write dirty lines back to SDRAM).
+ */
+#define CACHE_CTL_ADDR       0x6000C000
+#define CACHE_PRIORITY_ADDR  0x60006044
+#define CACHE_MASK_ADDR      0xF000F040
+#define CACHE_OP_ADDR        0xF000F044
+
+#define CACHE_CTL_ENABLE     0x0001
+#define CACHE_CTL_RUN        0x0002
+#define CACHE_CTL_INIT       0x0004
+#define CACHE_CTL_VECT_REMAP 0x0010
+#define CACHE_CTL_READY      0x4000
+#define CACHE_CTL_BUSY       0x8000
+
+#define CACHE_OP_FLUSH       0x0002
+#define CACHE_OP_INVALIDATE  0x0004
+
+#define CACHE_PRIORITY_CPU   0x10   /* CACHE_PRIORITY bit for the CPU core */
+#define CACHE_INIT_MASK      0x00001C00  /* CACHE_MASK value (cacheable region) */
+#define CACHE_INIT_OP        0x00000FC0  /* CACHE_OPERATION value during init   */
+#define CACHE_SIZE_BYTES     0x2000      /* 8 KB store                          */
+#define CACHE_LINE_BYTES     16u
+#define CACHE_PRIME_SRC     0x2000      /* readable cached SDRAM to prime lines */
+
+#ifndef __ASSEMBLER__
+#define CACHE_CTL       PP_REG32(CACHE_CTL_ADDR)
+#define CACHE_PRIORITY  PP_REG32(CACHE_PRIORITY_ADDR)
+#define CACHE_MASK_REG  PP_REG32(CACHE_MASK_ADDR)
+#define CACHE_OP        PP_REG32(CACHE_OP_ADDR)
+#endif
+
 /* ---------- Interrupt controller -------------------------------------
  * core/docs/hw/01-soc-pp5022.md, "Interrupt controller". Low-priority
  * bank only (the timer sources we need live there). Sources #<32 route

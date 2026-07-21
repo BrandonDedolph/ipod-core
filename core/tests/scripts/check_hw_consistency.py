@@ -42,6 +42,7 @@ WINDOWS = [
     (0x70000000, 0x70100000),   # GPO32 / SER0 / misc peripherals
     (0xC3000000, 0xC3001000),   # ATA/IDE controller (04-ata.md)
     (0xF000F000, 0xF000F008),   # MMAP0 remap pair
+    (0xF000F040, 0xF000F04C),   # cache mask / operation / flush-mask
 ]
 
 

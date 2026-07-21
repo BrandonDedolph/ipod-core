@@ -26,6 +26,7 @@
 #include "timer.h"
 #include "irq.h"
 #include "clock.h"
+#include "cache.h"
 #include "console.h"
 #include "pcm_ring.h"
 #include "../codecs/decoder.h"
@@ -245,6 +246,12 @@ _Noreturn void kernel_main(void) {
     uart_put_hex32(cpu_frequency());
     uart_putc('\n');
 
+    /* Turn on the unified cache now — decode is far too slow with it off.
+     * Write-back, so the audio DMA path flushes (cache_commit) before the
+     * DMA reads a freshly-filled buffer. */
+    uart_puts("core: cache init\n");
+    cache_init();
+
     /* LCD bring-up: host-side port init, then probe the BCM power
      * rail. After a chainload the BCM is already powered and idle
      * (core/docs/hw/02-lcd.md, "Chainload handoff state"). If the
@@ -362,6 +369,11 @@ _Noreturn void kernel_main(void) {
          * (a case for the 80 MHz boost). */
         int playable = (oc == 0 && arate == 44100u && achan == 2u);
         if (playable) {
+            /* FLAC decode is CPU-bound; boost to 80 MHz for it (the whole
+             * point of cpu_boost). DTKS below is then measured at 80 MHz. The
+             * timer tick runs off a fixed source, so DTKS stays comparable
+             * across clocks. (Cache enable — the bigger lever — is next.) */
+            cpu_boost();
             pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
             g_eos = 0;
             uint32_t t0 = current_tick();
@@ -408,6 +420,7 @@ _Noreturn void kernel_main(void) {
                 hal_audio_stop();
             }
             g_dec.ops->close(&g_dec);
+            cpu_unboost();
             uart_puts("core: playback done\n");
         }
     } else {

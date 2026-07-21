@@ -22,6 +22,7 @@
 #include "i2s.h"
 #include "dma.h"
 #include "audio.h"
+#include "../../kernel/cache.h"   /* cache_commit(): flush before DMA reads */
 
 /*
  * Ping-pong PCM buffers. 2048 frames = ~46 ms at 44.1 kHz, 8 KB each — well
@@ -61,11 +62,10 @@ static uint32_t buf_phys(int i)
  * Refill buffer `i` from the source, zero-padding any frames it doesn't
  * produce so the DMA chunk stays a constant size (silence, not a click).
  *
- * CACHE NOTE: this is a CPU write that the DMA then reads. It is coherent
- * today only because the D-cache / write-buffer is OFF (crt0.S runs cache
- * off). When caches are enabled in a later phase, a cache-clean of this
- * buffer range is required here before the DMA reads it, or the DMA will
- * fetch stale SDRAM.
+ * CACHE COHERENCY: this is a CPU write that the DMA then reads. The unified
+ * cache is write-back, so we cache_commit() (flush dirty lines to SDRAM) after
+ * filling — otherwise the DMA, reading the buffer's native SDRAM alias, would
+ * fetch stale data. Called from both the priming path and the completion ISR.
  */
 static void fill_buffer(int i)
 {
@@ -80,6 +80,7 @@ static void fill_buffer(int i)
         audio_buf[i][2u * f]      = 0;
         audio_buf[i][2u * f + 1u] = 0;
     }
+    cache_commit();      /* flush so the DMA reads fresh PCM, not stale SDRAM */
 }
 
 int hal_audio_init(uint32_t sample_rate, uint16_t channels)
