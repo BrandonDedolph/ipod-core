@@ -32,6 +32,7 @@
 #include "../codecs/decoder.h"
 #include "../codecs/arena.h"
 #include "../codecs/dr_flac/flac.h"
+#include "../codecs/dr_mp3/mp3.h"
 
 /*
  * Idle-task CPU sleep. Program the per-core countdown to wake this core
@@ -58,7 +59,9 @@ static void cpu_wait_ms(uint8_t ms) {
  */
 #define RING_FRAMES   (1u << 16)         /* 65536 frames = 256 KB ~ 1.49 s      */
 #define DECODE_FRAMES 4096u              /* frames per decode() call            */
-#define ARENA_BYTES   (64u * 1024u)      /* dr_flac peak was 37 KB (host-tested)*/
+#define ARENA_BYTES   (128u * 1024u)     /* MP3 arena high-water ~96 KB (measured);
+                                            FLAC ~40 KB. Sized for the larger. This
+                                            raises .bss ~64 KB — fine on 64 MB SDRAM.*/
 
 static int16_t    ring_storage[RING_FRAMES * 2];
 static int16_t    decode_buf[DECODE_FRAMES * 2];        /* decoder output stage */
@@ -153,10 +156,11 @@ static int ring_source(void *ud, int16_t *buf, int frames)
     return (int)pcm_ring_read(&g_ring, buf, (uint32_t)frames);
 }
 
-/* Producer: decode FLAC into the ring until it's full or end-of-stream.
- * Foreground only. decode() pulls compressed bytes off the disk internally,
- * so this both reads and decodes. */
-static void flac_pump(void)
+/* Producer: decode (FLAC or MP3) into the ring until it's full or end-of-stream.
+ * Codec-agnostic — it only calls g_dec.ops->decode, so the same loop drives
+ * whichever decoder open() installed. Foreground only. decode() pulls compressed
+ * bytes off the disk internally, so this both reads and decodes. */
+static void decode_pump(void)
 {
     while (!g_eos && pcm_ring_free(&g_ring) >= DECODE_FRAMES) {
         int got = g_dec.ops->decode(&g_dec, decode_buf, (int)DECODE_FRAMES);
@@ -350,10 +354,11 @@ _Noreturn void kernel_main(void) {
         decoder_arena_t  arena;
         decoder_alloc_t  alloc;
         int      mnt = -1, op = -1, oc = -1;
+        int      fmt = -1;               /* which codec opened: 0=FLAC, 1=MP3    */
         uint32_t fclus = 0, fsize = 0, arate = 0, achan = 0;
         uint32_t awater = 0, dtks = 0;
         if (sig == 0xAA55u && fat_lba != 0) {
-            uart_puts("core: [fat32] mount + open TEST.FLAC\n");
+            uart_puts("core: [fat32] mount + probe TEST.FLA / TEST.MP3\n");
             /* The MBR partition-start LBA may be in the disk's native
              * 512-byte units OR (on the stock 80 GB, whose FAT uses
              * 2048-byte sectors) in 2048-byte units. Try as-is first, then
@@ -363,16 +368,28 @@ _Noreturn void kernel_main(void) {
                 mnt = fat32_mount(&fs, disk_read, 0, fat_lba * 4u);
             }
             if (mnt == 0) {
-                /* 8.3 name: a 4-char extension (".FLAC") has no valid short
-                 * name, so on disk it's mangled (TEST~1.FLA) and our 8.3-only
-                 * fat32_open can't find it. Use a 3-char extension. (Proper
-                 * long-filename support is future work.) */
+                /* Format probe: TEST.FLA (FLAC) wins if present, else TEST.MP3
+                 * (MP3). fat32_open now matches VFAT long names too (LFN landed),
+                 * but we keep the simple fixed-name probe for bring-up. NOTE on
+                 * 8.3: a 4-char extension like ".FLAC" has no valid short name and
+                 * is mangled on disk (TEST~1.FLA); the 3-char TEST.FLA/TEST.MP3
+                 * names always resolve, so we stick with those here. */
                 op = fat32_open(&fs, "TEST.FLA", &fclus, &fsize);
+                if (op == 0) {
+                    fmt = 0;             /* FLAC */
+                } else {
+                    op = fat32_open(&fs, "TEST.MP3", &fclus, &fsize);
+                    if (op == 0) {
+                        fmt = 1;         /* MP3 */
+                    }
+                }
             }
             if (op == 0) {
-                /* Open the FLAC as a stream: dr_flac pulls compressed bytes
-                 * off the disk through fat_src_*, decoding on a static arena
-                 * (no libc). Only the header is read here. */
+                /* Open as a stream: the decoder pulls compressed bytes off the
+                 * disk through fat_src_*, decoding on a static arena (no libc).
+                 * Only the header is read here. The fat_src source, arena, ring,
+                 * pump loop, ISR and DMA are all codec-agnostic — only THIS
+                 * open() call differs between FLAC and MP3. */
                 fat_src_open(&g_fsrc, &fs, fclus, fsize);
                 src.read = fat_src_read;
                 src.seek = fat_src_seek;
@@ -380,7 +397,8 @@ _Noreturn void kernel_main(void) {
                 src.userdata = &g_fsrc;
                 decoder_arena_init(&arena, arena_buf, sizeof arena_buf);
                 alloc = decoder_arena_allocator(&arena);
-                oc = flac_open_stream(&g_dec, &src, &alloc);
+                oc = (fmt == 1) ? mp3_open_stream(&g_dec, &src, &alloc)
+                                : flac_open_stream(&g_dec, &src, &alloc);
                 if (oc == 0) {
                     arate = g_dec.sample_rate;
                     achan = g_dec.channels;
@@ -405,7 +423,7 @@ _Noreturn void kernel_main(void) {
             pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
             g_eos = 0;
             uint32_t t0 = current_tick();
-            flac_pump();                 /* decode-prime the ring */
+            decode_pump();               /* decode-prime the ring */
             dtks   = current_tick() - t0;
             awater = (uint32_t)arena.high_water;
 
@@ -416,7 +434,8 @@ _Noreturn void kernel_main(void) {
              * follows streams in a few ms while the DMA drains the 1.49 s
              * ring, so the ring cannot underrun before the play loop below
              * resumes refilling. */
-            uart_puts("core: playing TEST.FLAC\n");
+            uart_puts(fmt == 1 ? "core: playing TEST.MP3\n"
+                               : "core: playing TEST.FLAC\n");
             if (hal_audio_init(44100u, 2u) == 0) {
                 hal_audio_set_source(ring_source, 0);
                 hal_audio_start();
@@ -434,7 +453,8 @@ _Noreturn void kernel_main(void) {
          *   SIG=MBR sig(AA55). MNT/OP=mount/open rc(0). OPN=flac open rc(0).
          *   RATE=sample rate(AC44). AWTR=arena bytes used(<0x10000).
          *   DTKS=decode-prime ticks — <~0x95 => real-time.
-         *   BTUS=boot->screen microseconds. TFUS=boot->first-sound us. */
+         *   BTUS=boot->screen microseconds. TFUS=boot->first-sound us.
+         *   FMT=active codec: 0=FLAC, 1=MP3 (FFFFFFFF => neither opened). */
         console_clear(bg);
         console_str  (2, 3, "SIG",  CON_WHITE, bg);
         console_hex32(8, 3, sig,               CON_WHITE, bg);
@@ -454,6 +474,8 @@ _Noreturn void kernel_main(void) {
         console_hex32(8, 17, btus,             CON_WHITE, bg);
         console_str  (2, 19, "TFUS", CON_WHITE, bg);
         console_hex32(8, 19, tfus,             CON_WHITE, bg);
+        console_str  (2, 21, "FMT",  CON_WHITE, bg);
+        console_hex32(8, 21, (uint32_t)fmt,    CON_WHITE, bg);
         lcd_present_fb(console_framebuffer());
         uart_puts("core: diagnostic screen presented BTUS ");
         uart_put_hex32(btus);
@@ -466,7 +488,7 @@ _Noreturn void kernel_main(void) {
          * stream AND the ring is empty. */
         if (started) {
             while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
-                flac_pump();
+                decode_pump();
                 sleep_ms(20);
             }
             sleep_ms(200);               /* let the FIFO/DMA drain the tail */
