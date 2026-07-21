@@ -216,6 +216,15 @@ static void demo_task(void) {
 }
 
 _Noreturn void kernel_main(void) {
+    /* Free-running 1 MHz microsecond counter (USEC_TIMER, 01-soc-pp5022.md
+     * "Timers"). Sampled here at the very top so every later milestone can
+     * report elapsed-since-boot in real time, INDEPENDENT of the 100 Hz tick
+     * (which isn't armed until timer_init below). Powers the on-screen BTUS
+     * (boot -> diagnostic screen) and TFUS (boot -> first sound) counters,
+     * and their UART echoes. Wraps every ~71 min — boot is seconds, so no
+     * wrap concern; unsigned subtraction is wrap-safe regardless. */
+    uint32_t boot_us0 = mmio_read32(USEC_TIMER_ADDR);
+
     uart_init();
 
     uart_puts("core: kernel alive (iPod 5G/5.5G, PP5022)\n");
@@ -290,8 +299,26 @@ _Noreturn void kernel_main(void) {
      * silicon-proven for the first frame; a second present stalls in the
      * BCM wait-for-idle poll). GREEN bg = PLL locked. */
     if (lcd_init()) {
+        /* Capture the GREEN/RED background BEFORE boosting: green means
+         * clock_init's 30 MHz PLL locked (cpu_frequency() still reads
+         * CPUFREQ_NORMAL here). cpu_boost() below moves us to 80 MHz, so this
+         * must be sampled first or the "PLL locked" proof would always read
+         * red. */
         uint16_t bg = (cpu_frequency() == CPUFREQ_NORMAL) ? CON_GREEN
                                                           : CON_RED;
+
+        /* Boost to 80 MHz up front, bracketing the ENTIRE open path (ATA
+         * init, MBR read, FAT mount, TEST.FLAC open + album-art skip) and the
+         * decode prime — not just playback. Song-open is partly CPU-bound (FAT
+         * chain walks, the dr_flac header parse), so the higher clock cuts
+         * time-to-first-sound, not only decode headroom. Correctness is
+         * unaffected: clock rate never changes the decoded PCM. Tradeoff: the
+         * sub-second open path now draws 80 MHz power instead of 30 MHz —
+         * negligible battery cost, and cpu_unboost() at the end of this block
+         * drops back to 30 MHz on every exit path (playable or not). The timer
+         * is a fixed 1 MHz source, so BTUS/TFUS/DTKS stay comparable across
+         * clocks. */
+        cpu_boost();
 
         /* Read the MBR, find the FAT32 data partition (type 0B/0C), mount
          * it, open TEST.WAV and preload it to RAM — then play it through
@@ -367,25 +394,47 @@ _Noreturn void kernel_main(void) {
          * DTKS < ~0x95 (149 ticks = 1.49 s) the decoder beats real time at
          * this CPU clock — playback will be clean; larger means too slow
          * (a case for the 80 MHz boost). */
-        int playable = (oc == 0 && arate == 44100u && achan == 2u);
+        int      playable = (oc == 0 && arate == 44100u && achan == 2u);
+        int      started  = 0;   /* audio DMA actually running               */
+        uint32_t tfus     = 0;   /* boot -> first sound, microseconds        */
         if (playable) {
-            /* FLAC decode is CPU-bound; boost to 80 MHz for it (the whole
-             * point of cpu_boost). DTKS below is then measured at 80 MHz. The
-             * timer tick runs off a fixed source, so DTKS stays comparable
-             * across clocks. (Cache enable — the bigger lever — is next.) */
-            cpu_boost();
+            /* Already at 80 MHz (boosted up front). Prime the ring and time
+             * it: DTKS = ticks to decode ~1.49 s of audio at 80 MHz, cache on.
+             * The timer runs off a fixed 1 MHz source, so DTKS stays
+             * comparable across CPU clocks. */
             pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
             g_eos = 0;
             uint32_t t0 = current_tick();
             flac_pump();                 /* decode-prime the ring */
             dtks   = current_tick() - t0;
             awater = (uint32_t)arena.high_water;
+
+            /* Start audio BEFORE the diagnostic present so the on-screen TFUS
+             * reflects the true time-to-first-sound. hal_audio_start() primes
+             * both DMA buffers and kicks channel 0, then returns (non-
+             * blocking) — sound is live from here. The single BCM present that
+             * follows streams in a few ms while the DMA drains the 1.49 s
+             * ring, so the ring cannot underrun before the play loop below
+             * resumes refilling. */
+            uart_puts("core: playing TEST.FLAC\n");
+            if (hal_audio_init(44100u, 2u) == 0) {
+                hal_audio_set_source(ring_source, 0);
+                hal_audio_start();
+                tfus    = mmio_read32(USEC_TIMER_ADDR) - boot_us0;
+                started = 1;
+            }
         }
+
+        /* Boot -> here, microseconds. Sampled just before the present, so it
+         * measures our whole boot + open + prime path (excludes the present
+         * itself). With audio already started above, TFUS <= BTUS + a few ms. */
+        uint32_t btus = mmio_read32(USEC_TIMER_ADDR) - boot_us0;
 
         /* One diagnostic screen (single silicon-proven present):
          *   SIG=MBR sig(AA55). MNT/OP=mount/open rc(0). OPN=flac open rc(0).
          *   RATE=sample rate(AC44). AWTR=arena bytes used(<0x10000).
-         *   DTKS=decode-prime ticks — the key number: <~0x95 => real-time. */
+         *   DTKS=decode-prime ticks — <~0x95 => real-time.
+         *   BTUS=boot->screen microseconds. TFUS=boot->first-sound us. */
         console_clear(bg);
         console_str  (2, 3, "SIG",  CON_WHITE, bg);
         console_hex32(8, 3, sig,               CON_WHITE, bg);
@@ -401,28 +450,35 @@ _Noreturn void kernel_main(void) {
         console_hex32(8, 13, awater,           CON_WHITE, bg);
         console_str  (2, 15, "DTKS", CON_WHITE, bg);
         console_hex32(8, 15, dtks,             CON_WHITE, bg);
+        console_str  (2, 17, "BTUS", CON_WHITE, bg);
+        console_hex32(8, 17, btus,             CON_WHITE, bg);
+        console_str  (2, 19, "TFUS", CON_WHITE, bg);
+        console_hex32(8, 19, tfus,             CON_WHITE, bg);
         lcd_present_fb(console_framebuffer());
-        uart_puts("core: diagnostic screen presented\n");
+        uart_puts("core: diagnostic screen presented BTUS ");
+        uart_put_hex32(btus);
+        uart_puts(" TFUS ");
+        uart_put_hex32(tfus);
+        uart_putc('\n');
 
         /* Play: decode into the ring while the DMA ISR drains it. The ring is
-         * already primed; keep decoding until end-of-stream AND the ring is
-         * empty. */
-        if (playable) {
-            uart_puts("core: playing TEST.FLAC\n");
-            if (hal_audio_init(44100u, 2u) == 0) {
-                hal_audio_set_source(ring_source, 0);
-                hal_audio_start();
-                while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
-                    flac_pump();
-                    sleep_ms(20);
-                }
-                sleep_ms(200);           /* let the FIFO/DMA drain the tail */
-                hal_audio_stop();
+         * already primed and audio is running; keep decoding until end-of-
+         * stream AND the ring is empty. */
+        if (started) {
+            while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
+                flac_pump();
+                sleep_ms(20);
             }
+            sleep_ms(200);               /* let the FIFO/DMA drain the tail */
+            hal_audio_stop();
+        }
+        if (playable) {
             g_dec.ops->close(&g_dec);
-            cpu_unboost();
             uart_puts("core: playback done\n");
         }
+        /* Drop back to 30 MHz on EVERY exit of the boosted block (matches the
+         * single cpu_boost() up front), so we never idle the core at 80 MHz. */
+        cpu_unboost();
     } else {
         uart_puts("core: lcd bcm NOT powered, skipping audio + screen\n");
     }
