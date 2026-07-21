@@ -275,6 +275,23 @@ if target == 'sim'
   )
   test('hw-lcd-present', lcd_present_test, suite: 'unit')
 
+  # hw-backlight: the GPIO-bit-banged backlight dimmer (hal/hw/backlight.c)
+  # host-side under -DMMIO_MOCK. The backlight has no status register — it's
+  # a bare GPIO charge-pump dimmer — so this asserts the exact ordered write
+  # grammar of backlight_init (route + power + 16->32 walk + LED on),
+  # backlight_set(0) (single atomic LED-off), and backlight_set(MAX) (LED-on
+  # + walk to full), each op a single write to the +0x800 atomic set/clear
+  # alias. Pulse widths are untraced busy-loops (device-gated timing).
+  backlight_trace_test = executable(
+    'backlight_trace_test',
+    sources: ['hw_mmio/backlight_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/backlight.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+  )
+  test('hw-backlight', backlight_trace_test, suite: 'unit')
+
   # End-to-end audio-playback test: spawns core-sim with the SDL2
   # disk audio driver, plays the FLAC fixture, then bit-compares
   # the captured PCM to the codec_kat reference. Exercises the

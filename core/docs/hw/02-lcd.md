@@ -515,6 +515,86 @@ G = (74*(Y - 16) -  24*(Cb - 128) -  51*(Cr - 128)) >> 8
 B = (74*(Y - 16) + 128*(Cb - 128))                  >> 9
 ```
 
+## Backlight (GPIO charge-pump dimmer)
+
+The backlight is **not** a PWM peripheral and is **not** on the BCM. On
+the iPod Video 5G/5.5G (and Nano 1G — Rockbox drives both from the same
+`backlight-nano_video.c`) it is an external multi-level LED-driver IC
+bit-banged over three PortalPlayer GPIO lines. Facts below are extracted
+cleanroom from Rockbox `backlight-nano_video.c` + `firmware/export/pp5020.h`
+(read 2026-07-21); no code was copied.
+
+### GPIO lines
+
+| Line  | Bit          | Role |
+|-------|--------------|------|
+| GPIOB | bit 3 `0x08` | Backlight-circuit power enable (boost/charge pump) |
+| GPIOD | bit 7 `0x80` | Step / "clock" line — pulses walk the level up/down |
+| GPIOL | bit 7 `0x80` | LED enable — fast on/off, does **not** change level |
+
+Register addresses (PP502x GPIO block, base `0x6000D000`; A–D grouped at
+`+0x00/10/20` for ENABLE/OUTPUT_EN/OUTPUT_VAL, I–L quad based at
+`+0x100`):
+
+| Register           | ENABLE       | OUTPUT_EN    | OUTPUT_VAL   |
+|--------------------|--------------|--------------|--------------|
+| GPIOB              | `0x6000D004` | `0x6000D014` | `0x6000D024` |
+| GPIOD              | `0x6000D00C` | `0x6000D01C` | `0x6000D02C` |
+| GPIOL              | `0x6000D10C` | `0x6000D11C` | `0x6000D12C` |
+
+### Atomic bit set/clear alias
+
+Each GPIO register has a shadow **`+0x800` bytes higher** that applies a
+masked update in one 32-bit write (no read-modify-write, ISR-safe against
+another bit of the same port). The written word is `(writemask << 8) |
+values`:
+
+- **set** bits `m`:   `(m << 8) | m`
+- **clear** bits `m`: `(m << 8)`
+
+So e.g. setting GPIOL bit 7 writes `0x00008080` to `0x6000D92C`
+(`0x6000D12C + 0x800`); clearing it writes `0x00008000`.
+
+### Dimmer protocol
+
+There are **32 discrete levels** and **no absolute-set interface** — only
+relative single-steps, so software must track the current level. The chip
+powers up at a **mid reference level of 16**. With GPIOD idling **high**, a
+**low pulse** on GPIOD steps one level, and the low-pulse **width** picks
+direction:
+
+- **short** low (~10 µs)  → one step **brighter**
+- **long**  low (~200 µs) → one step **dimmer**
+
+each followed by a short (~10 µs) high gap. The low phase is done with
+IRQs masked so an interrupt can't stretch a "short" low past the chip's
+threshold (a brighten misread as a dim).
+
+### Sequences
+
+**Init** (route → power → walk to full → LED on):
+
+1. Set GPIOB ENABLE + OUTPUT_EN (bit 3); set GPIOD ENABLE + OUTPUT_EN (bit 7).
+2. Set GPIOB OUTPUT_VAL (power on); set GPIOD OUTPUT_VAL (step line idle high); settle.
+3. Seed tracked level = 16 (power-up reference); pulse **up** to the target (full = 32).
+4. Set GPIOL ENABLE + OUTPUT_EN + OUTPUT_VAL (bit 7) — LED on.
+
+**Brightness change**: ensure GPIOL OUTPUT_VAL set (LED on), then emit
+`|target − current|` directional pulses on GPIOD.
+
+**Off**: clear GPIOL OUTPUT_VAL (LED off). Circuit stays powered and the
+tracked level is preserved, so re-enabling is instant. (Rockbox's deeper
+LCD-sleep path additionally clears GPIOD then GPIOB OUTPUT_VAL and waits
+~50 ms; we don't need that for a UI inactivity dim/off.)
+
+**Caveat — timing is device-gated.** The register addresses and the
+pulse *protocol* are transcribed facts, but the exact microsecond widths
+are not verifiable off-device. Our driver approximates them with bounded
+busy-loops preserving the ~1:20 short:long ratio; the absolute widths
+(and the visual result) must be confirmed on real hardware. If a level
+comes out wrong on-device, the pulse-width calibration is the first
+suspect.
+
 ## Source citations
 
 | Topic                | File |
@@ -522,3 +602,4 @@ B = (74*(Y - 16) + 128*(Cb - 128))                  >> 9
 | Driver               | `firmware/target/arm/ipod/video/lcd-video.c` |
 | ASM data write       | `firmware/target/arm/ipod/video/lcd-as-video.S` |
 | Backlight            | `firmware/target/arm/ipod/backlight-nano_video.c` |
+| Backlight GPIO addrs | `firmware/export/pp5020.h` |

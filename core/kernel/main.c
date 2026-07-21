@@ -20,6 +20,7 @@
 #include "hw/audio.h"
 #include "hw/ata.h"
 #include "hw/clickwheel.h"
+#include "hw/backlight.h"
 #include "hal.h"
 #include "../fs/fat32.h"
 #include "sched.h"
@@ -776,11 +777,31 @@ _Noreturn static void run_ui(fat32_t *fs)
     uint32_t np_last = 0xFFFFFFFFu;
     int      np_first = 1;
 
+    /* Backlight inactivity: full -> dim -> off. Any input wakes to full; a press
+     * that wakes from fully-OFF is swallowed (it just lights the screen, the way
+     * a real iPod's first touch does). Playback keeps running the whole time. */
+    enum { BL_OFF, BL_DIM, BL_FULL };
+    int      bl_state   = BL_FULL;
+    uint32_t last_input = mmio_read32(USEC_TIMER_ADDR);
+    const uint32_t BL_DIM_US = 15u * 1000000u;
+    const uint32_t BL_OFF_US = 30u * 1000000u;
+
     for (;;) {
         player_pump();
 
         wheel_event_t ev;
         if (clickwheel_poll(&ev)) {
+            last_input = mmio_read32(USEC_TIMER_ADDR);
+            if (bl_state != BL_FULL) {
+                int was_off = (bl_state == BL_OFF);
+                backlight_set(BACKLIGHT_MAX);
+                bl_state = BL_FULL;
+                dirty = 1;                    /* repaint anything drawn while off */
+                if (was_off) {                /* swallow the wake press */
+                    ev.buttons = 0;
+                    ev.wheel_delta = 0;
+                }
+            }
             switch (scr_cur()) {
             case SCR_MENU:
                 if (ev.wheel_delta) {
@@ -841,9 +862,22 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
         }
 
-        /* Render the current screen. Now Playing repaints ~1/s for the clock;
-         * Menu/Browser only on change. */
-        if (scr_cur() == SCR_NOWPLAYING) {
+        /* Idle-timeout backlight: dim, then off. Playback keeps running. */
+        uint32_t idle = mmio_read32(USEC_TIMER_ADDR) - last_input;
+        if (bl_state == BL_FULL && idle > BL_DIM_US) {
+            backlight_set(BACKLIGHT_MAX / 4);
+            bl_state = BL_DIM;
+        } else if (bl_state == BL_DIM && idle > BL_OFF_US) {
+            backlight_set(0);
+            bl_state = BL_OFF;
+        }
+
+        /* Render the current screen (skipped entirely when the screen is off —
+         * saves the IRQ-masked present while music plays dark). Now Playing
+         * repaints ~1/s for the clock; Menu/Browser only on change. */
+        if (bl_state == BL_OFF) {
+            /* nothing to draw */
+        } else if (scr_cur() == SCR_NOWPLAYING) {
             uint32_t elapsed = g_pl_active
                 ? (mmio_read32(USEC_TIMER_ADDR) - g_pl_start_us) / 1000000u : 0;
             if (dirty || elapsed != np_last) {
@@ -955,6 +989,10 @@ _Noreturn void kernel_main(void) {
          * we never drop back because the browser never returns (fine for
          * bring-up — the device is on a cable during testing). */
         cpu_boost();
+
+        /* Backlight to full (GPIO charge-pump dimmer) so the splash + UI are lit;
+         * run_ui dims then turns it off after inactivity. */
+        backlight_init();
 
         /* Paint the boot splash immediately, so the panel shows CORE branding
          * instead of the chainloader's leftover framebuffer (a blue field with

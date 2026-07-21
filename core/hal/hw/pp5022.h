@@ -362,6 +362,41 @@
 #define GPIOC_OUTPUT_EN  PP_REG32(GPIOC_OUTPUT_EN_ADDR)
 #endif
 
+/* ---------- GPIO ports B / D / L (LCD backlight dimmer) --------------
+ * core/docs/hw/02-lcd.md, "Backlight (GPIO charge-pump dimmer)".
+ * The iPod Video 5G / 5.5G (and Nano 1G) backlight is NOT a hardware PWM
+ * peripheral — it is three plain GPIO lines driving an external
+ * multi-level LED-driver IC (register addresses + the pulse protocol
+ * verified against Rockbox firmware/target/arm/ipod/backlight-nano_video.c
+ * and firmware/export/pp5020.h, 2026-07-21):
+ *   - GPIOB bit 3 (0x08) : backlight-circuit power enable
+ *   - GPIOD bit 7 (0x80) : the driver IC's serial "clock" / step line
+ *   - GPIOL bit 7 (0x80) : the LED-enable (fast on/off, ISR-safe)
+ * Port register layout matches the A-D block above (ENABLE at +0x00
+ * group, OUTPUT_EN at +0x10 group, OUTPUT_VAL at +0x20 group); the I-L
+ * quad is based at 0x6000D100 (so GPIOL = base+0x0C in each group). Only
+ * the three registers per port that the backlight touches are defined.
+ */
+#define GPIOB_ENABLE_ADDR     0x6000D004
+#define GPIOB_OUTPUT_EN_ADDR  0x6000D014
+#define GPIOB_OUTPUT_VAL_ADDR 0x6000D024
+#define GPIOD_ENABLE_ADDR     0x6000D00C
+#define GPIOD_OUTPUT_EN_ADDR  0x6000D01C
+#define GPIOD_OUTPUT_VAL_ADDR 0x6000D02C
+#define GPIOL_ENABLE_ADDR     0x6000D10C
+#define GPIOL_OUTPUT_EN_ADDR  0x6000D11C
+#define GPIOL_OUTPUT_VAL_ADDR 0x6000D12C
+
+/* Atomic bit set/clear alias. Each GPIO register has a shadow 0x800
+ * bytes higher that performs a masked update in a SINGLE 32-bit write —
+ * no read-modify-write, so it is safe against a concurrent ISR touching
+ * a different bit of the same port. The written word packs a per-bit
+ * WRITE-ENABLE mask in bits 15:8 and the target bit VALUES in bits 7:0:
+ *   set   bits `m`:  (m << 8) | m
+ *   clear bits `m`:  (m << 8)
+ * (02-lcd.md, "Backlight"; Rockbox pp5020.h GPIO_SET/CLEAR_BITWISE.) */
+#define GPIO_BITWISE_OFFSET   0x800
+
 /* ---------- BCM video coprocessor (LCD) -------------------------------
  * core/docs/hw/02-lcd.md, "Memory-mapped BCM interface" + "Internal
  * BCM addresses" + "Commands", verified against Rockbox lcd-video.c /
