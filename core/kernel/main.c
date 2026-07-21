@@ -310,15 +310,16 @@ static int name_eq_ci(const char *a, const char *b)
     return *a == '\0' && *b == '\0';
 }
 
-/* Read + validate the captured folder.art into g_art_raw; sets g_art_ok/w/h. */
-static void load_folder_art(fat32_t *fs)
+/* Read + validate a folder.art (at `clus`, `size` bytes) into g_art_raw; sets
+ * g_art_ok/w/h. Called once per queue so the now-playing art stays the PLAYING
+ * folder's even as the user browses elsewhere. */
+static void load_folder_art(fat32_t *fs, uint32_t clus, uint32_t size)
 {
     g_art_ok = 0;
-    if (g_art_clus == 0 || g_art_size < ART_HDR_LEN ||
-        g_art_size > sizeof g_art_raw) {
+    if (clus == 0 || size < ART_HDR_LEN || size > sizeof g_art_raw) {
         return;
     }
-    int32_t n = fat32_read_file(fs, g_art_clus, g_art_raw, g_art_size);
+    int32_t n = fat32_read_file(fs, clus, g_art_raw, size);
     if (n < (int32_t)ART_HDR_LEN) {
         return;
     }
@@ -553,18 +554,37 @@ static void nowplaying_render(const browse_entry_t *b, uint32_t elapsed_s,
     ui_text(LCD_WIDTH - 14 - wh, 208, hint, FONT_SMALL, LINEN_MUTED);
 }
 
-/*
- * Open, stream, and play one track. Returns 1 if the user pressed MENU to stop,
- * 0 if the track played to its end (or failed to open) — the browser uses that
- * to decide whether to auto-advance to the next track. Wraps the raw fat_src in
- * the read-ahead shim so the codec's many small header/tag reads collapse into
- * a few big disk reads (the fix for the ~27 s MP3 startup). Fixed 44.1 kHz /
- * stereo DAC path; a track that opens as anything else is skipped.
- */
-static int play_file(fat32_t *fs, const browse_entry_t *b)
+/* Now-playing animated strip: the album art (y 8..128) is static for a track,
+ * so we full-present it once then partial-present only this lower band each
+ * second — shrinking the IRQ-masked pixel push (relies on the BCM persisting
+ * the un-repainted art region across a partial LCD_UPDATE). */
+#define NP_ANIM_Y 128
+#define NP_ANIM_H 112
+
+/* ---------------------------------------------------------------------------
+ * Background player engine
+ *
+ * Playback is decoupled from the UI: player_pump() decodes one bounded chunk
+ * per main-loop pass and auto-advances at end of track, so audio keeps running
+ * while the user navigates menus. A "queue" is the set of files in the folder a
+ * track was launched from; the player owns its own copy so browsing elsewhere
+ * doesn't disturb the currently-playing album (or its art).
+ * ------------------------------------------------------------------------- */
+static fat32_t       *g_pl_fs;
+static browse_entry_t g_queue[BROWSE_MAX];
+static int            g_queue_n;
+static int            g_queue_idx;
+static int            g_pl_active;        /* a track is decoding + DMA running   */
+static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start    */
+static uint32_t       g_pl_total_s;       /* current track length, seconds        */
+static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
+
+/* Open g_queue[g_queue_idx] and start the DAC. Returns 0, or -1 on any failure
+ * (bad open / unsupported rate / audio init) — caller decides whether to skip. */
+static int player_open_current(void)
 {
-    /* Raw file source -> read-ahead shim -> codec. */
-    fat_src_open(&g_fsrc, fs, b->clus, b->size);
+    const browse_entry_t *b = &g_queue[g_queue_idx];
+    fat_src_open(&g_fsrc, g_pl_fs, b->clus, b->size);
     g_file_src.read = fat_src_read;
     g_file_src.seek = fat_src_seek;
     g_file_src.tell = fat_src_tell;
@@ -577,98 +597,139 @@ static int play_file(fat32_t *fs, const browse_entry_t *b)
     int oc = (b->fmt == 1) ? mp3_open_stream(&g_dec, &g_dec_src, &alloc)
                            : flac_open_stream(&g_dec, &g_dec_src, &alloc);
     if (oc != 0) {
-        console_clear(CON_RED);
-        console_str(2, 3, "OPEN FAILED", CON_WHITE, CON_RED);
-        console_hex32(2, 5, (uint32_t)oc, CON_WHITE, CON_RED);
-        lcd_present_fb(console_framebuffer());
-        sleep_ms(1000);
-        return 0;
+        return -1;
     }
     if (g_dec.sample_rate != 44100u || g_dec.channels != 2u) {
-        console_clear(CON_RED);
-        console_str(2, 3, "UNSUPPORTED RATE", CON_WHITE, CON_RED);
-        console_hex32(2, 5, g_dec.sample_rate, CON_WHITE, CON_RED);
-        lcd_present_fb(console_framebuffer());
-        sleep_ms(1000);
         g_dec.ops->close(&g_dec);
-        return 0;
+        return -1;
     }
 
-    uint32_t total_s = (g_dec.total_frames > 0)
-                     ? (uint32_t)(g_dec.total_frames / 44100u) : 0;
+    g_pl_total_s = (g_dec.total_frames > 0)
+                 ? (uint32_t)(g_dec.total_frames / 44100u) : 0;
 
-    /* Load this folder's pre-scaled album art (captured during enumeration)
-     * into RAM once, so the now-playing screen can blit it every frame. */
-    load_folder_art(fs);
-
-    /* Prime the ring, then start the DMA-fed DAC. */
     pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
     g_eos = 0;
-    decode_pump();
+    decode_pump();                       /* prime */
 
     if (hal_audio_init(44100u, 2u) != 0) {
         g_dec.ops->close(&g_dec);
-        return 0;
+        return -1;
     }
     hal_audio_set_source(ring_source, 0);
     hal_audio_start();
-    uint32_t start_us = mmio_read32(USEC_TIMER_ADDR);
-    int stopped = 0;                     /* set when the user presses MENU */
+    g_pl_start_us = mmio_read32(USEC_TIMER_ADDR);
+    g_pl_low_fill = RING_FRAMES;
+    g_pl_active   = 1;
+    return 0;
+}
 
-    /* Play loop: decode ONE bounded chunk per pass (so a slow codec can't
-     * freeze the UI), poll the wheel (MENU stops), and repaint the now-playing
-     * screen once a second. Track the ring's low-water fill between repaints so
-     * the BUF% readout exposes whether the decoder is keeping real-time.
-     *
-     * Present: the album art (y 8..128) is static for the whole track, so we
-     * full-present ONCE (first paint) and thereafter partial-present only the
-     * animated strip below it (clock / progress / BUF, y 128..240). That shrinks
-     * the IRQ-masked pixel push ~3x each second — the full-frame present was
-     * masking IRQs long enough to starve the audio DMA ISR (the DAC underran
-     * even with the ring full), which is the ~5s FLAC stutter. Relies on the BCM
-     * persisting the un-repainted art region across a partial LCD_UPDATE. */
-    #define NP_ANIM_Y 128                /* first row below the 120px art        */
-    #define NP_ANIM_H 112                /* 128..240                             */
-    uint32_t last_shown = 0xFFFFFFFFu;
-    uint32_t low_fill   = RING_FRAMES;   /* min ring fill seen since last repaint */
-    int      first_paint = 1;
-    while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
-        decode_step();
-
-        uint32_t fill = pcm_ring_fill(&g_ring);
-        if (fill < low_fill) {
-            low_fill = fill;
-        }
-
-        wheel_event_t ev;
-        if (clickwheel_poll(&ev)) {
-            if (ev.buttons & WHEEL_BTN_MENU) {        /* stop -> back to list */
-                stopped = 1;
-                break;
-            }
-        }
-
-        uint32_t elapsed_s = (mmio_read32(USEC_TIMER_ADDR) - start_us) / 1000000u;
-        if (elapsed_s != last_shown) {
-            uint32_t buf_pct = (low_fill * 100u) / RING_FRAMES;
-            nowplaying_render(b, elapsed_s, total_s, buf_pct);
-            if (first_paint) {
-                lcd_present_fb(console_framebuffer());   /* art + text, once */
-                first_paint = 0;
-            } else {
-                lcd_present_rect(console_framebuffer(),
-                                 0, NP_ANIM_Y, LCD_WIDTH, NP_ANIM_H);
-            }
-            last_shown = elapsed_s;
-            low_fill   = fill;           /* reset low-water for the next second */
-        }
+/* Stop playback and release the decoder. */
+static void player_stop(void)
+{
+    if (!g_pl_active) {
+        return;
     }
-
-    sleep_ms(200);                       /* let the FIFO/DMA drain the tail */
+    sleep_ms(60);                        /* let the FIFO/DMA drain the tail */
     hal_audio_stop();
     g_dec.ops->close(&g_dec);
-    return stopped;
+    g_pl_active = 0;
 }
+
+/* Advance to the next playable file in the queue (skipping folders and any that
+ * fail to open). Marks the player idle when the queue is exhausted. */
+static void player_advance(void)
+{
+    hal_audio_stop();
+    g_dec.ops->close(&g_dec);
+    g_pl_active = 0;
+    for (;;) {
+        int nxt = -1;
+        for (int j = g_queue_idx + 1; j < g_queue_n; j++) {
+            if (!g_queue[j].is_dir) { nxt = j; break; }
+        }
+        if (nxt < 0) {
+            return;                      /* queue done → idle */
+        }
+        g_queue_idx = nxt;
+        if (player_open_current() == 0) {
+            return;                      /* next track playing */
+        }
+        /* else: broken track, loop to skip it */
+    }
+}
+
+/* Launch playback: copy the folder's entries as the queue, load its album art
+ * once, and start at `start`. Replaces any current playback. */
+static void player_play_queue(fat32_t *fs, const browse_entry_t *src, int n,
+                              int start)
+{
+    player_stop();
+    g_pl_fs = fs;
+    for (int i = 0; i < n && i < BROWSE_MAX; i++) {
+        g_queue[i] = src[i];
+    }
+    g_queue_n   = (n < BROWSE_MAX) ? n : BROWSE_MAX;
+    g_queue_idx = start;
+    load_folder_art(fs, g_art_clus, g_art_size);   /* queue-level art */
+    if (player_open_current() != 0) {
+        player_advance();                /* skip a broken first track */
+    }
+}
+
+/* Decode one chunk per call and auto-advance at end of track. Called every
+ * main-loop pass, so audio runs in the background while the UI is elsewhere. */
+static void player_pump(void)
+{
+    if (!g_pl_active) {
+        return;
+    }
+    decode_step();
+    uint32_t fill = pcm_ring_fill(&g_ring);
+    if (fill < g_pl_low_fill) {
+        g_pl_low_fill = fill;
+    }
+    if (g_eos && fill == 0u) {
+        player_advance();
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Main menu + screen stack
+ * ------------------------------------------------------------------------- */
+enum { MI_MUSIC, MI_NOWPLAYING, MI_COUNT };
+static const char *g_menu_labels[MI_COUNT] = { "Music", "Now Playing" };
+static int g_menu_sel;
+
+static void menu_render(void)
+{
+    console_clear(LINEN_SURFACE);
+    ui_text(14, 20, "Core", FONT_HEADER, LINEN_INK);
+    console_fill_rect(14, 27, LCD_WIDTH - 28, 1, LINEN_BORDER);
+    for (int i = 0; i < MI_COUNT; i++) {
+        int ry = LIST_Y0 + i * ROW_H;
+        uint16_t ink;
+        if (i == g_menu_sel) {
+            console_fill_rect(6, ry, LCD_WIDTH - 12, ROW_H - 2, LINEN_ACCENT);
+            ink = LINEN_SURFACE;
+        } else {
+            /* "Now Playing" is muted when nothing is playing. */
+            ink = (i == MI_NOWPLAYING && !g_pl_active) ? LINEN_MUTED : LINEN_INK;
+        }
+        ui_text(14, ry + 16, g_menu_labels[i], FONT_ROW, ink);
+    }
+}
+
+typedef enum { SCR_MENU, SCR_BROWSER, SCR_NOWPLAYING } screen_t;
+#define SCR_STACK_MAX 8
+static screen_t g_scr[SCR_STACK_MAX];
+static int      g_scr_n;
+
+static void      scr_push(screen_t s) { if (g_scr_n < SCR_STACK_MAX) g_scr[g_scr_n++] = s; }
+static void      scr_pop(void)        { if (g_scr_n > 1) g_scr_n--; }
+static screen_t  scr_cur(void)        { return g_scr[g_scr_n - 1]; }
+
+/* Browser view state (was local to the old browse loop). */
+static int g_br_sel, g_br_top, g_br_accum;
 
 /* (Re)enumerate the directory at cluster `dir_clus` into g_browse. */
 static void browse_load(fat32_t *fs, uint32_t dir_clus)
@@ -680,97 +741,138 @@ static void browse_load(fat32_t *fs, uint32_t dir_clus)
     fat32_readdir(fs, dir_clus, browse_collect, 0);
 }
 
-/* Play the file at index `start`, then auto-advance through the following FILES
- * in the current listing until the user presses MENU or the folder runs out.
- * Directories are skipped by auto-advance. Returns the index of the last track
- * touched so the caller can leave the selection there. */
-static int play_from(fat32_t *fs, int start)
+/* Apply a wheel event to a selection index in [0, count) with acceleration. */
+static int wheel_move(int sel, int count, int8_t delta, int *accum)
 {
-    int i = start;
-    for (;;) {
-        int stopped = play_file(fs, &g_browse[i]);
-        if (stopped) {
-            return i;                    /* user backed out here */
-        }
-        int nxt = -1;                    /* next non-dir entry after i */
-        for (int j = i + 1; j < g_browse_n; j++) {
-            if (!g_browse[j].is_dir) { nxt = j; break; }
-        }
-        if (nxt < 0) {
-            return i;                    /* end of folder */
-        }
-        i = nxt;
-    }
+    int wd = delta;
+    if (wd >  WHEEL_MAX_DELTA) wd =  WHEEL_MAX_DELTA;
+    if (wd < -WHEEL_MAX_DELTA) wd = -WHEEL_MAX_DELTA;
+    *accum += wd;
+    int move = *accum / WHEEL_CLICKS_PER_ITEM;
+    *accum -= move * WHEEL_CLICKS_PER_ITEM;
+    sel += move;
+    if (sel < 0)          sel = 0;
+    if (sel >= count)     sel = count - 1;
+    return sel;
 }
 
 /*
- * The browser: list the current directory and handle the wheel. Wheel scrolls
- * the selection; SELECT descends into a highlighted folder or plays a
- * highlighted track (auto-advancing to the rest of the folder); MENU climbs
- * back up a directory. Starts at the root and never returns.
+ * The UI: one event loop that pumps the background player every pass and
+ * dispatches input to the current screen (Menu / Browser / Now Playing) on a
+ * stack. MENU pops the screen WITHOUT stopping playback, so a song keeps going
+ * while you navigate. Never returns.
  */
-_Noreturn static void browse_and_play(fat32_t *fs)
+_Noreturn static void run_ui(fat32_t *fs)
 {
     clickwheel_init();
     g_dir_depth = 0;
     browse_load(fs, fs->root_clus);
+    g_br_sel = g_br_top = g_br_accum = 0;
+    g_menu_sel = 0;
+    g_scr_n = 0;
+    scr_push(SCR_MENU);
 
-    int sel = 0, top = 0;
-    int wheel_accum = 0;
-    browse_render(sel, top);
-    lcd_present_fb(console_framebuffer());
+    int      dirty = 1;
+    uint32_t np_last = 0xFFFFFFFFu;
+    int      np_first = 1;
 
     for (;;) {
+        player_pump();
+
         wheel_event_t ev;
-        int dirty = 0;
         if (clickwheel_poll(&ev)) {
-            if (ev.wheel_delta && g_browse_n > 0) {
-                int wd = ev.wheel_delta;
-                if (wd >  WHEEL_MAX_DELTA) wd =  WHEEL_MAX_DELTA;
-                if (wd < -WHEEL_MAX_DELTA) wd = -WHEEL_MAX_DELTA;
-                wheel_accum += wd;
-                int move = wheel_accum / WHEEL_CLICKS_PER_ITEM;
-                wheel_accum -= move * WHEEL_CLICKS_PER_ITEM;
-                if (move != 0) {
-                    sel += move;
-                    if (sel < 0)            sel = 0;
-                    if (sel >= g_browse_n)  sel = g_browse_n - 1;
-                    if (sel < top)              top = sel;
-                    if (sel >= top + LIST_ROWS) top = sel - (LIST_ROWS - 1);
+            switch (scr_cur()) {
+            case SCR_MENU:
+                if (ev.wheel_delta) {
+                    g_menu_sel = wheel_move(g_menu_sel, MI_COUNT,
+                                            ev.wheel_delta, &g_br_accum);
                     dirty = 1;
                 }
-            }
-            if ((ev.buttons & WHEEL_BTN_SELECT) && g_browse_n > 0) {
-                if (g_browse[sel].is_dir) {
-                    /* Descend, remembering the parent so MENU can return. */
-                    if (g_dir_depth < DIR_STACK_MAX) {
-                        g_dir_stack[g_dir_depth++] = g_cur_dir;
-                        browse_load(fs, g_browse[sel].clus);
-                        sel = 0;
-                        top = 0;
+                if (ev.buttons & WHEEL_BTN_SELECT) {
+                    if (g_menu_sel == MI_MUSIC) {
+                        scr_push(SCR_BROWSER);
+                    } else if (g_menu_sel == MI_NOWPLAYING && g_pl_active) {
+                        scr_push(SCR_NOWPLAYING);
+                        np_first = 1;
                     }
-                } else {
-                    sel = play_from(fs, sel);
-                    if (sel >= top + LIST_ROWS) top = sel - (LIST_ROWS - 1);
-                }
-                dirty = 1;               /* repaint the list afterwards */
-            }
-            if (ev.buttons & WHEEL_BTN_MENU) {
-                /* Climb back up a directory (no-op at the root). */
-                if (g_dir_depth > 0) {
-                    browse_load(fs, g_dir_stack[--g_dir_depth]);
-                    sel = 0;
-                    top = 0;
                     dirty = 1;
                 }
+                break;
+
+            case SCR_BROWSER:
+                if (ev.wheel_delta && g_browse_n > 0) {
+                    g_br_sel = wheel_move(g_br_sel, g_browse_n,
+                                          ev.wheel_delta, &g_br_accum);
+                    if (g_br_sel < g_br_top)               g_br_top = g_br_sel;
+                    if (g_br_sel >= g_br_top + LIST_ROWS)  g_br_top = g_br_sel - (LIST_ROWS - 1);
+                    dirty = 1;
+                }
+                if ((ev.buttons & WHEEL_BTN_SELECT) && g_browse_n > 0) {
+                    if (g_browse[g_br_sel].is_dir) {
+                        if (g_dir_depth < DIR_STACK_MAX) {
+                            g_dir_stack[g_dir_depth++] = g_cur_dir;
+                            browse_load(fs, g_browse[g_br_sel].clus);
+                            g_br_sel = g_br_top = g_br_accum = 0;
+                        }
+                    } else {
+                        player_play_queue(fs, g_browse, g_browse_n, g_br_sel);
+                        scr_push(SCR_NOWPLAYING);
+                        np_first = 1;
+                    }
+                    dirty = 1;
+                }
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    if (g_dir_depth > 0) {              /* up a directory */
+                        browse_load(fs, g_dir_stack[--g_dir_depth]);
+                        g_br_sel = g_br_top = g_br_accum = 0;
+                    } else {                            /* back to main menu */
+                        scr_pop();
+                    }
+                    dirty = 1;
+                }
+                break;
+
+            case SCR_NOWPLAYING:
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    scr_pop();                          /* back, keep playing */
+                    dirty = 1;
+                }
+                break;
             }
         }
-        if (dirty) {
-            browse_render(sel, top);
+
+        /* Render the current screen. Now Playing repaints ~1/s for the clock;
+         * Menu/Browser only on change. */
+        if (scr_cur() == SCR_NOWPLAYING) {
+            uint32_t elapsed = g_pl_active
+                ? (mmio_read32(USEC_TIMER_ADDR) - g_pl_start_us) / 1000000u : 0;
+            if (dirty || elapsed != np_last) {
+                uint32_t buf_pct = (g_pl_low_fill * 100u) / RING_FRAMES;
+                nowplaying_render(&g_queue[g_queue_idx], elapsed, g_pl_total_s,
+                                  buf_pct);
+                if (np_first || dirty) {
+                    lcd_present_fb(console_framebuffer());
+                    np_first = 0;
+                } else {
+                    lcd_present_rect(console_framebuffer(),
+                                     0, NP_ANIM_Y, LCD_WIDTH, NP_ANIM_H);
+                }
+                np_last = elapsed;
+                g_pl_low_fill = pcm_ring_fill(&g_ring);
+                dirty = 0;
+            }
+        } else if (dirty) {
+            if (scr_cur() == SCR_MENU) menu_render();
+            else                       browse_render(g_br_sel, g_br_top);
             lcd_present_fb(console_framebuffer());
+            dirty = 0;
         }
-        /* Light throttle so the idle browser doesn't spin the panel/CPU. */
-        for (volatile uint32_t d = 0; d < (1u << 16); d++) {
+
+        /* Only throttle when idle; while playing, decode_step paces the loop and
+         * the wheel stays responsive. */
+        if (!g_pl_active) {
+            for (volatile uint32_t d = 0; d < (1u << 15); d++) {
+            }
         }
     }
 }
@@ -894,7 +996,7 @@ _Noreturn void kernel_main(void) {
 
         if (mnt == 0) {
             uart_puts("core: entering browser\n");
-            browse_and_play(&fs);              /* never returns */
+            run_ui(&fs);                       /* never returns */
         }
 
         /* Mount failed: show a diagnostic error screen and fall through to the
