@@ -132,6 +132,17 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Freestanding nearest-neighbor RGB565 downscaler (ours): shrinks a loaded
+  # folder.art to a list chip / album-detail cover when no dedicated folder.thm
+  # is on disk. Pure integer math — no libc/libm/malloc, no allocation. Same
+  # thumb.c the host thumb_test compiles; links into core.elf. Only relative
+  # includes (thumb.h), so no extra include dirs; stays under -Werror.
+  thumb_hw_lib = static_library(
+    'core_thumb_hw',
+    sources: ['ui/thumb.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Background streaming playback engine (ours): the FLAC/MP3 decode path, the
   # SPSC PCM ring feeding the DMA DAC, the fat32 byte-source + read-ahead glue,
   # album art, and the queue/auto-advance player — extracted out of kernel/main.c
@@ -148,7 +159,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, text_hw_lib, player_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, text_hw_lib, thumb_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

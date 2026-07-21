@@ -76,6 +76,19 @@ if target == 'sim'
   )
   test('text', text_test, suite: 'unit')
 
+  # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
+  # — the SAME source the ARM build links into core.elf. Shrinks a loaded
+  # folder.art to a list chip / album-detail cover when no folder.thm is present.
+  # Asserts an exact identity copy (dst == src dims), a hand-worked 4x4->2x2 pixel
+  # selection, in-bounds source reads + no OOB writes for a non-integer ratio
+  # (120->22, sentinel-guarded dst), and the zero/negative-dim no-op. Plain cc.
+  thumb_test = executable(
+    'thumb_test',
+    sources: ['ui/thumb_test.c', '../ui/thumb.c'],
+    include_directories: include_directories('../ui'),
+  )
+  test('thumb', thumb_test, suite: 'unit')
+
   tag_mp3_test = executable(
     'tag_mp3_test',
     sources: ['tag_mp3_test.c'],
@@ -300,4 +313,22 @@ if target == 'sim'
     c_args: ['-DMMIO_MOCK'],
   )
   test('hw-battery', battery_trace_test, suite: 'unit')
+
+  # hw-volume: the WM8758 output-volume HAL (hal/hw/volume.c) over the
+  # reused i2c.c write path, host-side under -DMMIO_MOCK. Volume is not
+  # modelled by clicky and the device needs a logic analyzer, so this is
+  # the automated check of the percent->register policy: the PURE
+  # percent->OUT1VOL mapping (monotonic gain, clamping, 0%=mute,
+  # 100%=0 dB/0x39 never +6 dB) plus hal_volume_set's L-then-R(+VU)
+  # two-write codec grammar and hal_volume_get round-trip.
+  volume_trace_test = executable(
+    'volume_trace_test',
+    sources: ['hw_mmio/volume_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/volume.c',
+              '../hal/hw/i2c.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+  )
+  test('hw-volume', volume_trace_test, suite: 'unit')
 endif
