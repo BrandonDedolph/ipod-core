@@ -309,6 +309,13 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
 #define LIST_TOP_ROW 2
 #define LIST_ROWS    26                  /* rows LIST_TOP_ROW .. 27              */
 
+/* Wheel scroll feel. The driver reports the raw differenced detent count (up to
+ * ~half a rotation per poll), so adding it straight to the selection flung the
+ * list. Accumulate detents and advance one row per WHEEL_CLICKS_PER_ITEM,
+ * clamping a single event so a fast flick can't teleport to the end. */
+#define WHEEL_CLICKS_PER_ITEM 3          /* higher = less sensitive             */
+#define WHEEL_MAX_DELTA       6          /* max raw detents honoured per event  */
+
 /* Draw one list row as a full-width bar so the selected entry reads as a solid
  * highlight (name padded with spaces to 40 cells). `fg_unsel` colours the row
  * when it isn't the selection (dirs cyan, files white). */
@@ -344,6 +351,17 @@ static void browse_render(int sel, int top, uint16_t bg)
         uint16_t fg = e->is_dir ? CON_CYAN : CON_WHITE;
         draw_row(LIST_TOP_ROW + r, e->name, idx == sel, fg, bg);
     }
+}
+
+/* Boot splash: centred CORE branding shown the moment the panel is ours, so
+ * the disk-spin-up / mount delay reads as "loading" rather than the leftover
+ * chainloader framebuffer. */
+static void boot_splash(uint16_t bg)
+{
+    console_clear(bg);
+    console_str(14, 12, "CORE PLAYER", CON_CYAN,   bg);   /* 11 chars, centred */
+    console_str(16, 15, "LOADING",     CON_YELLOW, bg);   /*  7 chars, centred */
+    lcd_present_fb(console_framebuffer());
 }
 
 /* Render two decimal digits at (col,row). */
@@ -534,6 +552,7 @@ _Noreturn static void browse_and_play(fat32_t *fs, uint16_t bg)
     browse_load(fs, fs->root_clus);
 
     int sel = 0, top = 0;
+    int wheel_accum = 0;
     browse_render(sel, top, bg);
     lcd_present_fb(console_framebuffer());
 
@@ -542,12 +561,20 @@ _Noreturn static void browse_and_play(fat32_t *fs, uint16_t bg)
         int dirty = 0;
         if (clickwheel_poll(&ev)) {
             if (ev.wheel_delta && g_browse_n > 0) {
-                sel += ev.wheel_delta;
-                if (sel < 0)            sel = 0;
-                if (sel >= g_browse_n)  sel = g_browse_n - 1;
-                if (sel < top)              top = sel;
-                if (sel >= top + LIST_ROWS) top = sel - (LIST_ROWS - 1);
-                dirty = 1;
+                int wd = ev.wheel_delta;
+                if (wd >  WHEEL_MAX_DELTA) wd =  WHEEL_MAX_DELTA;
+                if (wd < -WHEEL_MAX_DELTA) wd = -WHEEL_MAX_DELTA;
+                wheel_accum += wd;
+                int move = wheel_accum / WHEEL_CLICKS_PER_ITEM;
+                wheel_accum -= move * WHEEL_CLICKS_PER_ITEM;
+                if (move != 0) {
+                    sel += move;
+                    if (sel < 0)            sel = 0;
+                    if (sel >= g_browse_n)  sel = g_browse_n - 1;
+                    if (sel < top)              top = sel;
+                    if (sel >= top + LIST_ROWS) top = sel - (LIST_ROWS - 1);
+                    dirty = 1;
+                }
             }
             if ((ev.buttons & WHEEL_BTN_SELECT) && g_browse_n > 0) {
                 if (g_browse[sel].is_dir) {
@@ -662,6 +689,11 @@ _Noreturn void kernel_main(void) {
          * we never drop back because the browser never returns (fine for
          * bring-up — the device is on a cable during testing). */
         cpu_boost();
+
+        /* Paint the boot splash immediately, so the panel shows CORE branding
+         * instead of the chainloader's leftover framebuffer (a blue field with
+         * a green stripe) while the disk spins up and the volume mounts. */
+        boot_splash(CON_BLACK);
 
         /* Read the MBR, find the FAT32 data partition (type 0B/0C), mount it. */
         uint8_t *mbr = (uint8_t *)mbr_sector;
