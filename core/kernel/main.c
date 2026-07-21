@@ -28,6 +28,7 @@
 #include "clock.h"
 #include "cache.h"
 #include "console.h"
+#include "../ui/text.h"
 #include "pcm_ring.h"
 #include "../codecs/decoder.h"
 #include "../codecs/arena.h"
@@ -228,7 +229,39 @@ static int disk_read(void *ud, uint32_t lba, uint32_t count, void *buf)
  * ------------------------------------------------------------------------- */
 
 #define BROWSE_MAX 128
-#define NAME_MAX   40                    /* one 40-cell console row             */
+#define NAME_MAX   64                    /* stored display name (Nunito, ASCII)  */
+
+/* Linen theme palette (design_reference/README.md tokens -> RGB565).
+ *   surface #f4f1ec, ink #1a1714, muted #7a7068, accent terracotta,
+ *   border = 8% ink over surface. */
+#define LINEN_SURFACE 0xF79Du            /* #f4f1ec warm off-white               */
+#define LINEN_INK     0x18A2u            /* #1a1714 near-black text              */
+#define LINEN_MUTED   0x7B8Du            /* #7a7068 secondary text               */
+#define LINEN_ACCENT  0xC348u            /* terracotta accent / selection        */
+#define LINEN_BORDER  0xE71Bu            /* subtle divider line                  */
+
+/* Nunito faces (freestanding renderer, core/ui/text.h). */
+#define FONT_HEADER   text_font_bold_13()
+#define FONT_ROW      text_font_regular_13()
+#define FONT_TITLE    text_font_bold_17()
+#define FONT_SUB      text_font_regular_11()
+#define FONT_SMALL    text_font_regular_9()
+
+/* Draw a NUL-terminated string; thin wrapper over text_draw with the panel
+ * dimensions baked in. `y` is the text baseline. Returns the advance. */
+static int ui_text(int x, int y, const char *s, const text_font_t *font,
+                   uint16_t ink)
+{
+    return text_draw(console_fb(), LCD_WIDTH, LCD_HEIGHT, x, y, s, font, ink);
+}
+
+/* Centre a string horizontally at baseline `y`. */
+static void ui_text_centered(int y, const char *s, const text_font_t *font,
+                             uint16_t ink)
+{
+    int w = text_width(s, font);
+    ui_text((LCD_WIDTH - w) / 2, y, s, font, ink);
+}
 
 typedef struct {
     char     name[NAME_MAX + 1];         /* display name (uppercased, font-safe) */
@@ -300,16 +333,29 @@ static void load_folder_art(fat32_t *fs)
     g_art_ok = 1;
 }
 
-/* Map a filename byte to a glyph the 8x8 font can draw: uppercase letters,
- * digits, and the few name punctuation marks; everything else becomes a
- * space. Keeps the list legible without a full ASCII font. */
-static char disp_char(char c)
+/* Copy `src` into `dst` (<= NAME_MAX), keeping only printable ASCII (the Nunito
+ * atlas covers 0x20..0x7E; UTF-8 multibyte bytes in fancy filenames are dropped
+ * rather than drawn as tofu). If `drop_ext`, trim a trailing ".ext" so the list
+ * shows track titles, not filenames. */
+static void copy_display_name(char *dst, const char *src, int drop_ext)
 {
-    if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
-    if (c >= 'A' && c <= 'Z') return c;
-    if (c >= '0' && c <= '9') return c;
-    if (c == '.' || c == '_' || c == '-') return c;
-    return ' ';
+    int end = 0;
+    while (src[end]) end++;
+    if (drop_ext) {
+        int dot = -1;
+        for (int j = 0; src[j]; j++) {
+            if (src[j] == '.') dot = j;
+        }
+        if (dot > 0) end = dot;              /* trim the extension */
+    }
+    int i = 0;
+    for (int j = 0; j < end && i < NAME_MAX; j++) {
+        char c = src[j];
+        if (c >= 0x20 && c <= 0x7E) {
+            dst[i++] = c;
+        }
+    }
+    dst[i] = '\0';
 }
 
 /* MP3 playback is parked: dr_mp3's float synthesis can't hit real-time on this
@@ -363,12 +409,7 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
 
     if (e->is_dir) {
         browse_entry_t *b = &g_browse[g_browse_n++];
-        int i = 0;
-        b->name[i++] = '>';                   /* dir marker glyph */
-        for (const char *p = e->name; *p && i < NAME_MAX; p++) {
-            b->name[i++] = disp_char(*p);
-        }
-        b->name[i] = '\0';
+        copy_display_name(b->name, e->name, 0);   /* keep folder name as-is */
         b->clus   = e->first_clus;
         b->size   = 0;
         b->fmt    = 0;
@@ -379,11 +420,7 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
     int fmt = classify_ext(e->name);
     if (fmt < 0) return 0;
     browse_entry_t *b = &g_browse[g_browse_n++];
-    int i = 0;
-    for (; e->name[i] && i < NAME_MAX; i++) {
-        b->name[i] = disp_char(e->name[i]);
-    }
-    b->name[i] = '\0';
+    copy_display_name(b->name, e->name, 1);       /* trim ".flac" -> title */
     b->clus   = e->first_clus;
     b->size   = e->size;
     b->fmt    = (uint8_t)fmt;
@@ -391,8 +428,9 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
     return 0;
 }
 
-#define LIST_TOP_ROW 2
-#define LIST_ROWS    26                  /* rows LIST_TOP_ROW .. 27              */
+#define LIST_Y0   34                     /* first row top (below header+divider) */
+#define ROW_H     22                     /* px per list row (design: 22-24px)    */
+#define LIST_ROWS 9                       /* visible rows: (240-34)/22 ~= 9       */
 
 /* Wheel scroll feel. The driver reports the raw differenced detent count (up to
  * ~half a rotation per poll), so adding it straight to the selection flung the
@@ -401,107 +439,112 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
 #define WHEEL_CLICKS_PER_ITEM 3          /* higher = less sensitive             */
 #define WHEEL_MAX_DELTA       6          /* max raw detents honoured per event  */
 
-/* Draw one list row as a full-width bar so the selected entry reads as a solid
- * highlight (name padded with spaces to 40 cells). `fg_unsel` colours the row
- * when it isn't the selection (dirs cyan, files white). */
-static void draw_row(int row, const char *s, int selected,
-                     uint16_t fg_unsel, uint16_t bg)
+/* Draw one Nunito list row. The selection is a filled terracotta bar with light
+ * text; folders are accent-coloured, files ink. */
+static void draw_row(int r, const browse_entry_t *e, int selected)
 {
-    uint16_t fg = selected ? CON_BLACK : fg_unsel;
-    uint16_t rb = selected ? CON_WHITE : bg;
-    char line[NAME_MAX + 1];
-    int i = 0;
-    for (; s[i] && i < NAME_MAX; i++) line[i] = s[i];
-    for (; i < NAME_MAX; i++)         line[i] = ' ';
-    line[NAME_MAX] = '\0';
-    console_str(0, row, line, fg, rb);
+    int ry       = LIST_Y0 + r * ROW_H;
+    int baseline = ry + 16;
+    uint16_t ink;
+    if (selected) {
+        console_fill_rect(6, ry, LCD_WIDTH - 12, ROW_H - 2, LINEN_ACCENT);
+        ink = LINEN_SURFACE;
+    } else {
+        ink = e->is_dir ? LINEN_ACCENT : LINEN_INK;
+    }
+    ui_text(14, baseline, e->name, FONT_ROW, ink);
 }
 
-static void browse_render(int sel, int top, uint16_t bg)
+static void browse_render(int sel, int top)
 {
-    console_clear(bg);
-    console_str(2, 0, "CORE PLAYER", CON_CYAN, bg);
+    console_clear(LINEN_SURFACE);
+    ui_text(14, 20, g_dir_depth > 0 ? "Folder" : "Core Player",
+            FONT_HEADER, LINEN_INK);
     if (g_dir_depth > 0) {
-        console_str(28, 0, "MENU:UP", CON_YELLOW, bg);   /* not at root */
+        const char *hint = "menu: back";
+        int w = text_width(hint, FONT_SMALL);
+        ui_text(LCD_WIDTH - 14 - w, 19, hint, FONT_SMALL, LINEN_MUTED);
     }
+    console_fill_rect(14, 27, LCD_WIDTH - 28, 1, LINEN_BORDER);
 
     if (g_browse_n == 0) {
-        console_str(2, 4, "EMPTY FOLDER", CON_YELLOW, bg);
+        ui_text(14, LIST_Y0 + 20, "Empty folder", FONT_ROW, LINEN_MUTED);
         return;
     }
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
         if (idx >= g_browse_n) break;
-        const browse_entry_t *e = &g_browse[idx];
-        uint16_t fg = e->is_dir ? CON_CYAN : CON_WHITE;
-        draw_row(LIST_TOP_ROW + r, e->name, idx == sel, fg, bg);
+        draw_row(r, &g_browse[idx], idx == sel);
     }
 }
 
-/* Boot splash: centred CORE branding shown the moment the panel is ours, so
- * the disk-spin-up / mount delay reads as "loading" rather than the leftover
- * chainloader framebuffer. */
-static void boot_splash(uint16_t bg)
+/* Boot splash: Nunito CORE branding on the Linen surface the moment the panel
+ * is ours, so the disk-spin-up / mount delay reads as "loading" rather than the
+ * leftover chainloader framebuffer. */
+static void boot_splash(void)
 {
-    console_clear(bg);
-    console_str(14, 12, "CORE PLAYER", CON_CYAN,   bg);   /* 11 chars, centred */
-    console_str(16, 15, "LOADING",     CON_YELLOW, bg);   /*  7 chars, centred */
+    console_clear(LINEN_SURFACE);
+    ui_text_centered(120, "Core Player", FONT_TITLE, LINEN_INK);
+    ui_text_centered(142, "loading",     FONT_SUB,   LINEN_MUTED);
     lcd_present_fb(console_framebuffer());
 }
 
-/* Render two decimal digits at (col,row). */
-static void draw_dd(int col, int row, uint32_t v, uint16_t fg, uint16_t bg)
+/* Format `s` seconds as "M:SS" (minutes uncapped). */
+static void fmt_time(char *buf, uint32_t s)
 {
-    console_char(col,     row, (char)('0' + (v / 10) % 10), fg, bg);
-    console_char(col + 1, row, (char)('0' + v % 10),        fg, bg);
+    uint32_t m = s / 60, ss = s % 60;
+    int i = 0;
+    if (m >= 10) buf[i++] = (char)('0' + (m / 10) % 10);
+    buf[i++] = (char)('0' + m % 10);
+    buf[i++] = ':';
+    buf[i++] = (char)('0' + ss / 10);
+    buf[i++] = (char)('0' + ss % 10);
+    buf[i]   = '\0';
 }
 
-/* Now-playing screen: title, track name, elapsed MM:SS / total MM:SS, and a
- * '='-bar progress meter. Elapsed is wall-clock since play start (the fixed
- * 1 MHz USEC_TIMER), which tracks the DAC closely enough for a UI. */
+/* Now-playing (Linen): album art up top, track title + elapsed/total clock and
+ * an accent progress bar below, with a small buffer-health readout. */
 static void nowplaying_render(const browse_entry_t *b, uint32_t elapsed_s,
-                              uint32_t total_s, uint32_t buf_pct, uint16_t bg)
+                              uint32_t total_s, uint32_t buf_pct)
 {
-    console_clear(bg);
+    console_clear(LINEN_SURFACE);
 
-    /* Pre-scaled album art (folder.art), centred near the top. Falls back to a
-     * text header when the folder has no art sidecar. */
+    /* Pre-scaled album art (folder.art), centred near the top. */
     if (g_art_ok) {
         int ax = (LCD_WIDTH - g_art_w) / 2;
         console_blit565(ax, 8, g_art_w, g_art_h,
                         (const uint16_t *)(g_art_raw + ART_HDR_LEN));
-    } else {
-        console_str(2, 1, "NOW PLAYING", CON_CYAN, bg);
     }
 
-    /* Track name + metadata below the art (rows 17..25 clear the 120px art). */
-    console_str(2, 17, b->name, CON_WHITE, bg);
+    /* Track title (extension already trimmed at collect time). */
+    ui_text(14, 150, b->name, FONT_TITLE, LINEN_INK);
 
-    /* Clock line: "MM:SS / MM:SS" */
-    draw_dd(2,  19, elapsed_s / 60, CON_WHITE, bg);
-    console_char(4, 19, ':', CON_WHITE, bg);
-    draw_dd(5,  19, elapsed_s % 60, CON_WHITE, bg);
-    console_str(8, 19, "/", CON_WHITE, bg);
-    draw_dd(10, 19, total_s / 60, CON_WHITE, bg);
-    console_char(12, 19, ':', CON_WHITE, bg);
-    draw_dd(13, 19, total_s % 60, CON_WHITE, bg);
+    /* Clock: elapsed left, total right. */
+    char te[12], tt[12];
+    fmt_time(te, elapsed_s);
+    fmt_time(tt, total_s);
+    ui_text(14, 174, te, FONT_SUB, LINEN_MUTED);
+    int wtt = text_width(tt, FONT_SUB);
+    ui_text(LCD_WIDTH - 14 - wtt, 174, tt, FONT_SUB, LINEN_MUTED);
 
-    /* Progress bar over 36 cells. */
-    int width = 36;
-    int fill = (total_s > 0) ? (int)((elapsed_s * (uint32_t)width) / total_s) : 0;
-    if (fill > width) fill = width;
-    for (int i = 0; i < width; i++) {
-        console_char(2 + i, 21, i < fill ? '=' : '-',
-                     i < fill ? CON_GREEN : CON_WHITE, bg);
-    }
+    /* Thin accent progress bar. */
+    int bx = 14, by = 182, bw = LCD_WIDTH - 28, bh = 3;
+    console_fill_rect(bx, by, bw, bh, LINEN_BORDER);
+    int fw = (total_s > 0) ? (int)((elapsed_s * (uint32_t)bw) / total_s) : 0;
+    if (fw > bw) fw = bw;
+    console_fill_rect(bx, by, fw, bh, LINEN_ACCENT);
 
-    /* Buffer health: the ring's low-water fill % since the last repaint. Near
-     * 100% => the decoder is comfortably ahead of the DAC. */
-    console_str(2, 23, "BUF", buf_pct < 20u ? CON_RED : CON_GREEN, bg);
-    draw_dd(6, 23, buf_pct > 99u ? 99u : buf_pct,
-            buf_pct < 20u ? CON_RED : CON_GREEN, bg);
-
-    console_str(2, 25, "MENU = STOP", CON_YELLOW, bg);
+    /* Small buffer-health readout, bottom-left ("buf NN"), + stop hint right. */
+    char bs[12];
+    uint32_t p = buf_pct > 99u ? 99u : buf_pct;
+    bs[0] = 'b'; bs[1] = 'u'; bs[2] = 'f'; bs[3] = ' ';
+    bs[4] = (char)('0' + (p / 10) % 10);
+    bs[5] = (char)('0' + p % 10);
+    bs[6] = '\0';
+    ui_text(14, 208, bs, FONT_SMALL, p < 20u ? LINEN_ACCENT : LINEN_MUTED);
+    const char *hint = "menu: stop";
+    int wh = text_width(hint, FONT_SMALL);
+    ui_text(LCD_WIDTH - 14 - wh, 208, hint, FONT_SMALL, LINEN_MUTED);
 }
 
 /*
@@ -512,7 +555,7 @@ static void nowplaying_render(const browse_entry_t *b, uint32_t elapsed_s,
  * a few big disk reads (the fix for the ~27 s MP3 startup). Fixed 44.1 kHz /
  * stereo DAC path; a track that opens as anything else is skipped.
  */
-static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
+static int play_file(fat32_t *fs, const browse_entry_t *b)
 {
     /* Raw file source -> read-ahead shim -> codec. */
     fat_src_open(&g_fsrc, fs, b->clus, b->size);
@@ -602,7 +645,7 @@ static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
         uint32_t elapsed_s = (mmio_read32(USEC_TIMER_ADDR) - start_us) / 1000000u;
         if (elapsed_s != last_shown) {
             uint32_t buf_pct = (low_fill * 100u) / RING_FRAMES;
-            nowplaying_render(b, elapsed_s, total_s, buf_pct, bg);
+            nowplaying_render(b, elapsed_s, total_s, buf_pct);
             if (first_paint) {
                 lcd_present_fb(console_framebuffer());   /* art + text, once */
                 first_paint = 0;
@@ -635,11 +678,11 @@ static void browse_load(fat32_t *fs, uint32_t dir_clus)
  * in the current listing until the user presses MENU or the folder runs out.
  * Directories are skipped by auto-advance. Returns the index of the last track
  * touched so the caller can leave the selection there. */
-static int play_from(fat32_t *fs, int start, uint16_t bg)
+static int play_from(fat32_t *fs, int start)
 {
     int i = start;
     for (;;) {
-        int stopped = play_file(fs, &g_browse[i], bg);
+        int stopped = play_file(fs, &g_browse[i]);
         if (stopped) {
             return i;                    /* user backed out here */
         }
@@ -660,7 +703,7 @@ static int play_from(fat32_t *fs, int start, uint16_t bg)
  * highlighted track (auto-advancing to the rest of the folder); MENU climbs
  * back up a directory. Starts at the root and never returns.
  */
-_Noreturn static void browse_and_play(fat32_t *fs, uint16_t bg)
+_Noreturn static void browse_and_play(fat32_t *fs)
 {
     clickwheel_init();
     g_dir_depth = 0;
@@ -668,7 +711,7 @@ _Noreturn static void browse_and_play(fat32_t *fs, uint16_t bg)
 
     int sel = 0, top = 0;
     int wheel_accum = 0;
-    browse_render(sel, top, bg);
+    browse_render(sel, top);
     lcd_present_fb(console_framebuffer());
 
     for (;;) {
@@ -701,7 +744,7 @@ _Noreturn static void browse_and_play(fat32_t *fs, uint16_t bg)
                         top = 0;
                     }
                 } else {
-                    sel = play_from(fs, sel, bg);
+                    sel = play_from(fs, sel);
                     if (sel >= top + LIST_ROWS) top = sel - (LIST_ROWS - 1);
                 }
                 dirty = 1;               /* repaint the list afterwards */
@@ -717,7 +760,7 @@ _Noreturn static void browse_and_play(fat32_t *fs, uint16_t bg)
             }
         }
         if (dirty) {
-            browse_render(sel, top, bg);
+            browse_render(sel, top);
             lcd_present_fb(console_framebuffer());
         }
         /* Light throttle so the idle browser doesn't spin the panel/CPU. */
@@ -808,7 +851,7 @@ _Noreturn void kernel_main(void) {
         /* Paint the boot splash immediately, so the panel shows CORE branding
          * instead of the chainloader's leftover framebuffer (a blue field with
          * a green stripe) while the disk spins up and the volume mounts. */
-        boot_splash(CON_BLACK);
+        boot_splash();
 
         /* Read the MBR, find the FAT32 data partition (type 0B/0C), mount it. */
         uint8_t *mbr = (uint8_t *)mbr_sector;
@@ -845,7 +888,7 @@ _Noreturn void kernel_main(void) {
 
         if (mnt == 0) {
             uart_puts("core: entering browser\n");
-            browse_and_play(&fs, CON_BLACK);   /* never returns */
+            browse_and_play(&fs);              /* never returns */
         }
 
         /* Mount failed: show a diagnostic error screen and fall through to the

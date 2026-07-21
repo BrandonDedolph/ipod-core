@@ -113,6 +113,28 @@ void console_clear(uint16_t rgb565)
     }
 }
 
+uint16_t *console_fb(void)
+{
+    return g_fb;
+}
+
+void console_fill_rect(int x, int y, int w, int h, uint16_t rgb565)
+{
+    for (int ry = 0; ry < h; ry++) {
+        int py = y + ry;
+        if (py < 0 || py >= LCD_HEIGHT) {
+            continue;
+        }
+        for (int rx = 0; rx < w; rx++) {
+            int px = x + rx;
+            if (px < 0 || px >= LCD_WIDTH) {
+                continue;
+            }
+            g_fb[py * LCD_WIDTH + px] = rgb565;
+        }
+    }
+}
+
 void console_blit565(int x, int y, int w, int h, const uint16_t *src)
 {
     for (int ry = 0; ry < h; ry++) {

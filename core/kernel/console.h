@@ -33,6 +33,13 @@ void console_clear(uint16_t rgb565);
  * (x,y), clipped to the panel. Used for pre-scaled album art. */
 void console_blit565(int x, int y, int w, int h, const uint16_t *src);
 
+/* Writable framebuffer pointer (LCD_WIDTH*LCD_HEIGHT RGB565) for drawing that
+ * doesn't go through the console glyph path — e.g. the Nunito text renderer. */
+uint16_t *console_fb(void);
+
+/* Fill a w*h rectangle with one RGB565 colour, clipped to the panel. */
+void console_fill_rect(int x, int y, int w, int h, uint16_t rgb565);
+
 /* Draw one character at character-cell (col,row) [col 0..39, row 0..29]
  * with fg/bg colors. Supported glyphs: '0'-'9', 'A'-'F' (hex), space,
  * and the uppercase letters used for labels: at minimum
