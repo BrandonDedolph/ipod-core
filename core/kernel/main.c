@@ -57,7 +57,11 @@ static void cpu_wait_ms(uint8_t ms) {
  * ISR). dr_flac / dr_mp3 run freestanding on a static arena — no libc.
  */
 #define RING_FRAMES   (1u << 16)         /* 65536 frames = 256 KB ~ 1.49 s      */
-#define DECODE_FRAMES 4096u              /* frames per decode() call            */
+#define DECODE_FRAMES 4096u              /* frames per decode() call (prime)    */
+#define PLAY_STEP_FRAMES 1024u           /* frames per decode step in the play   */
+                                         /* loop: small so the loop returns to   */
+                                         /* poll the wheel ~every 18ms (a 4096    */
+                                         /* chunk blocked ~74ms, missing MENU).  */
 #define ARENA_BYTES   (128u * 1024u)     /* MP3 arena high-water ~96 KB; FLAC   */
                                          /* ~40 KB. Sized for the larger.       */
 #define RA_BYTES      (32u * 1024u)      /* read-ahead block buffer (see below) */
@@ -188,10 +192,10 @@ static void decode_pump(void)
  * the frames decoded this step (0 at EOS or when the ring is already full). */
 static int decode_step(void)
 {
-    if (g_eos || pcm_ring_free(&g_ring) < DECODE_FRAMES) {
+    if (g_eos || pcm_ring_free(&g_ring) < PLAY_STEP_FRAMES) {
         return 0;
     }
-    int got = g_dec.ops->decode(&g_dec, decode_buf, (int)DECODE_FRAMES);
+    int got = g_dec.ops->decode(&g_dec, decode_buf, (int)PLAY_STEP_FRAMES);
     if (got <= 0) {
         g_eos = 1;
         return 0;
@@ -567,13 +571,18 @@ static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
      * screen once a second. Track the ring's low-water fill between repaints so
      * the BUF% readout exposes whether the decoder is keeping real-time.
      *
-     * Present: repaint + full present once a second. The now-playing screen
-     * blits the 120px album art (which overlaps the animated rows), so we push
-     * the whole frame rather than a partial band — art re-blits each frame and
-     * stays correct regardless of BCM persistence. (Partial present is kept for
-     * views without a full-height changing element.) */
+     * Present: the album art (y 8..128) is static for the whole track, so we
+     * full-present ONCE (first paint) and thereafter partial-present only the
+     * animated strip below it (clock / progress / BUF, y 128..240). That shrinks
+     * the IRQ-masked pixel push ~3x each second — the full-frame present was
+     * masking IRQs long enough to starve the audio DMA ISR (the DAC underran
+     * even with the ring full), which is the ~5s FLAC stutter. Relies on the BCM
+     * persisting the un-repainted art region across a partial LCD_UPDATE. */
+    #define NP_ANIM_Y 128                /* first row below the 120px art        */
+    #define NP_ANIM_H 112                /* 128..240                             */
     uint32_t last_shown = 0xFFFFFFFFu;
     uint32_t low_fill   = RING_FRAMES;   /* min ring fill seen since last repaint */
+    int      first_paint = 1;
     while (!g_eos || pcm_ring_fill(&g_ring) > 0u) {
         decode_step();
 
@@ -594,7 +603,13 @@ static int play_file(fat32_t *fs, const browse_entry_t *b, uint16_t bg)
         if (elapsed_s != last_shown) {
             uint32_t buf_pct = (low_fill * 100u) / RING_FRAMES;
             nowplaying_render(b, elapsed_s, total_s, buf_pct, bg);
-            lcd_present_fb(console_framebuffer());
+            if (first_paint) {
+                lcd_present_fb(console_framebuffer());   /* art + text, once */
+                first_paint = 0;
+            } else {
+                lcd_present_rect(console_framebuffer(),
+                                 0, NP_ANIM_Y, LCD_WIDTH, NP_ANIM_H);
+            }
             last_shown = elapsed_s;
             low_fill   = fill;           /* reset low-water for the next second */
         }
