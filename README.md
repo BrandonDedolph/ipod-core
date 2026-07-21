@@ -1,256 +1,141 @@
-# core — custom firmware for iPod Video 5G/5.5G
+# core — cleanroom firmware for the iPod 5.5G
 
-A from-scratch firmware that ships **Cabinet** as the shell and **Linen**
-as the only theme. Replaces Rockbox entirely on the device.
+`core` is a **from-scratch, Apache-2.0 firmware** for the 5th-generation
+iPod ("iPod Video", PortalPlayer PP5022). It boots on real hardware,
+reads music off the iPod's own disk, and plays it back through a custom
+Nunito/Linen interface. It **replaces Rockbox entirely** — it is not a
+Rockbox theme, patch, or plugin, and shares no Rockbox code.
 
-The simulator runs the real C firmware against an SDL2 host backend, so
-every screen below is rendered by the same code that will run on the
-iPod.
+The whole bare-metal stack is proven end-to-end on an actual iPod 5.5G:
+boot + memory remap → clock/PLL → timer/IRQ → LCD (BCM framebuffer
+present) → I²C/WM8758B/I²S first sound → DMA playback → ATA PIO reader →
+FAT32 → streaming FLAC/MP3 decode → audio out the headphone jack.
 
 ![Main menu](docs/img/01-main.png) ![Now Playing](docs/img/09-np-default.png) ![Big art](docs/img/10-np-bigart.png)
 
 ---
 
+## What it is
+
+- **Cleanroom.** Every driver and the freestanding codec/UI glue are
+  written from hardware facts — PortalPlayer register maps, the WM8758B
+  datasheet, the FAT32 spec — not from reading GPL sources. See
+  [`core/docs/hw/`](core/docs/hw/) for the subsystem-by-subsystem
+  hardware reference the drivers were written against.
+- **Bare metal.** No RTOS, no libc on the device. A small cooperative
+  kernel, a static-arena allocator, and our own `mem.c` back the
+  freestanding decoders; integer division and soft-float come from the
+  compiler runtime (`libgcc`), never libc.
+- **Real audio.** `dr_flac` and `dr_mp3` are compiled freestanding
+  (`-DCORE_FREESTANDING`) and fed by a read-ahead disk source into an
+  SPSC PCM ring drained by the DMA-completion ISR. Streaming, not
+  preload — a full-length track plays off the disk.
+- **Real type.** `core/ui/text.c` is a libc-free, gamma-correct
+  antialiased text renderer that draws pre-rasterized Nunito glyph
+  atlases straight into the RGB565 framebuffer — no FreeType, no malloc,
+  all `.rodata`.
+
+## Hardware target
+
+| | |
+|---|---|
+| Device | iPod 5.5G (Video), 80 GB |
+| SoC | PortalPlayer PP5022 (dual ARM7TDMI, ARMv4T) |
+| Audio DAC | Wolfson WM8758B over I²C control + I²S data |
+| Display | 320×240 LCD driven through the BCM framebuffer path |
+| Storage | ATA disk (PIO), read-only FAT32 reader |
+| Input | Apple click-wheel + buttons + hold switch (polled) |
+| Chainload | [ipodloader2](https://github.com/crozone/ipodloader2) loads our `.ipod` image |
+
 ## Status
 
-The music browser is feature-complete in sim — recursive scan, four
-iconic groupings (Artists / Albums / Genres / Composers), drill down,
-play. Now Playing shows real metadata, embedded album art, and a
-proper progress bar. Lists carry 22² thumbnails; Artists pulls real
-artist photos from Deezer at tagcache-build time.
+Working on real hardware today: boot and bring-up, LCD present, click-wheel
+input, backlight, WM8758B first sound, DMA continuous playback, ATA + FAT32
+read, and **streaming FLAC/MP3 playback off the iPod's own disk**. The
+menu UI and Now Playing screens (embedded album art, progress) render on
+device via the freestanding text renderer. There is no serial cable in the
+loop — on-device state is confirmed through an on-screen framebuffer console.
 
-| Working today (sim) | Pending |
-|---|---|
-| FLAC + MP3 decoders (bit-exact via codec KAT) | Boots on hardware (UART → LCD → scheduler) |
-| Audio engine — SPSC ring + SDL2 HAL | On-device USB / disk / battery |
-| Recursive library scan + tag parse (Vorbis, ID3v2.3/2.4) | Playlists, podcasts, audiobooks |
-| Same-track dedup (FLAC > MP3) + combo-artist fold | Per-track gain (replaygain) |
-| Drilldown: Artists / Albums / Genres / Composers → songs | Volume / brightness (need HAL knobs) |
-| Embedded album art (FLAC PICTURE, MP3 APIC → JPEG, box-averaged) |  |
-| Per-list 22² thumbnails (Songs / Albums / Artists), LRU cached |  |
-| Artist photos via Deezer at tagcache-build time |  |
-| Binary tagcache `.tcdb` v2 — Go encoder + C reader, artist art inline |  |
-| Categorized search (songs / albums / artists) with section headers |  |
-| Now Playing layout: cap-aligned format badge, 130² art, 6px progress bar, "Up next" beneath the bar |  |
-| Settings — light / dark theme cycle + About screen |  |
-| End-to-end audio playback test (captures real PCM, bit-compares to reference) |  |
-| **Phase 1 hw bringup** — `arm-none-eabi` cross-build + `.ipod` transport packaging (kernel still a spin loop) |  |
-
-Each commit on `main` squash-merges one PR; see [`STATUS.md`](STATUS.md) for the running list.
+See [`STATUS.md`](STATUS.md) for the running list of what works, what's
+pending, and what to pick up next, and [`PLAN.md`](PLAN.md) for the phased
+roadmap.
 
 ---
 
-## Quick start (sim)
+## Building
 
-Requires `meson`, `ninja`, `pkg-config`, `libsdl2-dev`, and a C11
-compiler. Run `tools/install_deps.sh` for a one-shot setup.
+Requires `meson`, `ninja`, `pkg-config`, a C11 host compiler, and (for
+the device build) `arm-none-eabi-gcc` with binutils + newlib. `libsdl2-dev`
+backs the host HAL build. On Arch: `pacman -S arm-none-eabi-gcc
+arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf sdl2`.
 
 ```bash
 cd core
-make sim                                  # builds build-sim/sim/core-sim
-./build-sim/sim/core-sim                  # synthetic data — empty library
-./build-sim/sim/core-sim --music ~/Music  # scan a real directory at startup
-meson test -C build-sim                   # codec KAT + .tcdb parser + audio playback
+
+# Device firmware — ARMv4T bare-metal ELF + flat binary
+make hw            # → build-hw/core.elf, build-hw/core.bin
+make ipod          # → build-hw/core.ipod (transport-wrapped image)
+
+# Host build + unit tests (freestanding drivers/codecs, MMIO golden traces)
+make sim           # configures + builds the host target
+meson test -C build-sim
 ```
 
-Wheel = scroll, center = SELECT, MENU = back, SPACE = pause/resume.
+The host (`sim`) target compiles the same freestanding driver, codec, and
+text-renderer sources the device links, plus the MMIO golden-trace tests
+that assert each hardware driver's exact register grammar against a
+recording mock bus — the automated safety net for code that otherwise
+needs a logic analyzer to verify.
 
-## Quick start (hardware build)
+## Flashing
 
-Requires `arm-none-eabi-gcc` (Arch: `arm-none-eabi-gcc`; Debian /
-Ubuntu: `gcc-arm-none-eabi`) and Go 1.22+. `make hw` cross-compiles a
-bare-metal ARMv4T ELF; `make ipod` wraps the flat binary in the
-ipodpatcher-style transport format ready to flash.
+`core` is chainloaded, not installed over Apple's firmware. Install
+[ipodloader2](https://github.com/crozone/ipodloader2) once, then copy the
+built image to the FAT32 data partition and reboot:
 
 ```bash
-cd core
-make hw                                   # → build-hw/core.elf + core.bin
-make ipod                                 # → build-hw/core.ipod
-arm-none-eabi-readelf -h build-hw/core.elf | grep Entry
-# Entry point address:               0x0
+make ipod
+cp build-hw/core.ipod /path/to/ipod/          # FAT32 root
+# eject, then boot — ipodloader2 chainloads core.ipod
 ```
-
-The kernel currently spins on a NOP loop; UART, LCD, and the
-cooperative scheduler land in upcoming PRs (see [`STATUS.md`](STATUS.md)
-§ Phase 1). Flashing on a real iPod is gated on the install flow
-(`core install`) being implemented.
-
----
-
-## Screenshots
-
-All captured headlessly via `core-sim --shot <path.bmp>` against a
-six-track tagged library; the same code path runs in interactive mode.
-
-### Cabinet shell — main menu and Music sub-menu
-![Main menu](docs/img/01-main.png) ![Music sub-menu](docs/img/02-music.png)
-
-### Search — on-screen keyboard with live results
-Wheel cycles the highlighted key (or, with focus shifted via RIGHT,
-the result list); SELECT types / plays. Substring match,
-case-insensitive ASCII against song title, artist, or album.
-
-![Search](docs/img/13-search.png)
-
-### Settings — light / dark theme
-Settings → **Theme** cycles between Light and Dark; everything except
-album art flips. **About** shows firmware version + library counts.
-
-| Light | Dark |
-|---|---|
-| ![Settings light](docs/img/14-settings-light.png) | ![Settings dark](docs/img/15-settings-dark.png) |
-
-| Main menu, dark | About |
-|---|---|
-| ![Main dark](docs/img/16-main-dark.png) | ![About](docs/img/17-about.png) |
-
-### Library views (all backed by the tagcache)
-22² thumbnails are decoded from embedded album art (Songs / Albums)
-or fetched from Deezer at tagcache-build time (Artists). All slots
-go through a 32-entry LRU so scrolling doesn't re-decode JPEGs.
-
-![Songs](docs/img/03-songs.png) ![Albums](docs/img/03b-albums.png)
-
-![Artists](docs/img/04-artists.png) ![Genres](docs/img/05-genres.png)
-
-![Composers](docs/img/06-composers.png)
-
-### Drilldowns — pick a row, see its songs
-![Artist → songs](docs/img/07-artist-songs.png) ![Genre → songs](docs/img/08-genre-songs.png)
-
-### Now Playing — four cycle-able pages
-The iconic iPod NP screen. Embedded album art renders at 130² on the
-default page and 180² on the big-art page; SELECT cycles pages, MENU
-pops. Format badge sits cap-aligned with the album line; the progress
-bar runs the full width with elapsed / remaining labels above it,
-"Up next" tucked beneath. Both art sizes go through a 4-slot LRU so
-scrubbing doesn't re-decode the JPEG.
-
-| Default | Big art |
-|---|---|
-| ![NP default](docs/img/09-np-default.png) | ![NP big art](docs/img/10-np-bigart.png) |
-
-| Peak meter (synthesized) | Track info |
-|---|---|
-| ![NP peak meter](docs/img/11-np-peakmeter.png) | ![NP track info](docs/img/12-np-trackinfo.png) |
-
----
-
-## Binary tagcache
-
-Real iPod hardware can't afford a scan-at-startup pass — even a small
-library on a USB-disk takes seconds-to-minutes to walk and re-parse
-every tag. The `core` host CLI builds a precomputed binary index the
-firmware mmaps at boot.
-
-```bash
-cd core/cli
-go build -o /tmp/core ./cmd/core
-/tmp/core tagcache build ~/Music
-# ~/Music/tagcache.tcdb: 1834 songs, 142 artists, 218 albums, 17 genres, 89 composers (412 KB)
-
-# --fetch-art pulls real artist photos from Deezer (no auth, ~150ms
-# per artist, cached under ~/.cache/core/artist-art/). Re-runs reuse
-# the cache; a `.missing` sentinel keeps unknown artists from
-# re-fetching every build.
-/tmp/core tagcache build --fetch-art ~/Music
-
-cd ..
-./build-sim/sim/core-sim --tagcache ~/Music/tagcache.tcdb
-```
-
-Format spec: [`core/apps/db/tagcache_format.h`](core/apps/db/tagcache_format.h)
-(C side) and [`core/cli/internal/tagcache/format.go`](core/cli/internal/tagcache/format.go)
-(Go side). Both sides have round-trip tests; a layout drift fails both
-simultaneously.
-
----
-
-## Firmware image packaging
-
-`make hw` emits a flat binary (`core.bin`); the host CLI wraps it in
-the `.ipod` transport format the installer / updater pushes to the
-device. Same binary unpacks too — useful for inspecting third-party
-images or verifying a write went out intact.
-
-```bash
-cd core/cli
-go build -o /tmp/core ./cmd/core
-/tmp/core firmware pack ../build-hw/core.bin --out /tmp/core.ipod
-/tmp/core firmware unpack /tmp/core.ipod --out /tmp/back.bin
-# back.bin is byte-identical to the input
-```
-
-Format: `[BE32 additive checksum][4-byte model name "ipvd"][image]`.
-The checksum seeds with the iPod model ID (`0x05` for Video) and
-wraps at 32 bits. Spec at
-[`core/docs/hw/08-boot-dock.md`](core/docs/hw/08-boot-dock.md);
-implementation at [`core/cli/internal/firmware/`](core/cli/internal/firmware/)
-with tests covering wrap-at-2^32, mismatch, truncation, and round-trip.
 
 ---
 
 ## Repo layout
 
 ```
-core/                     C firmware + simulator
-├── boot/                 (empty — Phase 1)
-├── kernel/               (empty — Phase 1)
+core/                     bare-metal firmware + host test build
+├── boot/                 crt0, image header, linker script
+├── kernel/               cooperative scheduler, IRQ, timer, clock, PCM ring
 ├── hal/
-│   ├── hal.h             contract
-│   ├── hw/               (empty — needs hardware)
-│   └── sim/              SDL2-backed implementation
-├── codecs/
-│   ├── tags.h            shared audio_tags_t (incl. owned art bytes)
-│   ├── decoder.h         unified decoder ABI
-│   ├── dr_flac/          vendored single-header FLAC + Vorbis comments
-│   ├── dr_mp3/           vendored single-header MP3 + custom ID3v2 parser
-│   └── stb_image/        JPEG-only build for embedded album art
-├── apps/
-│   ├── audio/            decoder → SPSC ring → hal_audio engine
-│   ├── db/               tagcache: scan, parse, build indexes, .tcdb reader
-│   └── ui/               Cabinet shell, list view, Now Playing, Linen chrome
-├── cli/                  Go host CLI (build / install / update / tagcache build)
-├── sim/                  core-sim entry point
-├── docs/hw/              Phase-0 hardware reference (8 subsystems, ~2,500 lines)
-└── tests/                codec KAT + .tcdb reader + end-to-end audio playback
+│   ├── hal.h             hardware contract
+│   ├── hw/               ARM drivers — LCD, ATA, I²C, I²S, WM8758B, DMA,
+│   │                     click-wheel, backlight, UART
+│   └── sim/              host HAL backend (SDL2)
+├── fs/                   read-only FAT32 reader
+├── lib/                  freestanding mem.c (memcpy/memset)
+├── codecs/               dr_flac + dr_mp3 (freestanding), static arena,
+│                         read-ahead source, stb_image (album art)
+├── ui/                   freestanding antialiased text renderer + Nunito atlases
+├── cli/                  Go host CLI (.ipod firmware pack/unpack)
+├── docs/hw/              hardware reference the drivers were written against
+├── cross/                Meson cross file (arm-none-eabi)
+└── tests/                host unit + MMIO golden-trace tests
 
-design_reference/              JSX/HTML design source — themes, palette, icon paths
-docs/img/                      Sim screenshots (this README)
-tools/                         Top-level build helpers (atlas generator, deps installer, font sources)
-                               (firmware-side tools live in core/tools/, e.g. icon_gen.sh)
+design_reference/         UI design source — palette, chrome, icon paths
+design_standalone/        standalone design prototype
+docs/img/                 interface screenshots (this README)
+tools/                    build helpers (atlas generator, font sources, deps)
 ```
 
-See [`core/README.md`](core/README.md) for the firmware-side build details
-and [`PLAN.md`](PLAN.md) for the phased roadmap.
-
----
-
-## Verifying audio actually plays
-
-The `sim-audio-playback` integration test spawns `core-sim` with the
-SDL2 `disk` audio driver, drives Music → Songs → SELECT, and bit-
-compares the captured S16LE samples against the codec KAT reference.
-This catches regressions anywhere in the chain — tagcache, cabinet's
-play path, audio engine, ring buffer, or HAL audio source callback.
-
-```bash
-cd core
-meson test -C build-sim --suite integration
-# 2/2 integration - core:sim-audio-playback OK     6.74s
-# stdout: ok: 176400 bytes of audio matched (capture started at byte 0)
-```
-
-To listen interactively, drop `--shot` and use `--music`:
-
-```bash
-./build-sim/sim/core-sim --music ~/Music
-```
+See [`core/README.md`](core/README.md) for firmware-side build detail.
 
 ---
 
 ## License
 
-Apache-2.0 first-party; vendored codecs (`dr_flac`, `dr_mp3`,
-`stb_image`) keep their upstream licenses (zlib / public domain / MIT).
-Nunito font: SIL Open Font License 1.1 (`tools/fonts-src/`).
+Apache-2.0, first-party. The firmware is a cleanroom implementation: its
+drivers and decoders are derived from hardware documentation, not from
+GPL sources. Vendored codecs keep their permissive upstream licenses —
+`dr_flac` / `dr_mp3` (public domain / MIT), `stb_image` (public domain / MIT).
+The Nunito font is under the SIL Open Font License 1.1 (`tools/fonts-src/`).

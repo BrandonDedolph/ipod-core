@@ -17,7 +17,7 @@
 #ifndef CORE_APPS_UI_ATLAS_H
 #define CORE_APPS_UI_ATLAS_H
 
-#include "../../hal/hal.h"
+#include "../hal/hal.h"
 
 #include <stdint.h>
 

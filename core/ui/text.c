@@ -22,14 +22,14 @@
  * const atlas_t. This TU is the sole definition site for those atlas_t
  * symbols in both the hw link (atlas.c is sim-only) and the host text_test
  * link (which links text.c but not atlas.c), so there is no clash. */
-#include "../apps/ui/atlas.h"
-#include "../apps/ui/atlas/nunito_regular_9.h"
-#include "../apps/ui/atlas/nunito_regular_11.h"
-#include "../apps/ui/atlas/nunito_regular_13.h"
-#include "../apps/ui/atlas/nunito_bold_9.h"
-#include "../apps/ui/atlas/nunito_bold_11.h"
-#include "../apps/ui/atlas/nunito_bold_13.h"
-#include "../apps/ui/atlas/nunito_bold_17.h"
+#include "atlas.h"
+#include "atlas/nunito_regular_9.h"
+#include "atlas/nunito_regular_11.h"
+#include "atlas/nunito_regular_13.h"
+#include "atlas/nunito_bold_9.h"
+#include "atlas/nunito_bold_11.h"
+#include "atlas/nunito_bold_13.h"
+#include "atlas/nunito_bold_17.h"
 
 /* text_font_t is just a thin, opaque wrapper over an atlas_t so the public
  * header need not expose the atlas layout. */

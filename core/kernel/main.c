@@ -633,9 +633,13 @@ static void player_stop(void)
     if (!g_pl_active) {
         return;
     }
-    sleep_ms(60);                        /* let the FIFO/DMA drain the tail */
     hal_audio_stop();
-    g_dec.ops->close(&g_dec);
+    /* NOTE: do NOT close the decoder here. Closing it MID-DECODE (song switch)
+     * hard-freezes the device (marker 9), while closing at end-of-track
+     * (auto-advance) is fine — a decode-in-progress teardown hazard. The next
+     * player_open_current() resets the whole arena, reclaiming this decoder's
+     * memory anyway (there is no file handle to leak — the source is a custom
+     * read callback), so skipping close here is safe. */
     g_pl_active = 0;
 }
 
@@ -649,8 +653,7 @@ static void player_advance(void)
      * hard-froze the device. g_pl_active is the "decoder open + running" flag. */
     if (g_pl_active) {
         hal_audio_stop();
-        g_dec.ops->close(&g_dec);
-        g_pl_active = 0;
+        g_pl_active = 0;                  /* no close: next open resets the arena */
     }
     for (;;) {
         int nxt = -1;
@@ -912,7 +915,7 @@ _Noreturn static void run_ui(fat32_t *fs)
              * immediately for a snappy UI. `dirty` stays set until we present, so
              * the latest scroll position is what lands. */
             uint32_t now = mmio_read32(USEC_TIMER_ADDR);
-            if (!g_pl_active || (now - last_present) >= 70000u) {
+            if (!g_pl_active || (now - last_present) >= 150000u) {
                 if (scr_cur() == SCR_MENU) menu_render();
                 else                       browse_render(g_br_sel, g_br_top);
                 lcd_present_fb(console_framebuffer());

@@ -76,19 +76,6 @@ if target == 'sim'
   )
   test('text', text_test, suite: 'unit')
 
-  # tcdb-reader: hand-rolls a minimal .tcdb byte string in memory
-  # (using the same constants the parser reads) and verifies the
-  # parser populates the public tagcache_* accessors correctly.
-  # Independent from the Go encoder — both sides implement the
-  # spec separately, so a layout drift fails this AND the Go
-  # round-trip test simultaneously.
-  tcdb_reader_test = executable(
-    'tcdb_reader_test',
-    sources: ['tcdb_reader_test.c'],
-    dependencies: [tagcache_dep],
-  )
-  test('tcdb-reader', tcdb_reader_test, suite: 'unit')
-
   tag_mp3_test = executable(
     'tag_mp3_test',
     sources: ['tag_mp3_test.c'],
@@ -291,30 +278,4 @@ if target == 'sim'
     c_args: ['-DMMIO_MOCK'],
   )
   test('hw-backlight', backlight_trace_test, suite: 'unit')
-
-  # End-to-end audio-playback test: spawns core-sim with the SDL2
-  # disk audio driver, plays the FLAC fixture, then bit-compares
-  # the captured PCM to the codec_kat reference. Exercises the
-  # tagcache → cabinet → audio_engine_play → ring → HAL audio
-  # callback path that codec_kat alone can't reach.
-  #
-  # The codec-vectors/ source dir doubles as the --music scan dir:
-  # it contains exactly one .flac and one .mp3, so title-sort puts
-  # the .flac at row 0 (the press sequence selects row 0). Capture
-  # is written under the meson temp dir so multiple test runs in
-  # parallel can't clobber each other.
-  sim_audio_playback = executable(
-    'sim_audio_playback',
-    sources: ['sim_audio_playback.c'],
-  )
-
-  test('sim-audio-playback', sim_audio_playback,
-       args: [
-         core_sim_target.full_path(),
-         vectors_dir,        # fixture-dir (sim --music)
-         vectors_dir,        # vectors-dir (where the reference PCM lives)
-       ],
-       depends: [core_sim_target],
-       suite:   'integration',
-       timeout: 30)
 endif

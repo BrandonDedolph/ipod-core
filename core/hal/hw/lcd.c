@@ -52,7 +52,10 @@
  * the frame is corrupt or dropped, the firmware keeps running and the
  * UART narration tells us what happened.
  */
-#define BCM_SPIN_LIMIT       (1u << 16)
+#define BCM_SPIN_LIMIT       (1u << 13)   /* ~8k; a healthy handshake takes a few
+                                          * cycles, so this is still orders past
+                                          * working hw but bounds a wedged BCM to
+                                          * sub-ms instead of the ~1ms of 1<<16. */
 
 /*
  * Upper bound on the wait-for-idle poll before issuing a new frame.
@@ -61,7 +64,17 @@
  * 1<<16 read attempts is far beyond any healthy update. On timeout we
  * just proceed — issuing over a busy BCM beats hanging.
  */
-#define BCM_IDLE_SPIN_LIMIT  (1u << 16)
+#define BCM_IDLE_SPIN_LIMIT  (1u << 9)    /* Bound the wait-for-idle OUTER loop:
+                                          * each trip is a bcm_read32 (itself
+                                          * bounded), so this caps a wedged BCM to
+                                          * ~tens of ms and issues the update
+                                          * anyway, instead of the minutes-long
+                                          * nested spin (65536 x 65536) that hard-
+                                          * froze the device on a present after a
+                                          * scroll wedged the BCM. Healthy path:
+                                          * the pixel stream already retired the
+                                          * previous update, so idle reads on the
+                                          * first trip. */
 
 /*
  * Poll-count budget before we re-kick a BCM that is still reading the

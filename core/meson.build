@@ -124,7 +124,7 @@ if target == 'hw'
   # pre-rasterized atlas/*.h data into an RGB565 framebuffer with a gamma-correct
   # integer blend — no libc/libm/malloc. Same text.c the host text_test compiles;
   # links into core.elf so the on-device UI can draw real type. Uses only relative
-  # includes (../apps/ui/atlas.h -> ../../hal/hal.h), so no extra include dirs; stays
+  # includes (ui/atlas.h -> ../hal/hal.h), so no extra include dirs; stays
   # under -Werror since we own it and it's warning-clean.
   text_hw_lib = static_library(
     'core_text_hw',
@@ -173,11 +173,7 @@ if target == 'hw'
 
 elif target == 'sim'
   subdir('codecs')      # vendored audio decoders (FLAC + MP3)
-  subdir('apps/audio')  # playback engine: decoder_t -> ring -> hal_audio
-  subdir('apps/db')     # tagcache (music library index)
-  subdir('apps/ui')     # Cabinet shell, list view, font
-  subdir('sim')         # core-sim entry point
-  subdir('tests')       # codec KAT + .tcdb reader + audio playback
+  subdir('tests')       # host unit tests for the freestanding firmware code
 endif
 
 # Future subsystems land here as they're written:
