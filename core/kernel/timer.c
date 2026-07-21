@@ -17,6 +17,7 @@
 #include "sched.h"
 #include "hw/pp5022.h"
 #include "hw/mmio.h"
+#include "hw/clickwheel.h"
 
 /* Monotonic tick counter. In .bss, zeroed by crt0. volatile: written by
  * the ISR, read by mainline code (current_tick / sleep_ms). */
@@ -39,6 +40,14 @@ void timer_tick_isr(void)
 {
     g_tick++;
     (void)mmio_read32(TIMER1_VAL_ADDR);   /* ack: clears the pending IRQ */
+
+    /* Sample the click wheel every tick (10 ms). Running this from the tick
+     * — not the main loop — is what keeps a quick face-button tap from being
+     * lost when the main loop is blocked in a ~100 ms synchronous disk read:
+     * the tick still fires, so clickwheel_service() latches the press for the
+     * loop to drain later. Bounded work (one OPTO packet); a no-op until
+     * clickwheel_init() arms it. */
+    clickwheel_service();
 }
 
 uint32_t current_tick(void)

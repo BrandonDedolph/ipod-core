@@ -71,6 +71,22 @@ static bool feed(uint32_t word, wheel_event_t *ev)
     return clickwheel_poll(ev);
 }
 
+/* Present one status word and run one tick-sampler pass (latches into the
+ * queue the main loop drains); no drain here. */
+static void sample(uint32_t word)
+{
+    mmio_mock_set_read(CLICKWHEEL_DATA_ADDR, word);
+    clickwheel_service();
+}
+
+/* Present one status word, sample it, then drain — the sampler+drain
+ * equivalent of feed(). */
+static bool feed_svc(uint32_t word, wheel_event_t *ev)
+{
+    sample(word);
+    return clickwheel_get_event(ev);
+}
+
 static void case_valid_gate(void)
 {
     printf("case valid-gate:\n");
@@ -227,6 +243,122 @@ static void case_hold(void)
     CHECK(!ev.hold, "release edge reports hold disengaged");
 }
 
+/* ---- Tick-sampler + drain path (clickwheel_service/clickwheel_get_event) --- */
+
+/* A fresh drain returns nothing. */
+static void case_svc_idle(void)
+{
+    printf("case svc-idle:\n");
+    setup_released();
+    wheel_event_t ev;
+    CHECK(!clickwheel_get_event(&ev), "empty latch drains nothing");
+    /* A sample with no button/motion also latches nothing. */
+    sample(mkword(0, 0, 0));
+    CHECK(!clickwheel_get_event(&ev), "idle sample latches nothing");
+}
+
+/* A press sampled by the tick is latched for the main loop to drain, once. */
+static void case_svc_press_latch(void)
+{
+    printf("case svc-press-latch:\n");
+    setup_released();
+    wheel_event_t ev;
+
+    CHECK(feed_svc(mkword(0, 0, CW_BTN_SELECT), &ev), "sampled press drains");
+    CHECK(ev.buttons == WHEEL_BTN_SELECT, "drained press decodes SELECT");
+    CHECK(ev.wheel_delta == 0, "no wheel motion on a pure press");
+    /* Button still held on the next sample is NOT a new down-edge. */
+    CHECK(!feed_svc(mkword(0, 0, CW_BTN_SELECT), &ev), "held button: no re-fire");
+}
+
+/*
+ * THE BUG FIX: a press that comes AND goes entirely between two main-loop
+ * drains is still delivered, because the tick sampled the down-edge. Sample
+ * a press then its release with NO drain in between, then drain once.
+ */
+static void case_svc_press_between_drains(void)
+{
+    printf("case svc-press-between-drains:\n");
+    setup_released();
+    wheel_event_t ev;
+
+    sample(mkword(0, 0, CW_BTN_MENU));   /* down  */
+    sample(mkword(0, 0, 0));             /* up, before the loop ever drained */
+    CHECK(clickwheel_get_event(&ev), "brief tap between drains survives");
+    CHECK(ev.buttons == WHEEL_BTN_MENU, "latched down-edge is MENU");
+    /* Drained exactly once. */
+    CHECK(!clickwheel_get_event(&ev), "tap not re-delivered");
+}
+
+/* Multiple distinct buttons pressed between drains OR together in the latch. */
+static void case_svc_multi_button_latch(void)
+{
+    printf("case svc-multi-button-latch:\n");
+    setup_released();
+    wheel_event_t ev;
+
+    sample(mkword(0, 0, CW_BTN_LEFT));                 /* left down */
+    sample(mkword(0, 0, CW_BTN_LEFT | CW_BTN_RIGHT));  /* right also down */
+    CHECK(clickwheel_get_event(&ev), "combined down-edges drain");
+    CHECK(ev.buttons == (WHEEL_BTN_LEFT | WHEEL_BTN_RIGHT),
+          "latch OR-accumulates both down-edges");
+}
+
+/* Wheel motion sampled across several ticks accumulates into one drain. */
+static void case_svc_wheel_accumulates(void)
+{
+    printf("case svc-wheel-accum:\n");
+    setup_released();
+    wheel_event_t ev;
+
+    sample(mkword(1, 10, 0));   /* seed reference */
+    sample(mkword(1, 14, 0));   /* +4 */
+    sample(mkword(1, 18, 0));   /* +4 */
+    CHECK(clickwheel_get_event(&ev), "accumulated motion drains");
+    CHECK(ev.wheel_delta == 8, "two +4 ticks accumulate to +8");
+    CHECK(ev.touched, "touched flag carried through the latch");
+    CHECK(!clickwheel_get_event(&ev), "accumulator cleared after drain");
+}
+
+/* The tick sampler gates the wheel on a hold edge and reports it via drain. */
+static void case_svc_hold(void)
+{
+    printf("case svc-hold:\n");
+    setup_released();
+    wheel_event_t ev;
+
+    /* Engage hold: the sampler latches the release->held edge. */
+    mmio_mock_set_read(GPIOA_INPUT_VAL_ADDR, GPIOA_HELD);
+    clickwheel_service();
+    CHECK(clickwheel_get_event(&ev), "hold engage drains an edge");
+    CHECK(ev.hold, "drained edge reports hold engaged");
+    CHECK(ev.buttons == 0 && ev.wheel_delta == 0, "hold edge carries no input");
+
+    /* Still held: the wheel is dead, nothing latches. */
+    sample(mkword(0, 0, CW_BTN_SELECT));
+    CHECK(!clickwheel_get_event(&ev), "no input latched while held");
+
+    /* Release: the held->release edge drains with hold clear. */
+    mmio_mock_set_read(GPIOA_INPUT_VAL_ADDR, GPIOA_RELEASED);
+    clickwheel_service();
+    CHECK(clickwheel_get_event(&ev), "hold release drains an edge");
+    CHECK(!ev.hold, "release edge reports hold disengaged");
+}
+
+/* A press captured just before a hold edge is dropped (carries no input). */
+static void case_svc_hold_clears_pending(void)
+{
+    printf("case svc-hold-clears-pending:\n");
+    setup_released();
+    wheel_event_t ev;
+
+    sample(mkword(0, 0, CW_BTN_PLAY));               /* latch a press */
+    mmio_mock_set_read(GPIOA_INPUT_VAL_ADDR, GPIOA_HELD);
+    clickwheel_service();                            /* hold edge clears it */
+    CHECK(clickwheel_get_event(&ev), "hold edge drains");
+    CHECK(ev.hold && ev.buttons == 0, "pending press dropped on hold engage");
+}
+
 int main(void)
 {
     case_valid_gate();
@@ -238,6 +370,13 @@ int main(void)
     case_wheel_wrap_backward();
     case_finger_lift_reseeds();
     case_hold();
+    case_svc_idle();
+    case_svc_press_latch();
+    case_svc_press_between_drains();
+    case_svc_multi_button_latch();
+    case_svc_wheel_accumulates();
+    case_svc_hold();
+    case_svc_hold_clears_pending();
 
     if (g_fail) {
         printf("SOME FAILED\n");

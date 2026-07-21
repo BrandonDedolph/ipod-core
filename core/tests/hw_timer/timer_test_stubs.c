@@ -33,3 +33,12 @@ void sched_yield(void)
 void audio_dma_isr(void)
 {
 }
+
+/* timer_tick_isr() now also samples the click wheel each tick. The timer
+ * test asserts the tick's register grammar (advance + ack TIMER1_VAL) in
+ * isolation and never arms the wheel, so a no-op stub satisfies the link
+ * without pulling the OPTO decode (and its MMIO) into the tick-count
+ * assertions. The wheel decode itself is covered by hw-clickwheel. */
+void clickwheel_service(void)
+{
+}

@@ -1141,8 +1141,11 @@ _Noreturn static void run_ui(fat32_t *fs)
             dirty = 1;
         }
 
+        /* Input is sampled on the 100 Hz tick and latched (clickwheel_service),
+         * so a tap that lands while this loop is blocked in a disk read isn't
+         * lost — we just drain the latch here. */
         wheel_event_t ev;
-        if (!g_locked && clickwheel_poll(&ev)) {
+        if (!g_locked && clickwheel_get_event(&ev)) {
             last_input = mmio_read32(USEC_TIMER_ADDR);
             if (bl_state != BL_FULL) {
                 int was_off = (bl_state == BL_OFF);
@@ -1278,11 +1281,13 @@ _Noreturn static void run_ui(fat32_t *fs)
 
             case SCR_NOWPLAYING:
                 if (ev.wheel_delta) {                    /* wheel = volume        */
-                    /* 1% per detent (clamp a fast flick so it can't teleport). */
+                    /* ~2% per detent for a responsive sweep, with a wider clamp
+                     * so a fast flick covers more range (but still can't
+                     * teleport). Slow single detents stay fine-grained. */
                     int d = ev.wheel_delta;
-                    if (d >  WHEEL_MAX_DELTA) d =  WHEEL_MAX_DELTA;
-                    if (d < -WHEEL_MAX_DELTA) d = -WHEEL_MAX_DELTA;
-                    g_volume += d;
+                    if (d >  12) d =  12;
+                    if (d < -12) d = -12;
+                    g_volume += d * 2;
                     if (g_volume < 0)   g_volume = 0;
                     if (g_volume > 100) g_volume = 100;
                     hal_volume_set(g_volume);
