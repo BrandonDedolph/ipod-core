@@ -47,6 +47,12 @@ const text_font_t *text_font_bold_17(void);
 int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
               const char *s, const text_font_t *font, uint16_t ink);
 
+/* Like text_draw but clips output to the horizontal window [clip_x0, clip_x1)
+ * — used by the marquee to scroll long text through a fixed region. */
+int text_draw_clip(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+                   const char *s, const text_font_t *font, uint16_t ink,
+                   int clip_x0, int clip_x1);
+
 /* Pixel width the string would advance, without drawing. */
 int text_width(const char *s, const text_font_t *font);
 

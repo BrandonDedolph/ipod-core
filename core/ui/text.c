@@ -144,8 +144,9 @@ int text_ascent(const text_font_t *font) {
 
 /* ---------- Rendering ---------------------------------------------- */
 
-int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
-              const char *s, const text_font_t *font, uint16_t ink) {
+static int text_draw_c(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+                       const char *s, const text_font_t *font, uint16_t ink,
+                       int cx0, int cx1) {
     if (!fb || !font || !s || fb_w <= 0 || fb_h <= 0) {
         return x;
     }
@@ -179,7 +180,7 @@ int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
             if (py < 0 || py >= fb_h) continue;
             for (int i = 0; i < gly->w; i++) {
                 int px = gx + i;
-                if (px < 0 || px >= fb_w) continue;
+                if (px < cx0 || px >= cx1) continue;
                 uint8_t alpha = src[j * gly->w + i];
                 if (alpha == 0) continue;
 
@@ -215,4 +216,19 @@ int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
         x += gly->advance;
     }
     return x;
+}
+
+int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+              const char *s, const text_font_t *font, uint16_t ink) {
+    return text_draw_c(fb, fb_w, fb_h, x, y, s, font, ink, 0, fb_w);
+}
+
+/* Like text_draw but writes only pixels with clip_x0 <= px < clip_x1 — the
+ * horizontal window a marquee scrolls its text through. */
+int text_draw_clip(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+                   const char *s, const text_font_t *font, uint16_t ink,
+                   int clip_x0, int clip_x1) {
+    if (clip_x0 < 0)     clip_x0 = 0;
+    if (clip_x1 > fb_w)  clip_x1 = fb_w;
+    return text_draw_c(fb, fb_w, fb_h, x, y, s, font, ink, clip_x0, clip_x1);
 }

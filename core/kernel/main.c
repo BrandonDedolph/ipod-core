@@ -124,6 +124,51 @@ static void fill_round_rect(int x, int y, int w, int h, int r, uint16_t c)
     }
 }
 
+/* Marquee: a single "currently-scrolling" text target (the selected overflowing
+ * row, or the now-playing title). Render fns set it while drawing; the main loop
+ * scrolls it in place via a tiny partial present. text must be stable across
+ * frames (it points into g_songs/g_browse/the player). */
+static struct {
+    int                active, x, y, w;
+    const char        *text;
+    const text_font_t *font;
+    uint16_t           ink, bg;
+} g_mq;
+
+#define MQ_GAP 28                         /* gap between the looped copies       */
+
+/* Draw `s` in the window [x, x+w) at baseline y, scrolling when it overflows
+ * (t_us paces the scroll). Clears the text band to bg first. */
+static void draw_marquee(int x, int y, int w, const char *s,
+                         const text_font_t *font, uint16_t ink, uint16_t bg,
+                         uint32_t t_us)
+{
+    int asc = text_ascent(font), lh = text_line_height(font);
+    console_fill_rect(x, y - asc, w, lh, bg);
+    int tw = text_width(s, font);
+    if (tw <= w) {
+        text_draw_clip(console_fb(), LCD_WIDTH, LCD_HEIGHT, x, y, s, font, ink,
+                       x, x + w);
+        return;
+    }
+    int span = tw + MQ_GAP;
+    int off = (int)((t_us / 24000u) % (uint32_t)span);   /* ~42 px/s */
+    text_draw_clip(console_fb(), LCD_WIDTH, LCD_HEIGHT, x - off, y, s, font, ink,
+                   x, x + w);
+    text_draw_clip(console_fb(), LCD_WIDTH, LCD_HEIGHT, x - off + span, y, s,
+                   font, ink, x, x + w);
+}
+
+/* Register the selected/overflowing text as the marquee target (only if it
+ * actually overflows its window). */
+static void mq_set(int x, int y, int w, const char *text,
+                   const text_font_t *font, uint16_t ink, uint16_t bg)
+{
+    if (text_width(text, font) <= w) return;
+    g_mq.active = 1; g_mq.x = x; g_mq.y = y; g_mq.w = w;
+    g_mq.text = text; g_mq.font = font; g_mq.ink = ink; g_mq.bg = bg;
+}
+
 /* ---------------------------------------------------------------------------
  * File / album browser
  *
@@ -492,8 +537,26 @@ static void list_row_at(int y0, int r, const char *text, const char *sub,
         console_blit565(12, ry + (ROW_H - 22) / 2, 22, 22, chip);
         tx = 12 + 22 + 8;
     }
+    /* Where the title must stop (before the right value / chevron). */
+    int title_right;
+    if (right && right[0]) {
+        title_right = LCD_WIDTH - 16 - text_width(right, text_font_bold_11()) - 6;
+    } else if (chevron) {
+        title_right = LCD_WIDTH - 18 - 4;
+    } else {
+        title_right = LCD_WIDTH - 16;
+    }
+    int avail = title_right - tx;
+    const text_font_t *tf = selected ? FONT_HEADER : FONT_ROW;
     int base = sub ? ry + 11 : ry + 15;       /* lift the title when a sub is shown */
-    ui_text(tx, base, text, selected ? FONT_HEADER : FONT_ROW, fg);
+    /* Clip the title so a long one never overruns the value/chevron; the selected
+     * row's long title scrolls (marquee). */
+    text_draw_clip(console_fb(), LCD_WIDTH, LCD_HEIGHT, tx, base, text, tf, fg,
+                   tx, tx + avail);
+    if (selected) {
+        mq_set(tx, base, avail, text, tf, fg,
+               selected ? LINEN_SEL_BG : LINEN_SURFACE);
+    }
     if (sub) {
         ui_text(tx, ry + 21, sub, FONT_SMALL, subc);
     }
@@ -555,6 +618,8 @@ static int u32_to_dec(char *dst, unsigned v)
     return t;
 }
 
+static void fmt_time(char *buf, uint32_t s);   /* "M:SS", defined below         */
+
 /* Format "a / b" into dst (needs >= 12 bytes). */
 static void fmt_count(char *dst, int a, int b)
 {
@@ -581,6 +646,18 @@ static int      g_detail_art_ok;
 static char     g_album_title[NAME_MAX + 1];     /* album part of "Artist - Album" */
 static char     g_album_artist[NAME_MAX + 1];    /* artist part (empty if none)    */
 static int      g_album_track_n;                  /* playable files in the folder   */
+
+/* Per-track disc/duration (from the index) + a display "view" that interleaves
+ * "Disc N" header rows for multi-disc albums. Filled in detail_load_meta. A view
+ * entry >= 0 is a track index into g_browse; < 0 encodes a header disc as
+ * -(disc+1). */
+#define DET_VIEW_MAX (BROWSE_MAX + 8)
+static uint16_t g_track_dur[BROWSE_MAX];
+static uint16_t g_track_num[BROWSE_MAX];
+static uint8_t  g_track_disc[BROWSE_MAX];
+static int16_t  g_det_view[DET_VIEW_MAX];
+static int      g_det_view_n;
+static int      g_detail_multidisc;
 
 /* Read the current folder's folder.art (clus/size captured by browse_load) and
  * downscale it to the 56x56 hero. Leaves g_detail_art_ok=0 if absent/malformed.
@@ -666,36 +743,60 @@ static void detail_render(int sel)
         ui_text(14, DET_LIST_Y0 + 14, "Empty folder", FONT_ROW, LINEN_MUTED);
         return;
     }
-    int top = scroll_window(sel, g_browse_n, DET_ROWS);
+    /* Scroll over the display view (tracks + any "Disc N" headers), centered on
+     * the selected track's position within it. */
+    int sel_view = 0;
+    for (int i = 0; i < g_det_view_n; i++) {
+        if (g_det_view[i] == (int16_t)sel) { sel_view = i; break; }
+    }
+    int top = scroll_window(sel_view, g_det_view_n, DET_ROWS);
     const char *playing = player_active() ? player_track_name() : 0;
     for (int r = 0; r < DET_ROWS; r++) {
-        int idx = top + r;
-        if (idx >= g_browse_n) break;
+        int vi = top + r;
+        if (vi >= g_det_view_n) break;
+        int ry = DET_LIST_Y0 + r * ROW_H;
+        int16_t v = g_det_view[vi];
+        if (v < 0) {                          /* a "Disc N" section header */
+            char h[12];
+            int hi = 0;
+            for (const char *p = "DISC "; *p; p++) h[hi++] = *p;
+            u32_to_dec(h + hi, (unsigned)(-(int)v - 1));
+            ui_text(14, ry + 15, h, FONT_SMALL, LINEN_MUTED_D);
+            continue;
+        }
+        int idx = v;
         const browse_entry_t *e = &g_browse[idx];
         int is_sel = (idx == sel);
-        int ry = DET_LIST_Y0 + r * ROW_H;
         if (is_sel) {
             fill_round_rect(6, ry + 1, LCD_WIDTH - 16, ROW_H - 2, 4, LINEN_SEL_BG);
         }
         uint16_t fg = is_sel ? LINEN_SEL_FG : LINEN_INK;
         uint16_t nc = is_sel ? LINEN_SEL_SUB : LINEN_MUTED2;
-        /* Track number, right-aligned in a small left gutter (collection-detail
-         * .jsx numbers the rows). */
-        char num[6];
-        u32_to_dec(num, (unsigned)(idx + 1));
-        int nw = text_width(num, FONT_SMALL);
-        ui_text(30 - nw, ry + 15, num, FONT_SMALL, nc);
+        /* Left gutter: the now-playing bars for the playing track, else its
+         * (per-disc) track number (collection-detail.jsx). */
+        if (playing && name_eq_ci(e->name, playing)) {
+            nowplaying_bars(15, ry + 6, is_sel ? LINEN_SEL_FG : LINEN_INK,
+                            mmio_read32(USEC_TIMER_ADDR));
+        } else {
+            char num[6];
+            u32_to_dec(num, (unsigned)(g_track_num[idx] ? g_track_num[idx]
+                                                        : idx + 1));
+            int nw = text_width(num, FONT_SMALL);
+            ui_text(30 - nw, ry + 15, num, FONT_SMALL, nc);
+        }
+        /* Duration on the right (from the index). */
+        if (g_track_dur[idx]) {
+            char dts[8];
+            fmt_time(dts, g_track_dur[idx]);
+            int dw = text_width(dts, text_font_bold_11());
+            ui_text(LCD_WIDTH - 16 - dw, ry + 15, dts, text_font_bold_11(),
+                    is_sel ? LINEN_SEL_SUB : LINEN_MUTED_D);
+        }
         /* Title (clean — number gutter provides the index), indented past it. */
         ui_text(38, ry + 15, track_display(e->name),
                 is_sel ? FONT_HEADER : FONT_ROW, fg);
-        /* The playing track gets the animated bars on the right. */
-        if (playing && !e->is_dir && name_eq_ci(e->name, playing)) {
-            nowplaying_bars(LCD_WIDTH - 22, ry + 7,
-                            is_sel ? LINEN_SEL_FG : LINEN_INK,
-                            mmio_read32(USEC_TIMER_ADDR));
-        }
     }
-    scrollbar_render(DET_LIST_Y0, top, DET_ROWS, g_browse_n);
+    scrollbar_render(DET_LIST_Y0, top, DET_ROWS, g_det_view_n);
 }
 
 /* A neutral tile shown in a row's chip slot until its real cover loads, so the
@@ -976,7 +1077,6 @@ static uint32_t folder_clus(const char *name)
  * Record (256B, LE): u32 dur, u16 track, u16 disc, folder[64], file[64],
  * title[48], artist[40], genre[24], pad[8]. */
 static void library_finish(void);        /* sort + genre counts (shared)        */
-static void fmt_time(char *buf, uint32_t s);   /* defined with now-playing below  */
 
 static int library_load_index(fat32_t *fs)
 {
@@ -1385,7 +1485,10 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
     /* Track title from tags (falls back to the filename), + "artist · album". */
     const flac_meta_t *m = player_meta();
     const char *title = (m->have && m->title[0]) ? m->title : track_display(name);
-    ui_text(14, 148, title, FONT_TITLE, LINEN_INK);
+    int tav = LCD_WIDTH - 28;
+    text_draw_clip(console_fb(), LCD_WIDTH, LCD_HEIGHT, 14, 148, title,
+                   FONT_TITLE, LINEN_INK, 14, 14 + tav);
+    mq_set(14, 148, tav, title, FONT_TITLE, LINEN_INK, LINEN_SURFACE);
     if (m->have && (m->artist[0] || m->album[0])) {
         char sub[136];
         int i = 0;
@@ -1525,14 +1628,44 @@ static void browse_load(fat32_t *fs, uint32_t dir_clus)
     fat32_readdir(fs, dir_clus, browse_collect, 0);
 }
 
-/* After entering an album folder: load its hero art + count its playable tracks
- * (for the detail view's "N tracks" line). */
+/* After entering an album folder: load its hero art, pull each track's
+ * disc/duration/number from the index (matched by folder+filename), and build
+ * the display view with "Disc N" section headers for a multi-disc album. */
 static void detail_load_meta(fat32_t *fs)
 {
     detail_art_load(fs);
     g_album_track_n = 0;
+    int maxd = 0;
     for (int i = 0; i < g_browse_n; i++) {
-        if (!g_browse[i].is_dir) g_album_track_n++;
+        g_track_dur[i] = 0;
+        g_track_disc[i] = 0;
+        g_track_num[i] = 0;
+        if (g_browse[i].is_dir) continue;
+        g_album_track_n++;
+        if (g_lib_indexed) {
+            for (int s = 0; s < g_songs_n; s++) {
+                if (g_songs[s].dir_clus == g_cur_dir &&
+                    name_eq_ci(g_songs[s].file, g_browse[i].name)) {
+                    g_track_dur[i]  = (uint16_t)g_songs[s].duration_s;
+                    g_track_disc[i] = (uint8_t)g_songs[s].disc;
+                    g_track_num[i]  = g_songs[s].track;
+                    if (g_songs[s].disc > maxd) maxd = g_songs[s].disc;
+                    break;
+                }
+            }
+        }
+    }
+    g_detail_multidisc = (maxd > 1);
+    g_det_view_n = 0;
+    int prev = -1;
+    for (int i = 0; i < g_browse_n && g_det_view_n < DET_VIEW_MAX - 1; i++) {
+        if (g_browse[i].is_dir) continue;
+        int d = g_track_disc[i];
+        if (g_detail_multidisc && d > 0 && d != prev) {
+            g_det_view[g_det_view_n++] = (int16_t)(-(d + 1));   /* Disc header */
+            prev = d;
+        }
+        g_det_view[g_det_view_n++] = (int16_t)i;
     }
 }
 
@@ -1555,6 +1688,7 @@ static int wheel_move(int sel, int count, int8_t delta, int *accum)
  * present) — used to paint context behind the lock/unlock plate. */
 static void paint_current_screen(void)
 {
+    g_mq.active = 0;                       /* a fresh paint re-registers any marquee */
     switch (scr_cur()) {
     case SCR_MENU:    main_menu_render();  break;
     case SCR_MUSIC:   music_menu_render(); break;
@@ -1622,6 +1756,7 @@ _Noreturn static void run_ui(fat32_t *fs)
     uint32_t last_present = 0;           /* rate-limit UI presents while playing */
     uint32_t last_bars = 0;              /* rate-limit the now-playing bar anim  */
     uint32_t last_chip = 0;              /* rate-limit album-cover chip loads    */
+    uint32_t last_mq = 0;                /* rate-limit the marquee scroll        */
     int      hold_prev = clickwheel_hold() ? 1 : 0;  /* seed hold-edge detect    */
     int      ext_prev  = power_is_external() ? 1 : 0; /* seed plug-in edge detect */
     int      lock_flashing = 0;          /* a lock/unlock plate is on screen     */
@@ -2081,6 +2216,7 @@ _Noreturn static void run_ui(fat32_t *fs)
             int want_full = dirty || expiring;
             if (want_full) {
                 if (np_first || (uint32_t)(nowv - last_present) >= 150000u) {
+                    g_mq.active = 0;
                     nowplaying_render(player_track_name(), elapsed,
                                       player_total_s(), player_buf_pct());
                     lcd_present_fb(console_framebuffer());
@@ -2093,6 +2229,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                 }
                 /* else: throttled — keep dirty set, present in the next window */
             } else if (elapsed != np_last) {
+                g_mq.active = 0;
                 nowplaying_render(player_track_name(), elapsed,
                                   player_total_s(), player_buf_pct());
                 lcd_present_rect(console_framebuffer(),
@@ -2109,6 +2246,7 @@ _Noreturn static void run_ui(fat32_t *fs)
              * the latest scroll position is what lands. */
             uint32_t now = mmio_read32(USEC_TIMER_ADDR);
             if (!player_active() || (now - last_present) >= 150000u) {
+                g_mq.active = 0;
                 switch (scr_cur()) {
                 case SCR_MENU:    main_menu_render();            break;
                 case SCR_MUSIC:   music_menu_render();           break;
@@ -2137,21 +2275,25 @@ _Noreturn static void run_ui(fat32_t *fs)
             && player_active()) {
             uint32_t nowb = mmio_read32(USEC_TIMER_ADDR);
             if ((uint32_t)(nowb - last_bars) >= 110000u) {
-                int top = scroll_window(g_br_sel, g_browse_n, DET_ROWS);
+                int sv = 0;
+                for (int i = 0; i < g_det_view_n; i++)
+                    if (g_det_view[i] == (int16_t)g_br_sel) { sv = i; break; }
+                int top = scroll_window(sv, g_det_view_n, DET_ROWS);
                 const char *pn = player_track_name();
                 for (int r = 0; r < DET_ROWS; r++) {
-                    int idx = top + r;
-                    if (idx >= g_browse_n) break;
-                    const browse_entry_t *e = &g_browse[idx];
+                    int vi = top + r;
+                    if (vi >= g_det_view_n) break;
+                    int16_t v = g_det_view[vi];
+                    if (v < 0) continue;
+                    const browse_entry_t *e = &g_browse[v];
                     if (e->is_dir || !name_eq_ci(e->name, pn)) continue;
                     int ry = DET_LIST_Y0 + r * ROW_H;
-                    int bx = LCD_WIDTH - 22, by = ry + 7;
-                    int is_sel = (idx == g_br_sel);
-                    console_fill_rect(bx, by, NP_BARS_W, NP_BARS_H,
+                    int is_sel = (v == g_br_sel);
+                    console_fill_rect(15, ry + 6, NP_BARS_W, NP_BARS_H,
                                       is_sel ? LINEN_SEL_BG : LINEN_SURFACE);
-                    nowplaying_bars(bx, by, is_sel ? LINEN_SEL_FG : LINEN_INK, nowb);
+                    nowplaying_bars(15, ry + 6, is_sel ? LINEN_SEL_FG : LINEN_INK, nowb);
                     lcd_present_rect(console_framebuffer(),
-                                     bx, by, NP_BARS_W + 1, NP_BARS_H);
+                                     15, ry + 6, NP_BARS_W + 1, NP_BARS_H);
                     break;
                 }
                 last_bars = nowb;
@@ -2177,6 +2319,20 @@ _Noreturn static void run_ui(fat32_t *fs)
                                      bx, by, NP_BARS_W + 1, NP_BARS_H);
                 }
                 last_bars = nowb;
+            }
+        }
+
+        /* Scroll the marquee target (a selected long row, or the now-playing
+         * title) in place — redraw just its band + partial-present it, ~16fps. */
+        if (bl_state != BL_OFF && g_mq.active) {
+            uint32_t nowm = mmio_read32(USEC_TIMER_ADDR);
+            if ((uint32_t)(nowm - last_mq) >= 60000u) {
+                draw_marquee(g_mq.x, g_mq.y, g_mq.w, g_mq.text, g_mq.font,
+                             g_mq.ink, g_mq.bg, nowm);
+                int asc = text_ascent(g_mq.font), lh = text_line_height(g_mq.font);
+                lcd_present_rect(console_framebuffer(),
+                                 g_mq.x, g_mq.y - asc, g_mq.w, lh);
+                last_mq = nowm;
             }
         }
 
