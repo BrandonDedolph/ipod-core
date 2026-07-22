@@ -62,11 +62,13 @@
  * is the safety margin: the decoder keeps feeding audio out of the buffer for
  * ~4.6 s while a refill burst is in flight, far longer than one bounded chunk
  * read. .bss cost is 4 MB; the low-32 MB image had <1 MB in use. */
-#define DISK_BUF_BYTES (4u * 1024u * 1024u)
-#define DISK_LOW       (512u * 1024u)    /* refill starts below this bytes-ahead */
-#define DISK_HIGH      (DISK_BUF_BYTES - 64u * 1024u)  /* ...and tops out here   */
-#define DISK_CHUNK     (32u * 1024u)     /* max bytes per pump (== RA block; the */
-                                         /* proven per-read PIO stall, no worse) */
+#define DISK_BUF_BYTES (8u * 1024u * 1024u)  /* ~73 s ahead -> longer idle gaps  */
+#define DISK_LOW       (1024u * 1024u)   /* refill starts below this bytes-ahead */
+#define DISK_HIGH      (DISK_BUF_BYTES - 128u * 1024u)  /* ...and tops out here  */
+#define DISK_CHUNK     (128u * 1024u)    /* bytes per pump: bigger => FEWER, more */
+                                         /* SEQUENTIAL reads (quieter head). A    */
+                                         /* 128 KB PIO read (~0.28 s) still fits   */
+                                         /* well under the ring-gate headroom.    */
 /* Only spend time on a (blocking) disk chunk when the PCM ring has healthy
  * headroom, so a refill burst can never drain the ring: when the ring dips
  * below half, the pump backs off and lets decode catch up first. Half the ring
@@ -560,16 +562,24 @@ const flac_meta_t *player_meta(void) { return &g_cur_meta; }
 /* Probe a file's tags/duration WITHOUT disturbing playback — a throwaway
  * fat-source on the stack (used by the library scan for Songs/Genres). Returns
  * 0 on success (out->have==1), -1 on not-a-FLAC. */
+static uint8_t     probe_ra_buf[16 * 1024];      /* buffers the metadata header  */
+static readahead_t probe_ra;
+
 int player_probe_meta(uint32_t clus, uint32_t size, flac_meta_t *out)
 {
     fat_src_t s;
-    decoder_source_t src;
+    decoder_source_t raw, buf;
     fat_src_open(&s, g_pl_fs, clus, size);
-    src.read = fat_src_read;
-    src.seek = fat_src_seek;
-    src.tell = fat_src_tell;
-    src.userdata = &s;
-    return flac_meta_read(&src, out);
+    raw.read = fat_src_read;
+    raw.seek = fat_src_seek;
+    raw.tell = fat_src_tell;
+    raw.userdata = &s;
+    /* Read the header through a 16 KB read-ahead so the parser's many tiny reads
+     * collapse into ~one backing disk read — the difference between a snappy and
+     * a minutes-long library scan over slow PIO. */
+    readahead_init(&probe_ra, &raw, probe_ra_buf, sizeof probe_ra_buf);
+    readahead_as_source(&probe_ra, &buf);
+    return flac_meta_read(&buf, out);
 }
 
 uint32_t player_elapsed_s(void)

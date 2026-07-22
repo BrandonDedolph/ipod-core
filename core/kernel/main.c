@@ -836,11 +836,16 @@ static void browse_render(int sel)
 #define LIB_TITLE_MAX  48
 #define LIB_GENRE_MAX  24
 
+#define LIB_ARTIST_MAX 40
+#define LIB_FILE_MAX   64
+
 typedef struct {
     char     title[LIB_TITLE_MAX];
-    uint32_t file_clus, file_size;
-    uint32_t dir_clus;                    /* album folder (queue context)       */
-    uint32_t art_clus, art_size;          /* its folder.art                     */
+    char     artist[LIB_ARTIST_MAX];
+    char     file[LIB_FILE_MAX];          /* track filename, ext trimmed        */
+    uint32_t dir_clus;                    /* album folder (queue context + play)*/
+    uint32_t duration_s;
+    uint16_t track, disc;
     int16_t  genre;                       /* index into g_genres, -1 = none     */
 } lib_song_t;
 
@@ -851,6 +856,14 @@ static char       g_genres[LIB_MAX_GENRES][LIB_GENRE_MAX];
 static int        g_genres_n;
 static int        g_genre_count[LIB_MAX_GENRES]; /* songs per genre (precomputed) */
 static int        g_lib_scanned;
+static int        g_lib_indexed;                  /* loaded from CORELIB.IDX     */
+
+/* Root-folder name -> cluster map (built once), for resolving an index record's
+ * album folder to a cluster without a per-album directory read. */
+#define FOLDER_MAP_MAX 160
+static struct { char name[NAME_MAX + 1]; uint32_t clus; } g_folder_map[FOLDER_MAP_MAX];
+static int      g_folder_n;
+static uint32_t g_idx_clus, g_idx_size;           /* CORELIB.IDX location        */
 
 /* Scan temporaries (kept off the browser's g_browse). */
 static uint32_t   g_scan_dirs[BROWSE_MAX];
@@ -919,6 +932,102 @@ static int scan_files_cb(void *ud, const fat32_dirent_t *e)
     return 0;
 }
 
+/* Copy a fixed-length index field (NUL-terminated within it) to a bounded C
+ * string, keeping printable ASCII (the atlas font's range). */
+static void field_copy(char *dst, int dcap, const uint8_t *src, int slen)
+{
+    int i = 0;
+    for (; i < slen && i < dcap - 1 && src[i]; i++) {
+        char c = (char)src[i];
+        dst[i] = (c >= 0x20 && c <= 0x7E) ? c : ' ';
+    }
+    dst[i] = '\0';
+}
+
+/* Root enumeration for the index path: capture CORELIB.IDX + a folder->cluster
+ * map (so records resolve to a cluster with no per-album directory read). */
+static int index_root_cb(void *ud, const fat32_dirent_t *e)
+{
+    (void)ud;
+    if (!e->is_dir && name_eq_ci(e->name, "CORELIB.IDX")) {
+        g_idx_clus = e->first_clus;
+        g_idx_size = e->size;
+        return 0;
+    }
+    if (e->is_dir && !is_junk_dir(e->name) && g_folder_n < FOLDER_MAP_MAX) {
+        copy_display_name(g_folder_map[g_folder_n].name, e->name, 0);
+        g_folder_map[g_folder_n].clus = e->first_clus;
+        g_folder_n++;
+    }
+    return 0;
+}
+
+static uint32_t folder_clus(const char *name)
+{
+    for (int i = 0; i < g_folder_n; i++) {
+        if (name_eq_ci(g_folder_map[i].name, name)) return g_folder_map[i].clus;
+    }
+    return 0;
+}
+
+/* Load the whole library from the host-built CORELIB.IDX in ONE streamed pass
+ * (no per-file tag reads) — instant Songs/Genres/durations/disc. Returns 1 on
+ * success, 0 if the index is absent/bad (caller falls back to a scan).
+ * Record (256B, LE): u32 dur, u16 track, u16 disc, folder[64], file[64],
+ * title[48], artist[40], genre[24], pad[8]. */
+static void library_finish(void);        /* sort + genre counts (shared)        */
+static void fmt_time(char *buf, uint32_t s);   /* defined with now-playing below  */
+
+static int library_load_index(fat32_t *fs)
+{
+    g_idx_clus = 0;
+    g_folder_n = 0;
+    fat32_readdir(fs, fs->root_clus, index_root_cb, 0);
+    if (g_idx_clus == 0) return 0;
+
+    fat32_stream_t st;
+    fat32_stream_open(&st, fs, g_idx_clus, g_idx_size);
+    uint8_t hdr[12];
+    if (fat32_stream_read(&st, hdr, 12) != 12) return 0;
+    if (hdr[0] != 'C' || hdr[1] != 'I' || hdr[2] != 'D' || hdr[3] != 'X') return 0;
+    int rec = hdr[6] | (hdr[7] << 8);
+    if (rec != 256) return 0;
+    uint32_t count = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) |
+                     ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
+
+    g_songs_n = g_genres_n = 0;
+    uint8_t r[256];
+    for (uint32_t n = 0; n < count && g_songs_n < LIB_MAX_SONGS; n++) {
+        if (fat32_stream_read(&st, r, 256) != 256) break;
+        char folder[NAME_MAX + 1];
+        field_copy(folder, sizeof folder, r + 8, 64);
+        uint32_t dc = folder_clus(folder);
+        if (dc == 0) continue;                 /* album not present on disk */
+        lib_song_t *s = &g_songs[g_songs_n];
+        s->dir_clus   = dc;
+        s->duration_s = (uint32_t)r[0] | ((uint32_t)r[1] << 8) |
+                        ((uint32_t)r[2] << 16) | ((uint32_t)r[3] << 24);
+        s->track = (uint16_t)(r[4] | (r[5] << 8));
+        s->disc  = (uint16_t)(r[6] | (r[7] << 8));
+        field_copy(s->title,  LIB_TITLE_MAX,  r + 136, 48);
+        field_copy(s->artist, LIB_ARTIST_MAX, r + 184, 40);
+        field_copy(s->file,   LIB_FILE_MAX,   r + 72,  64);
+        /* trim the extension (LAST '.') so it matches g_browse display names,
+         * which drop the ".flac" — but keep dots inside the title. */
+        { int dot = -1;
+          for (int k = 0; s->file[k]; k++) if (s->file[k] == '.') dot = k;
+          if (dot > 0) s->file[dot] = '\0'; }
+        char genre[LIB_GENRE_MAX];
+        field_copy(genre, LIB_GENRE_MAX, r + 224, 24);
+        s->genre = genre_intern(genre);
+        g_songs_n++;
+    }
+    library_finish();
+    g_lib_indexed = 1;
+    g_lib_scanned = 1;
+    return 1;
+}
+
 /* Walk root → album folders → FLAC files, probing each file's tags. */
 static void library_scan(fat32_t *fs)
 {
@@ -931,26 +1040,46 @@ static void library_scan(fat32_t *fs)
         fat32_readdir(fs, g_scan_dirs[d], scan_files_cb, 0);
         for (int i = 0; i < g_scan_files_n && g_songs_n < LIB_MAX_SONGS; i++) {
             player_pump();                 /* keep audio fed during the scan     */
+            if ((g_songs_n & 31) == 0) {   /* live progress every 32 tracks       */
+                console_clear(LINEN_SURFACE);
+                ui_text_centered(112, "Building Library", FONT_TITLE, LINEN_INK);
+                char pg[16];
+                int pl = u32_to_dec(pg, (unsigned)g_songs_n);
+                for (const char *p = " songs"; *p; p++) pg[pl++] = *p;
+                pg[pl] = '\0';
+                ui_text_centered(134, pg, FONT_SUB, LINEN_MUTED);
+                lcd_present_fb(console_framebuffer());
+            }
             flac_meta_t m;
             int ok = (player_probe_meta(g_scan_files[i].clus,
                                         g_scan_files[i].size, &m) == 0);
             lib_song_t *s = &g_songs[g_songs_n++];
             const char *t = (ok && m.have && m.title[0]) ? m.title
                                                          : g_scan_files[i].name;
-            int k = 0;
-            for (; t[k] && k < LIB_TITLE_MAX - 1; k++) s->title[k] = t[k];
-            s->title[k] = '\0';
-            s->file_clus = g_scan_files[i].clus;
-            s->file_size = g_scan_files[i].size;
-            s->dir_clus  = g_scan_dirs[d];
-            s->art_clus  = g_scan_art_clus;
-            s->art_size  = g_scan_art_size;
-            s->genre     = (ok && m.have) ? genre_intern(m.genre) : -1;
+            field_copy(s->title, LIB_TITLE_MAX, (const uint8_t *)t,
+                       (int)sizeof s->title);
+            if (ok && m.have && m.artist[0])
+                field_copy(s->artist, LIB_ARTIST_MAX, (const uint8_t *)m.artist, 64);
+            else
+                s->artist[0] = '\0';
+            field_copy(s->file, LIB_FILE_MAX,
+                       (const uint8_t *)g_scan_files[i].name, NAME_MAX);
+            s->dir_clus   = g_scan_dirs[d];
+            s->duration_s = (ok && m.have) ? m.duration_s : 0;
+            s->track      = (ok && m.have) ? (uint16_t)m.track : 0;
+            s->disc       = 0;
+            s->genre      = (ok && m.have) ? genre_intern(m.genre) : -1;
         }
     }
-    /* Title-sort an index array (insertion sort — one-time, bounded). */
+    library_finish();
+    g_lib_scanned = 1;
+}
+
+/* Shared post-load: title-sort the index array + precompute per-genre counts. */
+static void library_finish(void)
+{
     for (int i = 0; i < g_songs_n; i++) g_song_sorted[i] = (uint16_t)i;
-    for (int i = 1; i < g_songs_n; i++) {
+    for (int i = 1; i < g_songs_n; i++) {   /* insertion sort by title */
         uint16_t v = g_song_sorted[i];
         int j = i - 1;
         while (j >= 0 && title_cmp(g_songs[g_song_sorted[j]].title,
@@ -960,13 +1089,11 @@ static void library_scan(fat32_t *fs)
         }
         g_song_sorted[j + 1] = v;
     }
-    /* Precompute per-genre song counts (was O(n) per row per paint). */
     for (int i = 0; i < g_genres_n; i++) g_genre_count[i] = 0;
     for (int i = 0; i < g_songs_n; i++) {
         int g = g_songs[i].genre;
         if (g >= 0 && g < g_genres_n) g_genre_count[g]++;
     }
-    g_lib_scanned = 1;
 }
 
 /* Show a "building library" splash then scan (blocks; anti-skip covers audio). */
@@ -974,10 +1101,10 @@ static void library_ensure(fat32_t *fs)
 {
     if (g_lib_scanned) return;
     console_clear(LINEN_SURFACE);
-    ui_text_centered(118, "Building Library", FONT_TITLE, LINEN_INK);
-    ui_text_centered(140, "reading tags", FONT_SUB, LINEN_MUTED);
+    ui_text_centered(118, "Loading Library", FONT_TITLE, LINEN_INK);
     lcd_present_fb(console_framebuffer());
-    library_scan(fs);
+    if (library_load_index(fs)) return;   /* instant: host-built CORELIB.IDX */
+    library_scan(fs);                      /* fallback: per-file tag scan     */
 }
 
 /* Populate g_songview with the songs to show (genre < 0 = all), title-ordered. */
@@ -1026,7 +1153,7 @@ static void library_play_song(fat32_t *fs, int songview_idx)
     fat32_readdir(fs, s->dir_clus, queue_collect, 0);
     int start = 0;
     for (int i = 0; i < g_browse_n; i++) {
-        if (g_browse[i].clus == s->file_clus) { start = i; break; }
+        if (name_eq_ci(g_browse[i].name, s->file)) { start = i; break; }
     }
     player_play_queue(g_browse, g_browse_n, start, g_art_clus, g_art_size);
     hal_volume_set(g_volume);
@@ -1048,7 +1175,11 @@ static void songs_render(int sel)
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
         if (idx >= g_songview_n) break;
-        list_row(r, g_songs[g_songview[idx]].title, 0, 0, 0, idx == sel, 0, 0);
+        lib_song_t *sg = &g_songs[g_songview[idx]];
+        char dur[8];
+        if (sg->duration_s) fmt_time(dur, sg->duration_s); else dur[0] = '\0';
+        list_row(r, sg->title, sg->artist[0] ? sg->artist : 0,
+                 dur[0] ? dur : 0, 0, idx == sel, 0, 0);
     }
     scrollbar_render(LIST_Y0, top, LIST_ROWS, g_songview_n);
 }
@@ -1267,34 +1398,26 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
         ui_text(14, 166, sub, FONT_SUB, LINEN_MUTED_D);
     }
 
-    /* Clock: elapsed left, total right. */
+    /* Progress block near the bottom (more room below the art/title). */
     char te[12], tt[12];
     fmt_time(te, elapsed_s);
     fmt_time(tt, total_s);
-    ui_text(14, 174, te, FONT_SUB, LINEN_MUTED);
+    ui_text(14, 210, te, FONT_SUB, LINEN_MUTED);
     int wtt = text_width(tt, FONT_SUB);
-    ui_text(LCD_WIDTH - 14 - wtt, 174, tt, FONT_SUB, LINEN_MUTED);
+    ui_text(LCD_WIDTH - 14 - wtt, 210, tt, FONT_SUB, LINEN_MUTED);
 
-    /* Thin accent progress bar. */
-    int bx = 14, by = 182, bw = LCD_WIDTH - 28, bh = 3;
+    /* Thin accent progress bar under the times. */
+    int bx = 14, by = 218, bw = LCD_WIDTH - 28, bh = 3;
     console_fill_rect(bx, by, bw, bh, LINEN_BORDER);
     int fw = (total_s > 0) ? (int)((elapsed_s * (uint32_t)bw) / total_s) : 0;
     if (fw > bw) fw = bw;
     console_fill_rect(bx, by, fw, bh, LINEN_ACCENT);
 
-    /* Small buffer-health readout, bottom-left ("buf NN"), + stop hint right. */
-    char bs[12];
-    uint32_t p = buf_pct > 99u ? 99u : buf_pct;
-    bs[0] = 'b'; bs[1] = 'u'; bs[2] = 'f'; bs[3] = ' ';
-    bs[4] = (char)('0' + (p / 10) % 10);
-    bs[5] = (char)('0' + p % 10);
-    bs[6] = '\0';
-    ui_text(14, 208, bs, FONT_SMALL, p < 20u ? LINEN_ACCENT : LINEN_MUTED);
-    /* Show PAUSED (accent) when suspended, else the back hint. */
-    const char *hint = player_paused() ? "paused" : "menu: back";
-    int wh = text_width(hint, FONT_SMALL);
-    ui_text(LCD_WIDTH - 14 - wh, 208, hint, FONT_SMALL,
-            player_paused() ? LINEN_ACCENT : LINEN_MUTED);
+    /* PAUSED indicator between the artist line and the times when suspended. */
+    (void)buf_pct;
+    if (player_paused()) {
+        ui_text_centered(198, "PAUSED", FONT_SMALL, LINEN_ACCENT);
+    }
 
     /* Volume overlay rides on top for ~1.5 s after a wheel adjustment. */
     if (mmio_read32(USEC_TIMER_ADDR) < g_vol_show_until) {
@@ -1780,9 +1903,12 @@ _Noreturn static void run_ui(fat32_t *fs)
                      * so a fast flick covers more range (but still can't
                      * teleport). Slow single detents stay fine-grained. */
                     int d = ev.wheel_delta;
-                    if (d >  12) d =  12;
-                    if (d < -12) d = -12;
-                    g_volume += d * 2;
+                    if (d >  10) d =  10;
+                    if (d < -10) d = -10;
+                    /* A single detent moves exactly ±1 (fine); a faster flick
+                     * accelerates so you can still sweep the range quickly. */
+                    int step = (d == 1 || d == -1) ? d : d * 2;
+                    g_volume += step;
                     if (g_volume < 0)   g_volume = 0;
                     if (g_volume > 100) g_volume = 100;
                     hal_volume_set(g_volume);
