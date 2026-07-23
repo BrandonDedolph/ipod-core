@@ -20,23 +20,11 @@ present) → I²C/WM8758B/I²S first sound → DMA playback → ATA PIO reader �
 FAT32 → streaming FLAC/MP3 decode → audio out the headphone jack.
 
 <p align="center">
-  <img src="docs/screens/demo.gif" alt="core UI in motion" width="360">
+  <img src="docs/screens/demo.gif" alt="core UI in motion — main menu to Now Playing" width="420">
+  <br><em>Cold boot → browse → play, on the real device.</em>
 </p>
 
-<table>
-  <tr>
-    <td><img src="docs/screens/nowplaying.png" width="320" alt="Now Playing"></td>
-    <td><img src="docs/screens/albums.png" width="320" alt="Album list"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/screens/detail.png" width="320" alt="Album detail"></td>
-    <td><img src="docs/screens/genres.png" width="320" alt="Genres"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/screens/about.png" width="320" alt="About"></td>
-    <td><img src="docs/screens/volume.png" width="320" alt="Volume overlay"></td>
-  </tr>
-</table>
+See the [**Screens**](#screens) gallery below for a full tour.
 
 ---
 
@@ -66,6 +54,101 @@ FAT32 → streaming FLAC/MP3 decode → audio out the headphone jack.
   titles, a warm-light **Linen** theme and a warm-dark **Onyx** one,
   plus settings (tone/balance, backlight, click profiles), volume and
   lock overlays, and a battery gauge that warns red when low.
+
+## Screens
+
+A tour of what's on the device. *(Faithful renders of the on-device UI.)*
+
+### Browse your whole library
+
+Main menu → Music → browse by **Artist / Album / Song / Genre**, all off a
+host-built index that loads in one read. Two-line rows carry album-art
+chips; long titles scroll a marquee.
+
+<p align="center"><img src="docs/screens/browse.gif" alt="browsing the library" width="360"></p>
+
+<table>
+  <tr>
+    <td><img src="docs/screens/mainmenu.png" width="260" alt="Main menu"></td>
+    <td><img src="docs/screens/music.png" width="260" alt="Music menu"></td>
+    <td><img src="docs/screens/artists.png" width="260" alt="Artists"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screens/albums.png" width="260" alt="Albums"></td>
+    <td><img src="docs/screens/songs.png" width="260" alt="Songs"></td>
+    <td><img src="docs/screens/genres.png" width="260" alt="Genres"></td>
+  </tr>
+</table>
+
+### Now Playing
+
+A 120×120 cover, marquee title, artist/album, `TRACK N OF M`, elapsed /
+−remaining, and a rounded progress bar. The volume overlay's speaker icon
+grows its sound waves as you turn it up.
+
+<p align="center"><img src="docs/screens/volume.gif" alt="volume overlay with growing sound waves" width="360"></p>
+
+<table>
+  <tr>
+    <td><img src="docs/screens/nowplaying.png" width="260" alt="Now Playing"></td>
+    <td><img src="docs/screens/detail.png" width="260" alt="Album detail"></td>
+    <td><img src="docs/screens/volume.png" width="260" alt="Volume overlay"></td>
+  </tr>
+</table>
+
+### Two themes — Linen &amp; Onyx
+
+The same UI in a warm-light and a warm-dark palette, swapped live from
+Settings.
+
+<p align="center"><img src="docs/screens/themes.gif" alt="Linen and Onyx themes" width="360"></p>
+
+<table>
+  <tr>
+    <td><img src="docs/screens/nowplaying.png" width="260" alt="Now Playing — Linen"></td>
+    <td><img src="docs/screens/nowplaying_onyx.png" width="260" alt="Now Playing — Onyx"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screens/albums.png" width="260" alt="Albums — Linen"></td>
+    <td><img src="docs/screens/albums_onyx.png" width="260" alt="Albums — Onyx"></td>
+  </tr>
+</table>
+
+### Settings
+
+Playback (shuffle / repeat), Sound (volume / bass / treble / balance via
+the WM8758B EQ), a theme picker, backlight, **seven** piezo click
+profiles, and an About dashboard.
+
+<p align="center"><img src="docs/screens/settings.gif" alt="adjusting a Sound slider" width="360"></p>
+
+<table>
+  <tr>
+    <td><img src="docs/screens/settings.png" width="260" alt="Settings"></td>
+    <td><img src="docs/screens/sound.png" width="260" alt="Sound"></td>
+    <td><img src="docs/screens/clicker.png" width="260" alt="Clicker profiles"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screens/theme.png" width="260" alt="Theme picker"></td>
+    <td><img src="docs/screens/about.png" width="260" alt="About"></td>
+    <td></td>
+  </tr>
+</table>
+
+### System
+
+Boot splash, charging screen, and the Hold-switch lock / unlock overlays.
+
+<p align="center"><img src="docs/screens/lock.gif" alt="lock and unlock overlays" width="360"></p>
+
+<table>
+  <tr>
+    <td><img src="docs/screens/boot.png" width="260" alt="Boot splash"></td>
+    <td><img src="docs/screens/charging.png" width="260" alt="Charging"></td>
+    <td><img src="docs/screens/lock.png" width="260" alt="Unlocked"></td>
+    <td><img src="docs/screens/locked.png" width="260" alt="Locked"></td>
+  </tr>
+</table>
 
 ## Hardware target
 
