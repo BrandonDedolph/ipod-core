@@ -381,14 +381,14 @@ ALBUMS = [
 ]
 ALBUMS_SEL = 1
 
-def screen_albums(title_offset=0):
+def screen_albums(sel=ALBUMS_SEL, title_offset=0):
     sc = Screen()
     status_strip(sc, "CORE")
-    header(sc, "Albums", "%d / %d" % (ALBUMS_SEL + 1, len(ALBUMS)), back=True)
+    header(sc, "Albums", "%d / %d" % (sel + 1, len(ALBUMS)), back=True)
     for r, (t, a, art) in enumerate(ALBUMS):
-        sel = (r == ALBUMS_SEL)
-        list_row(sc, LIST_Y0, r, t, sub=a, selected=sel, chip=art, rh=ROW_H2,
-                 title_offset=title_offset if sel else 0)
+        s = (r == sel)
+        list_row(sc, LIST_Y0, r, t, sub=a, selected=s, chip=art, rh=ROW_H2,
+                 title_offset=title_offset if s else 0)
     scrollbar(sc, LIST_Y0, 0, LIST_ROWS2, len(ALBUMS))
     return sc.img
 
@@ -422,10 +422,10 @@ TRACKS = [
 ]
 DETAIL_SEL = 1
 
-def screen_detail():
+def screen_detail(sel=DETAIL_SEL):
     sc = Screen()
     status_strip(sc, "CORE")
-    header(sc, "Albums", "%d / %d" % (DETAIL_SEL + 1, 17), back=True)
+    header(sc, "Albums", "%d / %d" % (sel + 1, 17), back=True)
     sc.blit_art(12, 42, 56, "austin")
     tx = 12 + 56 + 12
     sc.text(tx, 42 + 15, "AUSTIN", FONT_HEADER, INK)
@@ -449,7 +449,7 @@ def screen_detail():
     return sc.img
 
 
-def _now_playing_base(vol_overlay=None):
+def _now_playing_base(vol_overlay=None, elapsed=73, total=182):
     sc = Screen()
     # top status row
     sc.text(12, 15, "Now Playing", bold_11, INK)
@@ -467,9 +467,6 @@ def _now_playing_base(vol_overlay=None):
     sc.text(mx, 94, "Something Real", FONT_TITLE, INK, clip=(mx, mr))
     sc.text(mx, 114, "Post Malone", FONT_SUB, MUTED_D, clip=(mx, mr))
     sc.text(mx, 130, "AUSTIN", FONT_SUB, MUTED2, clip=(mx, mr))
-    # times
-    total = 182
-    elapsed = 73  # ~40%
     def fmt(s):
         return "%d:%02d" % (s // 60, s % 60)
     sc.text(18, 198, fmt(elapsed), FONT_SUB, MUTED_D)
@@ -646,36 +643,86 @@ def save_png(im, name):
     return path
 
 
-def build_gif():
-    """Marquee: the long selected album title scrolls to reveal its tail."""
-    t, a, art = ALBUMS[ALBUMS_SEL]
-    # compute overflow width for the selected row's title window
-    tx = 12 + 28 + 8
-    title_right = W - 16
-    avail = title_right - tx
-    tw = text_width(t, FONT_HEADER)
-    max_off = max(0, tw - avail)
+# ---------------------------------------------------------------------------
+# Menu screens (main + Music submenu) — real rows from core/kernel/main.c
+# ---------------------------------------------------------------------------
+MAIN_MENU = [   # (label, active) — idle: "Now Playing" row is hidden
+    ("Music", True), ("Playlists", False), ("Podcasts", False),
+    ("Audiobooks", False), ("Settings", True),
+]
+MUSIC_MENU = [
+    ("Playlists", False), ("Artists", True), ("Albums", True), ("Songs", True),
+    ("Shuffle Songs", True), ("Genres", True), ("Composers", False),
+    ("Audiobooks", False),
+]
 
+def screen_menu(title, items, sel, back):
+    sc = Screen()
+    status_strip(sc, "CORE")
+    header(sc, title, back=back)
+    for i, (label, active) in enumerate(items):
+        if i >= LIST_ROWS:
+            break
+        list_row(sc, LIST_Y0, i, label, chevron=True, selected=(i == sel),
+                 greyed=not active)
+    return sc.img
+
+
+def build_walkthrough_gif():
+    """A little "someone using the iPod" story: main menu -> Music -> Albums
+    (with the long title marqueeing) -> album detail -> now playing, with the
+    selection bar visibly stepping row to row and the progress bar advancing."""
     frames = []
     durations = []
-    HOLD_START = 6   # frames dwelling at start
-    HOLD_END = 4
-    STEP = 4         # px per scroll frame
-    # scroll frames
-    offs = [0] * HOLD_START
+
+    def add(im, hold=1, ms=140):
+        p = upscale(im, GIF_SCALE).convert("P", palette=Image.ADAPTIVE, colors=96)
+        for _ in range(hold):
+            frames.append(p)
+            durations.append(ms)
+
+    # 1) MAIN MENU — bar starts on Music, browses down, settles back on Music.
+    add(screen_menu("Core", MAIN_MENU, 0, False), hold=3)   # Music
+    add(screen_menu("Core", MAIN_MENU, 1, False), hold=2)   # Playlists
+    add(screen_menu("Core", MAIN_MENU, 2, False), hold=3)   # Podcasts
+    add(screen_menu("Core", MAIN_MENU, 1, False), hold=2)   # back up
+    add(screen_menu("Core", MAIN_MENU, 0, False), hold=4)   # settle on Music
+
+    # 2) MUSIC SUBMENU — step from Artists down to Albums.
+    add(screen_menu("Music", MUSIC_MENU, 1, True), hold=3)  # Artists
+    add(screen_menu("Music", MUSIC_MENU, 2, True), hold=4)  # Albums
+
+    # 3) ALBUMS LIST — bar steps down onto the long-titled album; marquee scrolls.
+    add(screen_albums(sel=0), hold=3)                       # AUSTIN
+    add(screen_albums(sel=1, title_offset=0), hold=3)       # long title (start)
+    # marquee reveal
+    t = ALBUMS[1][0]
+    tx = 12 + 28 + 8
+    avail = (W - 16) - tx
+    max_off = max(0, text_width(t, FONT_HEADER) - avail)
     o = 0
     while o < max_off:
-        o = min(max_off, o + STEP)
-        offs.append(o)
-    offs += [max_off] * HOLD_END
-    for off in offs:
-        im = screen_albums(title_offset=off)
-        frames.append(upscale(im, GIF_SCALE).convert("P", palette=Image.ADAPTIVE, colors=128))
-        durations.append(80)
+        o = min(max_off, o + 6)
+        add(screen_albums(sel=1, title_offset=o), hold=1, ms=90)
+    add(screen_albums(sel=1, title_offset=max_off), hold=3)  # dwell on tail
+    add(screen_albums(sel=0), hold=3)                        # bar back to AUSTIN, select
+
+    # 4) ALBUM DETAIL — step down a couple of tracks, settle on "Something Real".
+    add(screen_detail(sel=0), hold=3)                        # Don't Understand
+    add(screen_detail(sel=1), hold=2)                        # Something Real
+    add(screen_detail(sel=2), hold=3)                        # Chemical
+    add(screen_detail(sel=1), hold=4)                        # settle -> select
+
+    # 5) NOW PLAYING — progress bar advances ~5% -> ~35%, times tick.
+    total = 182
+    for pct in range(5, 36, 4):
+        add(_now_playing_base(elapsed=int(total * pct / 100)).img, hold=1, ms=150)
+    add(_now_playing_base(elapsed=int(total * 0.35)).img, hold=6)  # hold, then loop
+
     path = os.path.join(HERE, "demo.gif")
     frames[0].save(path, save_all=True, append_images=frames[1:], loop=0,
                    duration=durations, optimize=True, disposal=2)
-    return path
+    return path, len(frames), sum(durations)
 
 
 def main():
@@ -688,9 +735,12 @@ def main():
     outputs.append(save_png(screen_volume(), "volume.png"))
     outputs.append(save_png(screen_lock(), "lock.png"))
     outputs.append(save_png(screen_locked(), "locked.png"))
-    outputs.append(build_gif())
+    gif_path, nframes, total_ms = build_walkthrough_gif()
+    outputs.append(gif_path)
     for p in outputs:
         print("wrote", p, os.path.getsize(p), "bytes")
+    print("demo.gif: %d frames, %dx%d, %.1fs loop" %
+          (nframes, W * GIF_SCALE, H * GIF_SCALE, total_ms / 1000.0))
 
 
 if __name__ == "__main__":
