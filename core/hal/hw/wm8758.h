@@ -4,10 +4,14 @@
  * The WM8758B is reached over the SoC I2C controller (see
  * core/hal/hw/i2c.h and core/docs/hw/09-i2c.md), NOT via MMIO — so this
  * header carries no memory addresses, only 7-bit register numbers and
- * 9-bit data bit values. Every value is transcribed from
- * core/docs/hw/05-audio.md, "Numeric register reference" (the only
- * permitted source), which resolves the Rockbox/Wolfson mnemonics to
- * concrete numbers.
+ * 9-bit data bit values. The register map and bit fields below are the
+ * WM8758B datasheet's own — register numbers are the datasheet's R0..R61
+ * (R0 Software Reset, R1..R3 Power Management, R4 Audio Interface, R6/R7
+ * Clock/Sample control, R10..R12 DAC, R36..R39 PLL, R18..R22 EQ, R49..R57
+ * Output mixers/volumes, R61 Bias control), and the mnemonics are Wolfson's
+ * (VMIDSEL, BIASEN, POBCTRL, …). That datasheet is the primary source; the
+ * concrete init values are cross-referenced in core/docs/hw/05-audio.md,
+ * "Numeric register reference".
  *
  * Register data is 9 bits: several bits (the volume-update VU latches,
  * some enable bits, PLLK2 MSBs) live at bit 8 and ride the I2C framing's
