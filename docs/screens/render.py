@@ -505,12 +505,17 @@ def _now_playing_base(vol_overlay=None, elapsed=73, total=182):
 
 
 def draw_speaker(sc, sx, sy, c, vol):
-    sc.fill_round_rect(sx - 8, sy - 3, 4, 6, 1, c)
-    for dx in range(5):
+    sc.fill_round_rect(sx - 8, sy - 3, 4, 6, 1, c)          # cabinet
+    for dx in range(5):                                     # cone, opening right
         half = 2 + dx
         sc.fill_rect(sx - 4 + dx, sy - half, 1, 2 * half, c)
+    if vol <= 0:                                            # muted: an X (firmware)
+        for i in range(6):
+            sc.fill_rect(sx + 3 + i, sy - 3 + i, 2, 1, c)   # '\'
+            sc.fill_rect(sx + 3 + i, sy + 2 - i, 2, 1, c)   # '/'
+        return
 
-    def arc(R, span):
+    def arc(R, span):                                       # skinny 1px crescents
         for dy in range(-span, span + 1):
             dxx = sc._isqrt(R * R - dy * dy)
             sc.fill_rect(sx + dxx, sy + dy, 1, 1, c)
@@ -797,7 +802,7 @@ def gif_volume():
     # values chosen to sit around the wave thresholds (5 / 40 / 72) for clarity
     ups = [0, 4, 10, 20, 30, 41, 50, 60, 73, 82, 92, 100]
     spec = []
-    spec.append((frame(0), 4, 160))           # mute: speaker shows the X
+    spec.append((frame(0), 6, 150))           # MUTE: speaker shows the X (held)
     for v in ups[1:]:
         hold = 3 if v in (41, 73) else 2      # linger as waves 2 & 3 pop in
         spec.append((frame(v), hold, 130))
@@ -805,7 +810,7 @@ def gif_volume():
     # coarser down-ramp keeps the file small (the 120px photo is the cost)
     for v in (82, 60, 41, 20, 4):
         spec.append((frame(v), 2, 120))
-    spec.append((frame(0), 3, 160))
+    spec.append((frame(0), 6, 150))           # back to MUTE: X clearly held again
     return _save_gif("volume.gif", spec, colors=64)
 
 
