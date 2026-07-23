@@ -8,10 +8,12 @@
  * The iPod Video 5G/5.5G backlight is NOT a PWM peripheral and does NOT
  * live on the BCM video coprocessor. It is an external multi-level
  * LED-driver IC (an "S-wire"/charge-pump style dimmer) driven by three
- * plain PP5022 GPIO lines (02-lcd.md, "Backlight"; facts extracted
- * cleanroom from Rockbox firmware/target/arm/ipod/backlight-nano_video.c
- * + firmware/export/pp5020.h, 2026-07-21 — the shared Nano-1G/Video-5G
- * backlight target, so it is the definitive source for exactly our SoC):
+ * plain PP5022 GPIO lines (02-lcd.md, "Backlight"). The hardware facts
+ * below — the GPIO lines, the pulse protocol, the 32-level count — were
+ * cross-referenced against Rockbox firmware/target/arm/ipod/
+ * backlight-nano_video.c + firmware/export/pp5020.h (2026-07-21; the
+ * shared Nano-1G/Video-5G backlight target, i.e. exactly our SoC). Only
+ * those facts were taken — no code body is copied; the driver is our own:
  *
  *   GPIOB bit 3 (0x08)  circuit power   — powers the boost/charge pump
  *   GPIOD bit 7 (0x80)  step/clock line — pulses walk the level up/down

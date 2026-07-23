@@ -1,10 +1,15 @@
-# core — cleanroom firmware for the iPod 5.5G
+# core — a modern music player for the iPod 5.5G
 
 `core` is a **from-scratch, Apache-2.0 firmware** for the 5th-generation
 iPod ("iPod Video", PortalPlayer PP5022). It boots on real hardware,
 reads music off the iPod's own disk, and plays it back through a custom
-Nunito/Linen interface. It **replaces Rockbox entirely** — it is not a
-Rockbox theme, patch, or plugin, and contains no copied Rockbox code.
+Nunito/Linen interface.
+
+It's **a different take on the iPod, not a replacement for another
+firmware.** Where [Rockbox](https://www.rockbox.org/) is the do-everything
+option, `core` aims at one thing: a clean, modern player experience on the
+original hardware. It's independent firmware in its own right — not a
+Rockbox theme, patch, or plugin, and it contains no copied Rockbox code.
 
 > ### ▶ This runs on a real iPod. Not an emulator, not a simulator.
 > It boots and plays on **actual 2006 Apple hardware** — a physical iPod

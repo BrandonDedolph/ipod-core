@@ -1,8 +1,9 @@
 # core — firmware (device + host build)
 
 The bare-metal firmware for the iPod 5.5G and its host test build. From
-scratch, Apache-2.0, no RTOS and no libc on the device — it **replaces
-Rockbox** rather than theming it. See [`../README.md`](../README.md) for the
+scratch, Apache-2.0, no RTOS and no libc on the device — an independent,
+modern player experience on the original hardware (not a Rockbox theme or
+plugin; no copied Rockbox code). See [`../README.md`](../README.md) for the
 project overview and [`../PLAN.md`](../PLAN.md) for the phased roadmap.
 
 ## Layout
