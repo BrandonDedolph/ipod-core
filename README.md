@@ -11,9 +11,24 @@ boot + memory remap → clock/PLL → timer/IRQ → LCD (BCM framebuffer
 present) → I²C/WM8758B/I²S first sound → DMA playback → ATA PIO reader →
 FAT32 → streaming FLAC/MP3 decode → audio out the headphone jack.
 
-![Album list](docs/screens/albums.png) ![Now Playing](docs/screens/nowplaying.png) ![About](docs/screens/about.png)
+<p align="center">
+  <img src="docs/screens/demo.gif" alt="core UI in motion" width="360">
+</p>
 
-<p align="center"><img src="docs/screens/demo.gif" alt="core UI in motion" width="320"></p>
+<table>
+  <tr>
+    <td><img src="docs/screens/nowplaying.png" width="320" alt="Now Playing"></td>
+    <td><img src="docs/screens/albums.png" width="320" alt="Album list"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screens/detail.png" width="320" alt="Album detail"></td>
+    <td><img src="docs/screens/genres.png" width="320" alt="Genres"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screens/about.png" width="320" alt="About"></td>
+    <td><img src="docs/screens/volume.png" width="320" alt="Volume overlay"></td>
+  </tr>
+</table>
 
 ---
 
