@@ -6,6 +6,14 @@ reads music off the iPod's own disk, and plays it back through a custom
 Nunito/Linen interface. It **replaces Rockbox entirely** — it is not a
 Rockbox theme, patch, or plugin, and shares no Rockbox code.
 
+> ### ▶ This runs on a real iPod. Not an emulator, not a simulator.
+> It boots and plays on **actual 2006 Apple hardware** — a physical iPod
+> 5.5G. Written from scratch in C and ARM assembly, flashed to the device,
+> coming up from a cold start and streaming music straight off the iPod's
+> own hard drive. Bare metal: no OS, no libc, nothing between this code and
+> the silicon. *(The screenshots and GIF below are faithful renders of the
+> on-device UI — the panel is hard to photograph cleanly.)*
+
 The whole bare-metal stack is proven end-to-end on an actual iPod 5.5G:
 boot + memory remap → clock/PLL → timer/IRQ → LCD (BCM framebuffer
 present) → I²C/WM8758B/I²S first sound → DMA playback → ATA PIO reader →
