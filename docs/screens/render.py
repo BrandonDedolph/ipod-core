@@ -391,15 +391,19 @@ def list_row(sc, y0, r, text, sub=None, right=None, chevron=False,
 # ---------------------------------------------------------------------------
 # Screens
 # ---------------------------------------------------------------------------
-ALBUMS = [
+# The firmware sorts the album list A->Z by ALBUM TITLE (the bold main line,
+# case-insensitive) — not by artist. Sort here so the render matches.
+ALBUMS = sorted([
     ("AUSTIN", "Post Malone", "austin"),
     ("Rearrange My World / There's a Field (That's Only Yours)", "Daniel Caesar", "rearrange"),
     ("F-1 Trillion", "Post Malone", "f1"),
     ("Hollywood's Bleeding", "Post Malone", "hollywood"),
     ("Malibu Nights", "LANY", "malibu"),
     ("Changes", "Justin Bieber", "changes"),
-]
-ALBUMS_SEL = 1
+], key=lambda a: a[0].lower())
+# keep the selection on the long-titled album (now sorts near the end) so it
+# still demonstrates truncation / the marquee.
+ALBUMS_SEL = next(i for i, a in enumerate(ALBUMS) if a[0].startswith("Rearrange"))
 
 def screen_albums(sel=ALBUMS_SEL, title_offset=0):
     sc = Screen()
@@ -590,8 +594,8 @@ def lock_plate(sc, locked):
     sc.text_centered_at(PY + 84, PX, PW, label, FONT_HEADER, fg)
 
 
-def _lock_screen(locked):
-    sc = _now_playing_base()
+def _lock_screen(locked, elapsed=73):
+    sc = _now_playing_base(elapsed=elapsed)
     # add a helper for centered-in-plate text
     def centered(baseline, x, w, s, font, ink):
         sc.text(x + (w - text_width(s, font)) // 2, baseline, s, font, ink)
@@ -706,30 +710,36 @@ def build_walkthrough_gif():
             frames.append(p)
             durations.append(ms)
 
-    # 1) MAIN MENU — bar starts on Music, browses down, settles back on Music.
-    add(screen_menu("Core", MAIN_MENU, 0, False), hold=3)   # Music
-    add(screen_menu("Core", MAIN_MENU, 1, False), hold=2)   # Playlists
-    add(screen_menu("Core", MAIN_MENU, 2, False), hold=3)   # Podcasts
-    add(screen_menu("Core", MAIN_MENU, 1, False), hold=2)   # back up
-    add(screen_menu("Core", MAIN_MENU, 0, False), hold=4)   # settle on Music
+    # 1) MAIN MENU — dwell only on ACTIVE rows; greyed rows (Playlists/Podcasts/
+    #    Audiobooks) are passed over quickly (1 frame), never selected.
+    add(screen_menu("Core", MAIN_MENU, 0, False), hold=4)   # Music (active)
+    for i in (1, 2, 3):                                      # pass greyed rows
+        add(screen_menu("Core", MAIN_MENU, i, False), hold=1)
+    add(screen_menu("Core", MAIN_MENU, 4, False), hold=3)   # Settings (active) — pause
+    for i in (3, 2, 1):                                      # pass back up
+        add(screen_menu("Core", MAIN_MENU, i, False), hold=1)
+    add(screen_menu("Core", MAIN_MENU, 0, False), hold=4)   # settle on Music -> enter
 
     # 2) MUSIC SUBMENU — step from Artists down to Albums.
     add(screen_menu("Music", MUSIC_MENU, 1, True), hold=3)  # Artists
     add(screen_menu("Music", MUSIC_MENU, 2, True), hold=4)  # Albums
 
-    # 3) ALBUMS LIST — bar steps down onto the long-titled album; marquee scrolls.
-    add(screen_albums(sel=0), hold=3)                       # AUSTIN
-    add(screen_albums(sel=1, title_offset=0), hold=3)       # long title (start)
+    # 3) ALBUMS LIST (sorted A->Z by title) — bar steps DOWN onto the long-titled
+    #    album, which now sorts near the end; the marquee then scrolls it.
+    LONG = ALBUMS_SEL
+    for s in range(0, LONG):                                # step down to the long one
+        add(screen_albums(sel=s), hold=2 if s else 3)
+    add(screen_albums(sel=LONG, title_offset=0), hold=3)    # long title (start)
     # marquee reveal
-    t = ALBUMS[1][0]
+    t = ALBUMS[LONG][0]
     tx = 12 + 28 + 8
     avail = (W - 16) - tx
     max_off = max(0, text_width(t, FONT_HEADER) - avail)
     o = 0
     while o < max_off:
         o = min(max_off, o + 6)
-        add(screen_albums(sel=1, title_offset=o), hold=1, ms=90)
-    add(screen_albums(sel=1, title_offset=max_off), hold=3)  # dwell on tail
+        add(screen_albums(sel=LONG, title_offset=o), hold=1, ms=90)
+    add(screen_albums(sel=LONG, title_offset=max_off), hold=3)  # dwell on tail
     add(screen_albums(sel=0), hold=3)                        # bar back to AUSTIN, select
 
     # 4) ALBUM DETAIL — step down a couple of tracks, settle on "Something Real".
@@ -738,11 +748,11 @@ def build_walkthrough_gif():
     add(screen_detail(sel=2), hold=3)                        # Chemical
     add(screen_detail(sel=1), hold=4)                        # settle -> select
 
-    # 5) NOW PLAYING — progress bar advances ~5% -> ~35%, times tick.
-    total = 182
-    for pct in range(5, 36, 4):
-        add(_now_playing_base(elapsed=int(total * pct / 100)).img, hold=1, ms=150)
-    add(_now_playing_base(elapsed=int(total * 0.35)).img, hold=6)  # hold, then loop
+    # 5) NOW PLAYING — the selected song starts; the clock ticks up one second at
+    #    a time (elapsed + -remaining = length each frame) and the bar creeps.
+    for e in range(0, 6):
+        add(_now_playing_base(elapsed=e).img, hold=2, ms=220)
+    add(_now_playing_base(elapsed=6).img, hold=5, ms=220)   # hold a beat, then loop
 
     path = os.path.join(HERE, "demo.gif")
     frames[0].save(path, save_all=True, append_images=frames[1:], loop=0,
@@ -770,67 +780,84 @@ def _save_gif(name, spec, colors=96):
     return path, n, sum(durations)
 
 
+# One consistent track across every Now Playing GIF: Something Real / Post Malone
+# / AUSTIN / TRACK 3 OF 12, battery 78, SHUF — all baked into _now_playing_base.
+NP_TOTAL = 182
+
+def _np(elapsed, vol=None, theme=None):
+    """A Now Playing frame at `elapsed` seconds (elapsed + -remaining = NP_TOTAL
+    every frame; the progress bar tracks elapsed). Optional volume overlay and
+    theme (Onyx). The clock is the single source of the elapsed/remaining/bar."""
+    fn = lambda: _now_playing_base(vol_overlay=vol, elapsed=elapsed,
+                                   total=NP_TOTAL).img
+    return with_palette(theme, fn) if theme else fn()
+
+
 def gif_browse():
-    """LIBRARY: selection bar steps down the album list; the long title marquees."""
+    """LIBRARY: album list (sorted A->Z by title). The selection bar steps DOWN
+    through the albums and lands on the long-titled one (which sorts near the
+    end); its title then marquees to reveal the tail. Loops."""
     spec = []
-    spec.append((screen_albums(sel=0), 3, 150))              # AUSTIN
-    # step onto the long title and reveal the tail
-    t = ALBUMS[1][0]
+    LONG = ALBUMS_SEL
+    for s in range(0, LONG):                                 # step down the list
+        spec.append((screen_albums(sel=s), 3 if s == 0 else 2, 150))
+    spec.append((screen_albums(sel=LONG, title_offset=0), 3, 150))  # land, truncated
+    # marquee: dwell (above), scroll once to reveal the tail, dwell, then reset
+    t = ALBUMS[LONG][0]
     tx = 12 + 28 + 8
     max_off = max(0, text_width(t, FONT_HEADER) - ((W - 16) - tx))
-    spec.append((screen_albums(sel=1, title_offset=0), 3, 150))
     o = 0
     while o < max_off:
         o = min(max_off, o + 6)
-        spec.append((screen_albums(sel=1, title_offset=o), 1, 90))
-    spec.append((screen_albums(sel=1, title_offset=max_off), 4, 150))  # dwell on tail
-    spec.append((screen_albums(sel=1, title_offset=0), 2, 130))        # snap back
-    spec.append((screen_albums(sel=2), 3, 150))              # F-1 Trillion
-    spec.append((screen_albums(sel=3), 4, 150))              # Hollywood's Bleeding
-    return _save_gif("browse.gif", spec)
+        spec.append((screen_albums(sel=LONG, title_offset=o), 1, 90))
+    spec.append((screen_albums(sel=LONG, title_offset=max_off), 4, 150))  # dwell tail
+    spec.append((screen_albums(sel=LONG, title_offset=0), 3, 150))        # reset -> loop
+    return _save_gif("browse.gif", spec, colors=80)
 
 
 def gif_volume():
-    """VOLUME: overlay volume 0 -> 100 -> 0; wave crescents grow, fill + % count."""
-    base = _now_playing_base().img            # render the heavy base once
-    def frame(v):
-        sc = Screen()
-        sc.img = base.copy()
-        sc.px = sc.img.load()
-        volume_overlay(sc, v)
-        return sc.img
-    # values chosen to sit around the wave thresholds (5 / 40 / 72) for clarity
+    """VOLUME: the overlay ramps volume 0 -> 100 -> 0 ON TOP of a track that keeps
+    playing — the clock ticks up and the progress bar creeps the whole time. The
+    speaker shows the mute X at 0; wave crescents grow at >5 / >40 / >72; the fill
+    bar and the percent match the volume."""
     ups = [0, 4, 10, 20, 30, 41, 50, 60, 73, 82, 92, 100]
+    e0, clock_ms = 73, 0
     spec = []
-    spec.append((frame(0), 6, 150))           # MUTE: speaker shows the X (held)
+    def push(vol, hold, ms):
+        nonlocal clock_ms
+        elapsed = e0 + clock_ms // 1000           # playback advances with GIF time
+        spec.append((_np(elapsed, vol=vol), hold, ms))
+        clock_ms += hold * ms
+    push(0, 6, 150)                               # MUTE: speaker X (held)
     for v in ups[1:]:
-        hold = 3 if v in (41, 73) else 2      # linger as waves 2 & 3 pop in
-        spec.append((frame(v), hold, 130))
-    spec.append((frame(100), 4, 160))         # all three waves, full
-    # coarser down-ramp keeps the file small (the 120px photo is the cost)
-    for v in (82, 60, 41, 20, 4):
-        spec.append((frame(v), 2, 120))
-    spec.append((frame(0), 6, 150))           # back to MUTE: X clearly held again
+        push(v, 3 if v in (41, 73) else 2, 130)   # linger as waves 2 & 3 pop in
+    push(100, 4, 160)                             # all three waves, full
+    for v in (82, 60, 41, 20, 4):                 # coarser down-ramp (size)
+        push(v, 2, 120)
+    push(0, 5, 150)                               # back to MUTE
     return _save_gif("volume.gif", spec, colors=64)
 
 
 def gif_themes():
-    """DUAL THEME: cross-cut the same Now Playing between Linen and Onyx."""
-    linen = screen_nowplaying()
-    onyx = with_palette(ONYX, lambda: screen_nowplaying())
-    spec = [(linen, 6, 170), (onyx, 6, 170), (linen, 6, 170), (onyx, 6, 170)]
+    """DUAL THEME: cross-cut the SAME playing track between Linen and Onyx. The
+    track keeps playing across the cuts, so the clock ticks up at each flip."""
+    spec = []
+    e = 73
+    for theme in (None, ONYX, None, ONYX):        # Linen / Onyx / Linen / Onyx
+        spec.append((_np(e, theme=theme), 6, 170))
+        e += 1                                    # ~1s hold -> +1s playback
     return _save_gif("themes.gif", spec)
 
 
 def gif_lock():
-    """LOCK: Now Playing -> LOCKED modal -> UNLOCKED modal -> back."""
-    base = _now_playing_base().img
-    spec = [
-        (base, 3, 160),
-        (_lock_screen(True), 5, 170),         # padlock closed, "LOCKED"
-        (_lock_screen(False), 5, 170),        # padlock open, "UNLOCKED"
-        (base, 3, 160),
-    ]
+    """LOCK: Now Playing -> LOCKED modal -> UNLOCKED modal -> back. Playback keeps
+    running behind the Hold modal, so the clock ticks up throughout."""
+    e = 73
+    spec = []
+    spec.append((_np(e), 3, 160)); e += 1
+    spec.append((_lock_screen(True, elapsed=e), 5, 170)); e += 1    # closed, LOCKED
+    spec.append((_lock_screen(False, elapsed=e), 5, 170)); e += 1   # open, UNLOCKED
+    spec.append((_np(e), 3, 160))
     return _save_gif("lock.gif", spec)
 
 
@@ -866,13 +893,14 @@ def screen_music():
     return screen_menu("Music", MUSIC_MENU, 2, back=True)   # Albums selected
 
 
-ARTISTS = [
+# Firmware sorts Artists A->Z by ARTIST NAME (case-insensitive).
+ARTISTS = sorted([
     ("Post Malone", 6), ("Justin Bieber", 5), ("The Kid LAROI", 5),
     ("Daniel Caesar", 4), ("LANY", 3), ("Morgan Wallen", 3),
     ("Juice WRLD", 2), ("Rex Orange County", 2), ("Steely Dan", 2),
     ("XXXTENTACION", 2),
-]
-ARTISTS_SEL = 3
+], key=lambda a: a[0].lower())
+ARTISTS_SEL = next(i for i, a in enumerate(ARTISTS) if a[0] == "LANY")
 
 def screen_artists():
     sc = Screen()
@@ -887,15 +915,17 @@ def screen_artists():
     return sc.img
 
 
-SONGS = [
+# Firmware sorts Songs A->Z by SONG TITLE (case-insensitive).
+SONGS = sorted([
     ("Something Real", "Post Malone", "3:02"),
     ("Sunflower", "Post Malone", "2:38"),
     ("Ghost", "Justin Bieber", "2:33"),
     ("STAY", "The Kid LAROI", "2:21"),
     ("Rearrange My World / There's a Field (That's Only Yours)", "Daniel Caesar", "5:16"),
     ("Malibu Nights", "LANY", "3:48"),
-]
-SONGS_SEL = 4
+], key=lambda s: s[0].lower())
+# keep the long-titled song selected (demonstrates truncation)
+SONGS_SEL = next(i for i, s in enumerate(SONGS) if s[0].startswith("Rearrange"))
 
 def screen_songs():
     sc = Screen()
