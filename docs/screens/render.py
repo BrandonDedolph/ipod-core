@@ -473,14 +473,17 @@ def screen_detail(sel=DETAIL_SEL):
     return sc.img
 
 
-def _now_playing_base(vol_overlay=None, elapsed=73, total=182):
+def _now_playing_base(vol_overlay=None, elapsed=73, total=182, locked=False):
     sc = Screen()
     # top status row
     sc.text(12, 15, "Now Playing", bold_11, INK)
     bx = W - 12 - 19
     draw_battery(sc, bx, 3, 78)
-    # shuffle token
-    sc.text_right(bx - 6, 13, "SHUF", FONT_SMALL, MUTED2)
+    # Persistent Hold padlock in the strip while locked (main.c: drawn just left
+    # of the battery at bx-14). The shuffle token shifts left to clear it.
+    if locked:
+        draw_lock_glyph(sc, bx - 14, 3, INK)
+    sc.text_right(bx - (18 if locked else 6), 13, "SHUF", FONT_SMALL, MUTED2)
     # art 120x120 at (16,44)
     sc.blit_art(16, 44, 120, "austin")
     mx = 16 + 120 + 14
@@ -594,8 +597,9 @@ def lock_plate(sc, locked):
     sc.text_centered_at(PY + 84, PX, PW, label, FONT_HEADER, fg)
 
 
-def _lock_screen(locked, elapsed=73):
-    sc = _now_playing_base(elapsed=elapsed)
+def _lock_screen(locked, elapsed=73, glyph=False):
+    # `glyph` draws the persistent Hold padlock in the status strip (engaged).
+    sc = _now_playing_base(elapsed=elapsed, locked=glyph)
     # add a helper for centered-in-plate text
     def centered(baseline, x, w, s, font, ink):
         sc.text(x + (w - text_width(s, font)) // 2, baseline, s, font, ink)
@@ -784,12 +788,12 @@ def _save_gif(name, spec, colors=96):
 # / AUSTIN / TRACK 3 OF 12, battery 78, SHUF — all baked into _now_playing_base.
 NP_TOTAL = 182
 
-def _np(elapsed, vol=None, theme=None):
+def _np(elapsed, vol=None, theme=None, locked=False):
     """A Now Playing frame at `elapsed` seconds (elapsed + -remaining = NP_TOTAL
-    every frame; the progress bar tracks elapsed). Optional volume overlay and
-    theme (Onyx). The clock is the single source of the elapsed/remaining/bar."""
+    every frame; the progress bar tracks elapsed). Optional volume overlay, theme
+    (Onyx), and the persistent Hold padlock in the status strip (`locked`)."""
     fn = lambda: _now_playing_base(vol_overlay=vol, elapsed=elapsed,
-                                   total=NP_TOTAL).img
+                                   total=NP_TOTAL, locked=locked).img
     return with_palette(theme, fn) if theme else fn()
 
 
@@ -850,13 +854,19 @@ def gif_themes():
 
 
 def gif_lock():
-    """LOCK: Now Playing -> LOCKED modal -> UNLOCKED modal -> back. Playback keeps
-    running behind the Hold modal, so the clock ticks up throughout."""
+    """LOCK: Now Playing (no lock) -> LOCKED modal -> the screen WHILE locked with
+    the persistent padlock in the status strip -> UNLOCKED modal -> back to Now
+    Playing (glyph gone). Playback keeps running, so the clock ticks up throughout
+    and the padlock stays in the strip the whole time Hold is engaged."""
     e = 73
     spec = []
     spec.append((_np(e), 3, 160)); e += 1
-    spec.append((_lock_screen(True, elapsed=e), 5, 170)); e += 1    # closed, LOCKED
-    spec.append((_lock_screen(False, elapsed=e), 5, 170)); e += 1   # open, UNLOCKED
+    # Hold engaged: modal flashes, and the strip padlock appears (glyph=True).
+    spec.append((_lock_screen(True, elapsed=e, glyph=True), 5, 170)); e += 1
+    # Modal dismissed but still locked: the small padlock persists top-right.
+    spec.append((_np(e, locked=True), 5, 170)); e += 1
+    # Hold disengaged: UNLOCKED modal, and the strip padlock is gone (glyph=False).
+    spec.append((_lock_screen(False, elapsed=e, glyph=False), 5, 170)); e += 1
     spec.append((_np(e), 3, 160))
     return _save_gif("lock.gif", spec)
 
