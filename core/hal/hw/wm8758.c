@@ -4,9 +4,12 @@
  * I2S playback.
  *
  * Reaches the codec over the SoC I2C controller (i2c.c). Register/bit
- * numbers come from core/hal/hw/wm8758.h, which transcribes
- * core/docs/hw/05-audio.md. The init order is the codec's power-up
- * requirement (bias/VMID before rails, route DAC last, unmute last) —
+ * numbers are the WM8758B datasheet's own register map (see wm8758.h).
+ * The init order follows the datasheet's power-up requirements — the
+ * "Recommended Power Up Sequence" (bias/VMID and POBCTRL pop-suppression
+ * before the output rails, VMID 10K fast-charge then 500K hold), I2S
+ * interface + PLL for 44.1 kHz, DAC routed to the mixers, then outputs
+ * un-muted last with the zero-cross + volume-update latches. It is
  * expressed here as a data table so the exact bus grammar is easy to
  * assert in the trace tests.
  *

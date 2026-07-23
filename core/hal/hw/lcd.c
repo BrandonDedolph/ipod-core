@@ -324,11 +324,15 @@ void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h)
         return;
     }
 
-    /* Even alignment: grow width to absorb an odd x (rounding x down
-     * adds a left column) and round the span up, then drop x to even.
-     * LCD_WIDTH is even and x is now even, so the re-clamp keeps w even. */
-    w = (w + (x & 1) + 1) & ~1;
-    x &= ~1;
+    /* Even alignment (BCM streams two pixels per 32-bit store): snap the
+     * left edge down to an even column and the right edge up to an even
+     * column, then take the width between them — so the aligned window
+     * still fully covers the requested [x, x+w). Both endpoints even ->
+     * width even. */
+    int left  = x & ~1;                     /* floor x to even            */
+    int right = (x + w + 1) & ~1;           /* ceil (x+w) to even         */
+    x = left;
+    w = right - left;
     if (x + w > LCD_WIDTH) { w = LCD_WIDTH - x; }
     if (w <= 0 || h <= 0) {
         return;
