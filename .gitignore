@@ -15,3 +15,11 @@ tools/.venv/
 
 .claude/
 build/
+
+# Dev scratch notes and one-off audits (not part of the shipped repo)
+scratchpad/
+__pycache__/
+*.pyc
+
+# Extracted album covers used to render screenshots (regenerable via ffmpeg)
+docs/screens/art/

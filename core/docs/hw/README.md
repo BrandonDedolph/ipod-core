@@ -2,9 +2,13 @@
 
 A consolidated hardware reference for the iPod Video 5G and 5.5G,
 written for someone who needs to drive every register and replicate
-every sequence from scratch. Reverse-engineered from the Rockbox source
-tree at the time of writing, plus the iPodLinux wiki and the leaked
-PortalPlayer documentation; cross-referenced where possible.
+every sequence from scratch. Compiled from public hardware
+documentation — the PortalPlayer PP502x datasheets, the Wolfson WM8758
+datasheet, the FAT32 spec, and the iPodLinux wiki — and cross-referenced
+against community projects for **hardware facts only** (register
+addresses, bit fields, init sequences), never their source code. This
+keeps the reference and the firmware built on it cleanroom and
+Apache-2.0.
 
 > **Status:** Phase 0 deliverable. This document stands on its own —
 > even if no firmware is ever built on top of it, the iPod 5G modding

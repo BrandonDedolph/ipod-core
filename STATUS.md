@@ -1,27 +1,36 @@
 # Status — picking up where we left off
 
-Last working session ended **2026-07-18** on `phase1/audio-first-sound`
-(the live branch — **check out this branch, not `main`**; all of Phase 1
-is stacked here unmerged, and `main` is 30 commits behind). The README is
-the canonical public story; this doc is the running list of what works,
-what doesn't, and what to pick up next.
+The README is the canonical public story; this doc is the running list of
+what works, what doesn't, and what to pick up next.
 
-## Where we are right now (2026-07-18)
+## Where we are right now (2026-07-22)
 
-**Phase 1 HAL bring-up is real music on real hardware.** The whole
-bare-metal stack is proven end to end on an actual iPod 5.5G 80GB: boot
-+ MMAP0 remap → clock/PLL (30 MHz, PLL lock confirmed) → timer/IRQ →
-LCD (BCM present) → I²C/WM8758/I²S first sound → DMA continuous playback
-→ ATA PIO reader → FAT32 read → WAV parse → **a 20 s WAV clip off the
-iPod's own disk played through the headphones.** On-screen console
-(framebuffer hex readout) is the cable-free debug channel — there is NO
-serial cable (user ruled it out; don't re-suggest — confirm hw state on
+**A full music player on real hardware.** The whole bare-metal stack is
+proven end to end on an actual iPod 5.5G 80GB — boot + MMAP0 remap →
+clock/PLL → timer/IRQ → LCD (BCM present) → I²C/WM8758/I²S → DMA →
+ATA PIO → FAT32 — and on top of it a real player: **streaming FLAC/MP3
+off the iPod's own disk** (read-ahead ring, not preload, so full-length
+tracks play), a host-built library index (`CORELIB.IDX`) for instant
+Songs / Albums / Artists / Genres, and the full Linen/Onyx UI —
+album-art chips, 120×120 now-playing cover, scrolling marquee, settings,
+volume/lock overlays, battery gauge. On-screen framebuffer console is the
+cable-free debug channel; there is NO serial cable (confirm hw state on
 screen instead).
 
-**The next concrete build:** playback currently *preloads the whole file
-to a 4 MB RAM buffer*, so it's a clip, not a full song. The next PR is
-the **streaming ring buffer + pump** (read disk while playing) so a
-full-length track plays. See PR #8 notes below and `PLAN.md`.
+Recent work: full UTF-8 name support (atlas Latin-1 + smart punctuation,
+FAT LFN → UTF-8, UTF-8 index fields); a normalized-name **hash locator**
+that binds index records to files independent of quote/case style;
+library reconcile (MC master ↔ device, 911 songs / 94 albums); a genre
+rework (per-artist clean genres); taller two-line list rows with bigger
+28 px album-art chips; anti-aliased modal/progress corners; a larger
+low-battery-red gauge; and the skinny-wave volume icon.
+
+**Dev-environment note:** the clean flash environment is **native Linux**
+(the iPod is a real `/dev/sdX`, so `ipodpatcher` writes the firmware
+partition and data copies persist). The WSL path used in recent sessions
+copies over Windows interop (`/mnt` writes don't persist — must go
+Windows-native + `Write-VolumeCache`), and the device drops out of disk
+mode frequently, so flashing retries until `D:` reappears.
 
 **Working on the hardware (dev-environment note):** the clean flash
 environment is **native Linux** (e.g. an Arch/Omarchy box), NOT WSL — on
