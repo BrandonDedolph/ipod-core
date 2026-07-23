@@ -11,7 +11,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$REPO/tools/.venv/bin/python3"
 GEN="$REPO/tools/atlas_gen.py"
 SRC="$REPO/tools/fonts-src"
-OUT="$REPO/core/apps/ui/atlas"
+OUT="$REPO/core/ui/atlas"
 
 if [[ ! -x "$PY" ]]; then
     echo "ERROR: $PY missing. Set up the venv:" >&2

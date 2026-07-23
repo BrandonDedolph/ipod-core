@@ -10,7 +10,7 @@ pass.
 
 Two sidecar sizes ship per album:
     folder.art  — full-size cover (default 120x120), now-playing screen
-    folder.thm  — small thumbnail (default  24x24), list chip / album-detail
+    folder.thm  — small thumbnail (default  28x28), list chip / album-detail
 
 Both use the SAME CoreArt container; only the width/height differ.
 
@@ -36,7 +36,7 @@ MAGIC = b"CART"
 VERSION = 1
 
 ART_SIZE_DEFAULT = 120
-THM_SIZE_DEFAULT = 24
+THM_SIZE_DEFAULT = 28   # matches firmware ARTCACHE_DIM: exact-size = no on-device resample
 
 
 def extract(flac_path, size):
