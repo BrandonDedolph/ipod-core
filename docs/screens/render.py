@@ -34,22 +34,32 @@ def rgb565(v):
     b = v & 0x1F
     return (round(r * 255 / 31), round(g * 255 / 63), round(b * 255 / 31))
 
-SURFACE = rgb565(0xF79D)
-INK     = rgb565(0x18A2)
-MUTED   = rgb565(0x7B8D)
-MUTED2  = rgb565(0x9C70)
-MUTED_D = rgb565(0x5A89)
-ACCENT  = rgb565(0xC348)   # terracotta
-BORDER  = rgb565(0xE71B)
-PLATE   = rgb565(0xF7BE)
-TRK     = rgb565(0xDEDA)
-SB_TRK  = rgb565(0xE73C)
-SB_THMB = rgb565(0xAD34)
-SEL_SUB = rgb565(0xB595)
-BATT_RED = rgb565(0xE125)
+BATT_RED = rgb565(0xE125)   # low-battery warning, theme-independent
 
-SEL_BG = INK        # selection bar fill
-SEL_FG = SURFACE    # text on selection bar
+# Two themes, both RGB565. SEL_BG/SEL_FG derive from INK/SURFACE so the inverted
+# selection bar reads right in both (Linen: dark bar/light text; Onyx: the
+# reverse). apply_palette() rebinds the module globals the screen builders read.
+LINEN = dict(
+    SURFACE=0xF79D, INK=0x18A2, MUTED=0x7B8D, MUTED2=0x9C70, MUTED_D=0x5A89,
+    ACCENT=0xC348, BORDER=0xE71B, PLATE=0xF7BE, TRK=0xDEDA, SB_TRK=0xE73C,
+    SB_THMB=0xAD34, SEL_SUB=0xB595, CHEVRON=0xC638, SEL_TRK=0x4A69,
+)
+ONYX = dict(
+    SURFACE=0x18C2, INK=0xEF3C, MUTED=0xACF2, MUTED2=0xB533, MUTED_D=0x8C0E,
+    ACCENT=0xC348, BORDER=0x3185, PLATE=0x2944, TRK=0x39A5, SB_TRK=0x2924,
+    SB_THMB=0x6B0B, SEL_SUB=0x5A89, CHEVRON=0x4A27, SEL_TRK=0x8410,
+)
+_PAL_KEYS = list(LINEN.keys()) + ["SEL_BG", "SEL_FG"]
+
+def apply_palette(spec):
+    g = globals()
+    for k, v in spec.items():
+        g[k] = rgb565(v)
+    g["SEL_BG"] = g["INK"]        # selection bar fill
+    g["SEL_FG"] = g["SURFACE"]    # text on selection bar
+
+# default active theme = Linen (the stills are Linen)
+apply_palette(LINEN)
 
 # ---------------------------------------------------------------------------
 # Gamma-correct text blend
@@ -100,7 +110,11 @@ def text_width(s, font):
 # Surface / primitives
 # ---------------------------------------------------------------------------
 class Screen:
-    def __init__(self, bg=SURFACE):
+    def __init__(self, bg=None):
+        # resolve the surface at call time so the active palette wins (a default
+        # arg would freeze the Linen surface captured at def time)
+        if bg is None:
+            bg = SURFACE
         self.img = Image.new("RGB", (W, H), bg)
         self.px = self.img.load()
 
@@ -319,7 +333,7 @@ def scrollbar(sc, y0, top, visible, total):
 # ---------------------------------------------------------------------------
 def list_row(sc, y0, r, text, sub=None, right=None, chevron=False,
              selected=False, greyed=False, chip=None, rh=ROW_H,
-             title_offset=0):
+             title_offset=0, title_priority=False):
     ry = y0 + r * rh
     rowmid = ry + rh // 2 + 3
     if selected:
@@ -327,7 +341,7 @@ def list_row(sc, y0, r, text, sub=None, right=None, chevron=False,
         fg, subc, rightc, chevc = SEL_FG, SEL_SUB, SEL_SUB, SEL_SUB
     else:
         fg = MUTED if greyed else INK
-        subc, rightc, chevc = MUTED2, MUTED_D, MUTED2
+        subc, rightc, chevc = MUTED2, MUTED_D, CHEVRON
 
     tx = 14
     if chip:
@@ -349,7 +363,13 @@ def list_row(sc, y0, r, text, sub=None, right=None, chevron=False,
     show_right = bool(right)
     if right:
         reserved = W - 16 - text_width(right, bold_11) - 6
-        title_right = reserved
+        # title_priority: a long title spans the full width (over the value) and
+        # the value drops, so it truncates/marquees at the row edge (main.c).
+        if title_priority and text_width(text, tf) > reserved - tx:
+            title_right = W - 16
+            show_right = False
+        else:
+            title_right = reserved
     elif chevron:
         title_right = W - 18 - 4
     else:
@@ -371,15 +391,19 @@ def list_row(sc, y0, r, text, sub=None, right=None, chevron=False,
 # ---------------------------------------------------------------------------
 # Screens
 # ---------------------------------------------------------------------------
-ALBUMS = [
+# The firmware sorts the album list A->Z by ALBUM TITLE (the bold main line,
+# case-insensitive) — not by artist. Sort here so the render matches.
+ALBUMS = sorted([
     ("AUSTIN", "Post Malone", "austin"),
     ("Rearrange My World / There's a Field (That's Only Yours)", "Daniel Caesar", "rearrange"),
     ("F-1 Trillion", "Post Malone", "f1"),
     ("Hollywood's Bleeding", "Post Malone", "hollywood"),
     ("Malibu Nights", "LANY", "malibu"),
     ("Changes", "Justin Bieber", "changes"),
-]
-ALBUMS_SEL = 1
+], key=lambda a: a[0].lower())
+# keep the selection on the long-titled album (now sorts near the end) so it
+# still demonstrates truncation / the marquee.
+ALBUMS_SEL = next(i for i, a in enumerate(ALBUMS) if a[0].startswith("Rearrange"))
 
 def screen_albums(sel=ALBUMS_SEL, title_offset=0):
     sc = Screen()
@@ -485,12 +509,17 @@ def _now_playing_base(vol_overlay=None, elapsed=73, total=182):
 
 
 def draw_speaker(sc, sx, sy, c, vol):
-    sc.fill_round_rect(sx - 8, sy - 3, 4, 6, 1, c)
-    for dx in range(5):
+    sc.fill_round_rect(sx - 8, sy - 3, 4, 6, 1, c)          # cabinet
+    for dx in range(5):                                     # cone, opening right
         half = 2 + dx
         sc.fill_rect(sx - 4 + dx, sy - half, 1, 2 * half, c)
+    if vol <= 0:                                            # muted: an X (firmware)
+        for i in range(6):
+            sc.fill_rect(sx + 3 + i, sy - 3 + i, 2, 1, c)   # '\'
+            sc.fill_rect(sx + 3 + i, sy + 2 - i, 2, 1, c)   # '/'
+        return
 
-    def arc(R, span):
+    def arc(R, span):                                       # skinny 1px crescents
         for dy in range(-span, span + 1):
             dxx = sc._isqrt(R * R - dy * dy)
             sc.fill_rect(sx + dxx, sy + dy, 1, 1, c)
@@ -565,8 +594,8 @@ def lock_plate(sc, locked):
     sc.text_centered_at(PY + 84, PX, PW, label, FONT_HEADER, fg)
 
 
-def _lock_screen(locked):
-    sc = _now_playing_base()
+def _lock_screen(locked, elapsed=73):
+    sc = _now_playing_base(elapsed=elapsed)
     # add a helper for centered-in-plate text
     def centered(baseline, x, w, s, font, ink):
         sc.text(x + (w - text_width(s, font)) // 2, baseline, s, font, ink)
@@ -681,30 +710,36 @@ def build_walkthrough_gif():
             frames.append(p)
             durations.append(ms)
 
-    # 1) MAIN MENU — bar starts on Music, browses down, settles back on Music.
-    add(screen_menu("Core", MAIN_MENU, 0, False), hold=3)   # Music
-    add(screen_menu("Core", MAIN_MENU, 1, False), hold=2)   # Playlists
-    add(screen_menu("Core", MAIN_MENU, 2, False), hold=3)   # Podcasts
-    add(screen_menu("Core", MAIN_MENU, 1, False), hold=2)   # back up
-    add(screen_menu("Core", MAIN_MENU, 0, False), hold=4)   # settle on Music
+    # 1) MAIN MENU — dwell only on ACTIVE rows; greyed rows (Playlists/Podcasts/
+    #    Audiobooks) are passed over quickly (1 frame), never selected.
+    add(screen_menu("Core", MAIN_MENU, 0, False), hold=4)   # Music (active)
+    for i in (1, 2, 3):                                      # pass greyed rows
+        add(screen_menu("Core", MAIN_MENU, i, False), hold=1)
+    add(screen_menu("Core", MAIN_MENU, 4, False), hold=3)   # Settings (active) — pause
+    for i in (3, 2, 1):                                      # pass back up
+        add(screen_menu("Core", MAIN_MENU, i, False), hold=1)
+    add(screen_menu("Core", MAIN_MENU, 0, False), hold=4)   # settle on Music -> enter
 
     # 2) MUSIC SUBMENU — step from Artists down to Albums.
     add(screen_menu("Music", MUSIC_MENU, 1, True), hold=3)  # Artists
     add(screen_menu("Music", MUSIC_MENU, 2, True), hold=4)  # Albums
 
-    # 3) ALBUMS LIST — bar steps down onto the long-titled album; marquee scrolls.
-    add(screen_albums(sel=0), hold=3)                       # AUSTIN
-    add(screen_albums(sel=1, title_offset=0), hold=3)       # long title (start)
+    # 3) ALBUMS LIST (sorted A->Z by title) — bar steps DOWN onto the long-titled
+    #    album, which now sorts near the end; the marquee then scrolls it.
+    LONG = ALBUMS_SEL
+    for s in range(0, LONG):                                # step down to the long one
+        add(screen_albums(sel=s), hold=2 if s else 3)
+    add(screen_albums(sel=LONG, title_offset=0), hold=3)    # long title (start)
     # marquee reveal
-    t = ALBUMS[1][0]
+    t = ALBUMS[LONG][0]
     tx = 12 + 28 + 8
     avail = (W - 16) - tx
     max_off = max(0, text_width(t, FONT_HEADER) - avail)
     o = 0
     while o < max_off:
         o = min(max_off, o + 6)
-        add(screen_albums(sel=1, title_offset=o), hold=1, ms=90)
-    add(screen_albums(sel=1, title_offset=max_off), hold=3)  # dwell on tail
+        add(screen_albums(sel=LONG, title_offset=o), hold=1, ms=90)
+    add(screen_albums(sel=LONG, title_offset=max_off), hold=3)  # dwell on tail
     add(screen_albums(sel=0), hold=3)                        # bar back to AUSTIN, select
 
     # 4) ALBUM DETAIL — step down a couple of tracks, settle on "Something Real".
@@ -713,16 +748,409 @@ def build_walkthrough_gif():
     add(screen_detail(sel=2), hold=3)                        # Chemical
     add(screen_detail(sel=1), hold=4)                        # settle -> select
 
-    # 5) NOW PLAYING — progress bar advances ~5% -> ~35%, times tick.
-    total = 182
-    for pct in range(5, 36, 4):
-        add(_now_playing_base(elapsed=int(total * pct / 100)).img, hold=1, ms=150)
-    add(_now_playing_base(elapsed=int(total * 0.35)).img, hold=6)  # hold, then loop
+    # 5) NOW PLAYING — the selected song starts; the clock ticks up one second at
+    #    a time (elapsed + -remaining = length each frame) and the bar creeps.
+    for e in range(0, 6):
+        add(_now_playing_base(elapsed=e).img, hold=2, ms=220)
+    add(_now_playing_base(elapsed=6).img, hold=5, ms=220)   # hold a beat, then loop
 
     path = os.path.join(HERE, "demo.gif")
     frames[0].save(path, save_all=True, append_images=frames[1:], loop=0,
                    duration=durations, optimize=True, disposal=2)
     return path, len(frames), sum(durations)
+
+
+# ---------------------------------------------------------------------------
+# Per-feature GIFs — short focused loops that pair with the still grids
+# ---------------------------------------------------------------------------
+def _save_gif(name, spec, colors=96):
+    """spec = list of (img, hold_frames, ms). Consecutive identical frames are
+    collapsed by the encoder, so holds are cheap."""
+    frames, durations = [], []
+    for img, hold, ms in spec:
+        p = upscale(img, GIF_SCALE).convert("P", palette=Image.ADAPTIVE, colors=colors)
+        for _ in range(hold):
+            frames.append(p)
+            durations.append(ms)
+    path = os.path.join(HERE, name)
+    frames[0].save(path, save_all=True, append_images=frames[1:], loop=0,
+                   duration=durations, optimize=True, disposal=2)
+    from PIL import Image as _I
+    n = _I.open(path).n_frames
+    return path, n, sum(durations)
+
+
+# One consistent track across every Now Playing GIF: Something Real / Post Malone
+# / AUSTIN / TRACK 3 OF 12, battery 78, SHUF — all baked into _now_playing_base.
+NP_TOTAL = 182
+
+def _np(elapsed, vol=None, theme=None):
+    """A Now Playing frame at `elapsed` seconds (elapsed + -remaining = NP_TOTAL
+    every frame; the progress bar tracks elapsed). Optional volume overlay and
+    theme (Onyx). The clock is the single source of the elapsed/remaining/bar."""
+    fn = lambda: _now_playing_base(vol_overlay=vol, elapsed=elapsed,
+                                   total=NP_TOTAL).img
+    return with_palette(theme, fn) if theme else fn()
+
+
+def gif_browse():
+    """LIBRARY: album list (sorted A->Z by title). The selection bar steps DOWN
+    through the albums and lands on the long-titled one (which sorts near the
+    end); its title then marquees to reveal the tail. Loops."""
+    spec = []
+    LONG = ALBUMS_SEL
+    for s in range(0, LONG):                                 # step down the list
+        spec.append((screen_albums(sel=s), 3 if s == 0 else 2, 150))
+    spec.append((screen_albums(sel=LONG, title_offset=0), 3, 150))  # land, truncated
+    # marquee: dwell (above), scroll once to reveal the tail, dwell, then reset
+    t = ALBUMS[LONG][0]
+    tx = 12 + 28 + 8
+    max_off = max(0, text_width(t, FONT_HEADER) - ((W - 16) - tx))
+    o = 0
+    while o < max_off:
+        o = min(max_off, o + 6)
+        spec.append((screen_albums(sel=LONG, title_offset=o), 1, 90))
+    spec.append((screen_albums(sel=LONG, title_offset=max_off), 4, 150))  # dwell tail
+    spec.append((screen_albums(sel=LONG, title_offset=0), 3, 150))        # reset -> loop
+    return _save_gif("browse.gif", spec, colors=80)
+
+
+def gif_volume():
+    """VOLUME: the overlay ramps volume 0 -> 100 -> 0 ON TOP of a track that keeps
+    playing — the clock ticks up and the progress bar creeps the whole time. The
+    speaker shows the mute X at 0; wave crescents grow at >5 / >40 / >72; the fill
+    bar and the percent match the volume."""
+    ups = [0, 4, 10, 20, 30, 41, 50, 60, 73, 82, 92, 100]
+    e0, clock_ms = 73, 0
+    spec = []
+    def push(vol, hold, ms):
+        nonlocal clock_ms
+        elapsed = e0 + clock_ms // 1000           # playback advances with GIF time
+        spec.append((_np(elapsed, vol=vol), hold, ms))
+        clock_ms += hold * ms
+    push(0, 6, 150)                               # MUTE: speaker X (held)
+    for v in ups[1:]:
+        push(v, 3 if v in (41, 73) else 2, 130)   # linger as waves 2 & 3 pop in
+    push(100, 4, 160)                             # all three waves, full
+    for v in (82, 60, 41, 20, 4):                 # coarser down-ramp (size)
+        push(v, 2, 120)
+    push(0, 5, 150)                               # back to MUTE
+    return _save_gif("volume.gif", spec, colors=64)
+
+
+def gif_themes():
+    """DUAL THEME: cross-cut the SAME playing track between Linen and Onyx. The
+    track keeps playing across the cuts, so the clock ticks up at each flip."""
+    spec = []
+    e = 73
+    for theme in (None, ONYX, None, ONYX):        # Linen / Onyx / Linen / Onyx
+        spec.append((_np(e, theme=theme), 6, 170))
+        e += 1                                    # ~1s hold -> +1s playback
+    return _save_gif("themes.gif", spec)
+
+
+def gif_lock():
+    """LOCK: Now Playing -> LOCKED modal -> UNLOCKED modal -> back. Playback keeps
+    running behind the Hold modal, so the clock ticks up throughout."""
+    e = 73
+    spec = []
+    spec.append((_np(e), 3, 160)); e += 1
+    spec.append((_lock_screen(True, elapsed=e), 5, 170)); e += 1    # closed, LOCKED
+    spec.append((_lock_screen(False, elapsed=e), 5, 170)); e += 1   # open, UNLOCKED
+    spec.append((_np(e), 3, 160))
+    return _save_gif("lock.gif", spec)
+
+
+def gif_settings():
+    """SETTINGS: the Sound screen's Volume slider ramps up then back down."""
+    def sound_vol(v):
+        rows = list(SOUND_ROWS)
+        rows[0] = ("Volume", "%d%%" % v, v, 100)
+        return screen_sound(rows=rows, sel_row=0)
+    vals = [20, 35, 50, 65, 80, 92]
+    spec = [(sound_vol(20), 3, 150)]
+    for v in vals[1:]:
+        spec.append((sound_vol(v), 2, 130))
+    spec.append((sound_vol(92), 3, 150))
+    for v in reversed(vals[:-1]):
+        spec.append((sound_vol(v), 2, 130))
+    spec.append((sound_vol(20), 3, 150))
+    return _save_gif("settings.gif", spec)
+
+
+# ---------------------------------------------------------------------------
+# Extra library / browsing screens
+# ---------------------------------------------------------------------------
+MAIN_MENU_FULL = [  # full menu, a track is loaded so "Now Playing" shows active
+    ("Music", True), ("Playlists", False), ("Podcasts", False),
+    ("Audiobooks", False), ("Settings", True), ("Now Playing", True),
+]
+
+def screen_mainmenu():
+    return screen_menu("Core", MAIN_MENU_FULL, 0, back=False)
+
+def screen_music():
+    return screen_menu("Music", MUSIC_MENU, 2, back=True)   # Albums selected
+
+
+# Firmware sorts Artists A->Z by ARTIST NAME (case-insensitive).
+ARTISTS = sorted([
+    ("Post Malone", 6), ("Justin Bieber", 5), ("The Kid LAROI", 5),
+    ("Daniel Caesar", 4), ("LANY", 3), ("Morgan Wallen", 3),
+    ("Juice WRLD", 2), ("Rex Orange County", 2), ("Steely Dan", 2),
+    ("XXXTENTACION", 2),
+], key=lambda a: a[0].lower())
+ARTISTS_SEL = next(i for i, a in enumerate(ARTISTS) if a[0] == "LANY")
+
+def screen_artists():
+    sc = Screen()
+    status_strip(sc, "CORE")
+    header(sc, "Artists", "%d / %d" % (ARTISTS_SEL + 1, len(ARTISTS)), back=True)
+    for r in range(LIST_ROWS):
+        if r >= len(ARTISTS):
+            break
+        name, cnt = ARTISTS[r]
+        list_row(sc, LIST_Y0, r, name, right=str(cnt), selected=(r == ARTISTS_SEL))
+    scrollbar(sc, LIST_Y0, 0, LIST_ROWS, len(ARTISTS))
+    return sc.img
+
+
+# Firmware sorts Songs A->Z by SONG TITLE (case-insensitive).
+SONGS = sorted([
+    ("Something Real", "Post Malone", "3:02"),
+    ("Sunflower", "Post Malone", "2:38"),
+    ("Ghost", "Justin Bieber", "2:33"),
+    ("STAY", "The Kid LAROI", "2:21"),
+    ("Rearrange My World / There's a Field (That's Only Yours)", "Daniel Caesar", "5:16"),
+    ("Malibu Nights", "LANY", "3:48"),
+], key=lambda s: s[0].lower())
+# keep the long-titled song selected (demonstrates truncation)
+SONGS_SEL = next(i for i, s in enumerate(SONGS) if s[0].startswith("Rearrange"))
+
+def screen_songs():
+    sc = Screen()
+    status_strip(sc, "CORE")
+    header(sc, "Songs", "%d / %d" % (SONGS_SEL + 1, len(SONGS)), back=True)
+    for r, (t, a, dur) in enumerate(SONGS):
+        list_row(sc, LIST_Y0, r, t, sub=a, right=dur, selected=(r == SONGS_SEL),
+                 rh=ROW_H2, title_priority=True)
+    scrollbar(sc, LIST_Y0, 0, LIST_ROWS2, len(SONGS))
+    return sc.img
+
+
+# ---------------------------------------------------------------------------
+# Settings sub-screens (no status strip — the header sits at the top band)
+# ---------------------------------------------------------------------------
+def _sel_bar(sc, y0, rowh, r):
+    sc.fill_round_rect(6, y0 + r * rowh + 1, W - 16, rowh - 2, 4, SEL_BG)
+
+ROOT_L = ["Playback", "Sound", "Theme", "Display", "Clicker", "About", "Reset Settings"]
+ROOT_SEL = 1   # Sound
+
+def screen_settings():
+    sc = Screen()
+    header(sc, "Settings", back=True)
+    right_vals = {2: "Linen", 4: "Tick"}   # Theme + Clicker carry their choice
+    for r, label in enumerate(ROOT_L):
+        ry = LIST_Y0 + r * ROW_H
+        sel = (r == ROOT_SEL)
+        if sel:
+            _sel_bar(sc, LIST_Y0, ROW_H, r)
+        fg = SEL_FG if sel else INK
+        rightc = SEL_SUB if sel else MUTED_D
+        chevc = SEL_SUB if sel else CHEVRON
+        sc.text(14, ry + 15, label, FONT_HEADER if sel else FONT_ROW, fg)
+        if r in right_vals:
+            sc.text_right(W - 16, ry + 15, right_vals[r], regular_11, rightc)
+        else:
+            sc.text(W - 18, ry + 15, RAQUO, FONT_ROW, chevc)
+    return sc.img
+
+
+SOUND_ROWS = [
+    # (label, value, num, den)
+    ("Volume", "72%", 72, 100),
+    ("Bass", "+3 dB", 3 + 12, 24),
+    ("Treble", "0 dB", 0 + 12, 24),
+    ("Balance", "Center", 0 + 100, 200),
+]
+SOUND_SEL = 1   # Bass (boosted)
+
+def screen_sound(rows=None, sel_row=SOUND_SEL):
+    rows = rows if rows is not None else SOUND_ROWS
+    sc = Screen()
+    header(sc, "Sound", back=True)
+    for r, (label, val, num, den) in enumerate(rows):
+        ry = LIST_Y0 + r * ROW_H
+        sel = (r == sel_row)
+        if sel:
+            _sel_bar(sc, LIST_Y0, ROW_H, r)
+        fg = SEL_FG if sel else INK
+        rightc = SEL_SUB if sel else MUTED_D
+        sc.text(14, ry + 11, label, FONT_HEADER if sel else FONT_ROW, fg)
+        sc.text_right(W - 16, ry + 11, val, regular_11, rightc)
+        # slider bar
+        bx, bw, by, bh = 14, W - 16 - 14, ry + 17, 3
+        sc.fill_rect(bx, by, bw, bh, SEL_TRK if sel else TRK)
+        fw = max(0, min(bw, bw * num // den))
+        sc.fill_rect(bx, by, fw, bh, SEL_FG if sel else INK)
+    return sc.img
+
+
+CLICK_L = ["Off", "Tick", "Click", "Pop", "Blip", "Tock", "Double", "Chirp"]
+CLICK_ACTIVE = 1   # Tick
+CLICK_SEL = 2      # Click
+
+def screen_clicker():
+    sc = Screen()
+    header(sc, "Clicker", back=True)
+    for r, label in enumerate(CLICK_L):
+        ry = LIST_Y0 + r * ROW_H
+        sel = (r == CLICK_SEL)
+        if sel:
+            _sel_bar(sc, LIST_Y0, ROW_H, r)
+        fg = SEL_FG if sel else INK
+        markc = SEL_SUB if sel else INK
+        sc.text(14, ry + 15, label, FONT_HEADER if sel else FONT_ROW, fg)
+        if r == CLICK_ACTIVE:
+            sc.text_right(W - 16, ry + 15, MIDDOT, bold_13, markc)  # marks active
+    return sc.img
+
+
+TH_ROW_H = 40
+TH_SWATCH = [0xF79D, 0x18C2]   # each theme's own surface tone
+TH_INK = [0x18A2, 0xEF3C]      # ink hint bar
+TH_NAME = ["Linen", "Onyx"]
+TH_SUB = ["Warm light - text-forward", "Warm dark - terracotta"]
+TH_CURRENT = 0                  # Linen active
+TH_SEL = 1                      # cursor on Onyx
+
+def screen_theme():
+    sc = Screen()
+    header(sc, "Theme", "2 themes", back=True)
+    for r in range(2):
+        ry = LIST_Y0 + r * TH_ROW_H
+        sel = (r == TH_SEL)
+        if sel:
+            _sel_bar(sc, LIST_Y0, TH_ROW_H, r)
+        sw, sx = 26, 14
+        sy = ry + (TH_ROW_H - sw) // 2
+        sc.fill_rect(sx - 1, sy - 1, sw + 2, sw + 2, SEL_SUB if sel else BORDER)
+        sc.fill_rect(sx, sy, sw, sw, rgb565(TH_SWATCH[r]))
+        sc.fill_rect(sx + 6, sy + 10, 14, 3, rgb565(TH_INK[r]))
+        tx = sx + sw + 10
+        fg = SEL_FG if sel else INK
+        subc = SEL_SUB if sel else MUTED
+        sc.text(tx, ry + 17, TH_NAME[r], FONT_HEADER, fg)
+        sc.text(tx, ry + 31, TH_SUB[r], FONT_SMALL, subc)
+        if r == TH_CURRENT:
+            sc.text_right(W - 14, ry + 20, "CURRENT", FONT_SMALL,
+                          SEL_FG if sel else MUTED2)
+    return sc.img
+
+
+# ---------------------------------------------------------------------------
+# Onyx (warm-dark) variants — same builders under the swapped palette
+# ---------------------------------------------------------------------------
+def with_palette(spec, fn):
+    apply_palette(spec)
+    try:
+        return fn()
+    finally:
+        apply_palette(LINEN)
+
+def screen_albums_onyx():
+    return with_palette(ONYX, lambda: screen_albums())
+
+def screen_nowplaying_onyx():
+    return with_palette(ONYX, lambda: screen_nowplaying())
+
+
+# ---------------------------------------------------------------------------
+# System screens: charging + boot splash
+# ---------------------------------------------------------------------------
+def _bolt(sc, cx, y0, bh, c):
+    """Lightning bolt polygon, scanline-filled (port of screen_charging.c)."""
+    pxb = [0, 0, 3, 3, 10, 6, 10]
+    pyb = [0, 11, 11, 20, 8, 8, 0]
+    N, box_w, box_h = 7, 10, 20
+    bw = (box_w * bh) // box_h
+    x0 = cx - bw // 2
+    sx = [x0 + (pxb[i] * bw) // box_w for i in range(N)]
+    sy = [y0 + (pyb[i] * bh) // box_h for i in range(N)]
+    for y in range(y0, y0 + bh):
+        xs = []
+        for i in range(N):
+            a, b = i, (i + 1) % N
+            ya, yb, xa, xb = sy[a], sy[b], sx[a], sx[b]
+            if ya == yb:
+                continue
+            if ya < yb:
+                ylo, yhi, xlo, xhi = ya, yb, xa, xb
+            else:
+                ylo, yhi, xlo, xhi = yb, ya, xb, xa
+            if y < ylo or y >= yhi:
+                continue
+            xs.append(xlo + (xhi - xlo) * (y - ylo) // (yhi - ylo))
+        xs.sort()
+        for k in range(0, len(xs) - 1, 2):
+            L, R = xs[k], xs[k + 1]
+            if R > L:
+                sc.fill_rect(L, y, R - L, 1, c)
+
+def screen_charging(pct=62, charging=True, external=True):
+    CHG_BG = rgb565(0x0861)
+    CHG_OUTLINE = rgb565(0x5A89)
+    CHG_FILL = rgb565(0xEF3B)
+    CHG_GREEN = rgb565(0x3E4D)
+    CHG_RED = rgb565(0xDA46)
+    CHG_TEXT = rgb565(0xEF3B)
+    CHG_UNIT = rgb565(0xACF2)
+    CHG_MUTED = rgb565(0x7B8D)
+    BW, BH = 150, 68
+    BX, BY, BT, INSET = (W - BW) // 2, 56, 3, 8
+    NUB_W, NUB_H = 6, 24
+    sc = Screen(CHG_BG)
+    fill = CHG_GREEN if charging else (CHG_RED if pct < 20 else CHG_FILL)
+    # outline (4 strokes) + softened corners
+    sc.fill_rect(BX, BY, BW, BT, CHG_OUTLINE)
+    sc.fill_rect(BX, BY + BH - BT, BW, BT, CHG_OUTLINE)
+    sc.fill_rect(BX, BY, BT, BH, CHG_OUTLINE)
+    sc.fill_rect(BX + BW - BT, BY, BT, BH, CHG_OUTLINE)
+    for cxx, cyy in ((BX, BY), (BX + BW - 1, BY), (BX, BY + BH - 1), (BX + BW - 1, BY + BH - 1)):
+        sc.px[cxx, cyy] = CHG_BG
+    # nub
+    sc.fill_rect(BX + BW, BY + (BH - NUB_H) // 2, NUB_W, NUB_H, CHG_OUTLINE)
+    # inner fill
+    ix, iy = BX + INSET, BY + INSET
+    iw, ih = BW - 2 * INSET, BH - 2 * INSET
+    fw = max(8, min(iw, iw * max(0, min(100, pct)) // 100))
+    sc.fill_rect(ix, iy, fw, ih, fill)
+    if charging:
+        _bolt(sc, W // 2, iy + 4, ih - 8, CHG_BG)
+    # big percent + unit
+    num = str(max(0, min(100, pct)))
+    wn = text_width(num, bold_17)
+    wu = text_width("%", bold_13)
+    nx = (W - (wn + 2 + wu)) // 2
+    sc.text(nx, 168, num, bold_17, CHG_TEXT)
+    sc.text(nx + wn + 2, 168, "%", bold_13, CHG_UNIT)
+    # status line
+    if charging:
+        status, sink = "CHARGING", CHG_GREEN
+    elif not external:
+        status, sink = "CONNECT CABLE", CHG_MUTED
+    else:
+        status, sink = "NOT CHARGING", CHG_MUTED
+    sc.text_centered(196, status, bold_11, sink)
+    return sc.img
+
+
+def screen_boot():
+    sc = Screen(SURFACE)
+    sc.text_centered(120, "Core Player", FONT_TITLE, INK)
+    sc.text_centered(142, "loading", FONT_SUB, MUTED)
+    return sc.img
 
 
 def main():
@@ -735,12 +1163,36 @@ def main():
     outputs.append(save_png(screen_volume(), "volume.png"))
     outputs.append(save_png(screen_lock(), "lock.png"))
     outputs.append(save_png(screen_locked(), "locked.png"))
-    gif_path, nframes, total_ms = build_walkthrough_gif()
-    outputs.append(gif_path)
+    # --- new: library / browsing ---
+    outputs.append(save_png(screen_mainmenu(), "mainmenu.png"))
+    outputs.append(save_png(screen_music(), "music.png"))
+    outputs.append(save_png(screen_artists(), "artists.png"))
+    outputs.append(save_png(screen_songs(), "songs.png"))
+    # --- new: settings ---
+    outputs.append(save_png(screen_settings(), "settings.png"))
+    outputs.append(save_png(screen_sound(), "sound.png"))
+    outputs.append(save_png(screen_clicker(), "clicker.png"))
+    outputs.append(save_png(screen_theme(), "theme.png"))
+    # --- new: dual theme (Onyx) ---
+    outputs.append(save_png(screen_nowplaying_onyx(), "nowplaying_onyx.png"))
+    outputs.append(save_png(screen_albums_onyx(), "albums_onyx.png"))
+    # --- new: system ---
+    outputs.append(save_png(screen_charging(), "charging.png"))
+    outputs.append(save_png(screen_boot(), "boot.png"))
+    # --- big walkthrough gif (unchanged) ---
+    gifs = [build_walkthrough_gif()]
+    # --- per-feature gifs ---
+    gifs.append(gif_browse())
+    gifs.append(gif_volume())
+    gifs.append(gif_themes())
+    gifs.append(gif_lock())
+    gifs.append(gif_settings())
     for p in outputs:
         print("wrote", p, os.path.getsize(p), "bytes")
-    print("demo.gif: %d frames, %dx%d, %.1fs loop" %
-          (nframes, W * GIF_SCALE, H * GIF_SCALE, total_ms / 1000.0))
+    for path, nframes, total_ms in gifs:
+        print("wrote %s  %d frames, %dx%d, %.1fs, %d bytes" %
+              (path, nframes, W * GIF_SCALE, H * GIF_SCALE,
+               total_ms / 1000.0, os.path.getsize(path)))
 
 
 if __name__ == "__main__":
