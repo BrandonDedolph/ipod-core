@@ -162,6 +162,41 @@ Boot splash, charging screen, and the Hold-switch lock / unlock overlays.
 | Input | Apple click-wheel + buttons + hold switch (polled) |
 | Chainload | [ipodloader2](https://github.com/crozone/ipodloader2) loads our `.ipod` image |
 
+## Performance — real-time on a 2006 SoC
+
+The PP5022 is a pair of ~80 MHz ARM7TDMI cores with **no FPU, no hardware
+divide**, a small unified cache, and a **PIO** disk (no DMA to the drive,
+~170 KB/s). Decoding FLAC in real time *and* driving a smooth, animated,
+antialiased UI on that budget took deliberate work — the interesting part
+of the project is how little the hardware gives you.
+
+- **Clock + cache first.** Enabling the PP5022 unified cache and holding an
+  80 MHz boost across the whole open/decode path is the line between
+  stuttering and real-time FLAC.
+- **No divides in the hot path.** The gamma-correct text blend runs entirely
+  in integers off pre-baked sRGB↔linear LUTs (never touches `<math.h>`), and
+  the per-pixel alpha composite replaces three soft-divides with an exact
+  `floor(x/255)` add-shift — the divide-less ARM7 never pays for a divide
+  while painting glyphs.
+- **Draw only what changed.** The marquee scrolls through a tiny partial
+  present (just the title band), not a full-frame blit, and clips per pixel to
+  its row — so continuous animation costs almost nothing.
+- **Instant library.** The song database is built on the host into a single
+  index the firmware loads in *one read*; Songs / Albums / Genres open with no
+  per-file tag scan at boot, and per-genre counts are precomputed. Records bind
+  to files by a hash, not a directory-walking string compare.
+- **Streaming without skips.** A read-ahead disk buffer does bursty reads so
+  the drive head parks between them (anti-skip), feeding a lock-free SPSC PCM
+  ring drained by the DMA-completion ISR — audio never waits on the UI. Bulk
+  ATA reads land straight in the caller's buffer, with a one-sector bounce only
+  for unaligned tails.
+- **Album art that never stalls audio.** Covers are pre-converted on the host
+  to raw RGB565 sidecars (no on-device JPEG decode); the list-chip cache loads
+  at most one thumbnail per main-loop pass so scrolling can't starve the audio
+  DMA, and the 28 px chip is an exact-size file — a 1:1 copy, no resample.
+- **No allocator in the render path.** The Nunito glyph atlases are `const`
+  `.rodata` resolved at link time — no FreeType, no malloc, no init step.
+
 ## Status
 
 Working on real hardware today: boot and bring-up, LCD present, click-wheel
