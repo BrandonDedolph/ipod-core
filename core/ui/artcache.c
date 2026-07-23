@@ -37,7 +37,8 @@ enum {
 
 typedef struct {
     uint8_t  state;
-    uint32_t dir_clus;                         /* album directory first cluster */
+    uint32_t thm_clus, thm_size;               /* pre-indexed folder.thm (24x24) */
+    uint32_t art_clus, art_size;               /* pre-indexed folder.art fallback */
     uint16_t px[ARTCACHE_DIM * ARTCACHE_DIM];  /* 22x22 RGB565 (valid iff LOADED) */
 } slot_t;
 
@@ -48,22 +49,28 @@ void artcache_reset(void)
 {
     for (int i = 0; i < ARTCACHE_SLOTS; i++) {
         g_slot[i].state    = SLOT_EMPTY;
-        g_slot[i].dir_clus = 0;
+        g_slot[i].thm_clus = 0;
+        g_slot[i].art_clus = 0;
     }
 }
 
-void artcache_queue(int slot, uint32_t dir_clus)
+void artcache_queue(int slot, uint32_t thm_clus, uint32_t thm_size,
+                    uint32_t art_clus, uint32_t art_size)
 {
     if (slot < 0 || slot >= ARTCACHE_SLOTS) {
         return;
     }
     slot_t *s = &g_slot[slot];
-    /* Same album already tracked in this slot: leave its state (and any cached
+    /* Same cover already tracked in this slot: leave its state (and any cached
      * pixels or prior FAILED verdict) alone so a per-frame re-queue is free. */
-    if (s->state != SLOT_EMPTY && s->dir_clus == dir_clus) {
+    if (s->state != SLOT_EMPTY && s->thm_clus == thm_clus &&
+        s->art_clus == art_clus) {
         return;
     }
-    s->dir_clus = dir_clus;
+    s->thm_clus = thm_clus;
+    s->thm_size = thm_size;
+    s->art_clus = art_clus;
+    s->art_size = art_size;
     s->state    = SLOT_QUEUED;
 }
 
@@ -76,42 +83,6 @@ const uint16_t *artcache_get(int slot)
         return 0;
     }
     return g_slot[slot].px;
-}
-
-/* Case-insensitive ASCII compare, self-contained so this module needs nothing
- * from kernel/main.c. Matches only 'a'..'z' folding (CoreArt names are ASCII). */
-static int name_eq_ci(const char *a, const char *b)
-{
-    for (; *a && *b; a++, b++) {
-        char ca = *a, cb = *b;
-        if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
-        if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
-        if (ca != cb) return 0;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
-/* readdir userdata: capture the preferred (.thm) and fallback (.art) sidecars
- * as we sweep the album directory once. */
-typedef struct {
-    uint32_t thm_clus, thm_size;
-    uint32_t art_clus, art_size;
-} art_scan_t;
-
-static int scan_cb(void *ud, const fat32_dirent_t *e)
-{
-    art_scan_t *sc = (art_scan_t *)ud;
-    if (e->is_dir) {
-        return 0;
-    }
-    if (name_eq_ci(e->name, "folder.thm")) {
-        sc->thm_clus = e->first_clus;
-        sc->thm_size = e->size;
-    } else if (name_eq_ci(e->name, "folder.art")) {
-        sc->art_clus = e->first_clus;
-        sc->art_size = e->size;
-    }
-    return 0;
 }
 
 /* Read + validate a CoreArt sidecar (clus/size) into g_scratch and downscale it
@@ -156,14 +127,14 @@ int artcache_pump(fat32_t *fs)
     }
 
     slot_t *s = &g_slot[slot];
-    art_scan_t sc = { 0, 0, 0, 0 };
-    int ok = 0;
-
-    if (s->dir_clus != 0 && fat32_readdir(fs, s->dir_clus, scan_cb, &sc) == 0) {
-        /* Prefer the purpose-built 24x24 folder.thm; fall back to folder.art. */
-        ok = load_one(fs, sc.thm_clus, sc.thm_size, s->px) ||
-             load_one(fs, sc.art_clus, sc.art_size, s->px);
-    }
+    /* Clusters were pre-resolved at library-load, so this is a direct file read
+     * — no directory scan. Prefer folder.thm: it is pre-baked at exactly
+     * ARTCACHE_DIM (28x28) by tools/coreart.py, so the load is a ~1.5KB read +
+     * a 1:1 copy (thumb_downscale is identity when src==dst) — no big read, no
+     * resample. folder.art (120x120) is only the fallback for an album that
+     * somehow lacks a thm (it downscales, still correct just slower). */
+    int ok = load_one(fs, s->thm_clus, s->thm_size, s->px) ||
+             load_one(fs, s->art_clus, s->art_size, s->px);
 
     s->state = ok ? SLOT_LOADED : SLOT_FAILED;
     return 1;

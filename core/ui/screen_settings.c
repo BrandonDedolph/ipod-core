@@ -19,30 +19,34 @@
  */
 
 #include "settings.h"
+#include "palette.h"                          /* live theme palette (g_pal[]) */
 
 #include "text.h"
 #include "../kernel/console.h"
 #include "../hal/hal.h"                        /* LCD_WIDTH / LCD_HEIGHT */
 
 /* ---------------------------------------------------------------------------
- * Linen palette (kernel/main.c tokens -> RGB565) + theme swatch tones
+ * Palette tokens — now resolve to the live, theme-selected g_pal[] (shared with
+ * kernel/main.c via ui/palette.h) so the Settings screens follow Linen / Onyx
+ * like the rest of the UI. SEL_BG/SEL_FG stay derived from INK/SURFACE.
  * ------------------------------------------------------------------------- */
-#define S_SURFACE 0xF79Du      /* #f4f1ec surface                             */
-#define S_INK     0x18A2u      /* #1a1714 ink / selection bar                 */
-#define S_MUTED   0x7B8Du      /* #7a7068 secondary text                      */
-#define S_MUTED2  0x9C70u      /* #9a8e80 lighter muted (subs / header right) */
-#define S_MUTED_D 0x5A89u      /* #5a5048 deep muted (right values / keys)    */
-#define S_ACCENT  0xC348u      /* terracotta accent (Ink theme ink hint)      */
-#define S_BORDER  0xE71Bu      /* subtle divider line                         */
-#define S_SEL_BG  S_INK        /* selection bar = dark ink                    */
-#define S_SEL_FG  S_SURFACE    /* selection text = surface                    */
-#define S_SEL_SUB 0xB595u      /* sub / right text ON a selected row          */
-#define S_CHEVRON 0xB575u      /* > chevron, rgba(ink,0.3) on surface         */
-#define S_TRK     0xDEDAu      /* slider track, rgba(ink,0.10)                */
-#define S_SEL_TRK 0x41E7u      /* slider track on a SELECTED (dark) row       */
-#define S_PILL_OFF 0xCE58u     /* toggle pill OFF fill (18% ink)              */
+#define S_SURFACE  g_pal[PAL_SURFACE]
+#define S_INK      g_pal[PAL_INK]
+#define S_MUTED    g_pal[PAL_MUTED]
+#define S_MUTED2   g_pal[PAL_MUTED2]
+#define S_MUTED_D  g_pal[PAL_MUTED_D]
+#define S_ACCENT   g_pal[PAL_ACCENT]
+#define S_BORDER   g_pal[PAL_BORDER]
+#define S_SEL_BG   g_pal[PAL_INK]      /* selection bar = ink (inverts w/ theme) */
+#define S_SEL_FG   g_pal[PAL_SURFACE]  /* selection text = surface               */
+#define S_SEL_SUB  g_pal[PAL_SEL_SUB]
+#define S_CHEVRON  g_pal[PAL_CHEVRON]
+#define S_TRK      g_pal[PAL_TRK]      /* slider track                           */
+#define S_SEL_TRK  g_pal[PAL_SEL_TRK]  /* slider track on a selected row         */
+#define S_PILL_OFF g_pal[PAL_PILL_OFF] /* toggle pill OFF fill                   */
 
 /* Nunito faces (see ui/text.h). */
+#define F_BIG    text_font_bold_17()
 #define F_HEADER text_font_bold_13()
 #define F_ROW    text_font_regular_13()
 #define F_SUB    text_font_regular_11()
@@ -80,7 +84,7 @@ static void header_render(const char *title, const char *right, int back)
 {
     int x = 12;
     if (back) {
-        x = st_text(x, HDR_BASE, "<", F_HEADER, S_MUTED2) + 4;
+        x = st_text(x, HDR_BASE, UI_GLYPH_LAQUO, F_HEADER, S_MUTED2) + 4;
     }
     st_text(x, HDR_BASE, title, F_HEADER, S_INK);
     if (right && right[0]) {
@@ -189,7 +193,7 @@ static void list_render(int screen, const settings_t *s, int sel)
             st_text_right(16, ry + 15, buf, F_SUB, rightc);
         } else {
             /* submenu / action with no value -> chevron. */
-            st_text(LCD_WIDTH - 18, ry + 15, ">", F_ROW, chevc);
+            st_text(LCD_WIDTH - 18, ry + 15, UI_GLYPH_RAQUO, F_ROW, chevc);
         }
     }
 }
@@ -198,18 +202,20 @@ static void list_render(int screen, const settings_t *s, int sel)
  * Theme picker (system-screens.jsx ThemePicker): swatch + name + sub, with a
  * "CURRENT" tag on the active theme.
  * ------------------------------------------------------------------------- */
-static const uint16_t TH_SWATCH[4] = { S_SURFACE, 0xFBDEu, 0x0861u, 0xEB5Cu };
-static const uint16_t TH_INK[4]    = { S_INK, S_INK, S_ACCENT, S_INK };
-static const char *const TH_SUB[4] = {
+/* Preview tones are each theme's OWN colours (fixed literals, NOT the live
+ * palette) so a row previews the theme it would switch to. Order matches the
+ * theme ids: 0 = Linen (light), 1 = Onyx (dark). */
+static const uint16_t TH_SWATCH[2] = { 0xF79Du, 0x18C2u };  /* surface tone   */
+static const uint16_t TH_INK[2]    = { 0x18A2u, 0xEF3Cu };  /* ink hint bar   */
+static const char *const TH_SUB[2] = {
     "Warm light - text-forward",
-    "Minimal - big art",
-    "True dark - terracotta",
-    "Floating card surface",
+    "Warm dark - terracotta",
 };
 
 static void theme_render(const settings_t *s, int sel)
 {
-    for (int r = 0; r < 4; r++) {
+    int n = settings_count(SETTINGS_THEME);
+    for (int r = 0; r < n; r++) {
         int ry = LIST_Y0 + r * TH_ROW_H;
         int is_sel = (r == sel);
         if (is_sel) {
@@ -244,7 +250,7 @@ void settings_render(int screen, const settings_t *s, int sel)
     if (screen == SETTINGS_ABOUT) {
         /* main.c should call settings_about_render() with live values; this
          * placeholder path keeps settings_render total over every screen. */
-        settings_about_render(-1, -1, 0, 0, 0);
+        settings_about_render(-1, -1, 0, 0xFFFFFFFFu, 0, 0, 0);
         return;
     }
 
@@ -256,7 +262,8 @@ void settings_render(int screen, const settings_t *s, int sel)
     case SETTINGS_PLAYBACK: title = "Playback"; break;
     case SETTINGS_SOUND:    title = "Sound";    break;
     case SETTINGS_DISPLAY:  title = "Display";  break;
-    case SETTINGS_THEME:    title = "Theme"; right = "4 themes"; break;
+    case SETTINGS_THEME:    title = "Theme"; right = "2 themes"; break;
+    case SETTINGS_CLICKER:  title = "Clicker"; break;
     default:                title = "Settings"; break;
     }
     header_render(title, right, 1);
@@ -303,49 +310,82 @@ static void fmt_gb(char *d, uint32_t mb)
     d[i]   = '\0';
 }
 
-/* One About row: muted key on the left, bold value on the right, divider under.
- * Advances and returns the next row's top y. */
-static int about_row(int y, const char *key, const char *val)
+/* Append " word" to the NUL-terminated string in `d`. */
+static void su_append(char *d, const char *w)
 {
-    st_text(16, y + 11, key, F_SUB, S_MUTED_D);
-    st_text_right(16, y + 11, val, F_HEADER, S_INK);
-    console_fill_rect(16, y + 22, LCD_WIDTH - 32, 1, S_BORDER);
-    return y + 24;
+    int i = 0; while (d[i]) i++;
+    su_copy(d + i, w);
 }
 
+/* About — a little device dashboard: three big library stats, a storage bar
+ * (used vs free), and a device footer, instead of a plain key/value list. */
 void settings_about_render(int battery_pct, int battery_mv,
-                           uint32_t free_mb, uint32_t total_mb, int n_artists)
+                           uint32_t total_mb, uint32_t free_mb,
+                           int n_songs, int n_albums, int n_artists)
 {
+    (void)battery_mv;
     console_clear(S_SURFACE);
     header_render("About", "", 1);
 
-    char v[24];
-    int y = 54;
+    char v[48];
 
-    y = about_row(y, "Model", "iPod 5.5G");
-    y = about_row(y, "Firmware", "core");
+    /* --- device name hero, centred at the top --- */
+    st_text((LCD_WIDTH - text_width("iPod 5.5G", F_BIG)) / 2, 62,
+            "iPod 5.5G", F_BIG, S_INK);
 
-    /* Battery: "NN% NNNN mV" (dashes if not yet sampled). */
-    if (battery_pct < 0) {
-        su_copy(v, "--");
-    } else {
-        int i = su_to_str(v, (unsigned)battery_pct);
-        v[i++] = '%';
-        if (battery_mv > 0) {
-            v[i++] = ' ';
-            i += su_to_str(v + i, (unsigned)battery_mv);
-            v[i++] = ' '; v[i++] = 'm'; v[i++] = 'V';
-        }
-        v[i] = '\0';
+    /* --- three big stat columns: Songs / Albums / Artists --- */
+    const char *lbl[3] = { "SONGS", "ALBUMS", "ARTISTS" };
+    int         val[3] = { n_songs, n_albums, n_artists };
+    int colw = LCD_WIDTH / 3;
+    for (int i = 0; i < 3; i++) {
+        int cx = colw * i + colw / 2;
+        su_to_str(v, (unsigned)(val[i] < 0 ? 0 : val[i]));
+        st_text(cx - text_width(v, F_BIG) / 2, 100, v, F_BIG, S_INK);
+        st_text(cx - text_width(lbl[i], F_SMALL) / 2, 116, lbl[i], F_SMALL, S_MUTED);
+        if (i) console_fill_rect(colw * i, 86, 1, 36, S_BORDER);   /* column rule */
     }
-    y = about_row(y, "Battery", v);
+    console_fill_rect(16, 130, LCD_WIDTH - 32, 1, S_BORDER);
 
-    fmt_gb(v, total_mb);
-    y = about_row(y, "Capacity", v);
-    fmt_gb(v, free_mb);
-    y = about_row(y, "Free", v);
+    /* --- firmware row: label left, "Core" chip on the right --- */
+    st_text(16, 150, "FIRMWARE", F_SMALL, S_MUTED);
+    {
+        int cw = text_width("Core", F_SUB);
+        int chw = cw + 16, chx = LCD_WIDTH - 16 - chw, chy = 140;
+        st_round_rect(chx, chy, chw, 15, 7, S_ACCENT);
+        st_text(chx + 8, 151, "Core", F_SUB, S_SURFACE);
+    }
 
-    su_to_str(v, (unsigned)(n_artists < 0 ? 0 : n_artists));
-    y = about_row(y, "Artists", v);
-    (void)y;
+    /* --- storage bar (used = accent fill on a faint track) --- */
+    st_text(16, 176, "STORAGE", F_SMALL, S_MUTED);
+    if (free_mb != 0xFFFFFFFFu) {
+        fmt_gb(v, free_mb); su_append(v, " free");
+        st_text_right(16, 176, v, F_SUB, S_MUTED_D);
+    }
+    int bx = 16, by = 182, bw = LCD_WIDTH - 32, bh = 8;
+    st_round_rect(bx, by, bw, bh, 4, S_TRK);
+    if (total_mb > 0 && free_mb != 0xFFFFFFFFu) {
+        uint32_t used = (total_mb > free_mb) ? total_mb - free_mb : 0;
+        int fw = (int)(((unsigned long long)used * bw) / total_mb);
+        if (fw < bh && used > 0) fw = bh;
+        if (fw > bw) fw = bw;
+        st_round_rect(bx, by, fw, bh, 4, S_ACCENT);
+    }
+
+    /* --- battery: a little battery pictogram with proportional fill --- */
+    st_text(16, 212, "BATTERY", F_SMALL, S_MUTED);
+    if (battery_pct >= 0) {
+        su_to_str(v, (unsigned)battery_pct); su_append(v, "%");
+        st_text_right(16, 212, v, F_SUB, S_INK);
+    }
+    {
+        int gx = 16, gy = 218, gw = LCD_WIDTH - 32 - 5, gh = 12;   /* body */
+        st_round_rect(gx, gy, gw, gh, 3, S_TRK);                   /* shell */
+        console_fill_rect(gx + gw, gy + 3, 4, gh - 6, S_TRK);      /* + nub */
+        if (battery_pct >= 0) {
+            int pct = battery_pct > 100 ? 100 : battery_pct;
+            int fw  = (gw - 4) * pct / 100;
+            if (fw < 2 && pct > 0) fw = 2;
+            st_round_rect(gx + 2, gy + 2, fw, gh - 4, 2, S_ACCENT);
+        }
+    }
 }

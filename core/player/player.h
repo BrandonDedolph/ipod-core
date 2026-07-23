@@ -19,9 +19,12 @@
 #include "../fs/fat32.h"
 #include "../codecs/flac_meta.h"
 
-/* Max entries in a browse listing / playback queue. Bounds both the UI's
- * g_browse[] and the player's own queue copy. */
+/* Max entries in a browse listing. Bounds the UI's g_browse[] (one album's
+ * worth of tracks). */
 #define BROWSE_MAX 128
+/* Max entries in the PLAYBACK queue — larger than a browse listing so
+ * "Shuffle Songs" can hold the whole library, not just one album. */
+#define QUEUE_MAX  1200
 #define NAME_MAX   64                    /* stored display name (Nunito, ASCII)  */
 
 /* One list row: a subdirectory or a playable file. Shared between the browser
@@ -30,6 +33,8 @@ typedef struct {
     char     name[NAME_MAX + 1];         /* display name (uppercased, font-safe) */
     uint32_t clus;
     uint32_t size;
+    uint32_t art_clus;                   /* this track's cover (folder.art); 0 =  */
+    uint32_t art_size;                   /*   use the queue-level art (album play) */
     uint8_t  fmt;                        /* 0 = FLAC, 1 = MP3 (only when !is_dir) */
     uint8_t  is_dir;                     /* 1 = subdirectory                     */
 } browse_entry_t;
@@ -48,6 +53,14 @@ void player_init(fat32_t *fs);
  * any current playback. */
 void player_play_queue(const browse_entry_t *entries, int n, int start_idx,
                        uint32_t art_clus, uint32_t art_size);
+
+/* Build a large queue incrementally (used by Shuffle Songs to enqueue the whole
+ * library without a huge caller-side staging array): begin (stops playback and
+ * clears), add each entry, then commit to start at `start`. Each entry's
+ * art_clus is used for its cover (per-track). */
+void player_queue_begin(void);
+void player_queue_add(const browse_entry_t *e);
+void player_queue_commit(int start);
 
 /* Decode one bounded chunk and auto-advance at end of track. Call every
  * main-loop pass so audio runs while the UI is elsewhere. */

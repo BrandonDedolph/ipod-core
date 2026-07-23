@@ -38,6 +38,24 @@ void hal_volume_set(int percent);
 int hal_volume_get(void);
 
 /*
+ * Set stereo balance, -100 (full left) .. +100 (full right), 0 = center.
+ * Pans by attenuating the far channel's OUT1 amp gain (muting it at the
+ * extreme); at 0 both channels are identical to hal_volume_set() alone.
+ * Clamped to [-100, 100]. Re-latches immediately at the current volume.
+ */
+void hal_balance_set(int balance);
+int  hal_balance_get(void);
+
+/*
+ * Set Bass / Treble tone, each in dB, clamped to [-12, +12]. Bass is the
+ * WM8758B low-shelf EQ band (105 Hz), Treble the high-shelf (6.9 kHz); the
+ * three mid bands are held flat. At 0/0 the EQ is left on the codec's ADC
+ * path (inert), so playback is bit-identical to no tone control. Requires the
+ * codec to be up (wm8758_init). See core/docs/hw/05-audio.md, "tone controls".
+ */
+void hal_tone_set(int bass_db, int treble_db);
+
+/*
  * Pure percent -> OUT1VOL data-word mapping (no side effects, no I2C).
  * Returns the 9-bit LOUT1VOL/ROUT1VOL data word WITHOUT the VU latch bit
  * (the caller ORs OUTVOL_VU onto the right-channel write). Exposed so the

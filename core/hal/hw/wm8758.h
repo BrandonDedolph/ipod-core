@@ -35,6 +35,11 @@
 #define WM_PLLK1      0x25
 #define WM_PLLK2      0x26
 #define WM_PLLK3      0x27
+#define WM_EQ1        0x12  /* low shelf  (Bass)  */
+#define WM_EQ2        0x13  /* peaking band 2     */
+#define WM_EQ3        0x14  /* peaking band 3     */
+#define WM_EQ4        0x15  /* peaking band 4     */
+#define WM_EQ5        0x16  /* high shelf (Treble) */
 #define WM_OUT4TOADC  0x2A
 #define WM_OUTCTRL    0x31
 #define WM_LOUTMIX    0x32
@@ -118,6 +123,16 @@
 
 /* ---- BIASCTRL (0x3D) ------------------------------------------------ */
 #define BIASCTRL_BIASCUT       0x100  /* low-power bias cut */
+
+/* ---- EQ1..EQ5 (0x12-0x16): 5-band EQ tone control (05-audio.md) -----
+ * Gain field EQxG[4:0] uses code = 12 - gain_dB (0x0C = 0 dB flat, 0x00 =
+ * +12 dB, 0x18 = -12 dB). EQ3DMODE (EQ1 bit 8) routes the EQ to the DAC
+ * (playback) when set; cleared it sits on the ADC path (inert here). */
+#define EQ_GAIN_MASK           0x01F  /* EQxG[4:0]                        */
+#define EQ_GAIN_0DB            0x00C  /* flat: code = 12 - 0 dB           */
+#define EQ_DAC_MODE            0x100  /* EQ1 bit 8: apply EQ to the DAC   */
+#define EQ1_CUTOFF_105HZ       0x020  /* EQ1C=01: bass shelf @ 105 Hz     */
+#define EQ5_CUTOFF_6K9         0x020  /* EQ5C=01: treble shelf @ 6.9 kHz  */
 
 /* ---- Sample-rate program: 44.1 kHz (05-audio.md, resolved) ---------
  * PLL preset 0 -> fPLLOUT 22.5792 MHz; MCLKDIV/2 -> SYSCLK = 256*44.1kHz.

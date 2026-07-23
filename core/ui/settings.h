@@ -54,6 +54,7 @@ typedef struct {
     int  backlight_secs;     /* 0=never / 5/10/15/30/60 — FUNCTIONAL          */
     int  backlight_bright;   /* 1..32 — FUNCTIONAL                            */
     int  theme;              /* 0..3; only 0 (Linen) renders — COSMETIC >0    */
+    int  clicker;            /* 0/1 — FUNCTIONAL (piezo click on navigation)  */
 } settings_t;
 
 /* Populate `s` with sensible defaults (shuffle off, repeat off, volume 70,
@@ -72,6 +73,7 @@ typedef enum {
     SETTINGS_DISPLAY,    /* Backlight timeout (select) + Brightness (slider)  */
     SETTINGS_ABOUT,      /* device info key/value rows                        */
     SETTINGS_THEME,      /* theme picker (swatch rows)                        */
+    SETTINGS_CLICKER,    /* clicker profile picker (Off / sound profiles)     */
     SETTINGS_SCREEN_COUNT
 } settings_screen_t;
 
@@ -87,6 +89,7 @@ typedef enum {
     SETTINGS_ENTER_DISPLAY,
     SETTINGS_ENTER_ABOUT,
     SETTINGS_ENTER_THEME,
+    SETTINGS_ENTER_CLICKER,
     SETTINGS_ACTION_RESET
 } settings_action_t;
 
@@ -117,8 +120,11 @@ int settings_count(int screen);
 /* The row label for (screen, idx), or "" if out of range. Stable .rodata. */
 const char *settings_label(int screen, int idx);
 
-/* The display name of theme index `theme` ("Linen"/"Paper"/"Ink"/"Card"). */
+/* The display name of theme index `theme` ("Linen"/"Onyx"). */
 const char *settings_theme_name(int theme);
+
+/* The display name of clicker profile `profile` ("Off"/"Tick"/"Click"/"Pop"). */
+const char *settings_clicker_name(int profile);
 
 /* The settings_kind_t of row (screen, idx). */
 int settings_kind(int screen, int idx);
@@ -161,6 +167,7 @@ void settings_render(int screen, const settings_t *s, int sel);
  * fabricate). free/total are whole megabytes; pct<0 or mv<=0 render as "--".
  */
 void settings_about_render(int battery_pct, int battery_mv,
-                           uint32_t free_mb, uint32_t total_mb, int n_artists);
+                           uint32_t total_mb, uint32_t free_mb,
+                           int n_songs, int n_albums, int n_artists);
 
 #endif /* CORE_UI_SETTINGS_H */

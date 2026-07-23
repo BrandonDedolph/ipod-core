@@ -11,7 +11,8 @@
  *
  * Each slot caches one album's cover pre-shrunk to ARTCACHE_DIM x ARTCACHE_DIM
  * RGB565. On pump, the album directory is enumerated for a "folder.thm"
- * (preferred, 24x24) or "folder.art" (fallback, up to 120x120) CoreArt sidecar;
+ * (preferred, 28x28 = ARTCACHE_DIM, a 1:1 copy) or "folder.art" (fallback, up
+ * to 120x120, downscaled) CoreArt sidecar;
  * the file is read into a module-static scratch buffer, its "CART" header +
  * dims validated, and thumb_downscale_rgb565() shrinks it into the slot. A slot
  * that can't be loaded (no art / bad header / read error) is marked FAILED so
@@ -26,8 +27,10 @@
 #include <stdint.h>
 #include "../fs/fat32.h"
 
-#define ARTCACHE_DIM   22          /* list-chip cover is 22x22 RGB565          */
-#define ARTCACHE_SLOTS 64          /* one slot per cacheable album row         */
+#define ARTCACHE_DIM   28          /* list-chip cover is 28x28 RGB565 (taller
+                                    * two-line rows give room for a bigger chip) */
+#define ARTCACHE_SLOTS 128         /* one slot per cacheable album row (covers
+                                    * the whole library; ~125 KB of chip cache) */
 
 /* Clear every slot to EMPTY (forgetting all cached pixels and pending work). */
 void artcache_reset(void);
@@ -39,7 +42,8 @@ void artcache_reset(void);
  * no-op, so re-queuing a visible row on every frame is cheap and never re-loads
  * or re-fails it; queuing a DIFFERENT dir_clus re-arms the slot as QUEUED.
  */
-void artcache_queue(int slot, uint32_t dir_clus);
+void artcache_queue(int slot, uint32_t thm_clus, uint32_t thm_size,
+                    uint32_t art_clus, uint32_t art_size);
 
 /*
  * Do at most one unit of loading work: find the first QUEUED slot, load +

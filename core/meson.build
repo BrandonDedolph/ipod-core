@@ -201,7 +201,7 @@ if target == 'hw'
   # (settings.h, ui/text.h, ../kernel/console.h, ../hal/hal.h); stays -Werror.
   settings_hw_lib = static_library(
     'core_settings_hw',
-    sources: ['ui/settings.c', 'ui/screen_settings.c'],
+    sources: ['ui/settings.c', 'ui/screen_settings.c', 'ui/palette.c'],
     c_args: ['-DCORE_FREESTANDING'],
   )
 

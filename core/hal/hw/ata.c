@@ -21,7 +21,12 @@
  * 1<<20 trips is generously past a healthy PIO sector.
  */
 #define ATA_BSY_SPIN_LIMIT (1u << 20)
-#define ATA_DRQ_SPIN_LIMIT (1u << 20)
+/* Data-phase (DRQ) wait ceiling is TIME-based (microseconds), not an iteration
+ * count, so it's robust to bus poll speed AND gives a spun-DOWN drive (parked by
+ * ata_standby during playback/suspend) room to spin back up on the next read —
+ * ~1-3 s typical. Kept under the PCM ring's depth so a stuck read errors before
+ * audio underruns. Normal reads set DRQ in microseconds, so this never bites. */
+#define ATA_SPINUP_US      4000000u
 
 /*
  * Logical (512-byte) sectors per PHYSICAL sector. The stock 80 GB 5.5G
@@ -68,8 +73,8 @@ static int ata_wait_ready(void)
  * error (ERR/DF) surfaced while waiting, -1 on timeout. */
 static int ata_wait_drq(void)
 {
-    uint32_t spin = ATA_DRQ_SPIN_LIMIT;
-    while (--spin != 0) {
+    uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
+    for (;;) {
         uint8_t s = mmio_read8(ATA_ALT_STATUS_ADDR);
         if (!(s & ATA_STATUS_BSY)) {
             if (s & ATA_STATUS_DRQ) {
@@ -79,8 +84,10 @@ static int ata_wait_drq(void)
                 return -2;
             }
         }
+        if ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - t0) > ATA_SPINUP_US) {
+            return -1;      /* spin-up / transfer never came */
+        }
     }
-    return -1;
 }
 
 int ata_init(void)
@@ -192,31 +199,95 @@ int ata_read_sectors(uint32_t lba, uint32_t count, void *buf)
 {
     uint8_t *out = (uint8_t *)buf;
 
-    /* Serve the request one physical sector at a time: round the current
-     * LBA down to a physical boundary, read the whole physical sector into
-     * the bounce, then copy out only the logical sectors the caller asked
-     * for. This makes the drive's physical-alignment requirement invisible
-     * to callers, who keep addressing plain 512-byte LBAs. */
     while (count > 0) {
-        uint32_t phys = lba & ~(ATA_PHYS_LOG - 1u);   /* physical boundary */
-        uint32_t off  = lba - phys;                   /* 0..ATA_PHYS_LOG-1 */
+        uint32_t off = lba & (ATA_PHYS_LOG - 1u);      /* 0..ATA_PHYS_LOG-1 */
 
+        /* FAST PATH: physically aligned start, at least one whole physical unit
+         * to read, and a 2-byte-aligned destination — stream straight into the
+         * caller's buffer in ONE large multi-sector command (up to 256 sectors),
+         * with no bounce buffer and no byte copy. This turns a 128 KB read from
+         * ~128 READ SECTORS commands + a 128 KB byte-copy into ~1 command. */
+        if (off == 0 && count >= ATA_PHYS_LOG &&
+            ((uintptr_t)out & 1u) == 0) {
+            uint32_t bulk = count & ~(ATA_PHYS_LOG - 1u);  /* whole phys units    */
+            if (bulk > 256u) bulk = 256u;                  /* per-command cap      */
+            int rc = ata_read_raw(lba, bulk, out);
+            if (rc != 0) {
+                return rc;
+            }
+            out   += bulk * ATA_SECTOR_SZ;
+            lba   += bulk;
+            count -= bulk;
+            continue;
+        }
+
+        /* SLOW PATH (unchanged, byte-identical): an unaligned head, a trailing
+         * partial physical unit, or an odd destination — read the whole physical
+         * unit into the bounce and copy out only the logical sectors asked for,
+         * hiding the drive's physical-alignment requirement from callers. */
+        uint32_t phys = lba - off;                    /* physical boundary */
         int rc = ata_read_raw(phys, ATA_PHYS_LOG, ata_bounce);
         if (rc != 0) {
             return rc;
         }
-
         uint32_t avail = ATA_PHYS_LOG - off;
         uint32_t take  = count < avail ? count : avail;
-
         const uint8_t *src = (const uint8_t *)ata_bounce + off * ATA_SECTOR_SZ;
         for (uint32_t i = 0; i < take * ATA_SECTOR_SZ; i++) {
             out[i] = src[i];
         }
-
         out   += take * ATA_SECTOR_SZ;
         lba   += take;
         count -= take;
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Drive power management (for suspend). STANDBY IMMEDIATE spins the platters
+ * down but leaves the drive able to accept commands; the next media access
+ * auto-spins it back up, holding BSY for the (multi-second) spin-up. So sleep
+ * = ata_standby(), and wake = ata_wakeup() which kicks a 1-sector read and
+ * tolerates the long spin-up before normal reads resume.
+ * ------------------------------------------------------------------------- */
+#define ATA_CMD_STANDBY_IMM   0xE0
+
+int ata_standby(void)
+{
+    if (ata_wait_ready() != 0) {
+        return -1;
+    }
+    mmio_write8(ATA_SELECT_ADDR, ATA_SELECT_OBS);          /* master */
+    mmio_write8(ATA_COMMAND_ADDR, ATA_CMD_STANDBY_IMM);
+    for (volatile uint32_t g = 0; g < 64; g++) {
+        /* command-to-status settle */
+    }
+    return ata_wait_not_busy();     /* accepted; platters coast down on their own */
+}
+
+int ata_wakeup(void)
+{
+    /* Drive is "ready" in standby (BSY clear, RDY set) but spun down; a read
+     * triggers spin-up. Issue a throwaway 1-sector read of LBA 0 and wait out
+     * the spin-up with the extended limit, then drain the sector. */
+    if (ata_wait_ready() != 0) {
+        return -1;
+    }
+    mmio_write8(ATA_NSECTOR_ADDR, 1);
+    mmio_write8(ATA_SECTOR_ADDR,  0);
+    mmio_write8(ATA_LCYL_ADDR,    0);
+    mmio_write8(ATA_HCYL_ADDR,    0);
+    mmio_write8(ATA_SELECT_ADDR,  (uint8_t)(ATA_SELECT_OBS | ATA_SELECT_LBA));
+    mmio_write8(ATA_COMMAND_ADDR, ATA_CMD_READ_SECTORS);
+    for (volatile uint32_t g = 0; g < 64; g++) {
+        /* settle */
+    }
+    int rc = ata_wait_drq();        /* time-based wait tolerates the spin-up */
+    if (rc != 0) {
+        return rc;
+    }
+    for (int w = 0; w < 256; w++) {
+        (void)mmio_read16(ATA_DATA_ADDR);
     }
     return 0;
 }

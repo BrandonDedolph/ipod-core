@@ -103,25 +103,57 @@ static void draw_battery_outline(int x, int y, int w, int h, int t, uint16_t c)
 }
 
 /* Lightning bolt cut into the fill (drawn in the background colour, as the
- * design does): two thick strokes that both slant down-left, with the x
- * snapping back to the right at the midpoint — the classic zig-zag "⚡".
- * `cx` is the horizontal centre, [y0, y0+h) the vertical span. */
-static void draw_bolt(int cx, int y0, int h, uint16_t c)
+ * design does). It's the classic "flash" glyph: a solid angular polygon that
+ * falls from a heavy top bar diagonally down-left, jogs right at the waist,
+ * then tapers to a point at the bottom — an unmistakable "⚡".
+ *
+ * The outline is a fixed 7-vertex shape defined in a 10x20 design box (Material
+ * flash proportions), scaled uniformly to `bh` tall and centred on `cx`, then
+ * filled row by row with an even-odd scanline span test — integer edge-walking
+ * only, since there's no polygon primitive to lean on. */
+static void draw_bolt(int cx, int y0, int bh, uint16_t c)
 {
-    const int th = 7;                 /* stroke thickness                     */
-    const int swing = 12;             /* left/right travel over one stroke    */
-    int half = h / 2;
-    if (half < 1) half = 1;
-    int low = h - half;
-    if (low < 1) low = 1;
+    /* Bolt outline in the 10x20 design box, walked in order. */
+    static const int px[7] = { 0, 0, 3, 3, 10, 6, 10 };
+    static const int py[7] = { 0, 11, 11, 20, 8,  8, 0  };
+    const int N = 7, box_w = 10, box_h = 20;
 
-    for (int dy = 0; dy < half; dy++) {
-        int x = cx + swing / 2 - (swing * dy) / half;   /* +6 -> -6 */
-        console_fill_rect(x, y0 + dy, th, 1, c);
+    /* Uniform scale off the height; keep the aspect ratio. */
+    int bw = (box_w * bh) / box_h;
+    int x0 = cx - bw / 2;
+
+    /* Vertices in pixel space. */
+    int sx[7], sy[7];
+    for (int i = 0; i < N; i++) {
+        sx[i] = x0 + (px[i] * bw) / box_w;
+        sy[i] = y0 + (py[i] * bh) / box_h;
     }
-    for (int dy = 0; dy < low; dy++) {
-        int x = cx + swing / 2 - (swing * dy) / low;    /* snaps back to +6 */
-        console_fill_rect(x, y0 + half + dy, th, 1, c);
+
+    for (int y = y0; y < y0 + bh; y++) {
+        /* Collect the x where each non-horizontal edge crosses this scanline,
+         * using a half-open [ylo, yhi) rule so shared vertices count once. */
+        int xs[8];
+        int n = 0;
+        for (int i = 0; i < N; i++) {
+            int a = i, b = (i + 1) % N;
+            int ya = sy[a], yb = sy[b], xa = sx[a], xb = sx[b];
+            if (ya == yb) continue;                 /* horizontal edge */
+            int ylo, yhi, xlo, xhi;
+            if (ya < yb) { ylo = ya; yhi = yb; xlo = xa; xhi = xb; }
+            else         { ylo = yb; yhi = ya; xlo = xb; xhi = xa; }
+            if (y < ylo || y >= yhi) continue;
+            xs[n++] = xlo + (xhi - xlo) * (y - ylo) / (yhi - ylo);
+        }
+        /* Insertion sort the (few) crossings, then fill between pairs. */
+        for (int i = 1; i < n; i++) {
+            int v = xs[i], j = i - 1;
+            while (j >= 0 && xs[j] > v) { xs[j + 1] = xs[j]; j--; }
+            xs[j + 1] = v;
+        }
+        for (int k = 0; k + 1 < n; k += 2) {
+            int L = xs[k], R = xs[k + 1];
+            if (R > L) console_fill_rect(L, y, R - L, 1, c);
+        }
     }
 }
 

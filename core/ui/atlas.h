@@ -22,8 +22,10 @@
 #include <stdint.h>
 
 /*
- * Per-glyph layout. ASCII-only for now (95 printable code points,
- * 0x20..0x7E); the table is indexed by (codepoint - 0x20).
+ * Per-glyph layout. Indices 0..94 are printable ASCII (0x20..0x7E,
+ * indexed by codepoint - 0x20); 95+ are the non-ASCII extras (Latin-1
+ * + smart punctuation) appended by tools/atlas_gen.py, reached via the
+ * codepoint->index table in atlas/glyphmap.h (see core/ui/text.c).
  *
  * data_offset  byte offset into atlas_t.data where this glyph's
  *              alpha rows begin. Rows are h × w bytes packed with
@@ -46,7 +48,7 @@ typedef struct {
 } atlas_glyph_t;
 
 typedef struct {
-    const atlas_glyph_t *glyphs;          /* 95 entries */
+    const atlas_glyph_t *glyphs;          /* 95 ASCII + non-ASCII extras */
     const uint8_t       *data;            /* concatenated glyph alpha rows */
     int8_t               ascent;          /* px above baseline */
     int8_t               descent;         /* px below baseline (positive) */

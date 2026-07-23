@@ -65,6 +65,7 @@ static void codec_write(uint8_t reg, uint16_t data)
 #define VOL_DEFAULT_PCT 70
 
 static int g_percent = VOL_DEFAULT_PCT;
+static int g_balance = 0;                /* -100 (full left) .. +100 (full right) */
 
 uint16_t hal_volume_out1_word(int percent)
 {
@@ -88,6 +89,58 @@ uint16_t hal_volume_out1_word(int percent)
     return (uint16_t)((code & OUTVOL_GAIN_MASK) | OUTVOL_ZC);
 }
 
+/* Build an OUT1VOL data word (ZC set, no VU) for an absolute gain code, muting
+ * if the code has been panned below the audible floor. */
+static uint16_t out1_word_for_code(int code)
+{
+    if (code < VOL_GAIN_FLOOR) {
+        return (uint16_t)(OUTVOL_MUTE | OUTVOL_ZC);
+    }
+    if (code > VOL_GAIN_0DB) {
+        code = VOL_GAIN_0DB;
+    }
+    return (uint16_t)((code & OUTVOL_GAIN_MASK) | OUTVOL_ZC);
+}
+
+/*
+ * Latch the current (percent, balance) into LOUT1VOL/ROUT1VOL. Balance pans by
+ * attenuating one channel's amp gain: at 0 both channels get the identical
+ * center word (byte-for-byte the old behaviour), so nothing changes when
+ * balance is untouched; toward an end, the FAR channel's gain code is walked
+ * down by up to the full span and hard-muted at the extreme.
+ */
+static void volume_latch(void)
+{
+    uint16_t lword, rword;
+    if (g_percent <= 0) {
+        lword = rword = (uint16_t)(OUTVOL_MUTE | OUTVOL_ZC);
+    } else if (g_balance == 0) {
+        lword = rword = hal_volume_out1_word(g_percent);   /* exact center path */
+    } else {
+        int span = VOL_GAIN_0DB - VOL_GAIN_FLOOR;
+        int code = VOL_GAIN_FLOOR + (span * g_percent + 50) / 100;
+        if (code > VOL_GAIN_0DB) {
+            code = VOL_GAIN_0DB;
+        }
+        int mag   = g_balance < 0 ? -g_balance : g_balance;
+        int atten = span * mag / 100;              /* full pan -> down to floor */
+        int lcode = code, rcode = code;
+        if (g_balance > 0) {
+            lcode -= atten;                        /* pan right: cut left  */
+        } else {
+            rcode -= atten;                        /* pan left:  cut right */
+        }
+        lword = (g_balance > 0 && mag >= 100) ? (uint16_t)(OUTVOL_MUTE | OUTVOL_ZC)
+                                              : out1_word_for_code(lcode);
+        rword = (g_balance < 0 && mag >= 100) ? (uint16_t)(OUTVOL_MUTE | OUTVOL_ZC)
+                                              : out1_word_for_code(rcode);
+    }
+
+    /* Left first, then right with the update bit so both latch together. */
+    codec_write(WM_LOUT1VOL, lword);
+    codec_write(WM_ROUT1VOL, (uint16_t)(rword | OUTVOL_VU));
+}
+
 void hal_volume_set(int percent)
 {
     if (percent < 0) {
@@ -96,12 +149,49 @@ void hal_volume_set(int percent)
         percent = 100;
     }
     g_percent = percent;
+    volume_latch();
+}
 
-    uint16_t word = hal_volume_out1_word(percent);
+void hal_balance_set(int balance)
+{
+    if (balance < -100) {
+        balance = -100;
+    } else if (balance > 100) {
+        balance = 100;
+    }
+    g_balance = balance;
+    volume_latch();
+}
 
-    /* Left first, then right with the update bit so both latch together. */
-    codec_write(WM_LOUT1VOL, word);
-    codec_write(WM_ROUT1VOL, (uint16_t)(word | OUTVOL_VU));
+int hal_balance_get(void)
+{
+    return g_balance;
+}
+
+/* EQxG gain code for a signed dB (05-audio.md: code = 12 - dB), clamped to the
+ * ±12 dB field. */
+static uint16_t eq_gain_code(int db)
+{
+    if (db >  12) db =  12;
+    if (db < -12) db = -12;
+    return (uint16_t)((12 - db) & EQ_GAIN_MASK);
+}
+
+void hal_tone_set(int bass_db, int treble_db)
+{
+    if (bass_db   >  12) bass_db   =  12; else if (bass_db   < -12) bass_db   = -12;
+    if (treble_db >  12) treble_db =  12; else if (treble_db < -12) treble_db = -12;
+
+    /* Only route the EQ onto the DAC when the user has actually dialed in
+     * some tone; at flat 0/0 it stays on the (silent) ADC path so playback is
+     * bit-identical to no-EQ. The three mid bands are held flat. */
+    uint16_t dac = (bass_db != 0 || treble_db != 0) ? EQ_DAC_MODE : 0;
+
+    codec_write(WM_EQ1, (uint16_t)(dac | EQ1_CUTOFF_105HZ | eq_gain_code(bass_db)));
+    codec_write(WM_EQ2, EQ_GAIN_0DB);
+    codec_write(WM_EQ3, EQ_GAIN_0DB);
+    codec_write(WM_EQ4, EQ_GAIN_0DB);
+    codec_write(WM_EQ5, (uint16_t)(EQ5_CUTOFF_6K9 | eq_gain_code(treble_db)));
 }
 
 void hal_volume_init(void)

@@ -120,19 +120,21 @@ static int bl_step(int secs, int dir, int wrap)
 /* ---------------------------------------------------------------------------
  * Row labels (stable .rodata tables, one per list screen)
  * ------------------------------------------------------------------------- */
-static const char *const ROOT_L[8] = {
-    "Playback", "Sound", "Theme", "Display",
-    "Shortcuts", "Language", "About", "Reset Settings",
+/* Only rows that actually do something are listed — the cosmetic placeholders
+ * (Crossfade, Replaygain, Skip Length, Stereo Width, Shortcuts, Language) were
+ * removed so the menu never presents a control that has no effect. */
+static const char *const ROOT_L[7] = {
+    "Playback", "Sound", "Theme", "Display", "Clicker", "About", "Reset Settings",
 };
-static const char *const PLAY_L[7] = {
-    "Shuffle", "Repeat", "Crossfade", "Crossfade Length",
-    "Replaygain", "Skip Length", "Resume on Startup",
-};
-static const char *const SOUND_L[5] = {
-    "Volume", "Bass", "Treble", "Balance", "Stereo Width",
-};
+static const char *const PLAY_L[2] = { "Shuffle", "Repeat" };
+static const char *const SOUND_L[4] = { "Volume", "Bass", "Treble", "Balance" };
 static const char *const DISP_L[2] = { "Backlight", "Brightness" };
-static const char *const THEME_L[4] = { "Linen", "Paper", "Ink", "Card" };
+static const char *const THEME_L[2] = { "Linen", "Onyx" };
+/* Clicker: index 0 = Off, 1..N = sound profiles (main.c maps to piezo tones). */
+static const char *const CLICK_L[8] = {
+    "Off", "Tick", "Click", "Pop", "Blip", "Tock", "Double", "Chirp",
+};
+#define CLICK_N ((int)(sizeof CLICK_L / sizeof CLICK_L[0]))
 
 /* ---------------------------------------------------------------------------
  * Public model API
@@ -151,17 +153,19 @@ void settings_defaults(settings_t *s)
     s->backlight_secs    = 15;
     s->backlight_bright  = 32;
     s->theme             = 0;
+    s->clicker           = 1;
 }
 
 int settings_count(int screen)
 {
     switch (screen) {
-    case SETTINGS_ROOT:     return 8;
-    case SETTINGS_PLAYBACK: return 7;
-    case SETTINGS_SOUND:    return 5;
+    case SETTINGS_ROOT:     return 7;
+    case SETTINGS_PLAYBACK: return 2;
+    case SETTINGS_SOUND:    return 4;
     case SETTINGS_DISPLAY:  return 2;
     case SETTINGS_ABOUT:    return 1;   /* non-interactive info page */
-    case SETTINGS_THEME:    return 4;
+    case SETTINGS_THEME:    return 2;
+    case SETTINGS_CLICKER:  return CLICK_N;   /* Off + sound profiles */
     default:                return 0;
     }
 }
@@ -177,31 +181,39 @@ const char *settings_label(int screen, int idx)
     case SETTINGS_SOUND:    return SOUND_L[idx];
     case SETTINGS_DISPLAY:  return DISP_L[idx];
     case SETTINGS_THEME:    return THEME_L[idx];
+    case SETTINGS_CLICKER:  return CLICK_L[idx];
     default:                return "";
     }
 }
 
 const char *settings_theme_name(int theme)
 {
-    if (theme < 0 || theme > 3) {
+    if (theme < 0 || theme > 1) {
         return "Linen";
     }
     return THEME_L[theme];
+}
+
+const char *settings_clicker_name(int profile)
+{
+    if (profile < 0 || profile >= CLICK_N) {
+        return "Off";
+    }
+    return CLICK_L[profile];
 }
 
 int settings_kind(int screen, int idx)
 {
     switch (screen) {
     case SETTINGS_ROOT:
-        return (idx == 7) ? SETTINGS_KIND_ACTION : SETTINGS_KIND_SUBMENU;
+        if (idx == 6) return SETTINGS_KIND_ACTION;    /* Reset Settings */
+        return SETTINGS_KIND_SUBMENU;                 /* incl. Clicker submenu */
+    case SETTINGS_CLICKER:
+        return SETTINGS_KIND_SELECT;                  /* radio pick, marked active */
     case SETTINGS_PLAYBACK:
-        /* Crossfade (2) + Resume on Startup (6) are toggles; the rest are
-         * cycling text selects (Shuffle/Repeat live; the middle three are
-         * cosmetic fixed placeholders). */
-        return (idx == 2 || idx == 6) ? SETTINGS_KIND_TOGGLE
-                                      : SETTINGS_KIND_SELECT;
+        return SETTINGS_KIND_SELECT;       /* Shuffle + Repeat: cycling selects */
     case SETTINGS_SOUND:
-        return SETTINGS_KIND_SLIDER;
+        return SETTINGS_KIND_SLIDER;       /* Volume / Bass / Treble / Balance  */
     case SETTINGS_DISPLAY:
         return (idx == 1) ? SETTINGS_KIND_SLIDER : SETTINGS_KIND_SELECT;
     case SETTINGS_THEME:
@@ -225,11 +237,17 @@ void settings_value(int screen, const settings_t *s, int idx,
 
     switch (screen) {
     case SETTINGS_ROOT:
-        /* Only Theme + Language carry a right value; the rest are chevrons. */
+        /* Theme + Clicker carry a right value (the current choice); rest chevrons. */
         if (idx == 2) {
             scopy(buf, settings_theme_name(s->theme));
-        } else if (idx == 5) {
-            scopy(buf, "English");             /* fixed for now */
+        } else if (idx == 4) {
+            scopy(buf, settings_clicker_name(s->clicker));
+        }
+        break;
+
+    case SETTINGS_CLICKER:
+        if (idx == s->clicker) {
+            scopy(buf, "\x03");                 /* middot marks the active profile */
         }
         break;
 
@@ -238,11 +256,6 @@ void settings_value(int screen, const settings_t *s, int idx,
         case 0: scopy(buf, s->shuffle ? "On" : "Off"); break;
         case 1: scopy(buf, s->repeat == REPEAT_OFF ? "Off"
                          : s->repeat == REPEAT_ALL ? "All" : "One"); break;
-        case 2: *is_toggle = 1; *toggle_on = s->crossfade; break;
-        case 3: scopy(buf, "4 sec");  break;   /* cosmetic: crossfade length */
-        case 4: scopy(buf, "Album");  break;   /* cosmetic: replaygain mode  */
-        case 5: scopy(buf, "10 sec"); break;   /* cosmetic: skip length      */
-        case 6: *is_toggle = 1; *toggle_on = s->resume_on_startup; break;
         default: break;
         }
         break;
@@ -254,7 +267,6 @@ void settings_value(int screen, const settings_t *s, int idx,
         case 2: fmt_db(buf, s->treble);  *num = s->treble + 12; *den = 24;  break;
         case 3: fmt_balance(buf, s->balance);
                 *num = s->balance + 100; *den = 200; break;
-        case 4: scopy(buf, "120%"); *num = 65; *den = 100; break; /* cosmetic */
         default: break;
         }
         break;
@@ -289,10 +301,9 @@ int settings_activate(int screen, settings_t *s, int idx)
         case 1: return SETTINGS_ENTER_SOUND;
         case 2: return SETTINGS_ENTER_THEME;
         case 3: return SETTINGS_ENTER_DISPLAY;
-        case 4: return SETTINGS_ACTION_NONE;   /* Shortcuts: not implemented */
-        case 5: return SETTINGS_ACTION_NONE;   /* Language: fixed English    */
-        case 6: return SETTINGS_ENTER_ABOUT;
-        case 7: return SETTINGS_ACTION_RESET;
+        case 4: return SETTINGS_ENTER_CLICKER;
+        case 5: return SETTINGS_ENTER_ABOUT;
+        case 6: return SETTINGS_ACTION_RESET;
         default: return SETTINGS_ACTION_NONE;
         }
 
@@ -300,9 +311,7 @@ int settings_activate(int screen, settings_t *s, int idx)
         switch (idx) {
         case 0: s->shuffle = !s->shuffle; break;
         case 1: s->repeat = (repeat_mode_t)((s->repeat + 1) % 3); break;
-        case 2: s->crossfade = !s->crossfade; break;
-        case 6: s->resume_on_startup = !s->resume_on_startup; break;
-        default: break;                        /* cosmetic selects: no field */
+        default: break;
         }
         return SETTINGS_ACTION_NONE;
 
@@ -313,8 +322,14 @@ int settings_activate(int screen, settings_t *s, int idx)
         return SETTINGS_ACTION_NONE;
 
     case SETTINGS_THEME:
-        if (idx >= 0 && idx < 4) {
+        if (idx >= 0 && idx < 2) {
             s->theme = idx;
+        }
+        return SETTINGS_ACTION_NONE;
+
+    case SETTINGS_CLICKER:
+        if (idx >= 0 && idx < CLICK_N) {
+            s->clicker = idx;
         }
         return SETTINGS_ACTION_NONE;
 
@@ -335,7 +350,7 @@ void settings_adjust(int screen, settings_t *s, int idx, int delta)
         case 1: s->bass    = clampi(s->bass + delta, -12, 12);    break;
         case 2: s->treble  = clampi(s->treble + delta, -12, 12);  break;
         case 3: s->balance = clampi(s->balance + delta, -100, 100); break;
-        default: break;                        /* Stereo Width: cosmetic     */
+        default: break;
         }
         break;
 

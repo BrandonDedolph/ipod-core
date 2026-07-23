@@ -61,4 +61,13 @@ void lcd_present_fb(const uint16_t *fb);
  * powered gate applies. See core/docs/hw/02-lcd.md, "Partial present". */
 void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h);
 
+/*
+ * Panel sleep/wake for suspend (EXPERIMENTAL — see lcd.c). lcd_sleep() blanks
+ * the panel via the BCM LCD_SLEEP command without power-gating the BCM (so no
+ * firmware re-upload is needed to wake). After lcd_wake(), present a frame to
+ * re-light + repaint the panel.
+ */
+void lcd_sleep(void);
+void lcd_wake(void);
+
 #endif /* CORE_HAL_HW_LCD_H */

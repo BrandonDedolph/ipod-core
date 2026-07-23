@@ -38,7 +38,12 @@
  * producer (decode_pump, foreground) from the consumer (the DMA-completion
  * ISR). dr_flac / dr_mp3 run freestanding on a static arena — no libc.
  */
-#define RING_FRAMES   (1u << 16)         /* 65536 frames = 256 KB ~ 1.49 s      */
+#define RING_FRAMES   (1u << 18)         /* 262144 frames = 1 MB ~ 5.94 s. Big
+                                          * enough that the (blocking) HDD spin-up
+                                          * on a refill after the drive has been
+                                          * PARKED can't starve the DMA — decode is
+                                          * frozen for the ~1-3 s spin-up, so the
+                                          * ring must hold more than that. */
 #define DECODE_FRAMES 4096u              /* frames per decode() call (prime)    */
 #define PLAY_STEP_FRAMES 1024u           /* frames per decode step in the play   */
                                          /* loop: small so the loop returns to   */
@@ -119,6 +124,7 @@ static decoder_source_t g_disk_src;      /* g_dbuf as a source (ra's backing)   
 static readahead_t      g_ra;            /* block-buffering shim                 */
 static decoder_source_t g_dec_src;       /* buffered source handed to the codec  */
 static decoder_arena_t  g_arena;
+static int              g_drive_parked;  /* 1 while the HDD is spun down (idle burst) */
 
 static void fat_src_open(fat_src_t *s, fat32_t *fs, uint32_t clus, uint32_t sz)
 {
@@ -190,9 +196,17 @@ static int ring_source(void *ud, int16_t *buf, int frames)
 /* Producer: decode (FLAC or MP3) into the ring until it's full or end-of-stream.
  * Codec-agnostic — it only calls g_dec.ops->decode, so the same loop drives
  * whichever decoder open() installed. Foreground only. */
+/* How much to decode BEFORE audio starts. The ring is large (RING_FRAMES ~6s)
+ * so a drive spin-up mid-playback can't underrun it — but priming the WHOLE ring
+ * up front made every song take seconds to start (decode + read ~6s of audio
+ * before the first sample). Prime just ~1.5s (the old, proven-safe amount);
+ * player_pump tops the ring up to full in the background once playback runs. */
+#define PRIME_FRAMES (1u << 16)          /* 65536 frames ~ 1.49 s */
+
 static void decode_pump(void)
 {
-    while (!g_eos && pcm_ring_free(&g_ring) >= DECODE_FRAMES) {
+    while (!g_eos && pcm_ring_fill(&g_ring) < PRIME_FRAMES &&
+           pcm_ring_free(&g_ring) >= DECODE_FRAMES) {
         int got = g_dec.ops->decode(&g_dec, decode_buf, (int)DECODE_FRAMES);
         if (got <= 0) {
             g_eos = 1;
@@ -304,7 +318,7 @@ const uint16_t *player_art_pixels(void) { return (const uint16_t *)(g_art_raw + 
  * doesn't disturb the currently-playing album (or its art).
  * ------------------------------------------------------------------------- */
 static fat32_t       *g_pl_fs;
-static browse_entry_t g_queue[BROWSE_MAX];
+static browse_entry_t g_queue[QUEUE_MAX];
 static int            g_queue_n;
 static int            g_queue_idx;
 static int            g_pl_active;        /* a track is loaded (playing OR paused) */
@@ -363,16 +377,28 @@ void player_init(fat32_t *fs)
 static int player_open_current(void)
 {
     const browse_entry_t *b = &g_queue[g_queue_idx];
+    if (b->art_clus) {                   /* per-track cover (mixed/shuffle queue) */
+        load_folder_art(g_pl_fs, b->art_clus, b->art_size);
+    }
     fat_src_open(&g_fsrc, g_pl_fs, b->clus, b->size);
     g_file_src.read = fat_src_read;
     g_file_src.seek = fat_src_seek;
     g_file_src.tell = fat_src_tell;
     g_file_src.userdata = &g_fsrc;
-    /* Read tags + duration up front through the raw source (header only, cheap).
-     * Harmless on non-FLAC (returns -1 / have=0). diskbuf_init below starts fresh
-     * (inner_pos=-1) and re-seeks the source to 0 on its first read, undoing the
-     * position this advanced. */
-    flac_meta_read(&g_file_src, &g_cur_meta);
+    /* Read tags + duration up front. Buffer the header through a read-ahead so
+     * the parser's many tiny reads (4-byte block headers, per-comment lengths)
+     * collapse into ~one backing disk read instead of ~30 full-FS-sector PIO
+     * reads — a direct cut to time-to-first-sound. ra_buf is free here (the
+     * decode path re-inits it just below). Harmless on non-FLAC (have=0).
+     * diskbuf_init below starts fresh (inner_pos=-1) and re-seeks the source to 0
+     * on its first read, undoing the position this advanced. */
+    {
+        readahead_t      meta_ra;
+        decoder_source_t meta_src;
+        readahead_init(&meta_ra, &g_file_src, ra_buf, sizeof ra_buf);
+        readahead_as_source(&meta_ra, &meta_src);
+        flac_meta_read(&meta_src, &g_cur_meta);
+    }
     /* Anti-skip buffer over the raw disk, then the read-ahead shim over that. */
     diskbuf_init(&g_dbuf, &g_file_src, disk_buf, DISK_BUF_BYTES,
                  DISK_LOW, DISK_HIGH);
@@ -518,12 +544,38 @@ void player_play_queue(const browse_entry_t *src, int n, int start,
                        uint32_t art_clus, uint32_t art_size)
 {
     player_stop();
-    for (int i = 0; i < n && i < BROWSE_MAX; i++) {
+    for (int i = 0; i < n && i < QUEUE_MAX; i++) {
         g_queue[i] = src[i];
     }
-    g_queue_n   = (n < BROWSE_MAX) ? n : BROWSE_MAX;
+    g_queue_n   = (n < QUEUE_MAX) ? n : QUEUE_MAX;
     g_queue_idx = start;
     load_folder_art(g_pl_fs, art_clus, art_size);  /* queue-level art */
+    if (player_open_current() != 0) {
+        player_advance();                /* skip a broken first track */
+    }
+}
+
+/* Incremental large-queue builder (Shuffle Songs enqueues the whole library). */
+void player_queue_begin(void)
+{
+    player_stop();
+    g_queue_n = 0;
+}
+
+void player_queue_add(const browse_entry_t *e)
+{
+    if (g_queue_n < QUEUE_MAX) {
+        g_queue[g_queue_n++] = *e;
+    }
+}
+
+void player_queue_commit(int start)
+{
+    if (g_queue_n == 0) {
+        return;
+    }
+    g_queue_idx = (start >= 0 && start < g_queue_n) ? start : 0;
+    load_folder_art(g_pl_fs, 0, 0);      /* mixed queue: per-track art loads on open */
     if (player_open_current() != 0) {
         player_advance();                /* skip a broken first track */
     }
@@ -543,6 +595,19 @@ void player_pump(void)
      * drive head sits idle; see codecs/diskbuf.h. */
     if (pcm_ring_fill(&g_ring) >= RING_DISK_GATE) {
         diskbuf_pump(&g_dbuf, DISK_CHUNK);
+    }
+    /* Apple-quiet playback: physically PARK the drive between refill bursts.
+     * The diskbuf already goes idle (filling==0) once it's topped up; when it
+     * does, spin the platters DOWN so they're not just idle-spinning. The next
+     * burst's read spins them back up transparently (ata_read_sectors' DRQ wait
+     * is time-based to tolerate the ~1-3 s spin-up, which the enlarged PCM ring
+     * covers). While a burst is filling, the head is up by definition. */
+    if (g_dbuf.filling) {
+        g_drive_parked = 0;                      /* a burst is reading -> head up */
+    } else if (!g_drive_parked &&
+               diskbuf_fill_ahead(&g_dbuf) > DISK_LOW) {
+        ata_standby();                           /* topped up + idle -> park it */
+        g_drive_parked = 1;
     }
     uint32_t fill = pcm_ring_fill(&g_ring);
     if (fill < g_pl_low_fill) {
@@ -641,13 +706,13 @@ void player_next(void)
             for (int j = g_queue_idx + 1; j < g_queue_n; j++) {
                 if (!g_queue[j].is_dir) { nxt = j; break; }
             }
-            if (nxt < 0) {                               /* wrap to first */
+            if (nxt < 0 && g_repeat == 1) {              /* wrap only on Repeat All */
                 for (int j = 0; j < g_queue_n; j++) {
                     if (!g_queue[j].is_dir) { nxt = j; break; }
                 }
             }
         }
-        if (nxt < 0) return;
+        if (nxt < 0) return;                             /* past the last → stop     */
         g_queue_idx = nxt;
         if (player_open_current() == 0) return;
     }
