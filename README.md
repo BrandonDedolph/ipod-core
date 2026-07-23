@@ -4,7 +4,7 @@
 iPod ("iPod Video", PortalPlayer PP5022). It boots on real hardware,
 reads music off the iPod's own disk, and plays it back through a custom
 Nunito/Linen interface. It **replaces Rockbox entirely** — it is not a
-Rockbox theme, patch, or plugin, and shares no Rockbox code.
+Rockbox theme, patch, or plugin, and contains no copied Rockbox code.
 
 > ### ▶ This runs on a real iPod. Not an emulator, not a simulator.
 > It boots and plays on **actual 2006 Apple hardware** — a physical iPod
@@ -30,11 +30,14 @@ See the [**Screens**](#screens) gallery below for a full tour.
 
 ## What it is
 
-- **Cleanroom.** Every driver and the freestanding codec/UI glue are
-  written from hardware facts — PortalPlayer register maps, the WM8758B
-  datasheet, the FAT32 spec — not from reading GPL sources. See
-  [`core/docs/hw/`](core/docs/hw/) for the subsystem-by-subsystem
-  hardware reference the drivers were written against.
+- **Cleanroom-by-facts.** Every driver is written from hardware facts —
+  PortalPlayer register maps, the WM8758B datasheet, the FAT32 spec. Where
+  those facts were cross-referenced against existing sources (including
+  Rockbox), only non-copyrightable facts were taken — register addresses,
+  bit values, init sequences — never code bodies; the implementations are
+  our own. See [`core/docs/hw/`](core/docs/hw/) for the subsystem-by-
+  subsystem hardware reference the drivers were written against, which
+  cites its sources.
 - **Bare metal.** No RTOS, no libc on the device. A small cooperative
   kernel, a static-arena allocator, and our own `mem.c` back the
   freestanding decoders; integer division and soft-float come from the
@@ -285,8 +288,11 @@ See [`core/README.md`](core/README.md) for firmware-side build detail and
 
 ## License
 
-Apache-2.0, first-party. The firmware is a cleanroom implementation: its
-drivers and decoders are derived from hardware documentation, not from
-GPL sources. Vendored codecs keep their permissive upstream licenses —
-`dr_flac` / `dr_mp3` (public domain / MIT), `stb_image` (public domain / MIT).
+Apache-2.0, first-party. The firmware contains no copied Rockbox code and
+vendors no GPL code: its drivers are written from hardware facts (register
+maps, datasheets, the FAT32 spec), and where those facts were
+cross-referenced against existing sources — including Rockbox — only the
+facts themselves were taken (register addresses, bit values, init
+sequences), not code bodies. Vendored decoders are permissively licensed
+and unrelated to Rockbox — `dr_flac` / `dr_mp3` (public domain / MIT-0).
 The Nunito font is under the SIL Open Font License 1.1 (`tools/fonts-src/`).
