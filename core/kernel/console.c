@@ -118,36 +118,39 @@ uint16_t *console_fb(void)
     return g_fb;
 }
 
+/* Clamp the rect to the panel ONCE, then run tight inner loops (no per-pixel
+ * bounds branch). Identical output for the in-bounds pixels. */
 void console_fill_rect(int x, int y, int w, int h, uint16_t rgb565)
 {
-    for (int ry = 0; ry < h; ry++) {
-        int py = y + ry;
-        if (py < 0 || py >= LCD_HEIGHT) {
-            continue;
-        }
-        for (int rx = 0; rx < w; rx++) {
-            int px = x + rx;
-            if (px < 0 || px >= LCD_WIDTH) {
-                continue;
-            }
-            g_fb[py * LCD_WIDTH + px] = rgb565;
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w, y1 = y + h;
+    if (x1 > LCD_WIDTH)  x1 = LCD_WIDTH;
+    if (y1 > LCD_HEIGHT) y1 = LCD_HEIGHT;
+    for (int py = y0; py < y1; py++) {
+        uint16_t *row = &g_fb[py * LCD_WIDTH];
+        for (int px = x0; px < x1; px++) {
+            row[px] = rgb565;
         }
     }
 }
 
 void console_blit565(int x, int y, int w, int h, const uint16_t *src)
 {
-    for (int ry = 0; ry < h; ry++) {
-        int py = y + ry;
-        if (py < 0 || py >= LCD_HEIGHT) {
-            continue;
-        }
-        for (int rx = 0; rx < w; rx++) {
-            int px = x + rx;
-            if (px < 0 || px >= LCD_WIDTH) {
-                continue;
-            }
-            g_fb[py * LCD_WIDTH + px] = src[ry * w + rx];
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w, y1 = y + h;
+    if (x1 > LCD_WIDTH)  x1 = LCD_WIDTH;
+    if (y1 > LCD_HEIGHT) y1 = LCD_HEIGHT;
+    for (int py = y0; py < y1; py++) {
+        const uint16_t *srow = &src[(py - y) * w];
+        uint16_t       *drow = &g_fb[py * LCD_WIDTH];
+        for (int px = x0; px < x1; px++) {
+            drow[px] = srow[px - x];
         }
     }
 }

@@ -62,6 +62,33 @@ if target == 'sim'
   )
   test('readahead', readahead_test, suite: 'unit')
 
+  # flac-meta: the FLAC metadata reader (codecs/flac_meta.c) — the SAME source
+  # the ARM build links into core.elf. Backs a decoder_source_t with an in-RAM
+  # buffer and asserts: the committed KAT vector parses to sample_rate 44100 /
+  # 1 s duration (its VORBIS_COMMENT has no tags), a synthetic FLAC we build in
+  # RAM round-trips a full tag set (title/artist/ALBUMARTIST fallback/album/
+  # genre/"7/12" track/"2021-05-01" date) with UTF-8 stripped, and malformed /
+  # hostile inputs return -1 or bail without overrunning. Takes the fixture dir
+  # as argv[1] to find the KAT flac.
+  flac_meta_test = executable(
+    'flac_meta_test',
+    sources: ['codecs/flac_meta_test.c', '../codecs/flac_meta.c'],
+    include_directories: include_directories('../codecs'),
+  )
+  test('flac-meta', flac_meta_test, args: [vectors_dir], suite: 'unit')
+
+  # diskbuf: the MB-scale anti-skip buffer (codecs/diskbuf.c) that reads ahead in
+  # bursts so the drive head parks between refills (the "constant arm movement"
+  # fix). Backed by the same instrumented in-RAM source; asserts byte-exactness
+  # across reads/seeks AND that the pump is bursty (fills to high, idles, refills
+  # below low). Same diskbuf.c the ARM build compiles.
+  diskbuf_test = executable(
+    'diskbuf_test',
+    sources: ['codecs/diskbuf_test.c', '../codecs/diskbuf.c'],
+    include_directories: include_directories('../codecs'),
+  )
+  test('diskbuf', diskbuf_test, suite: 'unit')
+
   # text: the freestanding antialiased text renderer (core/ui/text.c) — the
   # SAME source the ARM build links into core.elf. Renders "Ag" into a small
   # RGB565 buffer over a known bg/ink and asserts width is positive+additive
@@ -75,6 +102,32 @@ if target == 'sim'
     include_directories: include_directories('../ui'),
   )
   test('text', text_test, suite: 'unit')
+
+  # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
+  # — the SAME source the ARM build links into core.elf. Shrinks a loaded
+  # folder.art to a list chip / album-detail cover when no folder.thm is present.
+  # Asserts an exact identity copy (dst == src dims), a hand-worked 4x4->2x2 pixel
+  # selection, in-bounds source reads + no OOB writes for a non-integer ratio
+  # (120->22, sentinel-guarded dst), and the zero/negative-dim no-op. Plain cc.
+  thumb_test = executable(
+    'thumb_test',
+    sources: ['ui/thumb_test.c', '../ui/thumb.c'],
+    include_directories: include_directories('../ui'),
+  )
+  test('thumb', thumb_test, suite: 'unit')
+
+  # settings: the Settings state model (core/ui/settings.c) — the SAME source the
+  # ARM build links into core.elf. Pure model logic (no framebuffer/hardware), so
+  # it compiles with plain cc. Asserts defaults, that activate() toggles Shuffle
+  # and cycles Repeat OFF->ALL->ONE->OFF, that adjust() clamps Volume/Bass and
+  # Display Brightness to range, that Backlight cycles its discrete list, and that
+  # Root rows return the right ENTER_*/RESET action codes plus value/kind report.
+  settings_test = executable(
+    'settings_test',
+    sources: ['ui/settings_test.c', '../ui/settings.c'],
+    include_directories: include_directories('../ui'),
+  )
+  test('settings', settings_test, suite: 'unit')
 
   tag_mp3_test = executable(
     'tag_mp3_test',
@@ -278,4 +331,44 @@ if target == 'sim'
     c_args: ['-DMMIO_MOCK'],
   )
   test('hw-backlight', backlight_trace_test, suite: 'unit')
+
+  # hw-battery: the battery gauge (PCF50605 PMU ADC over I2C) + power-state
+  # (GPIO input bits), host-side under -DMMIO_MOCK. There is no clicky PMU
+  # model and the device needs a logic analyzer, so this is the only
+  # automated check of the battery read grammar. It exercises the new
+  # i2c.c register-pointer READ path end-to-end: asserts battery_millivolts
+  # emits the exact channel-select write (ADCC1=0x05) + 2-byte result read
+  # (ADCS1/ADCS2) transaction stream and returns the seeded raw's mV, and
+  # that power_is_external/charging read the right GPIO input reg/width and
+  # decode the right bit + polarity. Scaling + %-curve are DEVICE-GATED
+  # (calibrate against the real cell); the test pins the transaction shape,
+  # not the on-cell accuracy.
+  battery_trace_test = executable(
+    'battery_trace_test',
+    sources: ['hw_mmio/battery_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/battery.c',
+              '../hal/hw/i2c.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+  )
+  test('hw-battery', battery_trace_test, suite: 'unit')
+
+  # hw-volume: the WM8758 output-volume HAL (hal/hw/volume.c) over the
+  # reused i2c.c write path, host-side under -DMMIO_MOCK. Volume is not
+  # modelled by clicky and the device needs a logic analyzer, so this is
+  # the automated check of the percent->register policy: the PURE
+  # percent->OUT1VOL mapping (monotonic gain, clamping, 0%=mute,
+  # 100%=0 dB/0x39 never +6 dB) plus hal_volume_set's L-then-R(+VU)
+  # two-write codec grammar and hal_volume_get round-trip.
+  volume_trace_test = executable(
+    'volume_trace_test',
+    sources: ['hw_mmio/volume_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/volume.c',
+              '../hal/hw/i2c.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+  )
+  test('hw-volume', volume_trace_test, suite: 'unit')
 endif

@@ -22,6 +22,14 @@
 /* An atlas font handle (opaque wrapper over the atlas.h data). */
 typedef struct text_font text_font_t;
 
+/* Non-ASCII atlas extras, embedded in UI strings as private single-byte codes
+ * (the atlas is otherwise ASCII-only; see text.c glyph_index + atlas_gen.py).
+ * Use as string literals, e.g. ui_text(x, y, UI_GLYPH_LAQUO "Back", …) or a
+ * separator: "Artist " UI_GLYPH_MIDDOT " Album". */
+#define UI_GLYPH_LAQUO  "\x01"   /* ‹ single left  angle quote  */
+#define UI_GLYPH_RAQUO  "\x02"   /* › single right angle quote  */
+#define UI_GLYPH_MIDDOT "\x03"   /* · middle dot                */
+
 /* The built-in Nunito faces, backed by the atlas data. One getter
  * per shipped atlas header (regular 9/11/13; bold 9/11/13/17 — there is
  * no regular-17 atlas in the tree). Each returns a stable pointer to a
@@ -47,6 +55,18 @@ const text_font_t *text_font_bold_17(void);
 int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
               const char *s, const text_font_t *font, uint16_t ink);
 
+/* Like text_draw but clips output to the horizontal window [clip_x0, clip_x1)
+ * — used by the marquee to scroll long text through a fixed region. */
+int text_draw_clip(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+                   const char *s, const text_font_t *font, uint16_t ink,
+                   int clip_x0, int clip_x1);
+
+/* text_draw_clip plus a vertical window [clip_y0, clip_y1) — keeps a marquee's
+ * scrolling glyphs inside their list row. */
+int text_draw_clip_v(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+                     const char *s, const text_font_t *font, uint16_t ink,
+                     int clip_x0, int clip_x1, int clip_y0, int clip_y1);
+
 /* Pixel width the string would advance, without drawing. */
 int text_width(const char *s, const text_font_t *font);
 
@@ -56,5 +76,9 @@ int text_line_height(const text_font_t *font);
 /* Pixels above the baseline for this face (for top-origin layout:
  * baseline_y = top_y + text_ascent(font)). */
 int text_ascent(const text_font_t *font);
+
+/* Pixels the font descends below the baseline (glyph ink box = ascent+descent,
+ * tighter than line_height which includes inter-line leading). */
+int text_descent(const text_font_t *font);
 
 #endif /* CORE_UI_TEXT_H */

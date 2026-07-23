@@ -120,6 +120,32 @@ if target == 'hw'
     include_directories: codec_inc,
   )
 
+  # FLAC metadata reader (ours, not vendored): parses a FLAC's STREAMINFO +
+  # VORBIS_COMMENT blocks up front so the UI can show real title/artist/album/
+  # genre/track#/year + duration without decoding audio. Pulls bytes through a
+  # decoder_source_t (same fat_src + read-ahead path as the streaming decoder).
+  # Freestanding (no libc/libm/malloc — all buffers are stack/struct); reaches
+  # decoder.h via a relative include (no extra dirs). Same flac_meta.c the host
+  # flac_meta_test compiles; stays under -Werror since we own it.
+  flac_meta_hw_lib = static_library(
+    'core_flac_meta_hw',
+    sources: ['codecs/flac_meta.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+    include_directories: codec_inc,
+  )
+
+  # Anti-skip disk buffer (ours, not vendored): a MB-scale watermarked buffer
+  # that reads ahead in bursts so the drive head parks between refills instead of
+  # streaming continuously (the "constant arm movement" fix). Sits under the
+  # read-ahead shim. Freestanding (CORE_FREESTANDING → lib/mem.h memcpy);
+  # warning-clean under -Werror. Same diskbuf.c the host diskbuf_test compiles.
+  diskbuf_hw_lib = static_library(
+    'core_diskbuf_hw',
+    sources: ['codecs/diskbuf.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+    include_directories: codec_inc,
+  )
+
   # Freestanding antialiased text renderer (ours): draws Nunito type from the
   # pre-rasterized atlas/*.h data into an RGB565 framebuffer with a gamma-correct
   # integer blend — no libc/libm/malloc. Same text.c the host text_test compiles;
@@ -132,11 +158,70 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Freestanding nearest-neighbor RGB565 downscaler (ours): shrinks a loaded
+  # folder.art to a list chip / album-detail cover when no dedicated folder.thm
+  # is on disk. Pure integer math — no libc/libm/malloc, no allocation. Same
+  # thumb.c the host thumb_test compiles; links into core.elf. Only relative
+  # includes (thumb.h), so no extra include dirs; stays under -Werror.
+  thumb_hw_lib = static_library(
+    'core_thumb_hw',
+    sources: ['ui/thumb.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
+  # Full-screen "charging" battery view (ours): renders design_reference's
+  # ChargingScreen into the RGB565 console framebuffer with fill_rect shapes +
+  # the Nunito text renderer. Pure integer rendering — no libc/libm/malloc, no
+  # hardware access. Relative includes only (ui/text.h, ../kernel/console.h,
+  # ../hal/hal.h), so no extra include dirs; stays under -Werror.
+  screen_charging_hw_lib = static_library(
+    'core_screen_charging_hw',
+    sources: ['ui/screen_charging.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
+  # Freestanding incremental album-art thumbnail cache (ours): loads AT MOST one
+  # album cover per pump() call and pre-shrinks it to a 22x22 list chip, spreading
+  # the disk I/O across many main-loop passes so scrolling the album list never
+  # stalls the audio decode/DMA loop. Uses thumb.c to downscale and fat32 to read;
+  # no libc/libm/malloc, no allocation. Reaches fat32.h + thumb.h via relative
+  # includes (no extra include dirs); stays under -Werror since we own it.
+  artcache_hw_lib = static_library(
+    'core_artcache_hw',
+    sources: ['ui/artcache.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
+  # Settings subsystem (ours): a data-driven settings_t model + a matching
+  # renderer for the Settings screens (design_reference menus.jsx + ThemePicker).
+  # settings.c is pure model logic (no framebuffer/hardware — the SAME source the
+  # host settings_test compiles); screen_settings.c draws it via the Nunito text
+  # renderer + console fill_rect. main.c owns the settings_t state + navigation
+  # and calls these generically. No libc/libm/malloc; relative includes only
+  # (settings.h, ui/text.h, ../kernel/console.h, ../hal/hal.h); stays -Werror.
+  settings_hw_lib = static_library(
+    'core_settings_hw',
+    sources: ['ui/settings.c', 'ui/screen_settings.c', 'ui/palette.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
+  # Background streaming playback engine (ours): the FLAC/MP3 decode path, the
+  # SPSC PCM ring feeding the DMA DAC, the fat32 byte-source + read-ahead glue,
+  # album art, and the queue/auto-advance player — extracted out of kernel/main.c
+  # into core/player/. Freestanding (its struct-copy lowers to lib/mem.c's memcpy,
+  # resolved at the final link against mem_dep). Needs the hal include dir for
+  # hw/*.h + hal.h; codec/kernel/fs headers are reached via relative includes.
+  player_hw_lib = static_library(
+    'core_player_hw',
+    sources: ['player/player.c'],
+    include_directories: include_directories('hal', 'codecs', 'codecs/dr_flac', 'codecs/dr_mp3'),
+  )
+
   core_elf = executable(
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, readahead_hw_lib, text_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

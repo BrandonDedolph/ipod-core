@@ -23,6 +23,7 @@
  * symbols in both the hw link (atlas.c is sim-only) and the host text_test
  * link (which links text.c but not atlas.c), so there is no clash. */
 #include "atlas.h"
+#include "atlas/glyphmap.h"        /* ATLAS_CPMAP[]: codepoint -> glyph index */
 #include "atlas/nunito_regular_9.h"
 #include "atlas/nunito_regular_11.h"
 #include "atlas/nunito_regular_13.h"
@@ -115,19 +116,65 @@ static const uint8_t linear_to_srgb6[256] = {
      61,  61,  62,  62,  62,  62,  62,  62,  62,  62,  62,  63,  63,  63,  63,  63,
 };
 
+/* Decode one UTF-8 sequence at *p, advance *p past it, and return the codepoint
+ * (or -1 at the terminating NUL). Malformed bytes yield U+FFFD and advance one
+ * byte so a bad string can't stall. UI strings are UTF-8; ASCII is the 1-byte
+ * fast path (the common case). */
+static int utf8_next(const unsigned char **p) {
+    unsigned char c = **p;
+    if (c == 0) return -1;
+    if (c < 0x80) { (*p)++; return c; }
+    int n, cp;
+    if      ((c & 0xE0) == 0xC0) { n = 1; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { n = 2; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { n = 3; cp = c & 0x07; }
+    else { (*p)++; return 0xFFFD; }               /* stray continuation/lead */
+    const unsigned char *q = *p + 1;
+    for (int i = 0; i < n; i++) {
+        if ((q[i] & 0xC0) != 0x80) { (*p)++; return 0xFFFD; }   /* truncated */
+        cp = (cp << 6) | (q[i] & 0x3F);
+    }
+    *p += n + 1;
+    return cp;
+}
+
+/* Map a Unicode codepoint to an atlas glyph index, or -1 for "no glyph"
+ * (rendered as space-width). ASCII 0x20..0x7E map linearly; the three legacy
+ * private control bytes 0x01/0x02/0x03 alias ‹ › · (UI_GLYPH_* predate UTF-8);
+ * everything else is looked up in the generated, codepoint-sorted ATLAS_CPMAP
+ * (tools/atlas_gen.py EXTRAS -> atlas/glyphmap.h) by binary search. */
+static int glyph_index(int cp) {
+    if (cp >= 0x20 && cp <= 0x7E) return cp - 0x20;
+    switch (cp) {                                 /* legacy private aliases */
+        case 0x01: cp = 0x2039; break;            /* ‹ */
+        case 0x02: cp = 0x203A; break;            /* › */
+        case 0x03: cp = 0x00B7; break;            /* · */
+        default: break;
+    }
+    int lo = 0, hi = ATLAS_CPMAP_N - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1, mc = ATLAS_CPMAP[mid].cp;
+        if      (cp < mc) hi = mid - 1;
+        else if (cp > mc) lo = mid + 1;
+        else return ATLAS_CPMAP[mid].idx;
+    }
+    return -1;
+}
+
 /* ---------- Measurement / metrics ---------------------------------- */
 
 int text_width(const char *s, const text_font_t *font) {
     if (!font || !s) return 0;
     const atlas_t *a = font->a;
-    int w = 0;
-    for (; *s; s++) {
-        int cp = (unsigned char)*s;
-        if (cp < 0x20 || cp > 0x7E) {
+    const unsigned char *p = (const unsigned char *)s;
+    int w = 0, cp;
+    while ((cp = utf8_next(&p)) >= 0) {
+        int gi = glyph_index(cp);
+        if (gi < 0) {
             w += a->glyphs[0].advance;   /* space width */
             continue;
         }
-        w += a->glyphs[cp - 0x20].advance;
+        w += a->glyphs[gi].advance;
     }
     return w;
 }
@@ -137,6 +184,11 @@ int text_line_height(const text_font_t *font) {
     return font->a->line_height;
 }
 
+int text_descent(const text_font_t *font) {
+    if (!font) return 0;
+    return font->a->descent;
+}
+
 int text_ascent(const text_font_t *font) {
     if (!font) return 0;
     return font->a->ascent;
@@ -144,11 +196,14 @@ int text_ascent(const text_font_t *font) {
 
 /* ---------- Rendering ---------------------------------------------- */
 
-int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
-              const char *s, const text_font_t *font, uint16_t ink) {
+static int text_draw_c(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+                       const char *s, const text_font_t *font, uint16_t ink,
+                       int cx0, int cx1, int cy0, int cy1) {
     if (!fb || !font || !s || fb_w <= 0 || fb_h <= 0) {
         return x;
     }
+    if (cy0 < 0) cy0 = 0;
+    if (cy1 > fb_h) cy1 = fb_h;
     const atlas_t *a = font->a;
 
     /* Ink in raw RGB565 bit-fields, pre-decoded to linear light. */
@@ -159,13 +214,15 @@ int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
     uint8_t ig_lin = srgb6_to_linear[ig6];
     uint8_t ib_lin = srgb5_to_linear[ib5];
 
-    for (; *s; s++) {
-        int cp = (unsigned char)*s;
-        if (cp < 0x20 || cp > 0x7E) {
+    const unsigned char *p = (const unsigned char *)s;
+    int cp;
+    while ((cp = utf8_next(&p)) >= 0) {
+        int gi = glyph_index(cp);
+        if (gi < 0) {
             x += a->glyphs[0].advance;   /* treat as space-width */
             continue;
         }
-        const atlas_glyph_t *gly = &a->glyphs[cp - 0x20];
+        const atlas_glyph_t *gly = &a->glyphs[gi];
         const uint8_t *src = a->data + gly->data_offset;
 
         /* offset_y is "px below the ascender line" (PIL bbox convention).
@@ -176,10 +233,10 @@ int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
 
         for (int j = 0; j < gly->h; j++) {
             int py = gy + j;
-            if (py < 0 || py >= fb_h) continue;
+            if (py < 0 || py >= fb_h || py < cy0 || py >= cy1) continue;
             for (int i = 0; i < gly->w; i++) {
                 int px = gx + i;
-                if (px < 0 || px >= fb_w) continue;
+                if (px < cx0 || px >= cx1) continue;
                 uint8_t alpha = src[j * gly->w + i];
                 if (alpha == 0) continue;
 
@@ -195,10 +252,16 @@ int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
                 uint8_t bg_lin = srgb6_to_linear[(bg >> 5)  & 0x3F];
                 uint8_t bb_lin = srgb5_to_linear[ bg        & 0x1F];
 
+                /* Exact floor(x/255) for x in [0,65025] via add-shift — avoids
+                 * three soft-divides (no HW divide on ARM7) per blended pixel,
+                 * the hottest UI inner loop. Bit-identical to `/255`. */
                 uint8_t inv = (uint8_t)(255 - alpha);
-                uint8_t r_lin = (uint8_t)(((uint16_t)ir_lin * alpha + (uint16_t)br_lin * inv) / 255);
-                uint8_t g_lin = (uint8_t)(((uint16_t)ig_lin * alpha + (uint16_t)bg_lin * inv) / 255);
-                uint8_t b_lin = (uint8_t)(((uint16_t)ib_lin * alpha + (uint16_t)bb_lin * inv) / 255);
+                unsigned xr = (unsigned)ir_lin * alpha + (unsigned)br_lin * inv;
+                unsigned xg = (unsigned)ig_lin * alpha + (unsigned)bg_lin * inv;
+                unsigned xb = (unsigned)ib_lin * alpha + (unsigned)bb_lin * inv;
+                uint8_t r_lin = (uint8_t)((xr + 1 + (xr >> 8)) >> 8);
+                uint8_t g_lin = (uint8_t)((xg + 1 + (xg >> 8)) >> 8);
+                uint8_t b_lin = (uint8_t)((xb + 1 + (xb >> 8)) >> 8);
 
                 uint8_t r5 = linear_to_srgb5[r_lin];
                 uint8_t g6 = linear_to_srgb6[g_lin];
@@ -209,4 +272,31 @@ int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
         x += gly->advance;
     }
     return x;
+}
+
+int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+              const char *s, const text_font_t *font, uint16_t ink) {
+    return text_draw_c(fb, fb_w, fb_h, x, y, s, font, ink, 0, fb_w, 0, fb_h);
+}
+
+/* Like text_draw but writes only pixels with clip_x0 <= px < clip_x1 — the
+ * horizontal window a marquee scrolls its text through. */
+int text_draw_clip(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+                   const char *s, const text_font_t *font, uint16_t ink,
+                   int clip_x0, int clip_x1) {
+    if (clip_x0 < 0)     clip_x0 = 0;
+    if (clip_x1 > fb_w)  clip_x1 = fb_w;
+    return text_draw_c(fb, fb_w, fb_h, x, y, s, font, ink, clip_x0, clip_x1, 0, fb_h);
+}
+
+/* text_draw_clip with an additional VERTICAL window [clip_y0, clip_y1) — used by
+ * the marquee to keep a scrolling title inside its list row (so tall glyph tops
+ * can't paint above the selection bar into the row above). */
+int text_draw_clip_v(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+                     const char *s, const text_font_t *font, uint16_t ink,
+                     int clip_x0, int clip_x1, int clip_y0, int clip_y1) {
+    if (clip_x0 < 0)     clip_x0 = 0;
+    if (clip_x1 > fb_w)  clip_x1 = fb_w;
+    return text_draw_c(fb, fb_w, fb_h, x, y, s, font, ink,
+                       clip_x0, clip_x1, clip_y0, clip_y1);
 }

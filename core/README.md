@@ -1,59 +1,86 @@
-# core — custom firmware for iPod Video 5G/5.5G
+# core — firmware (device + host build)
 
-A from-scratch firmware that ships **Cabinet** as the shell and **Linen**
-as the only theme. Replaces Rockbox entirely on the device.
-
-See [`../PLAN.md`](../PLAN.md) for the full plan: goals, performance
-budget, quality bar, design principles, codec stack, install/update flow,
-and phased timeline.
+The bare-metal firmware for the iPod 5.5G and its host test build. From
+scratch, Apache-2.0, no RTOS and no libc on the device — it **replaces
+Rockbox** rather than theming it. See [`../README.md`](../README.md) for the
+project overview and [`../PLAN.md`](../PLAN.md) for the phased roadmap.
 
 ## Layout
 
 ```
 core/
-├── boot/        crt0.S, image header, linker script
-├── kernel/      cooperative tasks, IPC, static memory, IRQs
+├── boot/        crt0.S, .ipod image header, linker script
+├── kernel/      cooperative scheduler, IRQ, timer, clock, cache,
+│                framebuffer console, PCM ring — and main.c (the UI)
 ├── hal/
-│   ├── hal.h    contract
-│   ├── hw/      ARM target — touches real registers
-│   └── sim/     host target — backed by SDL + a disk-image file
-├── fs/          FAT32 (vendored FatFs + adapter)
-├── codecs/      Helix MP3/AAC, dr_flac, ALAC, Tremor, libopus, WAV
-├── apps/
-│   ├── audio/   engine, DSP, replaygain
-│   ├── db/      tagcache build/query
-│   └── ui/      Cabinet shell + Linen renderer
-├── cli/         the `core` Go binary (host tooling)
-├── sim/         SDL-based simulator main + glue
-├── docs/hw/     hardware reference (phase-0 deliverable)
-├── tests/       golden frames, codec vectors, scripted scenarios
-├── cross/       Meson cross files (arm-none-eabi)
-└── scripts/     build helpers
+│   ├── hal.h    hardware contract shared by both backends
+│   ├── hw/      ARM drivers: lcd, ata, i2c, i2s, wm8758, dma, audio,
+│   │            clickwheel, backlight, battery, power, piezo, uart
+│   └── sim/     host backend (SDL2)
+├── fs/          from-scratch read-only FAT32 reader (LFN → UTF-8)
+├── lib/         freestanding mem.c (memcpy/memset)
+├── codecs/      dr_flac + dr_mp3 (freestanding), static arena, read-ahead
+│                disk source, FLAC metadata reader, unified decoder ABI
+├── ui/          gamma-correct AA text renderer + Nunito atlases, the
+│                runtime palette (Linen/Onyx), art thumbnail cache,
+│                settings model, and per-screen renderers
+├── cli/         Go host CLI (`core` — .ipod firmware pack/unpack, sim)
+├── docs/hw/     hardware reference the drivers were written against
+├── cross/       Meson cross file (arm-none-eabi)
+└── tests/       host unit + MMIO golden-trace tests
 ```
+
+The player UI lives in `kernel/main.c` (the menu / browser / now-playing
+loop) on top of the `ui/` primitives; there is no separate app layer.
 
 ## Prerequisites
 
-Run `../tools/install_deps.sh` from the repo root to install everything
-in one shot (asdf-managed Go + system packages via your distro's
-package manager). Specifically you need:
-
 - `meson` ≥ 0.62, `ninja`, `pkg-config`
-- `libsdl2-dev` / `sdl2` (for `make sim`)
-- `arm-none-eabi-gcc` 13+ with `binutils` and `newlib` (for `make hw`)
+- `libsdl2-dev` / `sdl2` — for the host (`sim`) HAL
+- `arm-none-eabi-gcc` 13+ with `binutils` and `newlib` — for the device build
+- `go` — for the host CLI (`.ipod` packaging)
+
+On Arch: `pacman -S arm-none-eabi-gcc arm-none-eabi-binutils
+arm-none-eabi-newlib meson ninja pkgconf sdl2 go`.
 
 ## Quick start
 
 ```bash
-make sim    # builds the simulator (host) — requires SDL2 dev headers
-make hw     # builds the firmware image (ARM cross-toolchain)
-make help   # see all targets
+make hw      # → build-hw/core.elf, build-hw/core.bin  (ARMv4T bare metal)
+make ipod    # → build-hw/core.ipod  (transport-wrapped image to flash)
+make sim     # configures + builds the host target (SDL2 HAL)
+make help    # all targets
+
+meson test -C build-sim     # host unit + MMIO golden-trace tests
 ```
 
-The Go CLI (`core`) and the C build are separate: Go talks to the host;
-C is what ends up on the iPod (or the host sim).
+The host (`sim`) target compiles the same freestanding driver, codec, and
+text-renderer sources the device links, plus MMIO golden-trace tests that
+assert each driver's exact register grammar against a recording mock bus —
+the automated safety net for code that would otherwise need a logic
+analyzer to verify.
+
+## Audio path
+
+`dr_flac` / `dr_mp3` are compiled freestanding (`-DCORE_FREESTANDING`) and
+fed by a read-ahead disk source into an SPSC PCM ring drained by the
+DMA-completion ISR. Streaming, not preload — a full-length track plays off
+the iPod's own disk while the UI stays responsive. Output is always 16-bit
+signed interleaved PCM (see [`codecs/README.md`](codecs/README.md)).
+
+## Library index
+
+The FAT volume is read-only to the firmware, so the song library is built
+on the host by [`../tools/build_index.py`](../tools/build_index.py) into a
+single `CORELIB.IDX` the firmware loads in one read — instant Songs / Albums
+/ Genres with no per-file tag scan at boot. Records carry UTF-8 display
+fields plus a normalized-name hash that binds each record to its file on
+disk independent of quote/case style. If the index is absent the firmware
+falls back to a per-file tag scan.
 
 ## Status
 
-Phase 0 — hardware reference doc (in progress).
-
-See `../PLAN.md` for the phased roadmap.
+Runs on real iPod 5.5G hardware: boot + bring-up, LCD, click-wheel, backlight,
+WM8758B audio, DMA streaming playback, ATA + FAT32, and streaming FLAC/MP3 off
+the device's disk, with the full menu / browser / now-playing UI. See
+[`../STATUS.md`](../STATUS.md) for the running list.

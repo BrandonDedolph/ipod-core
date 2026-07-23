@@ -22,4 +22,16 @@ void i2c_init(void);
  */
 int i2c_send(uint8_t dev, const uint8_t *bytes, int len);
 
+/*
+ * Register-pointer read: set the device's internal address pointer with a
+ * 1-byte write of `reg`, then read `n` result bytes (1..4) from 7-bit
+ * device address `dev` into `buf`. This is the shape the PCF50605 PMU
+ * (battery ADC) needs; the codec never reads, so Phase 1 shipped without
+ * it. Blocks (bounded) for the turn-around and for the read to complete
+ * before latching DATA — unlike the lazily-polled write path, the result
+ * bytes are only valid once BUSY clears. Returns 0 on success, -1 on a
+ * bad length/NULL buffer, -2 on a BUSY timeout.
+ */
+int i2c_read(uint8_t dev, uint8_t reg, uint8_t *buf, int n);
+
 #endif /* CORE_HAL_HW_I2C_H */

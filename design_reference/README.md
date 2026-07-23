@@ -2,7 +2,12 @@
 
 A clean, original Rockbox theme designed at the iPod's native **320×240** resolution. Rounded geometric type (Nunito), warm-light + true-dark palettes, and a complete set of menu, system, and Now Playing screens.
 
-This package is a design reference — the canonical layouts, tokens, and behaviors for an implementation in actual Rockbox WPS / SBS / FMS files.
+This package is a design reference — the canonical layouts, tokens, and behaviors the UI is built from.
+
+> **Note:** this JSX prototype predates the project's pivot. `core/` is now
+> **from-scratch firmware that replaces Rockbox** (not a Rockbox theme); this
+> folder is kept as the visual source of truth — palette, chrome, screen
+> layouts, and interaction behavior — that the firmware UI implements.
 
 ---
 

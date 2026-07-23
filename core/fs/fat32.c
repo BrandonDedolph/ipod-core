@@ -12,10 +12,32 @@
 /* End-of-cluster-chain marker (FAT32 entries are 28-bit). */
 #define FAT_EOC 0x0FFFFFF8u
 
-/* One FS-sector of scratch (BytesPerSector is at most 4096). Used for FAT
- * lookups and directory scanning; never live at the same time as the
- * bulk data path (which reads straight into the caller's buffer). */
+/* One FS-sector of scratch (BytesPerSector is at most 4096). Used for
+ * directory scanning and partial (unaligned / end-of-file) data copies;
+ * never live at the same time as the bulk data path (which reads straight
+ * into the caller's buffer). */
 static uint8_t fat_scratch[4096];
+
+/* One-sector FAT cache — the fix for burst-seeking during playback.
+ *
+ * next_cluster() is called at every cluster boundary while streaming a file,
+ * and without a cache it re-reads a FAT sector each time. The FAT lives near
+ * the start of the partition while the file's data lives far into the data
+ * region, so every one of those lookups seeks the head back to the FAT and
+ * then back to the data — hundreds of head seeks interleaved through a single
+ * multi-MB read-ahead burst (what you feel as the drive "seeking" mid-play).
+ *
+ * One FS-sector holds bytes_per_sec/4 FAT entries (512 on a 2048-byte volume),
+ * i.e. the chain for ~16 MB of a contiguous file. Caching it collapses those
+ * hundreds of FAT re-reads into ONE read per sector's worth of chain, so a
+ * refill becomes: seek to the FAT once, then stream the data region. Tagged by
+ * the fs pointer so a second mounted volume can never serve a stale sector.
+ * Kept separate from fat_scratch, which the partial-data path clobbers. The
+ * volume is read-only, so the cache never needs write invalidation. */
+static uint8_t   fat_cache[4096];
+static fat32_t  *fat_cache_fs    = 0;
+static uint32_t  fat_cache_sec   = 0;
+static int       fat_cache_valid = 0;
 
 /* ---- little helpers -------------------------------------------------- */
 
@@ -58,10 +80,19 @@ static uint32_t next_cluster(fat32_t *fs, uint32_t clus)
     uint32_t fs_sec   = fs->fat_start + byte_off / fs->bytes_per_sec;
     uint32_t in_off   = byte_off % fs->bytes_per_sec;
 
-    if (read_fs_sector(fs, fs_sec, fat_scratch) != 0) {
-        return 0;
+    /* Serve from the FAT cache when it already holds this sector for this
+     * volume; otherwise fetch it once and tag it. This is what keeps the
+     * head parked over the data region through a whole read-ahead burst. */
+    if (!(fat_cache_valid && fat_cache_fs == fs && fat_cache_sec == fs_sec)) {
+        if (read_fs_sector(fs, fs_sec, fat_cache) != 0) {
+            fat_cache_valid = 0;
+            return 0;
+        }
+        fat_cache_fs    = fs;
+        fat_cache_sec   = fs_sec;
+        fat_cache_valid = 1;
     }
-    return rd32(&fat_scratch[in_off]) & 0x0FFFFFFFu;
+    return rd32(&fat_cache[in_off]) & 0x0FFFFFFFu;
 }
 
 /* Build the on-disk 11-byte 8.3 name ("TEST.WAV" -> "TEST    WAV"). */
@@ -129,15 +160,22 @@ static void fmt_83(const uint8_t raw[11], char *out)
  * never match an ASCII request; names longer than the cap are marked unusable
  * and simply fall back to the 8.3 match.
  */
-#define FAT_LFN_MAX 64   /* longest long-name we reassemble (chars); plenty
-                          * for real track filenames, and the buffer stays
-                          * small for a freestanding build */
+#define FAT_LFN_MAX 128  /* longest long-name we reassemble (chars). Must clear
+                          * the longest real "NN. Title.flac" — a feature-heavy
+                          * title like "16. TRAGIC (feat. Youngboy Never Broke
+                          * Again & Internet Money).flac" is 67 chars; at 64 the
+                          * reassembly gave up and fell back to the ugly 8.3
+                          * short name ("16TRAG~1"), which then failed to match
+                          * the library index and lost the track's metadata.
+                          * 128 covers any realistic track name; the buffer
+                          * (a stack local) stays small for a freestanding build. */
 
 /* Byte offset of each of the 13 chars inside a 32-byte LFN entry. */
 static const uint8_t lfn_pos[13] = {1,3,5,7,9,14,16,18,20,22,24,28,30};
 
 typedef struct {
-    char lfn[FAT_LFN_MAX];  /* assembled ASCII long name (not NUL-terminated) */
+    uint16_t lfn[FAT_LFN_MAX]; /* assembled long name as UTF-16 code units (BMP;
+                                * UTF-8-encoded when the dirent is built)       */
     int  max_idx;           /* highest slot written, -1 if none               */
     int  term;              /* terminator (0x0000) position, -1 if none       */
     int  bad;               /* saw an out-of-range piece -> unusable          */
@@ -171,7 +209,8 @@ static void lfn_add(lfn_acc_t *a, const uint8_t *e)
         } else if (idx >= FAT_LFN_MAX) {
             a->bad = 1;                         /* longer than we handle */
         } else {
-            a->lfn[idx] = (u > 0x7Fu) ? (char)0x01 : (char)u;
+            a->lfn[idx] = u;                    /* keep the full code unit; the
+                                                * dirent build UTF-8-encodes it */
             if ((int)idx > a->max_idx) {
                 a->max_idx = (int)idx;
             }
@@ -196,14 +235,40 @@ static int lfn_length(const lfn_acc_t *a)
 
 /* Case-insensitive ASCII compare of `name` against the first `len` chars of
  * the assembled long name; both must end at the same place. */
-static int lfn_match(const char *name, const char *lfn, int len)
+static int lfn_match(const char *name, const uint16_t *lfn, int len)
 {
     for (int i = 0; i < len; i++) {
-        if (name[i] == '\0' || upcase(name[i]) != upcase(lfn[i])) {
+        uint16_t u = lfn[i];
+        /* Callers only ever look up ASCII names (CORELIB.IDX, folder.art …), so
+         * any non-ASCII code unit simply can't match — fall back to 8.3. */
+        int c = (u < 0x80u) ? upcase((char)u) : -1;
+        if (name[i] == '\0' || upcase(name[i]) != c) {
             return 0;
         }
     }
     return name[len] == '\0';
+}
+
+/* UTF-8-encode the assembled long name (BMP code units) into `dst` (capacity
+ * `cap`, always NUL-terminated). Truncates on a char boundary if it would
+ * overflow — real names are far shorter than the buffer. */
+static void lfn_to_utf8(const uint16_t *lfn, int len, char *dst, int cap)
+{
+    int bi = 0;
+    for (int i = 0; i < len && bi + 4 < cap; i++) {
+        uint16_t u = lfn[i];
+        if (u < 0x80u) {
+            dst[bi++] = (char)u;
+        } else if (u < 0x800u) {
+            dst[bi++] = (char)(0xC0u | (u >> 6));
+            dst[bi++] = (char)(0x80u | (u & 0x3Fu));
+        } else {
+            dst[bi++] = (char)(0xE0u | (u >> 12));
+            dst[bi++] = (char)(0x80u | ((u >> 6) & 0x3Fu));
+            dst[bi++] = (char)(0x80u | (u & 0x3Fu));
+        }
+    }
+    dst[bi] = '\0';
 }
 
 /* ---- public API ------------------------------------------------------ */
@@ -213,6 +278,10 @@ int fat32_mount(fat32_t *fs, fat_read_fn read, void *ud, uint32_t part_lba)
     fs->read     = read;
     fs->ud       = ud;
     fs->part_lba = part_lba;
+
+    /* A fresh mount may reuse this fat32_t's address for a different volume;
+     * drop any FAT sector cached under the old geometry. */
+    fat_cache_valid = 0;
 
     uint8_t bs[512];
     if (read(ud, part_lba, 1, bs) != 0) {
@@ -241,6 +310,28 @@ int fat32_mount(fat32_t *fs, fat_read_fn read, void *ud, uint32_t part_lba)
     fs->fat_start   = rsvd;
     fs->data_start  = rsvd + num_fats * fatsz;
     fs->clus_bytes  = fs->sec_per_clus * byts;
+
+    /* Capacity: total FS sectors (TotSec32, or TotSec16) minus the reserved +
+     * FAT region, in clusters. */
+    uint32_t totsec = rd32(&bs[32]);
+    if (totsec == 0) totsec = rd16(&bs[19]);
+    fs->total_clus = (totsec > fs->data_start)
+                   ? (totsec - fs->data_start) / fs->sec_per_clus : 0;
+
+    /* Free clusters: cheap read of the FSInfo sector's FSI_Free_Count (offset
+     * 488), validated by its three signatures. 0xFFFFFFFF = "unknown" (we don't
+     * scan the whole FAT — too slow on an 80 GB volume). */
+    fs->free_clus = 0xFFFFFFFFu;
+    uint32_t fsinfo = rd16(&bs[48]);
+    if (fsinfo != 0 && fsinfo != 0xFFFFu) {
+        uint8_t fi[512];
+        if (read(ud, part_lba + fsinfo * fs->sec_ratio, 1, fi) == 0 &&
+            rd32(&fi[0])   == 0x41615252u &&
+            rd32(&fi[484]) == 0x61417272u &&
+            rd32(&fi[508]) == 0xAA550000u) {
+            fs->free_clus = rd32(&fi[488]);
+        }
+    }
     return 0;
 }
 
@@ -365,11 +456,7 @@ int fat32_readdir(fat32_t *fs, uint32_t dir_clus, fat32_dir_cb cb, void *ud)
                 fat32_dirent_t ent;
                 int llen = lfn_length(&acc);
                 if (llen >= 0) {
-                    int i;
-                    for (i = 0; i < llen; i++) {
-                        ent.name[i] = acc.lfn[i];
-                    }
-                    ent.name[i] = '\0';
+                    lfn_to_utf8(acc.lfn, llen, ent.name, (int)sizeof ent.name);
                 } else {
                     fmt_83(e, ent.name);
                 }

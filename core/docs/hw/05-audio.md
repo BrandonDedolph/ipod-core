@@ -347,6 +347,49 @@ mute bit) and `OUT3MIX = OUT4MIX = 0x40` (mute). Source:
 > 44.1 kHz case legitimately programs the 48 kHz `SR` field value (`0x00`).
 > Worth a driver comment so it doesn't read as a bug.
 
+## WM8758 tone controls (5-band EQ)
+
+The WM8758B carries a 5-band equaliser that can be switched onto either the
+ADC (record) or DAC (playback) path. `core` uses only the two shelving bands
+as a Bass/Treble tone control on playback; the three parametric mid bands are
+held flat. Source: **Wolfson WM8758B datasheet, "Equaliser" section, register
+map R18–R22** (a primary hardware datasheet, transcribed here — not Rockbox).
+
+| Reg | Addr | Band | Role |
+|-----|------|------|------|
+| `WM_EQ1` | `0x12` | band 1 | **low shelf (Bass)** |
+| `WM_EQ2` | `0x13` | band 2 | peaking (held flat) |
+| `WM_EQ3` | `0x14` | band 3 | peaking (held flat) |
+| `WM_EQ4` | `0x15` | band 4 | peaking (held flat) |
+| `WM_EQ5` | `0x16` | band 5 | **high shelf (Treble)** |
+
+9-bit data layout, shared by all five registers:
+
+- **`EQxG[4:0]`** (bits 4:0) — band gain, **`code = 12 − gain_dB`**, so
+  `0x0C` = 0 dB (flat), `0x00` = +12 dB, `0x18` = −12 dB, 1 dB/step, range
+  ±12 dB. Values outside `0x00..0x18` are reserved.
+- **`EQxC[1:0]`** (bits 6:5) — band centre/cutoff select. For the shelves:
+  `EQ1C`: `00`=80 Hz, `01`=105 Hz, `10`=135 Hz, `11`=175 Hz.
+  `EQ5C`: `00`=5.3 kHz, `01`=6.9 kHz, `10`=9 kHz, `11`=11.7 kHz.
+- **`EQ3DMODE`** (bit 8, **`EQ1` register only**) — EQ path select:
+  `0` = applied to the ADC (record), `1` = applied to the **DAC (playback)**.
+  Bit 8 on `EQ2..EQ5` is `EQxBW` (bandwidth, peaking bands only) and is left
+  `0`; on the shelving bands it is unused.
+
+| Constant | Reg | Value | Meaning |
+|----------|-----|-------|---------|
+| `EQ_GAIN_0DB`      | EQ1..EQ5 | `0x0C` | flat (0 dB) gain code |
+| `EQ_DAC_MODE`      | EQ1      | `0x100`| route EQ to the DAC (playback) |
+| `EQ1_CUTOFF_105HZ` | EQ1      | `0x020`| Bass shelf corner = 105 Hz (`EQ1C=01`) |
+| `EQ5_CUTOFF_6K9`   | EQ5      | `0x020`| Treble shelf corner = 6.9 kHz (`EQ5C=01`) |
+
+Driver policy (`core/hal/hw/volume.c`, `hal_tone_set`): Bass drives `EQ1G`,
+Treble drives `EQ5G`; `EQ2..EQ4` are written at `EQ_GAIN_0DB`. `EQ_DAC_MODE`
+is set on the `EQ1` write **only when Bass or Treble is non-zero**, so at the
+0/0 default the EQ stays on the (silent) ADC path and playback is bit-identical
+to no-EQ — the tone control is inert until the user moves it. On-device listen
+test confirms polarity (boost vs. cut) and corner choice.
+
 ## WM8758 sample-rate program: 44.1 kHz resolved
 
 `audiohw_set_frequency(HW_FREQ_44)` reduces to six register writes. PLL

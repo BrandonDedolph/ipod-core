@@ -39,6 +39,8 @@ typedef struct {
     uint32_t    fat_start;     /* FS sector of the FAT region (rel. part) */
     uint32_t    data_start;    /* FS sector of the data region (rel.part) */
     uint32_t    clus_bytes;    /* bytes per cluster                       */
+    uint32_t    total_clus;    /* total data clusters (for capacity)      */
+    uint32_t    free_clus;     /* free clusters from FSInfo, or 0xFFFFFFFF */
 } fat32_t;
 
 /*

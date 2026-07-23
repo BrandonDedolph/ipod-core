@@ -11,7 +11,9 @@ boot + memory remap → clock/PLL → timer/IRQ → LCD (BCM framebuffer
 present) → I²C/WM8758B/I²S first sound → DMA playback → ATA PIO reader →
 FAT32 → streaming FLAC/MP3 decode → audio out the headphone jack.
 
-![Main menu](docs/img/01-main.png) ![Now Playing](docs/img/09-np-default.png) ![Big art](docs/img/10-np-bigart.png)
+![Album list](docs/screens/albums.png) ![Now Playing](docs/screens/nowplaying.png) ![About](docs/screens/about.png)
+
+<p align="center"><img src="docs/screens/demo.gif" alt="core UI in motion" width="320"></p>
 
 ---
 
@@ -33,7 +35,14 @@ FAT32 → streaming FLAC/MP3 decode → audio out the headphone jack.
 - **Real type.** `core/ui/text.c` is a libc-free, gamma-correct
   antialiased text renderer that draws pre-rasterized Nunito glyph
   atlases straight into the RGB565 framebuffer — no FreeType, no malloc,
-  all `.rodata`.
+  all `.rodata`. It decodes UTF-8 and covers Latin-1 + smart punctuation,
+  so accented names and curly quotes render true.
+- **A real library UI.** Browse by Album / Artist / Genre / Song off a
+  host-built index (`CORELIB.IDX`) that loads in one read — album-art
+  chips, a 120×120 now-playing cover, a scrolling marquee for long
+  titles, a warm-light **Linen** theme and a warm-dark **Onyx** one,
+  plus settings (tone/balance, backlight, click profiles), volume and
+  lock overlays, and a battery gauge that warns red when low.
 
 ## Hardware target
 
@@ -112,23 +121,24 @@ core/                     bare-metal firmware + host test build
 │   ├── hw/               ARM drivers — LCD, ATA, I²C, I²S, WM8758B, DMA,
 │   │                     click-wheel, backlight, UART
 │   └── sim/              host HAL backend (SDL2)
-├── fs/                   read-only FAT32 reader
+├── fs/                   from-scratch read-only FAT32 reader (LFN → UTF-8)
 ├── lib/                  freestanding mem.c (memcpy/memset)
 ├── codecs/               dr_flac + dr_mp3 (freestanding), static arena,
-│                         read-ahead source, stb_image (album art)
-├── ui/                   freestanding antialiased text renderer + Nunito atlases
+│                         read-ahead disk source, FLAC metadata reader
+├── ui/                   AA text renderer + Nunito atlases, palette, art cache
 ├── cli/                  Go host CLI (.ipod firmware pack/unpack)
 ├── docs/hw/              hardware reference the drivers were written against
 ├── cross/                Meson cross file (arm-none-eabi)
 └── tests/                host unit + MMIO golden-trace tests
 
 design_reference/         UI design source — palette, chrome, icon paths
-design_standalone/        standalone design prototype
-docs/img/                 interface screenshots (this README)
-tools/                    build helpers (atlas generator, font sources, deps)
+docs/screens/             interface screenshots + demo GIF (this README)
+tools/                    host tooling — atlas + glyphmap generator, album-art
+                          converter, library-index builder, font sources
 ```
 
-See [`core/README.md`](core/README.md) for firmware-side build detail.
+See [`core/README.md`](core/README.md) for firmware-side build detail and
+[`tools/README.md`](tools/README.md) for the host toolchain.
 
 ---
 

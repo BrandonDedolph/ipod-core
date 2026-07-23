@@ -377,3 +377,38 @@ void lcd_present_fb(const uint16_t *fb)
      * hw-lcd-trace golden traces, which are unchanged. */
     lcd_present_rect(fb, 0, 0, LCD_WIDTH, LCD_HEIGHT);
 }
+
+/* ---- Panel sleep/wake (suspend) -------------------------------------------
+ *
+ * EXPERIMENTAL. Rockbox's iPod-Video panel-off also POWER-GATES the BCM
+ * (GPO32 &= ~0x4000) and re-bootstraps + re-uploads its firmware on wake — code
+ * we don't have (we rely on the boot handoff for BCM bringup). So this is the
+ * RECOVERABLE subset: clear the panel-enable bits and issue the LCD_SLEEP
+ * command, but leave the BCM powered and bootstrapped. lcd_wake() restores the
+ * bits; the caller then presents a frame to re-light + repaint. If the panel
+ * doesn't come back, the BCM is still alive so a present (or worst case a
+ * reset) recovers — nothing is permanently off.
+ *
+ * Register/command facts (Rockbox iPod-Video bcm_powerdown): panel-enable bits
+ * 0xF0 in BCM reg 0x10001400; LCD_SLEEP is BCM command 8. */
+#define BCM_PANEL_CTL_ADDR    0x10001400u
+#define BCM_PANEL_CTL_ENABLE  0x000000F0u
+#define BCMCMD_LCD_SLEEP      BCM_CMD(8)
+
+void lcd_sleep(void)
+{
+    LCD_IRQ_ENTER();
+    bcm_write32(BCM_PANEL_CTL_ADDR,
+                bcm_read32(BCM_PANEL_CTL_ADDR) & ~BCM_PANEL_CTL_ENABLE);
+    bcm_write32(BCMA_COMMAND, BCMCMD_LCD_SLEEP);
+    mmio_write16(BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
+    LCD_IRQ_EXIT();
+}
+
+void lcd_wake(void)
+{
+    LCD_IRQ_ENTER();
+    bcm_write32(BCM_PANEL_CTL_ADDR,
+                bcm_read32(BCM_PANEL_CTL_ADDR) | BCM_PANEL_CTL_ENABLE);
+    LCD_IRQ_EXIT();
+}

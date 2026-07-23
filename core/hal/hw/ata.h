@@ -34,4 +34,19 @@ int ata_read_sectors(uint32_t lba, uint32_t count, void *buf);
  */
 int ata_identify(void *buf);
 
+/*
+ * Spin the drive DOWN (ATA STANDBY IMMEDIATE) for suspend. The drive still
+ * accepts commands; the next media access spins it back up. Returns 0, or
+ * negative on a not-ready/timeout.
+ */
+int ata_standby(void);
+
+/*
+ * Spin the drive back UP after ata_standby() and confirm it can transfer:
+ * kicks a throwaway 1-sector read and waits out the (multi-second) spin-up.
+ * Call once on wake before resuming normal reads. Returns 0, or negative on a
+ * spin-up timeout / drive error.
+ */
+int ata_wakeup(void);
+
 #endif /* CORE_HAL_HW_ATA_H */
