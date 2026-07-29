@@ -96,10 +96,67 @@ TRACKING_PX = {
     # 1.82px (bold 17 — loose). That spread is why the text read as tight in
     # some places and airy in others at the same time. Equalising the gap
     # matters more than the absolute number.
-    (False,  9): 0.92, (False, 11): 0.59, (False, 13): 0.86,
-    (True,   9): 1.44, (True,  11): 1.59, (True,  13): 0.64, (True, 17): 0.28,
+    (False,  9): 0.92, (False, 11): 0.59, (False, 12): 0.48,
+    (True,  12): 0.73, (True,  13): 0.64, (True,  18): 0.09,
 }
 TRACKING_DEFAULT = 0.7
+
+# Optical kerning: re-solve every LETTER pair from the baked bitmaps so they
+# all render at the same ink gap. See optical_kern(). The target is in whole
+# pixels because the device pen steps in whole pixels.
+OPTICAL_KERN = os.environ.get("CORE_OPTICAL_KERN", "1") != "0"
+OPTICAL_TARGET_PX = int(os.environ.get("CORE_OPTICAL_TARGET", "2"))
+# Word gap, in px of ink-to-ink daylight across a space. Once every LETTER gap
+# is pinned to OPTICAL_TARGET_PX, the space stops being self-correcting: the
+# faces' designed space advances gave word/letter ratios from 1.5 (regular 9 —
+# "Taylor Swift" read as one word) to 3.0 (bold 13). Pinning this too is what
+# makes word spacing consistent between faces rather than an accident of each
+# one's design width.
+OPTICAL_WORD_PX = int(os.environ.get("CORE_OPTICAL_WORD", "5"))
+
+
+def fit_space_advance(glyphs, glyph_data, kerns, tracking, target_px):
+    """Space advance (26.6) that puts the median word gap at target_px.
+
+    Measured the way the device draws it: A's step into the space (tracking
+    applies), then the space's step out (it does not), then the ink-to-ink
+    clearance between A and B over the rows they share.
+    """
+    kmap = {(l, r): v for l, r, v in kerns}
+    idx = {chr(0x20 + i): i for i in range(95)}
+    ups = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    los = "abcdefghijklmnopqrstuvwxyz"
+    ext = {}
+    for ch in ups + los:
+        gi = idx[ch]
+        ox, oy, w, h, adv, off = glyphs[gi]
+        if w and h:
+            ext[ch] = (row_extents_bitmap(glyph_data[off:off + w * h], w, h, oy),
+                       ox, adv)
+    sp_adv = glyphs[idx[" "]][4]
+    gaps = []
+    for a in ups:
+        if a not in ext:
+            continue
+        ra, oxa, adva = ext[a]
+        for b in los:
+            if b not in ext:
+                continue
+            rb, oxb, _ = ext[b]
+            sh = set(ra) & set(rb)
+            if not sh:
+                continue
+            s1 = (adva + tracking + kmap.get((idx[a], idx[" "]), 0) * 2
+                  + ADV_ONE // 2) >> ADV_SHIFT
+            s2 = (sp_adv + kmap.get((idx[" "], idx[b]), 0) * 2
+                  + ADV_ONE // 2) >> ADV_SHIFT
+            gaps.append(min((s1 + s2 + oxb + rb[y][0]) - (oxa + ra[y][1]) - 1
+                            for y in sh))
+    if not gaps:
+        return sp_adv
+    gaps.sort()
+    median = gaps[len(gaps) // 2]
+    return max(ADV_ONE, sp_adv + (target_px - median) * ADV_ONE)
 
 PRINTABLE = range(0x20, 0x7F)  # 0x20..0x7E inclusive — 95 glyphs
 
@@ -159,6 +216,88 @@ def write_glyphmap(out_dir: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out))
     sys.stderr.write(f"wrote {path}\n")
+
+
+def row_extents_bitmap(bmp, w, h, oy, thresh=1):
+    """Per-row (first,last) ink columns, keyed by ASCENDER-RELATIVE row.
+
+    Keying by the raw bitmap row is wrong and was the first version's bug: two
+    glyphs of different heights start at different distances below the
+    ascender, so raw row 0 of 'L' and raw row 0 of 'a' are not the same line on
+    screen. Comparing them made the solver measure 'L' against the wrong part
+    of its neighbour and pull lowercase letters straight into L's foot.
+    """
+    out = {}
+    for row in range(h):
+        base = row * w
+        first = last = None
+        for col in range(w):
+            if bmp[base + col] >= thresh:
+                if first is None:
+                    first = col
+                last = col
+        if first is not None:
+            out[oy + row] = (first, last)
+    return out
+
+
+def optical_kern(glyphs, glyph_data, tracking, target_px):
+    """Per-pair corrections that put every letter pair at the SAME ink gap.
+
+    The font's own kerning is a design for print at large sizes; at 9-12px on
+    this panel it is zero for most pairs and the RASTERISED gaps end up all
+    over the place. Measured on the shipped regular-9 atlas: 'or', 'ol', 'ou'
+    and 'ON' sat at 3px while 'rd', 'lo', 'ta' and 'wo' sat at 0px — a 3px
+    spread at a 9px face, which is what reads as "some letters cramped, some
+    loose" no matter how carefully the mean is tuned.
+
+    So we measure the actual baked ink and solve for the gap instead. The
+    device pen steps in whole pixels (core/ui/text.c pen_step), so for glyphs A
+    then B the gap is:
+
+        gap = step + min_over_shared_rows(left_B(y) - right_A(y)) + oxB - oxA - 1
+
+    which inverts to an exact integer step for a target gap, and from there to
+    the kern value that produces it. Pairs already on target get no entry.
+
+    ASCII letters only: digits and punctuation have deliberate design widths
+    (a comma should not be spaced like an 'o'), and forcing them to a uniform
+    optical gap looks mechanical.
+    """
+    idx = {}
+    for i in range(95):
+        idx[chr(0x20 + i)] = i
+    letters = [c for c in
+               "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"]
+    ext = {}
+    for ch in letters:
+        gi = idx[ch]
+        ox, oy, w, h, adv, off = glyphs[gi]
+        if w == 0 or h == 0:
+            continue
+        ext[ch] = (row_extents_bitmap(glyph_data[off:off + w * h], w, h, oy),
+                   ox, adv)
+    out = []
+    for a in letters:
+        if a not in ext:
+            continue
+        ra, oxa, adva = ext[a]
+        for b in letters:
+            if b not in ext:
+                continue
+            rb, oxb, _ = ext[b]
+            shared = set(ra) & set(rb)
+            if not shared:
+                continue
+            m = min(rb[y][0] - ra[y][1] for y in shared) + oxb - oxa
+            step = target_px + 1 - m
+            adj64 = step * ADV_ONE - adva - tracking
+            adj = int(round(adj64 / 2.0))          # 1/64 -> 1/32
+            if adj == 0:
+                continue
+            adj = max(KERN_ADJ_MIN, min(KERN_ADJ_MAX, adj))
+            out.append((idx[a], idx[b], adj))
+    return out
 
 
 def kern_pairs(font, chars):
@@ -275,6 +414,32 @@ def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
     out.append("};")
     out.append("")
     total = 95 + len(EXTRAS)
+    # Tracking first: the optical solver needs it to compute a pair's step.
+    _ovr = os.environ.get("CORE_TRACKING_PX")
+    _bold = "BOLD" in symbol.upper()
+    _tpx = (float(_ovr) if _ovr
+            else TRACKING_PX.get((_bold, px_size), TRACKING_DEFAULT))
+    track = int(round(_tpx * ADV_ONE))
+
+    chars = [chr(cp) for cp in PRINTABLE] + [ch for _cp, ch in EXTRAS]
+    kerns = kern_pairs(font, chars)
+    # Optical pass: every LETTER pair is re-solved from the baked ink so they
+    # all land on the same gap. Font kerning still governs everything else
+    # (digits, punctuation, the Latin-1 extras), where design widths matter
+    # more than a uniform optical rhythm.
+    if OPTICAL_KERN:
+        opt = optical_kern(glyphs, glyph_data, track, OPTICAL_TARGET_PX)
+        merged = {(l, r): v for l, r, v in kerns}
+        merged.update({(l, r): v for l, r, v in opt})   # optical wins
+        kerns = [(l, r, v) for (l, r), v in merged.items() if v != 0]
+        kerns.sort(key=lambda e: (e[0], e[1]))
+        # ...and pin the word gap the same way.
+        sp = glyphs[0]
+        glyphs[0] = (sp[0], sp[1], sp[2], sp[3],
+                     fit_space_advance(glyphs, glyph_data, kerns, track,
+                                       OPTICAL_WORD_PX),
+                     sp[5])
+
     out.append(f"static const atlas_glyph_t {symbol}_GLYPHS[{total}] = {{")
     for i, (ox, oy, w, h, adv, off) in enumerate(glyphs):
         if i < 95:
@@ -295,8 +460,6 @@ def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
     out.append("")
 
     # Kern table: sorted (left, right) so the device binary-searches it.
-    chars = [chr(cp) for cp in PRINTABLE] + [ch for _cp, ch in EXTRAS]
-    kerns = kern_pairs(font, chars)
     out.append(f"/* {len(kerns)} kern pairs, adj in 1/32 px, sorted by")
     out.append(" * (left<<8)|right for binary search. */")
     if kerns:
@@ -319,13 +482,6 @@ def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
     out.append(f"    .data        = {symbol}_DATA,")
     out.append(f"    .kern        = {symbol}_KERN,")
     out.append(f"    .kern_n      = {len(kerns)},")
-    # CORE_TRACKING_PX overrides the table, for sweeping candidate values
-    # against tools/text_preview.c without editing this file.
-    _ovr = os.environ.get("CORE_TRACKING_PX")
-    _bold = "BOLD" in symbol.upper()
-    _tpx = (float(_ovr) if _ovr
-            else TRACKING_PX.get((_bold, px_size), TRACKING_DEFAULT))
-    track = int(round(_tpx * ADV_ONE))
     out.append(f"    .tracking    = {track},"
                f"   // {track / ADV_ONE:+.2f}px letter-spacing")
     out.append(f"    .ascent      = {ascent},")

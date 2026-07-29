@@ -192,7 +192,7 @@ void screen_charging_render(int pct, int charging, int external)
     /* Big percent number, centred, with a smaller muted "%". */
     char num[4];
     u_to_str(num, pct);
-    const text_font_t *big  = text_font_bold_17();
+    const text_font_t *big  = text_font_bold_18();
     const text_font_t *unit = text_font_bold_13();
     int wn = text_width(num, big);
     int wu = text_width("%", unit);
@@ -229,7 +229,7 @@ void screen_charging_render(int pct, int charging, int external)
         status = "NOT CHARGING";
         status_ink = CHG_MUTED;
     }
-    const text_font_t *sfont = text_font_bold_11();
+    const text_font_t *sfont = text_font_bold_12();
     int ws = text_width(status, sfont);
     chg_text((LCD_WIDTH - ws) / 2, STAT_BASE, status, sfont, status_ink);
 }

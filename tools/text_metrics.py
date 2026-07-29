@@ -110,6 +110,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worst", type=int, default=10)
     ap.add_argument("--atlas", default=None)
+    ap.add_argument("--triplets", action="store_true",
+                    help="check all 52x52x52 letter triplets, including the "
+                         "OUTER pair's clearance across a narrow middle glyph "
+                         "— which no pairwise check can see")
     ap.add_argument("--target", type=float, default=None,
                     help="solve for the tracking (px) that puts each atlas's "
                          "soft mean gap at this many pixels, and print a "
@@ -153,6 +157,60 @@ def main():
         print(f"{name:<22}{tracking/64:>6.2f}{cm:>11.2f}{touch:>8.1f}%"
               f"{sm:>11.2f}{p10:>6d}{p90:>6d}")
         report[name] = (core, soft)
+
+    if args.triplets:
+        letters = ([chr(c) for c in range(0x41, 0x5B)] +
+                   [chr(c) for c in range(0x61, 0x7B)])
+        print(f"\n--- all {len(letters)}^3 = {len(letters)**3} letter triplets ---")
+        print(f"{'atlas':<14}{'triplets':>10}{'A-B/B-C bad':>13}"
+              f"{'A-C touch':>11}{'worst A-C':>11}")
+        for path in files:
+            glyphs, data, kern, track = load_atlas(path)
+            name = os.path.basename(path).replace("nunito_", "").replace(".h", "")
+            idx = {c: ord(c) - 0x20 for c in letters}
+            ext = {c: row_extents(glyphs[idx[c]], data, 1) for c in letters
+                   if idx[c] in glyphs}
+            keys = [c for c in letters if c in ext and ext[c]]
+            # pen step exactly as core/ui/text.c pen_step(): whole pixels
+            step = {}
+            for a in keys:
+                for b in keys:
+                    ia, ib = idx[a], idx[b]
+                    adv = glyphs[ia]["adv"]
+                    tr = 0 if (ia == 0 or ib == 0) else track
+                    step[(a, b)] = (adv + tr + kern.get((ia, ib), 0) * 2
+                                    + 32) >> 6
+            bad_adj = 0; ac_touch = 0; ac_worst = 99; ac_ex = ""
+            n = 0
+            for a in keys:
+                ea = ext[a]; oxa = glyphs[idx[a]]["ox"]
+                for b in keys:
+                    eb = ext[b]; oxb = glyphs[idx[b]]["ox"]
+                    s1 = step[(a, b)]
+                    g1 = min((s1 + oxb + eb[y][0]) - (oxa + ea[y][1]) - 1
+                             for y in (set(ea) & set(eb))) if (set(ea) & set(eb)) else 99
+                    for c in keys:
+                        n += 1
+                        ec = ext[c]; oxc = glyphs[idx[c]]["ox"]
+                        s2 = step[(b, c)]
+                        sh2 = set(eb) & set(ec)
+                        g2 = min((s1 + s2 + oxc + ec[y][0]) -
+                                 (s1 + oxb + eb[y][1]) - 1
+                                 for y in sh2) if sh2 else 99
+                        if g1 < 1 or g2 < 1:
+                            bad_adj += 1
+                        # OUTER pair: A's ink vs C's ink, across B
+                        shac = set(ea) & set(ec)
+                        if shac:
+                            gac = min((s1 + s2 + oxc + ec[y][0]) -
+                                      (oxa + ea[y][1]) - 1 for y in shac)
+                            if gac < ac_worst:
+                                ac_worst = gac; ac_ex = a + b + c
+                            if gac < 1:
+                                ac_touch += 1
+            print(f"{name:<14}{n:>10}{bad_adj:>13}{ac_touch:>11}"
+                  f"{ac_worst:>8}px {ac_ex}")
+        return 0
 
     if args.target is not None:
         # Solve per atlas. Tracking shifts every gap by (nearly) itself, but

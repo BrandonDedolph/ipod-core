@@ -52,9 +52,9 @@
 #define S_PILL_OFF g_pal[PAL_PILL_OFF] /* toggle pill OFF fill                   */
 
 /* Nunito faces (see ui/text.h). */
-#define F_BIG    text_font_bold_17()
+#define F_BIG    text_font_bold_18()
 #define F_HEADER text_font_bold_13()
-#define F_ROW    text_font_regular_13()
+#define F_ROW    text_font_regular_12()
 #define F_SUB    text_font_regular_11()
 #define F_SMALL  text_font_regular_9()
 

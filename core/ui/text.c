@@ -24,10 +24,10 @@
 #include "atlas/glyphmap.h"        /* ATLAS_CPMAP[]: codepoint -> glyph index */
 #include "atlas/nunito_regular_9.h"
 #include "atlas/nunito_regular_11.h"
-#include "atlas/nunito_regular_13.h"
-#include "atlas/nunito_bold_11.h"
+#include "atlas/nunito_regular_12.h"
+#include "atlas/nunito_bold_12.h"
 #include "atlas/nunito_bold_13.h"
-#include "atlas/nunito_bold_17.h"
+#include "atlas/nunito_bold_18.h"
 
 /* text_font_t is just a thin, opaque wrapper over an atlas_t so the public
  * header need not expose the atlas layout. */
@@ -37,17 +37,17 @@ struct text_font {
 
 static const struct text_font FONT_REGULAR_9  = { &NUNITO_REGULAR_9  };
 static const struct text_font FONT_REGULAR_11 = { &NUNITO_REGULAR_11 };
-static const struct text_font FONT_REGULAR_13 = { &NUNITO_REGULAR_13 };
-static const struct text_font FONT_BOLD_11    = { &NUNITO_BOLD_11    };
+static const struct text_font FONT_REGULAR_13 = { &NUNITO_REGULAR_12 };
+static const struct text_font FONT_BOLD_11    = { &NUNITO_BOLD_12    };
 static const struct text_font FONT_BOLD_13    = { &NUNITO_BOLD_13    };
-static const struct text_font FONT_BOLD_17    = { &NUNITO_BOLD_17    };
+static const struct text_font FONT_BOLD_17    = { &NUNITO_BOLD_18    };
 
 const text_font_t *text_font_regular_9(void)  { return &FONT_REGULAR_9;  }
 const text_font_t *text_font_regular_11(void) { return &FONT_REGULAR_11; }
-const text_font_t *text_font_regular_13(void) { return &FONT_REGULAR_13; }
-const text_font_t *text_font_bold_11(void)    { return &FONT_BOLD_11;    }
+const text_font_t *text_font_regular_12(void) { return &FONT_REGULAR_13; }
+const text_font_t *text_font_bold_12(void)    { return &FONT_BOLD_11;    }
 const text_font_t *text_font_bold_13(void)    { return &FONT_BOLD_13;    }
-const text_font_t *text_font_bold_17(void)    { return &FONT_BOLD_17;    }
+const text_font_t *text_font_bold_18(void)    { return &FONT_BOLD_17;    }
 
 /* ---------- Gamma LUTs ---------------------------------------------- *
  * Glyph alpha is linear-light coverage, but RGB565 channels are sRGB-
@@ -261,6 +261,36 @@ static int track_adv(const atlas_t *a, int prev_gi, int gi) {
     return a->tracking;
 }
 
+/*
+ * Whole-pixel pen step from `prev_gi` to `gi`: the previous glyph's advance,
+ * plus tracking and kerning for that pair, rounded ONCE to a pixel.
+ *
+ * This is the difference between text that measures correctly and text that
+ * LOOKS right, and they are not the same thing.
+ *
+ * Carrying the fraction in the pen (what this did before) makes a string's
+ * total width exact, but every glyph still lands on a whole pixel — so a 6.5px
+ * advance renders as 6px at one point in a word and 7px a few letters later,
+ * depending only on the accumulated phase. Identical pairs then sit at
+ * different distances in the same word: measured on the shipped atlases, "nn"
+ * stepped 6..7px and "oo" 7..8px within one string. That is exactly the
+ * "some letters cramped, some loose" the UI kept showing, and no tracking
+ * value can remove it because it is a quantisation artefact, not a spacing
+ * one.
+ *
+ * Rounding per PAIR instead makes every occurrence of a pair identical, which
+ * is what the eye actually reads as even. The cost is that a string's width
+ * drifts from the font's ideal by up to half a pixel per pair — invisible, and
+ * harmless here because text_width() accumulates these SAME steps, so a
+ * centred or right-aligned string is positioned from its actual drawn width rather
+ * than from an ideal it never renders at.
+ */
+static int pen_step(const atlas_t *a, int prev_gi, int gi) {
+    int adv = (prev_gi >= 0) ? a->glyphs[prev_gi].advance : 0;
+    return ATLAS_ADV_PX(adv + track_adv(a, prev_gi, gi) +
+                        kern_adv(a, prev_gi, gi));
+}
+
 /* Advance for a codepoint with no atlas glyph (blank or box). */
 static int fallback_advance(const atlas_t *a, int cp) {
     return is_blank_cp(cp) ? a->glyphs[0].advance : notdef_advance(a);
@@ -282,16 +312,21 @@ int text_width(const char *s, const text_font_t *font) {
     while ((cp = utf8_next(&p)) >= 0) {
         int gi = glyph_index(cp);
         if (gi < 0) {
-            w += fallback_advance(a, cp);
-            prev_gi = -1;              /* no glyph: nothing to kern against */
+            /* No glyph: close out the previous pen step, then the box's own
+             * (already whole-pixel) advance. */
+            w += (prev_gi >= 0) ? pen_step(a, prev_gi, -1) : 0;
+            w += ATLAS_ADV_PX(fallback_advance(a, cp));
+            prev_gi = -1;
             continue;
         }
-        w += track_adv(a, prev_gi, gi);
-        w += kern_adv(a, prev_gi, gi);
-        w += a->glyphs[gi].advance;
+        w += (prev_gi >= 0) ? pen_step(a, prev_gi, gi) : 0;
         prev_gi = gi;
     }
-    return ATLAS_ADV_PX(w);
+    /* The final glyph's own advance, with no pair to kern or track against. */
+    if (prev_gi >= 0) {
+        w += pen_step(a, prev_gi, -1);
+    }
+    return w;
 }
 
 int text_line_height(const text_font_t *font) {
@@ -371,23 +406,23 @@ static int text_draw_c(uint16_t *fb, int fb_w, int fb_h, int x, int y,
      * total, matching text_width() exactly. Callers chain on that.
      */
     const int x0 = x;
-    int pen = 0;
+    int pen = 0;                       /* WHOLE pixels; see pen_step() */
     int cp, prev_gi = -1;
     while ((cp = utf8_next(&p)) >= 0) {
         int gi = glyph_index(cp);
-        /* Kern BEFORE the pen is rounded into a position, so the pair's
-         * adjustment can actually move this glyph. */
-        if (gi >= 0) {
-            pen += track_adv(a, prev_gi, gi);
-            pen += kern_adv(a, prev_gi, gi);
+        /* Close out the previous glyph's step (its advance + this pair's
+         * tracking and kerning, rounded once) before placing this one. */
+        if (prev_gi >= 0) {
+            pen += pen_step(a, prev_gi, gi);
         }
-        prev_gi = gi;                  /* gi < 0 => nothing to kern against */
-        x = x0 + ATLAS_ADV_PX(pen);
+        prev_gi = gi;
+        x = x0 + pen;
         if (gi < 0) {
             if (!is_blank_cp(cp)) {
                 draw_notdef(fb, fb_w, x, y, a, ink, cx0, cx1, cy0, cy1);
             }
-            pen += fallback_advance(a, cp);
+            pen += ATLAS_ADV_PX(fallback_advance(a, cp));
+            prev_gi = -1;
             continue;
         }
         const atlas_glyph_t *gly = &a->glyphs[gi];
@@ -406,25 +441,26 @@ static int text_draw_c(uint16_t *fb, int fb_w, int fb_h, int x, int y,
          * on. At or right of it: nothing further can land, so stop drawing —
          * but keep summing advances, since callers chain on the returned pen. */
         if (gx + gw <= cx0) {
-            pen += gly->advance;
-            continue;
+            continue;                  /* step is applied at the top of the loop */
         }
         if (gx >= cx1) {
-            pen += gly->advance;
             /* Nothing further can land in the window, but the returned pen is
-             * the caller's contract, so keep accumulating — kerning included,
-             * or this tail would disagree with text_width(). */
+             * the caller's contract, so keep accumulating the SAME steps or
+             * this tail would disagree with text_width(). */
             while ((cp = utf8_next(&p)) >= 0) {
                 int gj = glyph_index(cp);
                 if (gj < 0) {
-                    pen += fallback_advance(a, cp);
+                    pen += (prev_gi >= 0) ? pen_step(a, prev_gi, -1) : 0;
+                    pen += ATLAS_ADV_PX(fallback_advance(a, cp));
                     prev_gi = -1;
                     continue;
                 }
-                pen += track_adv(a, prev_gi, gj);
-                pen += kern_adv(a, prev_gi, gj);
-                pen += a->glyphs[gj].advance;
+                pen += pen_step(a, prev_gi, gj);
                 prev_gi = gj;
+            }
+            if (prev_gi >= 0) {
+                pen += pen_step(a, prev_gi, -1);
+                prev_gi = -1;          /* closed out here; don't re-add below */
             }
             break;
         }
@@ -437,8 +473,7 @@ static int text_draw_c(uint16_t *fb, int fb_w, int fb_h, int x, int y,
         int j0 = cy0 - gy; if (j0 < 0) j0 = 0;
         int j1 = cy1 - gy; if (j1 > gh) j1 = gh;
         if (i0 >= i1 || j0 >= j1) {
-            pen += gly->advance;
-            continue;
+            continue;                  /* step is applied at the top of the loop */
         }
 
         const uint8_t *srow = a->data + gly->data_offset + (long)j0 * gw + i0;
@@ -479,9 +514,11 @@ static int text_draw_c(uint16_t *fb, int fb_w, int fb_h, int x, int y,
                 *dst = (uint16_t)(((uint16_t)r5 << 11) | ((uint16_t)g6 << 5) | (uint16_t)b5);
             }
         }
-        pen += gly->advance;
     }
-    return x0 + ATLAS_ADV_PX(pen);
+    if (prev_gi >= 0) {
+        pen += pen_step(a, prev_gi, -1);
+    }
+    return x0 + pen;
 }
 
 int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,

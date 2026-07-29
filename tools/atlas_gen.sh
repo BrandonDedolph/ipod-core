@@ -33,10 +33,18 @@ gen() {
 
 # Sizes the Linen design calls for. Each new atlas costs ~5-15 KB of
 # .rodata (static const u8); cheap to keep around.
+# Sizes are chosen for RASTERISATION QUALITY, not roundness — see
+# tools/glyph_quality.py. Nunito's fringe (ink below 25% alpha, i.e. blur that
+# never resolves) is strongly non-monotonic in pixel size, so a size can be
+# both larger and mushier:
+#     regular  11: 23.4%   12: 25.2%   13: 37.6%   14: 37.1%
+#     bold     11: 33.4%   12: 20.1%   13: 14.7%   17: 22.9%   18: 14.4%
+# regular 13 and bold 11/17 all sit on bad landings. Shipping them next to
+# bold 13 (the sharpest size the face has) is what made the UI look uneven:
+# a 37.6% row directly under a 14.7% header is a 2.5x mismatch in one list.
 gen Nunito-Regular.ttf  9 NUNITO_REGULAR_9  nunito_regular_9.h
 gen Nunito-Regular.ttf 11 NUNITO_REGULAR_11 nunito_regular_11.h
-gen Nunito-Regular.ttf 13 NUNITO_REGULAR_13 nunito_regular_13.h
-gen Nunito-Bold.ttf     9 NUNITO_BOLD_9     nunito_bold_9.h
-gen Nunito-Bold.ttf    11 NUNITO_BOLD_11    nunito_bold_11.h
+gen Nunito-Regular.ttf 12 NUNITO_REGULAR_12 nunito_regular_12.h
+gen Nunito-Bold.ttf    12 NUNITO_BOLD_12    nunito_bold_12.h
 gen Nunito-Bold.ttf    13 NUNITO_BOLD_13    nunito_bold_13.h
-gen Nunito-Bold.ttf    17 NUNITO_BOLD_17    nunito_bold_17.h
+gen Nunito-Bold.ttf    18 NUNITO_BOLD_18    nunito_bold_18.h

@@ -32,7 +32,7 @@ static int fails = 0;
 } while (0)
 
 int main(void) {
-    const text_font_t *font = text_font_bold_17();
+    const text_font_t *font = text_font_bold_18();
     CHECK(font != NULL, "font handle is NULL");
 
     /* ---- (a) width: positive, matches draw advance ----------------- */

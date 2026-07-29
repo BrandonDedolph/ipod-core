@@ -36,10 +36,10 @@ typedef struct text_font text_font_t;
  * Each returns a stable pointer to a .rodata-resident handle; never NULL. */
 const text_font_t *text_font_regular_9(void);
 const text_font_t *text_font_regular_11(void);
-const text_font_t *text_font_regular_13(void);
-const text_font_t *text_font_bold_11(void);
+const text_font_t *text_font_regular_12(void);
+const text_font_t *text_font_bold_12(void);
 const text_font_t *text_font_bold_13(void);
-const text_font_t *text_font_bold_17(void);
+const text_font_t *text_font_bold_18(void);
 
 /*
  * Draw ASCII string `s` into a fb_w x fb_h RGB565 framebuffer (row-major

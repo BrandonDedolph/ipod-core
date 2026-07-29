@@ -58,10 +58,10 @@ int main(int argc, char **argv)
     const struct face faces[] = {
         { "regular 9",  text_font_regular_9  },
         { "regular 11", text_font_regular_11 },
-        { "regular 13", text_font_regular_13 },
-        { "bold 11",    text_font_bold_11    },
+        { "regular 13", text_font_regular_12 },
+        { "bold 11",    text_font_bold_12    },
         { "bold 13",    text_font_bold_13    },
-        { "bold 17",    text_font_bold_17    },
+        { "bold 17",    text_font_bold_18    },
     };
     const int nfaces = (int)(sizeof faces / sizeof faces[0]);
 

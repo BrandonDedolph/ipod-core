@@ -121,10 +121,10 @@ typedef struct {
  * pulled in by core/ui/text.c — its TU is their sole definition site). */
 extern const atlas_t NUNITO_REGULAR_9;
 extern const atlas_t NUNITO_REGULAR_11;
-extern const atlas_t NUNITO_REGULAR_13;
-extern const atlas_t NUNITO_BOLD_11;
+extern const atlas_t NUNITO_REGULAR_12;
+extern const atlas_t NUNITO_BOLD_12;
 extern const atlas_t NUNITO_BOLD_13;
-extern const atlas_t NUNITO_BOLD_17;
+extern const atlas_t NUNITO_BOLD_18;
 
 /* Measurement and rendering live in core/ui/text.h (text_width /
  * text_draw*), which is what every caller uses. */

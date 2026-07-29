@@ -117,8 +117,8 @@ static int ui_window_up(ui_window_t *w, uint32_t span, uint32_t now)
 
 /* Nunito faces (freestanding renderer, core/ui/text.h). */
 #define FONT_HEADER   text_font_bold_13()
-#define FONT_ROW      text_font_regular_13()
-#define FONT_TITLE    text_font_bold_17()
+#define FONT_ROW      text_font_regular_12()
+#define FONT_TITLE    text_font_bold_18()
 #define FONT_SUB      text_font_regular_11()
 #define FONT_SMALL    text_font_regular_9()
 
@@ -1057,7 +1057,7 @@ static void list_row_at(int y0, int r, const char *text, const char *sub,
      * right-hand value ONCE — it used to be walked twice per row per frame. */
     int title_right;
     int show_right = (right && right[0]);
-    int right_w    = show_right ? text_width(right, text_font_bold_11()) : 0;
+    int right_w    = show_right ? text_width(right, text_font_bold_12()) : 0;
     if (show_right) {
         int reserved = LCD_WIDTH - 16 - right_w - 6;
         /* title_priority: the title owns the row. Reserve the value column only
@@ -1097,7 +1097,7 @@ static void list_row_at(int y0, int r, const char *text, const char *sub,
         ui_text(tx, sub_y, sub, FONT_SMALL, subc);
     }
     if (show_right) {
-        ui_text(LCD_WIDTH - 16 - right_w, rowmid, right, text_font_bold_11(),
+        ui_text(LCD_WIDTH - 16 - right_w, rowmid, right, text_font_bold_12(),
                 rightc);
     } else if (chevron) {
         ui_text(LCD_WIDTH - 18, rowmid, UI_GLYPH_RAQUO, FONT_ROW, chevc);
@@ -1322,8 +1322,8 @@ static void detail_row_draw(int r, int vi)
     if (g_track_dur[idx]) {
         char dts[FMT_TIME_MAX];
         fmt_time(dts, g_track_dur[idx]);
-        int dw = text_width(dts, text_font_bold_11());
-        ui_text(LCD_WIDTH - 16 - dw, ry + 15, dts, text_font_bold_11(),
+        int dw = text_width(dts, text_font_bold_12());
+        ui_text(LCD_WIDTH - 16 - dw, ry + 15, dts, text_font_bold_12(),
                 is_sel ? LINEN_SEL_SUB : LINEN_MUTED_D);
         title_right = LCD_WIDTH - 16 - dw - 8;
     }
@@ -2865,8 +2865,8 @@ static void volume_overlay_render(int vol)
     /* Percent, right-aligned. */
     char p[5];
     u32_to_dec(p, (unsigned)vol);
-    int w = text_width(p, text_font_bold_11());       /* percent is 11/700       */
-    ui_text(PX + PW - 14 - w, PY + PH / 2 + 4, p, text_font_bold_11(), LINEN_INK);
+    int w = text_width(p, text_font_bold_12());       /* percent is 11/700       */
+    ui_text(PX + PW - 14 - w, PY + PH / 2 + 4, p, text_font_bold_12(), LINEN_INK);
 }
 
 /* Padlock for the lock/unlock plate: a rounded body with a keyhole (punched in
@@ -3028,7 +3028,7 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
 
     /* --- top status row: context label left, state + battery right --------- */
     ui_text(12, 15, player_paused() ? "Paused" : "Now Playing",
-            text_font_bold_11(), LINEN_INK);
+            text_font_bold_12(), LINEN_INK);
 
     int bx = LCD_WIDTH - 12 - 19;                     /* battery block         */
     draw_battery(bx, 3, g_bat_pct);
