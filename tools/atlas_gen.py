@@ -183,9 +183,17 @@ def kern_pairs(font, chars):
             if adj == 0:
                 continue
             if adj < KERN_ADJ_MIN or adj > KERN_ADJ_MAX:
-                raise SystemExit(
-                    f"kern {a!r}{b!r} = {k:.3f}px does not fit int8 1/32px "
-                    f"(adj {adj}); widen the field")
+                # CLAMP, loudly. Refusing outright was the first behaviour and
+                # it blocks evaluating any face with wider kerning than Nunito
+                # (Inter has a '<'+em-dash pair at -4.16px). Clamping costs
+                # 0.2px on the handful of pairs past the field's +/-3.97px, and
+                # the warning keeps it from being a silent truncation — which
+                # is the thing actually worth preventing. Widen the field to
+                # int16 if a face ever needs it in bulk.
+                sys.stderr.write(
+                    f"warning: kern {a!r}{b!r} = {k:+.3f}px exceeds the int8 "
+                    f"1/32px field; clamped\n")
+                adj = max(KERN_ADJ_MIN, min(KERN_ADJ_MAX, adj))
             out.append((li, ri, adj))
     out.sort(key=lambda e: (e[0], e[1]))
     return out
