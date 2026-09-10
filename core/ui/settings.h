@@ -111,9 +111,18 @@ typedef enum {
 } settings_screen_t;
 
 /*
- * Return codes from settings_activate(). NONE means "handled in place (value
- * mutated), stay on this screen"; the ENTER_* codes ask main.c to push the
- * named sub-screen; RESET asks it to restore defaults.
+ * Return codes from settings_activate(). NONE means "handled in place — the
+ * record WAS mutated, persist it — stay on this screen"; NOOP means "nothing
+ * changed, there is nothing to persist"; the ENTER_* codes ask main.c to push
+ * the named sub-screen; RESET asks it to restore defaults.
+ *
+ * NONE vs NOOP is the difference between a disk write and none. Every
+ * settings_touch() ends, 3 s later, in config_save() -> ata_write_sectors():
+ * the ONLY code in this firmware that writes to the user's disk. Before NOOP
+ * existed, activate() answered NONE both when it changed the record and when
+ * it did nothing (SELECT on the About page, re-picking the theme already
+ * active), and main.c touched on every NONE — so pressing SELECT on About
+ * spun the drive up and burned a config slot for a byte-identical record.
  */
 typedef enum {
     SETTINGS_ACTION_NONE = 0,
@@ -128,7 +137,11 @@ typedef enum {
     /* Reboot into the Apple boot ROM's USB mass-storage mode. Lives under
      * Settings rather than the main menu: it is a maintenance action, not a
      * place you browse to. */
-    SETTINGS_ACTION_DISKMODE
+    SETTINGS_ACTION_DISKMODE,
+    /* Appended LAST so every value above keeps its number: main.c switches on
+     * these and the config record does not store them, but nothing is gained
+     * by renumbering either. */
+    SETTINGS_ACTION_NOOP
 } settings_action_t;
 
 /*
@@ -182,16 +195,19 @@ void settings_value(int screen, const settings_t *s, int idx,
 /*
  * Apply SELECT to row (screen, idx): mutate *s in place for a toggle/select and
  * return SETTINGS_ACTION_NONE, or return a settings_action_t for main.c to act
- * on (enter a sub-screen / reset). Out-of-range rows return NONE.
+ * on (enter a sub-screen / reset). Returns SETTINGS_ACTION_NOOP — and leaves
+ * *s byte-identical — from every branch that has nothing to do: info pages,
+ * slider screens, out-of-range rows, and re-picking the value already set.
  */
 int settings_activate(int screen, settings_t *s, int idx);
 
 /*
  * Apply a wheel tick of `delta` to a SLIDER row (Sound values, Display
- * Brightness) or step a discrete SELECT (Display Backlight). Clamped to range;
- * a no-op on rows that are not adjustable.
+ * Brightness) or step a discrete SELECT (Display Backlight). Clamped to range.
+ * Returns 1 if *s changed, 0 if not — at a rail, on a non-adjustable row, or
+ * for delta 0 — so the caller can skip the persist (see settings_action_t).
  */
-void settings_adjust(int screen, settings_t *s, int idx, int delta);
+int settings_adjust(int screen, settings_t *s, int idx, int delta);
 
 /*
  * Render the full 320x240 panel for `screen` into the console framebuffer

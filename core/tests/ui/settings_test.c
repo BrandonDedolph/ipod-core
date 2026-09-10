@@ -222,6 +222,108 @@ int main(void)
               settings_label(SETTINGS_PLAYBACK, 2)[0] == 'R');
     }
 
+    /* --- Test 12: NOOP — SELECT that changes nothing must SAY so ---
+     * Every SETTINGS_ACTION_NONE ends in a disk write (main.c touches, 3 s
+     * later config_save() puts a sector on the user's disk). Until NOOP
+     * existed, SELECT on the About page returned NONE like a real toggle and
+     * spun the drive up for a byte-identical record. The invariant checked
+     * here is two-sided: NOOP => the record is byte-identical to a copy, and
+     * NONE => it is not. Either half failing is a missed or a spurious write. */
+    settings_defaults(&s);
+    {
+        settings_t copy;
+
+        memcpy(&copy, &s, sizeof s);
+        check("noop-about",
+              settings_activate(SETTINGS_ABOUT, &s, 0) == SETTINGS_ACTION_NOOP);
+        check("noop-about-unchanged", memcmp(&copy, &s, sizeof s) == 0);
+
+        check("noop-diag",
+              settings_activate(SETTINGS_DIAG, &s, 0) == SETTINGS_ACTION_NOOP);
+        check("noop-diag-unchanged", memcmp(&copy, &s, sizeof s) == 0);
+
+        /* Sound rows are sliders: SELECT on them is not a control. */
+        check("noop-sound",
+              settings_activate(SETTINGS_SOUND, &s, 0) == SETTINGS_ACTION_NOOP);
+        check("noop-sound-unchanged", memcmp(&copy, &s, sizeof s) == 0);
+
+        /* Brightness (Display row 1) is wheel-only; Backlight (row 0) wraps
+         * and therefore always changes. */
+        check("noop-display-brightness",
+              settings_activate(SETTINGS_DISPLAY, &s, 1) == SETTINGS_ACTION_NOOP);
+        check("noop-display-unchanged", memcmp(&copy, &s, sizeof s) == 0);
+        check("none-display-backlight",
+              settings_activate(SETTINGS_DISPLAY, &s, 0) == SETTINGS_ACTION_NONE);
+        check("none-display-changed", memcmp(&copy, &s, sizeof s) != 0);
+
+        /* Re-picking the theme already active is a NOOP; picking the other
+         * one is a NONE and the field moves. */
+        settings_defaults(&s);
+        memcpy(&copy, &s, sizeof s);
+        check("noop-theme-same",
+              settings_activate(SETTINGS_THEME, &s, s.theme) == SETTINGS_ACTION_NOOP);
+        check("noop-theme-unchanged", memcmp(&copy, &s, sizeof s) == 0);
+        int other = 1 - s.theme;
+        check("none-theme-other",
+              settings_activate(SETTINGS_THEME, &s, other) == SETTINGS_ACTION_NONE);
+        check("none-theme-changed", s.theme == other && memcmp(&copy, &s, sizeof s) != 0);
+        check("noop-theme-range",
+              settings_activate(SETTINGS_THEME, &s, 7) == SETTINGS_ACTION_NOOP);
+
+        /* Same for the clicker profile. */
+        settings_defaults(&s);
+        memcpy(&copy, &s, sizeof s);
+        check("noop-clicker-same",
+              settings_activate(SETTINGS_CLICKER, &s, s.clicker) == SETTINGS_ACTION_NOOP);
+        check("noop-clicker-unchanged", memcmp(&copy, &s, sizeof s) == 0);
+        check("none-clicker-other",
+              settings_activate(SETTINGS_CLICKER, &s, s.clicker + 1) == SETTINGS_ACTION_NONE);
+        check("noop-clicker-range",
+              settings_activate(SETTINGS_CLICKER, &s, 99) == SETTINGS_ACTION_NOOP);
+
+        /* Out-of-range rows on the root and on Playback. */
+        settings_defaults(&s);
+        memcpy(&copy, &s, sizeof s);
+        check("noop-root-range",
+              settings_activate(SETTINGS_ROOT, &s, 42) == SETTINGS_ACTION_NOOP);
+        check("noop-playback-range",
+              settings_activate(SETTINGS_PLAYBACK, &s, 9) == SETTINGS_ACTION_NOOP);
+        check("noop-range-unchanged", memcmp(&copy, &s, sizeof s) == 0);
+
+        /* The real toggles still say NONE — a NOOP here would be a change
+         * that never reaches the disk. */
+        check("none-shuffle",
+              settings_activate(SETTINGS_PLAYBACK, &s, 0) == SETTINGS_ACTION_NONE);
+        check("none-repeat",
+              settings_activate(SETTINGS_PLAYBACK, &s, 1) == SETTINGS_ACTION_NONE);
+        check("none-resume",
+              settings_activate(SETTINGS_PLAYBACK, &s, 2) == SETTINGS_ACTION_NONE);
+        check("none-changed", memcmp(&copy, &s, sizeof s) != 0);
+
+        /* NOOP was appended: the codes main.c switches on keep their values. */
+        check("noop-appended-last",
+              SETTINGS_ACTION_NOOP > SETTINGS_ACTION_DISKMODE &&
+              SETTINGS_ACTION_NONE == 0);
+    }
+
+    /* --- Test 13: adjust() reports whether anything moved ---
+     * A wheel pinned at a rail used to earn a disk write per tick. */
+    settings_defaults(&s);                     /* volume 70, bright 32 */
+    check("adj-mid-changed",  settings_adjust(SETTINGS_SOUND, &s, 0, +1) == 1);
+    check("adj-zero-delta",   settings_adjust(SETTINGS_SOUND, &s, 0, 0) == 0);
+    settings_adjust(SETTINGS_SOUND, &s, 0, +1000);         /* pin at 100 */
+    check("adj-rail-hi",      settings_adjust(SETTINGS_SOUND, &s, 0, +1) == 0);
+    check("adj-rail-hi-val",  s.volume == 100);
+    check("adj-off-rail",     settings_adjust(SETTINGS_SOUND, &s, 0, -1) == 1);
+    check("adj-bright-rail",  settings_adjust(SETTINGS_DISPLAY, &s, 1, +1) == 0);
+    check("adj-bright-down",  settings_adjust(SETTINGS_DISPLAY, &s, 1, -1) == 1);
+    check("adj-bl-mid",       settings_adjust(SETTINGS_DISPLAY, &s, 0, +1) == 1);
+    settings_adjust(SETTINGS_DISPLAY, &s, 0, +100);        /* clamp at 60 */
+    check("adj-bl-rail",      settings_adjust(SETTINGS_DISPLAY, &s, 0, +1) == 0);
+    check("adj-bl-rail-val",  s.backlight_secs == 60);
+    check("adj-non-slider",   settings_adjust(SETTINGS_PLAYBACK, &s, 0, +1) == 0);
+    check("adj-bad-row",      settings_adjust(SETTINGS_SOUND, &s, 9, +1) == 0);
+
     printf("settings_test: %s\n", g_fail ? "FAIL" : "OK");
     return g_fail ? 1 : 0;
 }

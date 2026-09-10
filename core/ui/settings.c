@@ -305,6 +305,17 @@ void settings_value(int screen, const settings_t *s, int idx,
     }
 }
 
+/*
+ * NONE only where *s was actually written; NOOP everywhere else. The
+ * distinction is what stops SELECT on an info page from reaching the disk
+ * (settings.h, settings_action_t). Note the fix lives HERE, in what is
+ * reported, and deliberately not in settings_touch() or the commit gate: a
+ * touch must always record a pending change (the resume-position captures
+ * legitimately touch this same record, and a memcmp against the last saved
+ * copy would suppress those too), and the gate is where a previous session
+ * hit a deadlock against the DISKSAFE flush. Fewer touches, never fewer
+ * commits.
+ */
 int settings_activate(int screen, settings_t *s, int idx)
 {
     switch (screen) {
@@ -319,70 +330,90 @@ int settings_activate(int screen, settings_t *s, int idx)
         case 6: return SETTINGS_ENTER_DIAG;
         case 7: return SETTINGS_ACTION_DISKMODE;
         case 8: return SETTINGS_ACTION_RESET;
-        default: return SETTINGS_ACTION_NONE;
+        default: return SETTINGS_ACTION_NOOP;
         }
 
     case SETTINGS_PLAYBACK:
         switch (idx) {
-        case 0: s->shuffle = !s->shuffle; break;
-        case 1: s->repeat = (repeat_mode_t)((s->repeat + 1) % 3); break;
+        case 0: s->shuffle = !s->shuffle; return SETTINGS_ACTION_NONE;
+        case 1: s->repeat = (repeat_mode_t)((s->repeat + 1) % 3);
+                return SETTINGS_ACTION_NONE;
         /* Turning Resume OFF does not clear the stored locator here — this
          * module is pure, and main.c owns that (it drops it on the next pass,
          * so the record on disk stops carrying a position you asked it to
          * forget). */
-        case 2: s->resume_on_startup = !s->resume_on_startup; break;
-        default: break;
+        case 2: s->resume_on_startup = !s->resume_on_startup;
+                return SETTINGS_ACTION_NONE;
+        default: return SETTINGS_ACTION_NOOP;
         }
-        return SETTINGS_ACTION_NONE;
 
     case SETTINGS_DISPLAY:
         if (idx == 0) {
+            /* Wraps through six options, so this is always a change. */
             s->backlight_secs = bl_step(s->backlight_secs, +1, 1 /*wrap*/);
+            return SETTINGS_ACTION_NONE;
         }
-        return SETTINGS_ACTION_NONE;
+        return SETTINGS_ACTION_NOOP;       /* Brightness is wheel-adjusted */
 
     case SETTINGS_THEME:
-        if (idx >= 0 && idx < 2) {
+        if (idx >= 0 && idx < 2 && idx != s->theme) {
             s->theme = idx;
+            return SETTINGS_ACTION_NONE;
         }
-        return SETTINGS_ACTION_NONE;
+        return SETTINGS_ACTION_NOOP;       /* re-picking the active theme */
 
     case SETTINGS_CLICKER:
-        if (idx >= 0 && idx < CLICK_N) {
+        if (idx >= 0 && idx < CLICK_N && idx != s->clicker) {
             s->clicker = idx;
+            return SETTINGS_ACTION_NONE;
         }
-        return SETTINGS_ACTION_NONE;
+        return SETTINGS_ACTION_NOOP;       /* re-picking the active profile */
 
     default:
-        return SETTINGS_ACTION_NONE;
+        /* SOUND (sliders, wheel-adjusted), ABOUT and DIAG (info pages), and
+         * anything out of range: SELECT does nothing, and says so. */
+        return SETTINGS_ACTION_NOOP;
     }
 }
 
-void settings_adjust(int screen, settings_t *s, int idx, int delta)
+int settings_adjust(int screen, settings_t *s, int idx, int delta)
 {
     if (delta == 0) {
-        return;
+        return 0;
     }
+    /* Each branch computes the new value and reports whether it moved, so a
+     * wheel already pinned at a rail (volume 100, brightness 32) does not
+     * count as a change and does not earn a disk write. */
+    int old, nv;
     switch (screen) {
     case SETTINGS_SOUND:
         switch (idx) {
-        case 0: s->volume  = clampi(s->volume + delta, 0, 100);   break;
-        case 1: s->bass    = clampi(s->bass + delta, -12, 12);    break;
-        case 2: s->treble  = clampi(s->treble + delta, -12, 12);  break;
-        case 3: s->balance = clampi(s->balance + delta, -100, 100); break;
-        default: break;
+        case 0: old = s->volume;  nv = clampi(old + delta, 0, 100);
+                s->volume = nv;  return nv != old;
+        case 1: old = s->bass;    nv = clampi(old + delta, -12, 12);
+                s->bass = nv;    return nv != old;
+        case 2: old = s->treble;  nv = clampi(old + delta, -12, 12);
+                s->treble = nv;  return nv != old;
+        case 3: old = s->balance; nv = clampi(old + delta, -100, 100);
+                s->balance = nv; return nv != old;
+        default: return 0;
         }
-        break;
 
     case SETTINGS_DISPLAY:
         if (idx == 1) {
-            s->backlight_bright = clampi(s->backlight_bright + delta, 1, 32);
+            old = s->backlight_bright;
+            nv  = clampi(old + delta, 1, 32);
+            s->backlight_bright = nv;
+            return nv != old;
         } else if (idx == 0) {
-            s->backlight_secs = bl_step(s->backlight_secs, delta, 0 /*clamp*/);
+            old = s->backlight_secs;
+            nv  = bl_step(old, delta, 0 /*clamp*/);
+            s->backlight_secs = nv;
+            return nv != old;
         }
-        break;
+        return 0;
 
     default:
-        break;
+        return 0;
     }
 }
