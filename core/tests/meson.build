@@ -735,7 +735,7 @@ if target == 'sim'
     # timeout, so a non-terminating walk is a deterministic finding.
     fat32_corrupt_imgs = []
     foreach v : ['good', 'cyclic-fat', 'oob-cluster', 'fat16-bpb',
-                 'orphan-lfn', 'truncated']
+                 'orphan-lfn', 'truncated', 'long-lfn']
       fat32_corrupt_imgs += custom_target('fat32-img-' + v,
         output: v + '.img',
         command: [py, files('scripts' / 'make_fat32_image.py'),
