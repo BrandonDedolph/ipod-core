@@ -2616,6 +2616,29 @@ static void settings_commit(int force)
             return;
         }
     }
+    /*
+     * Refuse the write when the cell is too low to guarantee finishing it.
+     *
+     * config_save() is the ONLY thing in the firmware that writes to the
+     * user's disk, and settings_commit is its only caller, so this one check
+     * is the whole write gate. Below the disk-safe threshold the policy in
+     * battery.c has already flushed pending changes and parked the drive; a
+     * write starting after that would spin the platters back up on a cell that
+     * may not have the energy to see it through, and a cut mid-sector is how a
+     * config record gets torn.
+     *
+     * Deliberately BEFORE clearing g_cfg_dirty: the change stays pending, so
+     * it lands on the next commit if the charger goes in and the policy
+     * recovers. Refusing to write is not the same as discarding the edit.
+     *
+     * This also covers the forced commit inside enter_standby(): at the
+     * shutoff threshold that path would otherwise attempt a write at 3300 mV,
+     * which is exactly the moment there is least energy to complete one.
+     */
+    if (!battery_disk_writes_allowed()) {
+        uart_puts("core: cfg save deferred — battery below disk-safe\n");
+        return;
+    }
     g_cfg_dirty = 0;
     if (!config_writable()) {
         return;                            /* no CORECFG.DAT — nothing to do */
