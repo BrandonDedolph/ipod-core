@@ -80,6 +80,80 @@ void ui_text_centered(int y, const char *s, const text_font_t *font,
     ui_text((LCD_WIDTH - w) / 2, y, s, font, ink);
 }
 
+/* U+2026 HORIZONTAL ELLIPSIS as UTF-8. The atlas carries it (glyphmap.h), and
+ * at bold 13 it is 10 px against 11 for three periods — narrower, and one
+ * glyph so the pair kerning cannot spread it. */
+#define UI_ELLIPSIS "\xE2\x80\xA6"
+
+int ui_text_ellipsis_fit(char *buf, int buf_sz, const char *s,
+                         const text_font_t *font, int max_w)
+{
+    const int room = buf_sz - 4;          /* prefix bytes, leaving "…" + NUL */
+    if (max_w <= 0 || room <= 0) {
+        buf[0] = '\0';
+        return 0;
+    }
+
+    /* Copy what fits in the buffer. A string longer than the buffer cannot
+     * fit on the panel anyway, so treating it as "too long" is exact. */
+    int n = 0, whole = 1;
+    while (s[n] != '\0') {
+        if (n >= room) { whole = 0; break; }
+        buf[n] = s[n];
+        n++;
+    }
+    buf[n] = '\0';
+    if (whole && text_width(buf, font) <= max_w) {
+        return n;
+    }
+
+    /*
+     * Shorten from the end, one CODEPOINT at a time, re-measuring the WHOLE
+     * candidate string each step. Two things make the obvious shortcuts
+     * wrong: the renderer is UTF-8 (a byte-wise cut leaves a stray
+     * continuation byte that draws as a .notdef box), and text.c applies
+     * pair kerning and rounds once at the end, so summing per-glyph widths
+     * drifts from what text_width says — and the marquee already chains on
+     * text_width being the truth. The measure includes the ellipsis so the
+     * kern between the last letter and it is counted.
+     */
+    for (;;) {
+        if (n == 0) {
+            break;
+        }
+        n--;
+        while (n > 0 && ((unsigned char)buf[n] & 0xC0) == 0x80) {
+            n--;                        /* back over continuation bytes */
+        }
+        while (n > 0 && buf[n - 1] == ' ') {
+            n--;                        /* "of the…", not "of the …" */
+        }
+        buf[n]     = UI_ELLIPSIS[0];
+        buf[n + 1] = UI_ELLIPSIS[1];
+        buf[n + 2] = UI_ELLIPSIS[2];
+        buf[n + 3] = '\0';
+        if (text_width(buf, font) <= max_w) {
+            return n + 3;
+        }
+    }
+    /* Not even the ellipsis fits. */
+    buf[0] = '\0';
+    return 0;
+}
+
+int ui_text_ellipsis(int x, int y, const char *s, const text_font_t *font,
+                     uint16_t ink, int max_w)
+{
+    /* 160 bytes: at the smallest face that is ~4 panel widths of ASCII, and
+     * a title that long is shortened to a few words regardless. */
+    char buf[164];
+    int n = ui_text_ellipsis_fit(buf, (int)sizeof buf, s, font, max_w);
+    if (n == 0) {
+        return x;
+    }
+    return ui_text(x, y, buf, font, ink);
+}
+
 
 /* Filled rounded rectangle (radius `r`) — the design's selection bars (r=4) and
  * plates (r=6) are rounded, not square; this replaces the hard console_fill_rect
@@ -141,10 +215,20 @@ void ui_header(const char *title, const char *right, int back)
     if (back) {
         x = ui_text(x, HDR_BASE, UI_GLYPH_LAQUO, FONT_HEADER, LINEN_MUTED2) + 4;
     }
-    ui_text(x, HDR_BASE, title, FONT_HEADER, LINEN_INK);
-    if (right && right[0]) {
-        int w = text_width(right, FONT_SMALL);
-        ui_text(LCD_WIDTH - 12 - w, HDR_BASE - 1, right, FONT_SMALL, LINEN_MUTED2);
+    /* Measure the right-hand value FIRST: the title's room is what is left
+     * after it, less an 8 px gap. Real titles overflow — a Songs list
+     * filtered by "The Presidents of the United States of America" is
+     * ~300 px at bold 13 — and the title used to be drawn full width with
+     * the count painted over its tail, which the alpha-blending renderer
+     * turned into a smear rather than a cover. */
+    int show_right = (right && right[0]);
+    int right_w    = show_right ? text_width(right, FONT_SMALL) : 0;
+    int title_max  = show_right ? (LCD_WIDTH - 12 - right_w - 8) - x
+                                : (LCD_WIDTH - 12) - x;
+    ui_text_ellipsis(x, HDR_BASE, title, FONT_HEADER, LINEN_INK, title_max);
+    if (show_right) {
+        ui_text(LCD_WIDTH - 12 - right_w, HDR_BASE - 1, right, FONT_SMALL,
+                LINEN_MUTED2);
     }
     console_fill_rect(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, LINEN_BORDER);
 }

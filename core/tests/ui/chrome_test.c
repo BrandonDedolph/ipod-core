@@ -155,6 +155,160 @@ int main(void)
           count_in(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, LINEN_BORDER)
               == LCD_WIDTH - 24);
 
+    /* ---- 4b. ui_header: a long title must not smear into the count ----- *
+     * The title used to be drawn full width and the "n / m" value painted on
+     * top; the renderer alpha-blends, so both showed through each other. On
+     * the surface colour (as on the device) so a blended MUTED2 pixel cannot
+     * coincidentally equal INK. The header band is [HDR_BASE-14, HDR_BASE+5)
+     * for bold 13 (ascent 14, descent 5). */
+    {
+        char longt[301];
+        memset(longt, 'M', 300);
+        longt[300] = '\0';
+        const char *cnt = "3 / 12";
+        int rw = text_width(cnt, FONT_SMALL);
+        int box_x = LCD_WIDTH - 12 - rw - 8;          /* count + its 8 px gap */
+        int band_y = HDR_BASE - 14, band_h = 19;
+
+        console_clear(LINEN_SURFACE);
+        ui_header(longt, cnt, 1);
+        xpect(&c, "long header title leaves the count column free of ink",
+              count_in(box_x, band_y, LCD_WIDTH - box_x, band_h, LINEN_INK) == 0);
+        /* Regular 9 is thin enough that no pixel reaches full coverage, so
+         * "anything but the surface" is the honest test for the count. */
+        xpect(&c, "...and the count is actually drawn there",
+              (LCD_WIDTH - box_x) * band_h -
+                  count_in(box_x, band_y, LCD_WIDTH - box_x, band_h, LINEN_SURFACE)
+              > 0);
+        /* The title runs right up to its limit (not over-trimmed): the last
+         * ink column is inside the 24 px before the box — one 'M' (11 px) plus
+         * the ellipsis (10 px) of slack at most. */
+        {
+            const uint16_t *fb = console_framebuffer();
+            int last_ink = -1;
+            for (int yy = band_y; yy < band_y + band_h; yy++) {
+                for (int xx = 0; xx < LCD_WIDTH; xx++) {
+                    if (fb[yy * LCD_WIDTH + xx] == LINEN_INK && xx > last_ink) {
+                        last_ink = xx;
+                    }
+                }
+            }
+            xpect(&c, "the ellipsis lands just left of the count column",
+                  last_ink >= box_x - 24 && last_ink < box_x);
+        }
+        /* No count: the title may use the full width to the 12 px margin. */
+        console_clear(LINEN_SURFACE);
+        ui_header(longt, NULL, 1);
+        xpect(&c, "without a count the title stops at the right margin",
+              count_in(LCD_WIDTH - 12, band_y, 12, band_h, LINEN_INK) == 0 &&
+              count_in(LCD_WIDTH - 12 - 24, band_y, 24, band_h, LINEN_INK) > 0);
+    }
+
+    /* A SHORT title must render pixel-identically to the direct ui_text run
+     * it always was — the ellipsis path must not touch a title that fits. */
+    {
+        static uint16_t snap[LCD_WIDTH * LCD_HEIGHT];
+        console_clear(LINEN_SURFACE);
+        ui_header("Artists", "3 / 12", 1);
+        memcpy(snap, console_framebuffer(), sizeof snap);
+
+        console_clear(LINEN_SURFACE);
+        int x = ui_text(12, HDR_BASE, UI_GLYPH_LAQUO, FONT_HEADER, LINEN_MUTED2) + 4;
+        ui_text(x, HDR_BASE, "Artists", FONT_HEADER, LINEN_INK);
+        int rw = text_width("3 / 12", FONT_SMALL);
+        ui_text(LCD_WIDTH - 12 - rw, HDR_BASE - 1, "3 / 12", FONT_SMALL, LINEN_MUTED2);
+        console_fill_rect(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, LINEN_BORDER);
+        xpect(&c, "a short header title is pixel-identical to a plain ui_text",
+              memcmp(snap, console_framebuffer(), sizeof snap) == 0);
+    }
+
+    /* ---- 4c. ui_text_ellipsis_fit: the measuring half, without pixels --- */
+    {
+        char buf[164];
+        const char *ell = "\xE2\x80\xA6";
+        /* Fits: returned verbatim, no ellipsis. */
+        int n = ui_text_ellipsis_fit(buf, sizeof buf, "Artists", FONT_HEADER, 300);
+        xpect(&c, "fit: a short string comes back verbatim",
+              n == 7 && strcmp(buf, "Artists") == 0);
+        /* Exactly at its width: still verbatim (<=, not <). */
+        int w = text_width("Artists", FONT_HEADER);
+        n = ui_text_ellipsis_fit(buf, sizeof buf, "Artists", FONT_HEADER, w);
+        xpect(&c, "fit: a string exactly max_w wide is not shortened",
+              n == 7 && strcmp(buf, "Artists") == 0);
+        n = ui_text_ellipsis_fit(buf, sizeof buf, "Artists", FONT_HEADER, w - 1);
+        xpect(&c, "fit: one pixel short and it IS shortened",
+              n > 0 && n < 7 + 3 && strstr(buf, ell) != NULL);
+
+        /* The real case: trailing space trimmed, width honoured. */
+        const char *pres = "The Presidents of the United States of America";
+        int bad = 0, over = 0, under = 0, spaces = 0;
+        for (int mw = 12; mw <= 300; mw += 7) {
+            n = ui_text_ellipsis_fit(buf, sizeof buf, pres, FONT_HEADER, mw);
+            if (n <= 0) { bad++; continue; }
+            if (text_width(buf, FONT_HEADER) > mw) over++;
+            /* Not over-trimmed: adding back the widest glyph (~14 px) plus a
+             * space would overflow, so the result is within 20 px of max. */
+            if (mw >= 40 && text_width(buf, FONT_HEADER) < mw - 20) under++;
+            /* Ellipsis present, and never preceded by a space. */
+            if (n < 3 || memcmp(buf + n - 3, ell, 3) != 0) bad++;
+            if (n >= 4 && buf[n - 4] == ' ') spaces++;
+        }
+        xpect(&c, "fit: every shortened width is <= max_w", over == 0);
+        xpect(&c, "fit: no width is over-trimmed", under == 0);
+        xpect(&c, "fit: the ellipsis is always present and never after a space",
+              bad == 0 && spaces == 0);
+        n = ui_text_ellipsis_fit(buf, sizeof buf, pres, FONT_HEADER, 150);
+        xpect(&c, "fit: 'The Presidents of the…' style cut at a word",
+              strncmp(buf, "The Presidents", 14) == 0 && strchr(buf, ' ') != NULL);
+
+        /* UTF-8: "Björk " x 40 = 280 bytes (also longer than the buffer), so
+         * the cut must land on a codepoint boundary at every width, and the
+         * chosen prefix must parse as UTF-8 — a stray continuation byte would
+         * draw a hollow .notdef box. */
+        char bj[281];
+        bj[0] = '\0';
+        for (int i = 0; i < 40; i++) strcat(bj, "Bj\xC3\xB6rk ");
+        /* "Never ends on a continuation byte" is the wrong test: a prefix
+         * that ends in a complete "ö" (C3 B6) ends on one legitimately. The
+         * property is that the cut never lands INSIDE a sequence — i.e. the
+         * prefix parses: every lead byte has its continuation bytes, every
+         * continuation byte has a lead, and a 2-byte lead is never the last
+         * byte. That is what a byte-wise cut would break. */
+        int malformed = 0, none = 0, cut_o = 0;
+        for (int mw = 12; mw <= 300; mw += 5) {
+            n = ui_text_ellipsis_fit(buf, sizeof buf, bj, FONT_HEADER, mw);
+            if (n <= 0) { none++; continue; }
+            int plen = n - 3;                       /* bytes before the … */
+            for (int i = 0; i < plen; ) {
+                unsigned char b = (unsigned char)buf[i];
+                int len = b < 0x80 ? 1 : (b & 0xE0) == 0xC0 ? 2 : 0;
+                if (len == 0 || i + len > plen) { malformed++; break; }
+                for (int k = 1; k < len; k++) {
+                    if (((unsigned char)buf[i + k] & 0xC0) != 0x80) malformed++;
+                }
+                i += len;
+            }
+            /* A cut that split "ö" would leave a bare C3 as the last byte. */
+            if (plen > 0 && (unsigned char)buf[plen - 1] == 0xC3) cut_o++;
+        }
+        xpect(&c, "fit: a UTF-8 title is never cut inside a sequence",
+              malformed == 0 && cut_o == 0 && none == 0);
+        /* And on the panel: nothing is drawn past x + max_w. */
+        console_clear(LINEN_SURFACE);
+        int end = ui_text_ellipsis(20, HDR_BASE, bj, FONT_HEADER, LINEN_INK, 200);
+        xpect(&c, "ellipsis draw stays inside [x, x + max_w)",
+              end <= 220 && count_in(220, HDR_BASE - 14, 100, 19, LINEN_INK) == 0 &&
+              count_in(20, HDR_BASE - 14, 200, 19, LINEN_INK) > 0);
+
+        /* Degenerate: nothing fits -> nothing drawn, pen unchanged. */
+        console_clear(LINEN_SURFACE);
+        end = ui_text_ellipsis(20, HDR_BASE, pres, FONT_HEADER, LINEN_INK, 3);
+        xpect(&c, "ellipsis with no room draws nothing",
+              end == 20 && count_in(0, 0, LCD_WIDTH, LCD_HEIGHT, LINEN_INK) == 0);
+        n = ui_text_ellipsis_fit(buf, sizeof buf, "", FONT_HEADER, 100);
+        xpect(&c, "fit: an empty string is empty", n == 0 && buf[0] == '\0');
+    }
+
     /* ---- 5. ui_list_row ------------------------------------------------- *
      * The row band is [LIST_Y0 + r*rh, +rh). A row must paint inside it and
      * nowhere else — a selection bar bleeding one pixel up is how the tall-row

@@ -110,6 +110,37 @@ int  ui_text_clip(int x, int y, const char *s, const text_font_t *font,
 void ui_text_centered(int y, const char *s, const text_font_t *font,
                       uint16_t ink);
 
+/*
+ * Draw `s` at (x, y) if it fits in max_w pixels; otherwise draw the longest
+ * prefix that, with a trailing ellipsis (U+2026, which the atlas carries),
+ * does. Shortening happens on UTF-8 codepoint boundaries and drops trailing
+ * spaces, so "The Presidents of the United States of America" becomes
+ * "The Presidents of the…", never "The Presidents of the …" or half a "ö".
+ *
+ * This exists because clipping is the wrong tool for a title that has to
+ * share a line with something else: text_draw_clip cuts through the middle of
+ * a glyph, and the design (menus.jsx ScreenHeader) calls for an ellipsis. The
+ * header's title used to be drawn UNCLIPPED and the "n / m" count painted on
+ * top of it; the renderer alpha-blends, so the two smeared together.
+ *
+ * Returns the pen after whatever was drawn. Draws nothing (and returns x) if
+ * not even the ellipsis fits.
+ */
+int  ui_text_ellipsis(int x, int y, const char *s, const text_font_t *font,
+                      uint16_t ink, int max_w);
+
+/*
+ * The measuring half of ui_text_ellipsis, on its own so it can be tested
+ * without pixels: fills `buf` (size `buf_sz`, >= 8) with the string that
+ * ui_text_ellipsis would draw for `s` in `max_w` — either `s` itself when it
+ * fits, or the shortened prefix with the ellipsis appended — and returns its
+ * byte length (0 when nothing fits). Bounded by the buffer: anything past
+ * buf_sz - 4 bytes of `s` is treated as already too long, which at these
+ * sizes is several panel widths of text.
+ */
+int  ui_text_ellipsis_fit(char *buf, int buf_sz, const char *s,
+                          const text_font_t *font, int max_w);
+
 /* ---------- Shapes --------------------------------------------------- */
 
 /*
