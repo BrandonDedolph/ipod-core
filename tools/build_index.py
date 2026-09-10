@@ -94,7 +94,7 @@ def utf8_field(s, n):
 def norm_key(s):
     """Canonical form for name matching: fold smart quotes/dashes to ASCII and
     lowercase A-Z, so quote-style drift between the index and the on-disk name
-    can't break a match. MUST stay identical to name_hash() in kernel/main.c."""
+    can't break a match. MUST stay identical to name_hash() in core/library/names.c."""
     out = []
     for ch in (s or ""):
         o = ord(ch)
@@ -137,7 +137,7 @@ def read_lib_max_songs(path=MAIN_C):
 
 def name_hash(s):
     """FNV-1a 32 over the UTF-8 bytes of norm_key(s). Mirrors name_hash() in
-    kernel/main.c byte-for-byte."""
+    core/library/names.c byte-for-byte."""
     h = 0x811c9dc5
     for b in norm_key(s).encode("utf-8"):
         h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF

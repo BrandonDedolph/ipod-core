@@ -40,6 +40,10 @@
 #include "../ui/settings.h"
 #include "../ui/palette.h"
 #include "../ui/chrome.h"
+#include "../library/names.h"
+#include "../library/idx.h"
+#include "../library/sort.h"
+#include "../ui/wheel.h"
 #include "hw/volume.h"
 
 /*
@@ -472,203 +476,6 @@ static ui_window_t g_vol_show;
  * rendering that own it live in the Settings section further down. */
 static settings_t g_settings;
 
-/* Case-insensitive ASCII match of a dirent name against a literal. */
-static int name_eq_ci(const char *a, const char *b)
-{
-    for (; *a && *b; a++, b++) {
-        char ca = *a, cb = *b;
-        if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
-        if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
-        if (ca != cb) return 0;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
-/* Junk-filter for the album list: skip iPod/OS system folders and any dotfolder
- * (.Trashes, .Spotlight-V100, .fseventsd, …) so only music folders show. */
-static int is_junk_dir(const char *name)
-{
-    if (name[0] == '.') {
-        return 1;
-    }
-    static const char *const junk[] = {
-        "iPod_Control", "Calendars", "Contacts", "Photos", "Recordings",
-        "Notes", "System Volume Information", "$RECYCLE.BIN", "LOST.DIR",
-        "Find My iPod",
-    };
-    for (unsigned i = 0; i < sizeof junk / sizeof junk[0]; i++) {
-        if (name_eq_ci(name, junk[i])) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* Copy `src` into `dst` (<= NAME_MAX bytes), keeping printable ASCII AND UTF-8
- * multibyte bytes (the atlas now covers Latin-1 + smart punctuation, and the FAT
- * reader hands us real UTF-8) — only C0 control bytes (0x00..0x1F, incl. the
- * legacy 0x01 placeholder) are dropped. If `drop_ext`, trim a trailing ".ext".
- * Truncation is byte-bounded; a split multibyte tail just renders as one U+FFFD. */
-static void copy_display_name(char *dst, const char *src, int drop_ext)
-{
-    int end = 0;
-    while (src[end]) end++;
-    if (drop_ext) {
-        int dot = -1;
-        for (int j = 0; src[j]; j++) {
-            if (src[j] == '.') dot = j;
-        }
-        if (dot > 0) end = dot;              /* trim the extension */
-    }
-    int i = 0;
-    for (int j = 0; j < end && i < NAME_MAX; j++) {
-        unsigned char c = (unsigned char)src[j];
-        if (c >= 0x20) {                     /* keep ASCII + all UTF-8 bytes */
-            dst[i++] = (char)c;
-        }
-    }
-    dst[i] = '\0';
-}
-
-/* Decode one UTF-8 sequence at *p, advance past it, return the codepoint (-1 at
- * NUL). Malformed bytes yield one byte of progress so a bad name can't stall. */
-static int mn_utf8_next(const unsigned char **p)
-{
-    unsigned char c = **p;
-    if (c == 0) return -1;
-    if (c < 0x80) { (*p)++; return c; }
-    int n, cp;
-    if      ((c & 0xE0) == 0xC0) { n = 1; cp = c & 0x1F; }
-    else if ((c & 0xF0) == 0xE0) { n = 2; cp = c & 0x0F; }
-    else if ((c & 0xF8) == 0xF0) { n = 3; cp = c & 0x07; }
-    else { (*p)++; return 0xFFFD; }
-    const unsigned char *q = *p + 1;
-    for (int i = 0; i < n; i++) {
-        if ((q[i] & 0xC0) != 0x80) { (*p)++; return 0xFFFD; }
-        cp = (cp << 6) | (q[i] & 0x3F);
-    }
-    *p += n + 1;
-    /* Reject NON-MINIMAL (overlong) encodings and the UTF-16 surrogate range:
-     * "C0 80" would otherwise decode to U+0000 (a NUL smuggled into a name) and
-     * "E0 80 AF" to '/' (a path separator that never appears as a real byte).
-     * The whole sequence is still consumed, so progress is unchanged. */
-    static const int min_cp[3] = { 0x80, 0x800, 0x10000 };
-    if (cp < min_cp[n - 1] || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) {
-        return 0xFFFD;
-    }
-    return cp;
-}
-
-/* Case/quote-folded FNV-1a-32 over a UTF-8 name — the on-disk locator that binds
- * an index record to its file/folder without depending on byte-exact names
- * (quote-style drift can't break a match). MUST stay byte-identical to
- * tools/build_index.py name_hash(): fold smart quotes/dashes to ASCII, lowercase
- * A-Z, then FNV-1a over the re-encoded UTF-8 bytes. */
-static uint32_t name_hash(const char *s)
-{
-    const unsigned char *p = (const unsigned char *)s;
-    uint32_t h = 0x811c9dc5u;
-    for (;;) {
-        int cp = mn_utf8_next(&p);
-        if (cp < 0) break;
-        if      (cp == 0x2018 || cp == 0x2019) cp = '\'';
-        else if (cp == 0x201C || cp == 0x201D) cp = '"';
-        else if (cp == 0x2013 || cp == 0x2014) cp = '-';
-        if (cp >= 'A' && cp <= 'Z') cp += 32;
-        /* Re-encode. The 4-byte branch is load-bearing: without it an astral
-         * codepoint (any emoji) was folded into a 3-byte sequence while
-         * build_index.py emitted real 4-byte UTF-8, so the two hashes could
-         * never agree and the track silently never resolved to its file. */
-        unsigned char b[4]; int n;
-        if      (cp < 0x80)   { b[0] = (unsigned char)cp; n = 1; }
-        else if (cp < 0x800)  { b[0] = (unsigned char)(0xC0 | (cp >> 6));
-                                b[1] = (unsigned char)(0x80 | (cp & 0x3F)); n = 2; }
-        else if (cp < 0x10000){ b[0] = (unsigned char)(0xE0 | (cp >> 12));
-                                b[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
-                                b[2] = (unsigned char)(0x80 | (cp & 0x3F)); n = 3; }
-        else                  { b[0] = (unsigned char)(0xF0 | (cp >> 18));
-                                b[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
-                                b[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
-                                b[3] = (unsigned char)(0x80 | (cp & 0x3F)); n = 4; }
-        for (int i = 0; i < n; i++) { h ^= b[i]; h *= 0x01000193u; }
-    }
-    return h;
-}
-
-/* Split a "Artist - Album" folder name on its first " - " separator (the loader
- * names album folders this way). No separator -> artist empty, album = whole
- * name. Both outputs NAME_MAX-bounded (copy_display_name, UTF-8-preserving). */
-static void split_artist_album(const char *name, char *artist, char *album)
-{
-    int sep = -1;
-    for (int i = 0; name[i]; i++) {
-        if (name[i] == ' ' && name[i + 1] == '-' && name[i + 2] == ' ') {
-            sep = i;
-            break;
-        }
-    }
-    if (sep < 0) {
-        artist[0] = '\0';
-        copy_display_name(album, name, 0);
-        return;
-    }
-    char tmp[NAME_MAX + 1];
-    int n = (sep < NAME_MAX) ? sep : NAME_MAX;
-    for (int i = 0; i < n; i++) tmp[i] = name[i];
-    tmp[n] = '\0';
-    copy_display_name(artist, tmp, 0);
-    copy_display_name(album, name + sep + 3, 0);
-}
-
-/* Strip a leading track-number prefix ("NN. " / "NN.") from a track filename so
- * the tracklist shows a clean title (the row's own number gutter provides the
- * index). Only a digits-then-'.' prefix is removed, so titles that merely start
- * with a number ("99 Luftballons") are left alone. */
-static const char *track_display(const char *name)
-{
-    const char *p = name;
-    while (*p >= '0' && *p <= '9') p++;
-    if (p != name && *p == '.') {
-        p++;
-        while (*p == ' ') p++;
-        if (*p) return p;
-    }
-    return name;
-}
-
-/* MP3 playback is parked: dr_mp3's float synthesis can't hit real-time on this
- * FPU-less CPU (buffer starves -> stutter), and FLAC is lossless so there's no
- * quality reason to prefer it. The device is FLAC-only; a companion loader app
- * ensures music lands as FLAC. Flip to 1 to re-surface MP3 files (they'll open
- * but stutter) once a fixed-point/COP decoder exists. */
-#define CORE_ENABLE_MP3 0
-
-/* Classify by extension: 0 = FLAC (.fla/.flac), 1 = MP3 (.mp3), -1 = skip. */
-static int classify_ext(const char *name)
-{
-    int dot = -1;
-    for (int i = 0; name[i]; i++) {
-        if (name[i] == '.') dot = i;
-    }
-    if (dot < 0) return -1;
-
-    char ext[5];
-    int n = 0;
-    for (const char *e = name + dot + 1; *e && n < 4; e++) {
-        char c = *e;
-        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-        ext[n++] = c;
-    }
-    ext[n] = '\0';
-
-    if (n == 3 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A') return 0;
-    if (n == 4 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A' && ext[3] == 'C') return 0;
-#if CORE_ENABLE_MP3
-    if (n == 3 && ext[0] == 'M' && ext[1] == 'P' && ext[2] == '3') return 1;
-#endif
-    return -1;
-}
-
 /* fat32_readdir callback: collect music subdirectories + playable files into
  * g_browse. Directories named like iPod/OS system folders (or dotfolders) are
  * junk-filtered out; non-playable files are skipped. */
@@ -741,16 +548,6 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
  * (no artist repaint, no clipping of descenders). Fewer fit on screen. */
 #define ROW_H2     32
 #define LIST_ROWS2 6                       /* (240-42)/32 ~= 6                     */
-
-/* Wheel scroll feel. The driver reports the raw differenced position count (up
- * to ~half a rotation per poll), and a single slow detent crosses the wheel's
- * sensitivity gate at ~CW_WHEEL_SENSITIVITY (4) units. Dividing by 3 left a
- * remainder every detent, so the carry periodically double-stepped (move 1,1,2)
- * — felt like "it skipped, then jumped two". Matching the divisor to the
- * sensitivity makes one detent advance exactly one row; MAX_DELTA keeps the
- * 2-rows-per-event headroom (8/4) so a fast flick still scrolls quickly. */
-#define WHEEL_CLICKS_PER_ITEM CW_WHEEL_SENSITIVITY   /* = 4: one detent, one row */
-#define WHEEL_MAX_DELTA       (2 * CW_WHEEL_SENSITIVITY) /* fast flick: <=2 rows/evt */
 
 /* ---------------------------------------------------------------------------
  * Design-matched list chrome (menus.jsx): status strip, header, rows, scrollbar
@@ -829,9 +626,6 @@ static uint32_t g_bat_last_us;
 static int      g_bat_raw = -1;              /* 10-bit ADC code, for calibration  */
 static int      g_bat_mv_raw = -1;           /* mV before the plausibility clamp  */
 static int      g_bat_mv_filt = -1;          /* median of recent samples (policy) */
-
-/* Defined further down with the other formatters; needed by the battery log. */
-static int u32_to_dec(char *dst, unsigned v);
 
 /* Defined further down; the low-battery policy in battery_refresh() acts
  * through them. Forward-declared here rather than moving battery_refresh(),
@@ -1120,31 +914,6 @@ static void list_row_titled(int r, const char *text, const char *sub,
 
 /* Slim right-edge scrollbar (menus.jsx Scrollbar); no-op when everything fits.
  * `y0` is the list origin (differs between the full list and the detail view). */
-/* Write unsigned `v` as decimal into `dst`, return the length. The one decimal
- * writer — replaces the do/while digit-reversal that was open-coded ~8 times. */
-static int u32_to_dec(char *dst, unsigned v)
-{
-    char nb[10];
-    int t = 0;
-    do { nb[t++] = (char)('0' + v % 10); v /= 10; } while (v);
-    for (int i = 0; i < t; i++) dst[i] = nb[t - 1 - i];
-    dst[t] = '\0';
-    return t;
-}
-
-/* "M:SS" (minutes uncapped): up to 10 minute digits + ':' + 2 + NUL. Every
- * fmt_time buffer is sized FMT_TIME_MAX so a long track can't overrun it. */
-#define FMT_TIME_MAX 16
-static void fmt_time(char *buf, uint32_t s);   /* defined below                 */
-
-/* Format "a / b" into dst (needs >= 12 bytes). */
-static void fmt_count(char *dst, int a, int b)
-{
-    int i = u32_to_dec(dst, (unsigned)a);
-    dst[i++] = ' '; dst[i++] = '/'; dst[i++] = ' ';
-    u32_to_dec(dst + i, (unsigned)b);
-}
-
 /* ---------------------------------------------------------------------------
  * Album detail view (collection-detail.jsx AlbumDetail): a 56x56 art hero with
  * title + track count, then the folder's tracklist. Shown when you enter an
@@ -1521,21 +1290,6 @@ static lib_artist_t g_artists[ARTISTS_MAX];
 static int          g_artists_n;
 static int  g_artist_sel, g_artist_accum;
 
-static int title_cmp(const char *a, const char *b);   /* case-insensitive, defined below */
-
-/* De-duplication / sort key for an artist name: ignore a leading "The " so
- * "The Kid LAROI" and "Kid LAROI" collapse to one entry (and sort together
- * under K). Combined with title_cmp's case folding this also merges pure
- * case variants ("blackbear" vs "Blackbear"). Returns a pointer INTO `s`. */
-static const char *artist_key(const char *s)
-{
-    if ((s[0] == 'T' || s[0] == 't') && (s[1] == 'h' || s[1] == 'H') &&
-        (s[2] == 'e' || s[2] == 'E') && s[3] == ' ') {
-        return s + 4;
-    }
-    return s;
-}
-
 /* Build the unique, de-duplicated artist list from the index-derived album
  * list, then sort it A->Z. De-dup is by artist_key (leading "The " and case
  * ignored), so a differently-cased folder can't split one artist into two rows.
@@ -1726,18 +1480,6 @@ static uint16_t   g_songview[LIB_MAX_SONGS];
 static int        g_songview_n;
 static int        g_song_sel, g_song_accum;
 static int        g_genre_sel, g_genre_accum;
-
-/* Case-insensitive title compare (for the sort). */
-static int title_cmp(const char *a, const char *b)
-{
-    for (; *a && *b; a++, b++) {
-        char ca = *a, cb = *b;
-        if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
-        if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
-        if (ca != cb) return (int)ca - (int)cb;
-    }
-    return (int)*a - (int)*b;
-}
 
 static int16_t genre_intern(const char *g)
 {
@@ -2211,118 +1953,6 @@ static void library_resolve_art(fat32_t *fs)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * CORELIB.IDX: header validation and integrity
- *
- * The loader used to check the magic and that rec_size was 256, and nothing
- * else: the version bytes were never read, and there was no check that the
- * bytes after the header were the records the header claimed. A half-copied
- * index (a copy that stopped mid-file, or a tool that pre-sized the file and
- * never filled it) or a future layout with a bumped version parsed field by
- * field as plausible garbage — durations, titles and hashes from wherever
- * the offsets happened to land. Now:
- *
- *   - the version must be one this loader was written for (1 or 2); anything
- *     else is rejected before a record is read, so a v3 that moves fields
- *     falls back to the tag scan instead of loading nonsense;
- *   - the file size must be exactly header + count * 256 — so a truncated
- *     copy is refused up front, whatever its version;
- *   - a v2 header carries a CRC-32 (zlib's, the same one config.c checks its
- *     record with) over the records, verified as they stream past.
- *
- * v1 (the 12-byte header build_index.py wrote before the CRC existed) is
- * still accepted, on the size check alone, so an index already on a device
- * keeps loading; the host writes v2 now. The functions are copied verbatim
- * into tests/kernel/index_test.c (check_index_parity.py holds them in step)
- * because, like everything in this file, they cannot be linked into a host
- * test directly.
- * ------------------------------------------------------------------------- */
-#define IDX_REC_SIZE 256u
-#define IDX_HDR_V1   12u
-#define IDX_HDR_V2   16u
-
-enum {
-    IDX_OK = 0,
-    IDX_EMAGIC,          /* not a CIDX file                                   */
-    IDX_EVERSION,        /* a version this loader does not know               */
-    IDX_ERECSIZE,        /* record size is not 256                            */
-    IDX_ESIZE,           /* file size != header + count * 256 (truncated)     */
-    IDX_ECRC,            /* the records are not the ones the header signed    */
-    IDX_EREAD,           /* the stream came up short                          */
-};
-
-typedef struct {
-    uint32_t hdr_len;    /* 12 or 16                                          */
-    uint32_t count;
-    uint32_t crc;        /* records' CRC-32 from the header (v2)              */
-    int      has_crc;    /* v2: verify `crc`; v1: size check only             */
-} idx_hdr_t;
-
-static uint32_t idx_rd32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-/*
- * Validate a header. `h` holds at least IDX_HDR_V1 bytes, and IDX_HDR_V2 when
- * the version word says v2 (the caller reads the four extra bytes only then,
- * because on a v1 file they would be the first bytes of record 0 and the
- * stream has no way back). `file_size` is the directory entry's size.
- */
-static int idx_header_parse(const uint8_t *h, uint32_t file_size, idx_hdr_t *out)
-{
-    if (h[0] != 'C' || h[1] != 'I' || h[2] != 'D' || h[3] != 'X') return IDX_EMAGIC;
-    uint32_t ver = (uint32_t)h[4] | ((uint32_t)h[5] << 8);
-    uint32_t rec = (uint32_t)h[6] | ((uint32_t)h[7] << 8);
-    if (ver != 1 && ver != 2) return IDX_EVERSION;
-    if (rec != IDX_REC_SIZE) return IDX_ERECSIZE;
-    out->count   = idx_rd32(h + 8);
-    out->hdr_len = (ver == 2) ? IDX_HDR_V2 : IDX_HDR_V1;
-    out->has_crc = (ver == 2);
-    out->crc     = (ver == 2) ? idx_rd32(h + 12) : 0;
-    /* count * 256 must not wrap: a count of 0x01000000 would otherwise pass
-     * the size check against a 16-byte file and set the loop up to read 16M
-     * records that are not there. */
-    if (out->count > (0xFFFFFFFFu - IDX_HDR_V2) / IDX_REC_SIZE) return IDX_ESIZE;
-    if (file_size != out->hdr_len + out->count * IDX_REC_SIZE) return IDX_ESIZE;
-    return IDX_OK;
-}
-
-/*
- * CRC-32 (reflected, polynomial 0xEDB88320, init/final 0xFFFFFFFF): what
- * zlib.crc32 computes, so build_index.py can stamp it. Table-driven, unlike
- * config.c's bitwise crc32_buf: that one runs over a 1 KB record, this one
- * over the whole index — up to 1.5 MB at LIB_MAX_SONGS — and eight shift
- * steps per byte at 80 MHz would be most of a second on the boot path. The
- * table is 1 KB of .bss, filled on first use. Incremental: seed with
- * 0xFFFFFFFF, feed the batches as they stream in, invert at the end.
- */
-static uint32_t g_crc_tab[256];
-static int      g_crc_tab_ready;
-
-static void crc32_tab_init(void)
-{
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int b = 0; b < 8; b++) {
-            uint32_t mask = (uint32_t)0u - (c & 1u);
-            c = (c >> 1) ^ (0xEDB88320u & mask);
-        }
-        g_crc_tab[i] = c;
-    }
-    g_crc_tab_ready = 1;
-}
-
-static uint32_t crc32_update(uint32_t crc, const uint8_t *p, uint32_t n)
-{
-    if (!g_crc_tab_ready) crc32_tab_init();
-    for (uint32_t i = 0; i < n; i++) {
-        crc = g_crc_tab[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-    }
-    return crc;
-}
-
 /* Why the last index load was refused (an IDX_* code), for the About screen
  * and the UART. A refused index is not silent: the device falls back to the
  * tag scan, which takes minutes, and the user deserves to know it was the
@@ -2345,19 +1975,6 @@ static int idx_reject(int why)
     albums_reset();
     g_lib_orphaned = 0;
     return 0;
-}
-
-/* Drop a recognised audio extension from an index file[] field, IN PLACE —
- * and only a recognised one. The field is the first 63 bytes of the name; for
- * a name longer than that the ".flac" is not in it, and cutting at whatever
- * '.' remains produced the "16" of the bug described at lib_song_t. This is
- * the display placeholder until the resolve pass installs the on-disk stem. */
-static void trim_audio_ext(char *name)
-{
-    if (classify_ext(name) < 0) return;
-    int dot = -1;
-    for (int j = 0; name[j]; j++) if (name[j] == '.') dot = j;
-    if (dot > 0) name[dot] = '\0';
 }
 
 /* Load the whole library from the host-built CORELIB.IDX in ONE streamed pass
@@ -2568,39 +2185,6 @@ static void library_scan(fat32_t *fs)
     library_finish();
     library_resolve_art(fs);               /* index each album's cover clusters */
     g_lib_scanned = 1;
-}
-
-
-/*
- * Bottom-up merge sort over an index array.
- *
- * Both library sorts were insertion sorts, which is fine at a few hundred
- * entries and quadratic beyond that: at the old 1200-song cap the song sort
- * already cost ~720k case-insensitive string compares, and raising the cap
- * would have made "Loading Library" grow with the SQUARE of the library. This
- * is O(n log n), stable (so equal titles keep their load order), and needs one
- * scratch array of the same length.
- */
-typedef int (*idx_cmp_fn)(uint16_t a, uint16_t b);
-
-static void merge_sort_idx(uint16_t *a, int n, uint16_t *tmp, idx_cmp_fn cmp)
-{
-    for (int width = 1; width < n; width *= 2) {
-        for (int lo = 0; lo < n; lo += 2 * width) {
-            int mid = lo + width;
-            int hi  = lo + 2 * width;
-            if (mid > n) mid = n;
-            if (hi  > n) hi  = n;
-            int i = lo, j = mid, k = lo;
-            while (i < mid && j < hi) {
-                /* <= keeps the sort STABLE: a tie takes the left run first. */
-                tmp[k++] = (cmp(a[i], a[j]) <= 0) ? a[i++] : a[j++];
-            }
-            while (i < mid) tmp[k++] = a[i++];
-            while (j < hi)  tmp[k++] = a[j++];
-        }
-        for (int i = 0; i < n; i++) a[i] = tmp[i];
-    }
 }
 
 /* Scratch for merge_sort_idx. Sized to the larger of the two things sorted. */
@@ -3149,18 +2733,6 @@ static void boot_splash(void)
     lcd_present_fb(console_framebuffer());
 }
 
-/* Format `s` seconds as "M:SS" — minutes genuinely uncapped (the old two-digit
- * write rendered 123 min as "23:SS"). `buf` must be >= FMT_TIME_MAX bytes. */
-static void fmt_time(char *buf, uint32_t s)
-{
-    uint32_t m = s / 60, ss = s % 60;
-    int i = 0;
-    i += u32_to_dec(buf, m);          /* 1..10 digits, no truncation */
-    buf[i++] = ':';
-    buf[i++] = (char)('0' + ss / 10);
-    buf[i++] = (char)('0' + ss % 10);
-    buf[i]   = '\0';
-}
 
 /* Right-side circle arc (a ")" shape): radius R, +/- span rows tall, centred at
  * (cx, cy); ~2px thick. The speaker's sound waves + the lock shackle use it. */
@@ -4040,27 +3612,6 @@ static int list_repaint_partial(void)
     return 1;
 }
 
-/* ---------------------------------------------------------------------------
- * Wheel acceleration + the A-Z locator
- *
- * The driver reports a differenced position count, so one detent is one row no
- * matter how fast you spin — with 1200 songs that is a very long spin. Real
- * iPods accelerate: the faster the wheel turns, the more rows each detent
- * covers, with a big letter shown while it's flying so you can aim. Velocity is
- * derived from the GAP between wheel events (they arrive as fast as the wheel
- * is turned) and decays on its own.
- * ------------------------------------------------------------------------- */
-#define WHEEL_VEL_MAX   8                  /* rows per detent at full tilt      */
-/* (There is deliberately no "fast gap" threshold: the gap between drained
- * events measures the main loop's period, not the wheel. See wheel_accel_step.) */
-#define WHEEL_IDLE_US   200000u            /* > this gap => new gesture, reset  */
-#define WHEEL_AZ_VEL    3                  /* velocity at which the letter shows */
-#define WHEEL_AZ_HOLD   500000u            /* ...and how long after the last tick */
-/* In letter mode the plate is the control surface, not a hint, so it lingers
- * well past the last detent — it must not blink out while you are still
- * deciding which letter to stop on. */
-#define WHEEL_AZ_HOLD_LETTER 1200000u
-
 /* Cover loads under a moving wheel (the album-list pump in run_ui; see the
  * block comment there). A detent within SETTLE means the list is scrolling:
  * one disk read per pass, not six. A parked platter is only woken for covers
@@ -4068,127 +3619,6 @@ static int list_repaint_partial(void)
  * detent scroll (~300 ms apart) never trips a spin-up mid-gesture. */
 #define CHIP_WHEEL_SETTLE_US   150000u
 #define CHIP_SPINUP_QUIET_US   500000u
-
-static uint32_t g_wheel_last_us;
-static int      g_wheel_vel = 1;
-static int      g_wheel_letters;       /* 1 = a detent moves a whole letter    */
-
-/*
- * Called once per wheel event with that event's RAW tick delta.
- *
- * Speed is measured as ticks per second, NOT as the gap between events. The
- * gap is the wrong signal: clickwheel_service() latches motion in the 100 Hz
- * ISR and clickwheel_get_event() drains the accumulator, so an "event" arrives
- * once per main-loop pass — the gap therefore measures how long the loop took
- * (render, disk, decode), not how fast the wheel is turning. Deriving velocity
- * from it meant a fast spin during playback, when passes are longest, looked
- * SLOWER than the same spin on an idle menu, and the top of the range was
- * effectively unreachable.
- *
- * delta is ticks accumulated since the last drain, so delta/dt is real angular
- * velocity and is independent of how often we happen to drain. CW_CLICKS_PER_ROT
- * is 96, so one turn a second is ~96 ticks/s.
- */
-#define WHEEL_TPS_ACCEL   50u    /* above this, start multiplying rows      */
-#define WHEEL_TPS_SPAN   200u    /* ticks/s from vel 1 to WHEEL_VEL_MAX     */
-
-static uint32_t g_wheel_tps;     /* smoothed ticks/second                   */
-
-static int wheel_accel_step(int delta)
-{
-    uint32_t now = mmio_read32(USEC_TIMER_ADDR);
-    uint32_t dt  = now - g_wheel_last_us;
-    g_wheel_last_us = now;
-
-    if (dt > WHEEL_IDLE_US) {         /* new gesture: forget the old one */
-        g_wheel_vel     = 1;
-        g_wheel_letters = 0;
-        g_wheel_tps     = 0;
-        return 1;
-    }
-    if (dt < 1000u) {
-        dt = 1000u;                   /* floor: keep the divide sane */
-    }
-
-    uint32_t mag = (uint32_t)(delta < 0 ? -delta : delta);
-    uint32_t tps = mag * 1000000u / dt;
-    /* Light smoothing so one long loop pass can't spike or drop the estimate. */
-    g_wheel_tps = (g_wheel_tps * 3u + tps) / 4u;
-
-    if (g_wheel_tps <= WHEEL_TPS_ACCEL) {
-        g_wheel_vel = 1;
-    } else {
-        uint32_t over = g_wheel_tps - WHEEL_TPS_ACCEL;
-        uint32_t v    = 1u + (over * (WHEEL_VEL_MAX - 1u)) / WHEEL_TPS_SPAN;
-        g_wheel_vel   = (int)(v > (uint32_t)WHEEL_VEL_MAX ? (uint32_t)WHEEL_VEL_MAX : v);
-    }
-
-    /*
-     * Letter mode engages at exactly the speed the A-Z plate appears, because
-     * the plate IS the indicator for it: seeing the letter means the wheel is
-     * stepping letters. Having a second, higher threshold created a band where
-     * the letter was up but the wheel was still grinding through songs, which
-     * reads as the cue simply not working.
-     *
-     * Latched for the rest of the gesture (cleared on the idle gap at the top
-     * of this function). Re-testing the speed each detent would flip the unit
-     * back and forth mid-spin as the estimate wavers around the threshold —
-     * the control would change meaning under your thumb.
-     */
-    if (g_wheel_vel >= WHEEL_AZ_VEL) {
-        g_wheel_letters = 1;
-    }
-    return g_wheel_vel;
-}
-
-/* 1 while a detent should move a whole letter rather than a run of rows. */
-static int wheel_letter_mode(void)
-{
-    return g_wheel_letters;
-}
-
-/* Print the measured wheel speed (ticks/s) under the letter — a tuning aid for
- * calibrating WHEEL_TPS_ACCEL against a real spin. Off by default. */
-#define AZ_SHOW_TPS 0
-
-/* Smoothed wheel speed in ticks/second (96 ticks = one full rotation).
- * Only compiled in for the AZ_SHOW_TPS tuning readout. */
-#if AZ_SHOW_TPS
-static uint32_t wheel_tps(void)
-{
-    return g_wheel_tps;
-}
-#endif
-
-/* Forget the gesture entirely. Called when the UI is taken away from the user
- * (backlight off, panel wake, screen change) so a spin that ended before the
- * screen slept can't still be "in progress" when they come back to it. */
-static void wheel_accel_reset(void)
-{
-    g_wheel_vel     = 1;
-    g_wheel_letters = 0;
-    g_wheel_last_us = 0;
-    g_wheel_tps     = 0;
-}
-
-/* True while the list is flying past fast enough to want the letter cue. In
- * letter mode the plate stays up for the whole gesture: it IS the control
- * surface then, not a hint, so it must not blink out between detents. */
-static int wheel_accelerating(void)
-{
-    if (!g_wheel_letters && g_wheel_vel < WHEEL_AZ_VEL) return 0;
-    uint32_t hold = g_wheel_letters ? WHEEL_AZ_HOLD_LETTER : WHEEL_AZ_HOLD;
-    return (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - g_wheel_last_us) < hold;
-}
-
-/* Uppercased first letter of `s`, '#' for anything not A-Z. */
-static char initial_of(const char *s)
-{
-    while (*s == ' ') s++;
-    char c = *s;
-    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
-    return (c >= 'A' && c <= 'Z') ? c : '#';
-}
 
 /* The selected row's initial on the alphabetised lists (songs / artists /
  * albums), read straight off the already-sorted arrays; 0 on screens where an
@@ -4220,46 +3650,10 @@ static char list_sel_initial(void)
     return (scr_cur() == SCR_SONGS) ? list_initial_at(g_song_sel) : 0;
 }
 
-/*
- * Letter stepping: land on the FIRST entry of the next/previous letter present
- * in the list.
- *
- * Row acceleration alone tops out at WHEEL_VEL_MAX rows per detent, which on a
- * 1200-song list still means a long spin and a letter cue that only tells you
- * where you happen to have landed. Once the wheel is being spun in earnest the
- * useful unit stops being the row and becomes the letter — one detent, one
- * letter, so you can aim at "S" instead of scrubbing toward it.
- *
- * Walks the already-sorted view, so it is O(entries in the current letter) and
- * needs no index. Returns `sel` unchanged when there is no further letter, so
- * the ends of the list stop cleanly instead of wrapping under your thumb.
- */
-static int list_letter_step(int sel, int count, int dir)
+/* The wheel's clock (the ui/wheel.h seam): the free-running USEC_TIMER. */
+static uint32_t wheel_clock(void)
 {
-    if (count <= 0) {
-        return sel;
-    }
-    char cur = list_initial_at(sel);
-    if (cur == 0) {
-        return sel;                 /* screen has no alphabetised order */
-    }
-    int i = sel;
-    if (dir > 0) {
-        while (i < count - 1 && list_initial_at(i + 1) == cur) i++;
-        if (i >= count - 1) return sel;          /* already in the last letter */
-        return i + 1;                            /* first entry of the next    */
-    }
-    /* Backwards: to the head of this letter, and if already there, to the head
-     * of the previous one — so a back-step is never a no-op mid-letter. */
-    while (i > 0 && list_initial_at(i - 1) == cur) i--;
-    if (i != sel) {
-        return i;
-    }
-    if (i == 0) return sel;                      /* already in the first letter */
-    char prev = list_initial_at(i - 1);
-    i--;
-    while (i > 0 && list_initial_at(i - 1) == prev) i--;
-    return i;
+    return mmio_read32(USEC_TIMER_ADDR);
 }
 
 /* The letter itself, on a centred plate over the flying list. Its presence is
@@ -4318,63 +3712,6 @@ static void ui_click(void)
             break;
         default: break;                               /* 0 = Off                  */
     }
-}
-
-/* Apply a wheel event to a selection index in [0, count) with acceleration. */
-static int wheel_move(int sel, int count, int8_t delta, int *accum)
-{
-    /* Feed the RAW delta: it is the tick count since the last drain, which is
-     * what carries the wheel's speed. The clamp below is for the row maths and
-     * would throw exactly that information away. */
-    int vel = wheel_accel_step(delta);
-    int wd = delta;
-    if (wd >  WHEEL_MAX_DELTA) wd =  WHEEL_MAX_DELTA;
-    if (wd < -WHEEL_MAX_DELTA) wd = -WHEEL_MAX_DELTA;
-    *accum += wd;
-    int move = *accum / WHEEL_CLICKS_PER_ITEM;
-    *accum -= move * WHEEL_CLICKS_PER_ITEM;
-
-    int old = sel;
-
-    /* Sustained fast spin on an alphabetised list: one detent = one letter.
-     * Stepping rows faster still makes you scrub past everything between here
-     * and where you're going; stepping letters lets you aim. Falls through to
-     * row acceleration on screens with no alphabetical order (list_letter_step
-     * returns `sel` unchanged there). */
-    /*
-     * `list_initial_at(sel) != 0` is the load-bearing half of this guard: it
-     * asks "does THIS screen have letters to step through at all". Without it
-     * the branch was taken on every screen, list_letter_step returned `sel`
-     * unchanged on the ones with no alphabetical order (menus, settings, the
-     * queue, a tracklist), and the early return below meant the wheel never
-     * fell through to row scrolling — so spinning fast on those screens did
-     * nothing at all.
-     */
-    if (move != 0 && wheel_letter_mode() && list_initial_at(sel) != 0) {
-        int dir  = (move > 0) ? 1 : -1;
-        int step = (move > 0) ? move : -move;
-        for (int i = 0; i < step; i++) {
-            int next = list_letter_step(sel, count, dir);
-            if (next == sel) break;              /* ran out of letters */
-            sel = next;
-        }
-        if (sel != old) {
-            ui_click();
-        }
-        return sel;
-    }
-
-    /* Acceleration: one detent still moves one row when you turn the wheel
-     * deliberately (vel 1), but a fast spin covers up to WHEEL_VEL_MAX rows per
-     * detent — the difference between 1200 songs being reachable and not. */
-    move *= vel;
-    sel += move;
-    if (sel < 0)          sel = 0;
-    if (sel >= count)     sel = count - 1;
-    if (sel != old) {
-        ui_click();        /* click only when the cursor actually advances */
-    }
-    return sel;
 }
 
 /* ---------------------------------------------------------------------------
@@ -5866,7 +5203,7 @@ _Noreturn static void run_ui(fat32_t *fs)
         if (scr_cur() == SCR_BROWSER && g_dir_depth == 0) {
             uint32_t nowc = mmio_read32(USEC_TIMER_ADDR);
             int idle_now  = !player_active();
-            uint32_t since_wheel = nowc - g_wheel_last_us;
+            uint32_t since_wheel = nowc - wheel_last_us();
             int moving = since_wheel < CHIP_WHEEL_SETTLE_US;
             int budget;
             if (ata_is_parked() && since_wheel < CHIP_SPINUP_QUIET_US) {
@@ -6013,6 +5350,17 @@ _Noreturn void kernel_main(void) {
      * (as the host tests do) and titles are plainly clipped.
      */
     ui_set_scroll_text(mq_text);
+
+    /*
+     * The wheel's acceleration state machine (ui/wheel.c) is portable for the
+     * same reason and by the same means: its clock, its "what letter is row N
+     * on this screen" source and its navigation click are injected here rather
+     * than reached for. Unset, none of them can misbehave — no clock reads 0,
+     * no letter source means nothing letter-steps, no click is silent.
+     */
+    wheel_set_clock(wheel_clock);
+    wheel_set_initial_at(list_initial_at);
+    wheel_set_click(ui_click);
 
     /* Hex-path self-test: if this doesn't read 1234ABCD on the terminal,
      * distrust every register dump that follows. */

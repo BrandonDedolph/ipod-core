@@ -123,7 +123,22 @@ VARIANTS = {
     "truncated":
         "the image is cut off after the FAT region: every data-region read "
         "fails. Models a drive that dies mid-transfer.",
+    "long-lfn":
+        "the long-name bound, exactly: a 255-unit name (the VFAT maximum, in "
+        "3-byte characters so its UTF-8 is 741 bytes) that must come back "
+        "whole, and a 256-unit name that no conforming writer produces, which "
+        "must fall back to its 8.3 name AND say so (name_lossy).",
 }
+
+# The long-name bound. 255 UTF-16 units is the VFAT maximum (20 entries of 13,
+# the last padded). U+97F3 is a 3-byte UTF-8 character with no surrogate, so
+# the 255-unit name's UTF-8 form (7 + 243*3 + 5 = 741 bytes) is far past the
+# 256 bytes the reader's dirent used to hold. 256 units is one past the bound.
+LONG255_NAME = "LFN255-" + "音" * 243 + ".flac"
+LONG255_SHORT = b'LFN255~1FLA'
+LONG256_NAME = "LFN256-" + "x" * 244 + ".flac"
+LONG256_SHORT = b'LFN256~1FLA'
+assert len(LONG255_NAME) == 255 and len(LONG256_NAME) == 256
 
 # A real FAT16 boot sector, byte for byte, so the mis-detection it triggers is
 # the one a user would actually hit (an iPod restored to FAT16 by iTunes on a
@@ -264,6 +279,22 @@ def main():
         for ent in lfn_entries("Dangling.flac", b'DANGLE~1FLA'):
             img[e:e + 32] = ent
             e += 32
+
+    if variant == "long-lfn":
+        # Two files at the long-name bound, both content-sharing cluster 5.
+        # 20 LFN entries + one 8.3 entry each: 42 slots, and the root cluster
+        # holds 64, so both fit after HELLO.TXT and Intentions.flac.
+        for longname, short in ((LONG255_NAME, LONG255_SHORT),
+                                (LONG256_NAME, LONG256_SHORT)):
+            e += 32
+            for ent in lfn_entries(longname, short):
+                img[e:e + 32] = ent
+                e += 32
+            img[e:e + 11] = short
+            img[e + 11] = 0x20
+            struct.pack_into('<H', img, e + 20, (LFN_CLUS >> 16) & 0xFFFF)
+            struct.pack_into('<H', img, e + 26, LFN_CLUS & 0xFFFF)
+            struct.pack_into('<I', img, e + 28, LFN_SIZE)
 
     if variant == "cyclic-fat":
         # Fill the REST of the root cluster with deleted (0xE5) slots so there

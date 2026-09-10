@@ -15,10 +15,10 @@
  * drags in the whole UI, the FAT reader, the player and the HAL — there is no
  * way to link the real one into a host test. So the function body below is a
  * VERBATIM COPY, diffed against main.c by tests/scripts/check_resume_parity.py
- * (run from `meson test` and from `make verify-hw`), exactly as
- * name_hash_ref.c does for the locator hash. Do not reformat, re-indent or
- * rename anything between the BEGIN/END markers; if you change main.c, paste
- * the new text in here.
+ * (run from `meson test` and from `make verify-hw`). Do not reformat, re-indent
+ * or rename anything between the BEGIN/END markers; if you change main.c,
+ * paste the new text in here. (The locator hash it calls is no longer a copy:
+ * name_hash() lives in library/names.c and is linked here for real.)
  *
  * The library it reads is stubbed below with the same field NAMES main.c's
  * lib_song_t uses, so the copied body compiles unchanged.
@@ -28,7 +28,7 @@
 #include <string.h>
 #include <stdint.h>
 
-#include "name_hash_ref.h"
+#include "../../library/names.h"
 
 static int g_fails;
 
@@ -120,7 +120,7 @@ static void lib_add_disk(const char *file, const char *disk_stem,
     int i = g_songs_n++;
     size_t n = strlen(file);
     memcpy(g_songs[i].file, file, n < STUB_FILE_MAX ? n : STUB_FILE_MAX - 1);
-    g_songs[i].stem_hash  = name_hash_ref(disk_stem ? disk_stem : file);
+    g_songs[i].stem_hash  = name_hash(disk_stem ? disk_stem : file);
     g_songs[i].file_clus  = clus;
     g_songs[i].duration_s = dur;
 }
@@ -132,7 +132,7 @@ static void lib_add(const char *file, uint32_t clus, uint32_t dur)
     lib_add_disk(file, 0, clus, dur);
 }
 
-#define H(s) name_hash_ref(s)
+#define H(s) name_hash(s)
 
 /* ---- 1. the happy path -------------------------------------------------- */
 

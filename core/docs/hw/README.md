@@ -56,6 +56,7 @@ boot ROM, never disturb the partition signature. (08-boot-dock.md.)
 | [07-usb.md](07-usb.md)               | ARC USBOTG controller, MSC stack, exclusive-storage handoff |
 | [08-boot-dock.md](08-boot-dock.md)   | Firmware partition format, bootloader handoff, dock UART, recovery |
 | [09-i2c.md](09-i2c.md)               | On-SoC I²C controller (WM8758 codec control bus) |
+| [10-headphone-jack.md](10-headphone-jack.md) | Headphone jack: 4-pole conductors, insertion-detect GPIO + probe, why inline buttons cannot work |
 
 ## Conventions
 

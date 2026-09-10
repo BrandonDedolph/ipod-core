@@ -303,4 +303,27 @@ int  hal_backlight_get(void);
 void log_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #endif
 
+/* ---------- Headphone jack ------------------------------------------ */
+
+/*
+ * hal_headphones_present reports whether a plug is seated in the headphone
+ * jack, DEBOUNCED: 1 = seated, 0 = absent, -1 = unknown.
+ *
+ * The jack has a mechanical insertion switch and nothing else the firmware
+ * can sense — no inline-button path exists on this hardware; see
+ * core/docs/hw/10-headphone-jack.md before asking again. This is the "pause
+ * when the headphones are pulled" input.
+ *
+ * Poll it from the main loop (hw: two register reads). A new level is
+ * reported only after it has held for 200 ms, so a bouncing or wiggled plug
+ * yields exactly one transition; the first poll after boot answers at once.
+ *
+ * -1 means the backend cannot answer — on hw, until the detect line has been
+ * confirmed on the device (hal/hw/headphone.h, HEADPHONE_DETECT_TRUSTED). A
+ * caller must treat -1 as "do nothing", never as "unplugged".
+ *
+ * Sim: fixed at 1 unless CORE_SIM_HEADPHONES=0 in the environment.
+ */
+int hal_headphones_present(void);
+
 #endif /* CORE_HAL_H */
