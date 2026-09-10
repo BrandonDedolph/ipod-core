@@ -37,6 +37,11 @@ if sys.version_info < (3, 12):
 
 from PIL import Image, ImageDraw, ImageFont
 
+# The one definition of daylight between two glyphs, shared with the solver
+# and the judge. Read its docstring before touching any spacing number here.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from daylight import glyph_rows, core_span, band_daylight   # noqa: E402
+
 # The generated headers declare `uint16_t data_offset`, so the concatenated
 # glyph bitmap cannot exceed 64 KiB — past that the offsets wrap and every
 # glyph after the wrap point renders as a slice of some other glyph's bitmap.
@@ -112,7 +117,9 @@ OPTICAL_TARGET_PX = int(os.environ.get("CORE_OPTICAL_TARGET", "2"))
 # "Taylor Swift" read as one word) to 3.0 (bold 13). Pinning this too is what
 # makes word spacing consistent between faces rather than an accident of each
 # one's design width.
-OPTICAL_WORD_PX = int(os.environ.get("CORE_OPTICAL_WORD", "5"))
+# float, not int: the same variable overrides the solved word gap in area
+# mode (solved_for), whose values are quarter pixels.
+OPTICAL_WORD_PX = float(os.environ.get("CORE_OPTICAL_WORD", "5"))
 # Spacing criterion. "min" (the e190093 rule) puts every letter pair at the
 # same clearance on its single tightest row; "area" puts every pair at the same
 # mean DAYLIGHT over the x-height band, with a floor on the tightest row so
@@ -128,27 +135,35 @@ OPTICAL_MODE = os.environ.get("CORE_OPTICAL_MODE", "area")    # "min" | "area"
 # Floor: the tightest-row clearance that may never be violated, in px, and
 # the alpha at which a pixel counts as ink for that test (1 = any ink,
 # 128 = core). ~37% of the pixels in these atlases are sub-25%-alpha fringe;
-# floors measured on any-ink keep the fringe apart, which is where the
-# unavoidable 'ld' looseness comes from.
+# floors measured on any-ink keep the fringe apart (a 2%-alpha pixel blocked
+# every kern touching an f), which is where the unavoidable 'ld' looseness
+# came from. This is deliberately a THRESHOLD while the texture measure
+# (daylight.py) integrates: touching is decided by two dark-ish pixels
+# sitting side by side, and a coverage floor waved that through — see
+# daylight.band_daylight.
 OPTICAL_FLOOR_PX = int(os.environ.get("CORE_OPTICAL_FLOOR", "1"))
 OPTICAL_FLOOR_ALPHA = int(os.environ.get("CORE_OPTICAL_FLOOR_ALPHA", "64"))
 # SOLVED per atlas by tools/optical_solve.py, not chosen by eye: (area px,
-# word px). Area is the daylight target that minimises the rhythm CV over the
-# real strings subject to the mean daylight matching the face's own 'n'
-# counter at that size (the classic even-texture rule); word is the midpoint
-# of the range where every word gap clears every intra-word gap by a whole
-# pixel and the space advance stays under a third of an em. See the solver's
-# docstring for the argument and the table it printed.
+# word px). Area is the daylight target — coverage-integrated white between
+# the cores, tools/daylight.py — within a quarter pixel of the face's own
+# 'n' counter at that size (the classic even-texture rule) that minimises
+# the rhythm sd over the real strings; word is the midpoint of the range
+# where every word gap clears every intra-word gap by a whole pixel and the
+# space advance stays under half an em. See the solver's docstring for the
+# argument and the table it printed.
 # Output of: tools/optical_solve.py  (floor: alpha >= 64 clears 1px; strings:
-# tools/ui_strings.txt; 2026-09-10). Re-run it after changing the face, the
-# sizes, the tracking table, the floor, or the strings — never edit by hand.
+# tools/ui_strings.txt; 2026-09-10, coverage measure). Re-run it after
+# changing the face, the sizes, the tracking table, the floor, the measure,
+# or the strings — never edit by hand. The numbers are NOT comparable with
+# the any-alpha solve's (2.10/5.25 ... 2.65/9.00): a 2.1 there was ~2.8 of
+# white; text_metrics.py --edge any judges any atlas in the old units.
 OPTICAL_SOLVED = {
-    (False,  9): (2.10, 5.25),   # NUNITO_REGULAR_9: n counter 2.00, sd 0.23 CV 0.107, word range 4.25-6.0
-    (False, 11): (2.20, 7.00),   # NUNITO_REGULAR_11: n counter 2.40, sd 0.31 CV 0.140, word range 6.0-7.75
-    (False, 12): (2.20, 7.00),   # NUNITO_REGULAR_12: n counter 2.40, sd 0.31 CV 0.143, word range 5.75-8.0
-    (True , 12): (1.85, 6.75),   # NUNITO_BOLD_12: n counter 1.75, sd 0.26 CV 0.138, word range 5.5-7.75
-    (True , 13): (2.10, 8.00),   # NUNITO_BOLD_13: n counter 2.00, sd 0.27 CV 0.130, word range 6.5-9.25
-    (True , 18): (2.65, 9.00),   # NUNITO_BOLD_18: n counter 2.57, sd 0.39 CV 0.145, word range 6.25-11.5
+    (False,  9): (2.20, 6.25),   # NUNITO_REGULAR_9: n counter 1.97, sd 0.35 CV 0.154, word range 5.25-7.0
+    (False, 11): (2.75, 8.25),   # NUNITO_REGULAR_11: n counter 2.51, sd 0.35 CV 0.125, word range 7.75-8.5
+    (False, 12): (2.70, 8.25),   # NUNITO_REGULAR_12: n counter 2.50, sd 0.42 CV 0.151, word range 7.5-8.75
+    (True , 12): (1.95, 7.50),   # NUNITO_BOLD_12: n counter 1.75, sd 0.43 CV 0.200, word range 6.25-8.5
+    (True , 13): (1.95, 8.75),   # NUNITO_BOLD_13: n counter 1.74, sd 0.45 CV 0.203, word range 7.25-10.0
+    (True , 18): (3.50, 10.00),  # NUNITO_BOLD_18: n counter 3.25, sd 0.44 CV 0.120, word range 7.25-12.5
 }
 OPTICAL_AREA_DEFAULT = 2.5
 OPTICAL_WORD_DEFAULT = 7.0
@@ -163,12 +178,13 @@ def fit_space_advance(glyphs, glyph_data, kerns, tracking, target_px,
     clearance between A and B over the rows they share.
 
     With `band` (x-height rows, ascender-relative) the gap is the mean
-    daylight over the band rows both glyphs ink — the same measure the area
-    criterion pins letter pairs to, so the word/letter ratio means what it
-    says — sampled over Upper->lower, lower->Upper and lower->lower pairs.
-    The first version sampled only Upper->lower on the tightest row, which
-    left 'd M' ("Fleetwood Mac") and 'e S' unconstrained. Without `band` it
-    is the tightest-row clearance over Upper->lower, as before.
+    coverage-integrated daylight over the band rows both glyphs have a core
+    on (daylight.band_daylight) — the same measure the area criterion pins
+    letter pairs to, so the word/letter ratio means what it says — sampled
+    over Upper->lower, lower->Upper and lower->lower pairs. The first
+    version sampled only Upper->lower on the tightest row, which left 'd M'
+    ("Fleetwood Mac") and 'e S' unconstrained. Without `band` it is the
+    tightest-row any-alpha clearance over Upper->lower, as before.
     """
     kmap = {(l, r): v for l, r, v in kerns}
     idx = {chr(0x20 + i): i for i in range(95)}
@@ -179,8 +195,9 @@ def fit_space_advance(glyphs, glyph_data, kerns, tracking, target_px,
         gi = idx[ch]
         ox, oy, w, h, adv, off = glyphs[gi]
         if w and h:
-            ext[ch] = (row_extents_bitmap(glyph_data[off:off + w * h], w, h, oy),
-                       ox, adv)
+            bmp = glyph_data[off:off + w * h]
+            ext[ch] = (glyph_rows(bmp, w, h, oy) if band is not None
+                       else row_extents_bitmap(bmp, w, h, oy), ox, adv)
     sp_adv = glyphs[idx[" "]][4]
     combos = [(ups, los)] if band is None else [(ups, los), (los, ups), (los, los)]
     gaps = []
@@ -193,19 +210,20 @@ def fit_space_advance(glyphs, glyph_data, kerns, tracking, target_px,
                 if b not in ext:
                     continue
                 rb, oxb, _ = ext[b]
-                sh = set(ra) & set(rb)
-                if band is not None:
-                    sh = {y for y in sh if band[0] <= y < band[1]}
-                if not sh:
-                    continue
                 s1 = (adva + tracking + kmap.get((idx[a], idx[" "]), 0) * 2
                       + ADV_ONE // 2) >> ADV_SHIFT
                 s2 = (sp_adv + kmap.get((idx[" "], idx[b]), 0) * 2
                       + ADV_ONE // 2) >> ADV_SHIFT
-                per_row = [(s1 + s2 + oxb + rb[y][0]) - (oxa + ra[y][1]) - 1
-                           for y in sh]
-                gaps.append(min(per_row) if band is None
-                            else sum(per_row) / len(per_row))
+                if band is not None:
+                    d = band_daylight(ra, oxa, rb, s1 + s2 + oxb, band)
+                    if d is not None:
+                        gaps.append(d)
+                    continue
+                sh = set(ra) & set(rb)
+                if not sh:
+                    continue
+                gaps.append(min((s1 + s2 + oxb + rb[y][0]) - (oxa + ra[y][1]) - 1
+                                for y in sh))
     if not gaps:
         return sp_adv
     gaps.sort()
@@ -295,8 +313,75 @@ def row_extents_bitmap(bmp, w, h, oy, thresh=1):
     return out
 
 
+LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+# Steps sampled per pair past the floor. Daylight gains exactly one pixel per
+# step once the fringes clear, so anything past the table is extrapolated.
+PAIR_TABLE_STEPS = 8
+
+
+def pair_table(glyphs, glyph_data, band, floor_px=None, floor_alpha=None):
+    """Everything the area rule needs per ordered letter pair that does NOT
+    depend on the target, built once per atlas: the smallest whole-pixel
+    step (A's origin to B's) the no-touch floor allows, and the mean band
+    daylight (daylight.band_daylight) at that step and the next
+    PAIR_TABLE_STEPS-1. The solver sweeps dozens of targets over one atlas;
+    the bitmap work is the same for all of them, so it is done here once.
+
+    Returns {(a, b): (floor_step, [daylight at floor_step, +1, +2, ...])}
+    keyed by the characters. Pairs that share no core row at any height are
+    absent: they are never adjacent and keep the font's own kern.
+
+    The floor is the tightest row at floor_alpha ink clearing floor_px — the
+    same test as before — and the table starts no lower than the step at
+    which the >=CORE_ALPHA cores stop overlapping, so its first entry is a
+    real daylight and not a collision count.
+    """
+    floor_px = OPTICAL_FLOOR_PX if floor_px is None else floor_px
+    floor_alpha = OPTICAL_FLOOR_ALPHA if floor_alpha is None else floor_alpha
+    idx = {chr(0x20 + i): i for i in range(95)}
+    rows, extf, core, meta = {}, {}, {}, {}
+    for ch in LETTERS:
+        ox, oy, w, h, adv, off = glyphs[idx[ch]]
+        if w == 0 or h == 0:
+            continue
+        bmp = glyph_data[off:off + w * h]
+        rows[ch] = glyph_rows(bmp, w, h, oy)
+        extf[ch] = row_extents_bitmap(bmp, w, h, oy, floor_alpha)
+        core[ch] = {y: c for y, c in
+                    ((y, core_span(r)) for y, r in rows[ch].items())
+                    if c is not None}
+        meta[ch] = ox
+    table = {}
+    for a in rows:
+        ra, oxa = rows[a], meta[a]
+        for b in rows:
+            rb, oxb = rows[b], meta[b]
+            cshared = set(core[a]) & set(core[b])
+            if not cshared:
+                continue                      # no core row in common
+            # cores just apart: the table's first entry is a real daylight
+            mc = (min(core[b][y][0] - core[a][y][1] for y in cshared)
+                  + oxb - oxa)
+            s0 = 1 - mc
+            fshared = set(extf[a]) & set(extf[b])
+            if fshared:
+                # closest approach at step s is s + mf - 1; keep it >= floor
+                mf = (min(extf[b][y][0] - extf[a][y][1] for y in fshared)
+                      + oxb - oxa)
+                s0 = max(s0, floor_px + 1 - mf)
+            dl = []
+            for s in range(s0, s0 + PAIR_TABLE_STEPS):
+                d = band_daylight(ra, oxa, rb, s + oxb, band)
+                if d is None:                 # no core rows in the band:
+                    d = band_daylight(ra, oxa, rb, s + oxb, None)   # all rows
+                dl.append(d)
+            table[(a, b)] = (s0, dl)
+    return table
+
+
 def optical_kern(glyphs, glyph_data, tracking, target_px, band=None,
-                 mode=None, area_px=None, floor_px=None, floor_alpha=None):
+                 mode=None, area_px=None, floor_px=None, floor_alpha=None,
+                 table=None):
     """Per-pair corrections that put every letter pair at the SAME ink gap.
 
     The font's own kerning is a design for print at large sizes; at 9-12px on
@@ -316,11 +401,19 @@ def optical_kern(glyphs, glyph_data, tracking, target_px, band=None,
     the kern value that produces it. Pairs already on target get no entry.
 
     mode "min" pins that tightest-row gap to target_px. mode "area" pins the
-    MEAN daylight over the x-height `band` rows both glyphs ink to area_px,
-    then raises the step until the tightest row (at floor_alpha ink) clears
-    floor_px. Row extents are compared row against row throughout — the
-    extreme column of a glyph over all its rows is not its edge at any one
-    height. Parameters default to the module settings so atlas_gen.sh and the
+    MEAN daylight over the x-height `band` rows to area_px — daylight as
+    tools/daylight.py defines it: the white area between the two glyphs'
+    cores, antialiasing fringe counted by what it leaves white, not by its
+    presence. The first area solve measured from any pixel with any alpha,
+    and a 9px 'e' whose curve ends in a 17-alpha pixel got a letter placed a
+    full pixel further out than the eye could justify; see that module. The
+    step chosen is the one whose daylight is nearest area_px, never below
+    the no-touch floor (tightest row at floor_alpha ink clears floor_px).
+    Row extents are compared row against row throughout — the extreme
+    column of a glyph over all its rows is not its edge at any one height.
+    `table` is pair_table()'s output if the caller already has it (the
+    solver builds it once and sweeps); otherwise it is built here.
+    Parameters default to the module settings so atlas_gen.sh and the
     solver call the same function.
 
     ASCII letters only: digits and punctuation have deliberate design widths
@@ -329,55 +422,48 @@ def optical_kern(glyphs, glyph_data, tracking, target_px, band=None,
     """
     mode = mode or OPTICAL_MODE
     area_px = OPTICAL_AREA_DEFAULT if area_px is None else area_px
-    floor_px = OPTICAL_FLOOR_PX if floor_px is None else floor_px
-    floor_alpha = OPTICAL_FLOOR_ALPHA if floor_alpha is None else floor_alpha
-    idx = {}
-    for i in range(95):
-        idx[chr(0x20 + i)] = i
-    letters = [c for c in
-               "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"]
-    ext, extf = {}, {}
-    for ch in letters:
-        gi = idx[ch]
-        ox, oy, w, h, adv, off = glyphs[gi]
+    idx = {chr(0x20 + i): i for i in range(95)}
+    adv_of = {ch: glyphs[idx[ch]][4] for ch in LETTERS}
+
+    def emit(out, a, b, step):
+        adj64 = step * ADV_ONE - adv_of[a] - tracking
+        adj = int(round(adj64 / 2.0))          # 1/64 -> 1/32
+        if adj != 0:
+            out.append((idx[a], idx[b],
+                        max(KERN_ADJ_MIN, min(KERN_ADJ_MAX, adj))))
+
+    out = []
+    if mode == "area":
+        if table is None:
+            table = pair_table(glyphs, glyph_data, band, floor_px, floor_alpha)
+        for (a, b), (s0, dl) in table.items():
+            if area_px > dl[-1]:
+                # past the table: one pixel of daylight per pixel of step
+                step = s0 + len(dl) - 1 + int(round(area_px - dl[-1]))
+            else:
+                # nearest daylight to the target; a tie goes to the tighter
+                step = s0 + min(range(len(dl)),
+                                key=lambda k: (abs(dl[k] - area_px), k))
+            emit(out, a, b, step)
+        out.sort()
+        return out
+
+    # mode "min": the e190093 rule, kept so the history regenerates.
+    ext = {}
+    for ch in LETTERS:
+        ox, oy, w, h, adv, off = glyphs[idx[ch]]
         if w == 0 or h == 0:
             continue
-        bmp = glyph_data[off:off + w * h]
-        ext[ch] = (row_extents_bitmap(bmp, w, h, oy), ox, adv)
-        extf[ch] = row_extents_bitmap(bmp, w, h, oy, floor_alpha)
-    out = []
-    for a in letters:
-        if a not in ext:
-            continue
-        ra, oxa, adva = ext[a]
-        for b in letters:
-            if b not in ext:
-                continue
-            rb, oxb, _ = ext[b]
+        ext[ch] = (row_extents_bitmap(glyph_data[off:off + w * h], w, h, oy), ox)
+    for a in ext:
+        ra, oxa = ext[a]
+        for b in ext:
+            rb, oxb = ext[b]
             shared = set(ra) & set(rb)
             if not shared:
                 continue
             m = min(rb[y][0] - ra[y][1] for y in shared) + oxb - oxa
-            if mode == "area":
-                rows = [y for y in shared if band and band[0] <= y < band[1]]
-                if not rows:
-                    rows = list(shared)
-                ma = (sum(rb[y][0] - ra[y][1] for y in rows) / len(rows)
-                      + oxb - oxa)
-                step = int(round(area_px + 1 - ma))
-                fa, fb = extf.get(a, {}), extf.get(b, {})
-                fshared = set(fa) & set(fb)
-                if fshared:
-                    mf = min(fb[y][0] - fa[y][1] for y in fshared) + oxb - oxa
-                    step = max(step, floor_px + 1 - mf)
-            else:
-                step = target_px + 1 - m
-            adj64 = step * ADV_ONE - adva - tracking
-            adj = int(round(adj64 / 2.0))          # 1/64 -> 1/32
-            if adj == 0:
-                continue
-            adj = max(KERN_ADJ_MIN, min(KERN_ADJ_MAX, adj))
-            out.append((idx[a], idx[b], adj))
+            emit(out, a, b, target_px + 1 - m)
     return out
 
 

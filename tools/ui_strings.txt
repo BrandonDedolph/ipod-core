@@ -16,3 +16,11 @@ Bohemian Rhapsody
 3 / 12
 Shuffle Songs
 Playing 7 of 244
+# Artist sub-lines of the album list (regular 9, muted): Title Case, all
+# caps, and the e/s/c-final syllables that showed holes on the panel.
+Jeremih
+Justin Bieber
+Daniel Caesar
+Steely Dan
+The Kid LAROI
+LANY

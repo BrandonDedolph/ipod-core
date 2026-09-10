@@ -36,6 +36,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from daylight import glyph_rows, band_daylight     # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ATLAS_DIR = os.path.join(REPO, "core", "ui", "atlas")
 
@@ -78,23 +81,38 @@ def atlas_band(path):
     return (ascent - x["h"], ascent)
 
 
-def string_gaps(glyphs, data, kern, tracking, band, lines):
+def glyph_alpha_rows(g, data):
+    """The glyph's baked alpha, {ascender-relative row: [alpha per column]}."""
+    return glyph_rows(data[g["off"]:g["off"] + g["w"] * g["h"]],
+                      g["w"], g["h"], g["oy"])
+
+
+def string_gaps(glyphs, data, kern, tracking, band, lines, edge="cov"):
     """The rhythm measure, from the device's own pen.
 
     For every adjacent LETTER pair inside a word, over the x-height-band rows
-    where BOTH glyphs have ink (row against row — a glyph's extreme column
-    over all rows is not its edge at any one height), any alpha counting as
-    ink: the MEAN daylight (what the eye integrates as texture) and the MIN
-    daylight (the closest approach — what decides whether two letters read
-    as joined or as split). For every letter-space-letter: the same two
-    across the space. Returns (letter_pairs, word_gaps), each a list of
-    (mean, min, label). Shared by the solver and the report so the value
-    solved for is the value judged.
+    (row against row — a glyph's extreme column over all rows is not its
+    edge at any one height): the MEAN daylight (what the eye integrates as
+    texture) and the MIN daylight (the closest approach — what decides
+    whether two letters read as joined or as split). For every
+    letter-space-letter: the same two across the space. Returns
+    (letter_pairs, word_gaps), each a list of (mean, min, label). Shared by
+    the solver and the report so the value solved for is the value judged.
+
+    `edge` picks how the MEAN is measured. "cov" (the default, and what the
+    solver pins) is tools/daylight.py: white area between the glyphs' cores,
+    fringe counted by its coverage. "any" is the first area solve's measure
+    — the outermost pixel with any alpha is the edge — kept so a before and
+    an after can be judged in one set of units; it over-reads a glyph whose
+    curve ends in a faint pixel by a whole column. The MIN is any-alpha
+    closest approach under both: that is what the word-split guard has
+    always compared, like against like, and a change there is a separate
+    argument.
     """
     letters, words = [], []
     for line in lines:
         pen = 0                        # whole pixels, as text.c text_draw
-        xs, ext = [], {}
+        xs, ext, rows = [], {}, {}
         for i, ch in enumerate(line):
             gi = ord(ch) - 0x20
             if gi not in glyphs:
@@ -102,6 +120,7 @@ def string_gaps(glyphs, data, kern, tracking, band, lines):
                 continue
             xs.append(pen + glyphs[gi]["ox"])
             ext[i] = row_extents(glyphs[gi], data, 1)
+            rows[i] = glyph_alpha_rows(glyphs[gi], data)
             nxt = ord(line[i + 1]) - 0x20 if i + 1 < len(line) else None
             step = glyphs[gi]["adv"]
             if nxt is not None and nxt in glyphs:
@@ -118,7 +137,12 @@ def string_gaps(glyphs, data, kern, tracking, band, lines):
             if not sh:
                 return None
             g = [(xs[j] + rb[y][0]) - (xs[i] + ra[y][1]) - 1 for y in sh]
-            return sum(g) / len(g), min(g)
+            mean = sum(g) / len(g)
+            if edge == "cov":
+                mean = band_daylight(rows[i], xs[i], rows[j], xs[j], band)
+                if mean is None:       # no core on a shared band row
+                    return None
+            return mean, min(g)
 
         for i in range(len(line) - 1):
             a, b = line[i], line[i + 1]
@@ -254,6 +278,12 @@ def main():
                          "a 2px minimum and differ 3x in the daylight the eye "
                          "integrates. Also the word-splitting guard: every "
                          "word gap must clear every intra-word gap by 1px.")
+    ap.add_argument("--edge", choices=("cov", "any"), default="cov",
+                    help="how --strings measures a pair's mean daylight: "
+                         "cov = coverage-integrated between the cores "
+                         "(tools/daylight.py, what the solver pins); any = "
+                         "outermost any-alpha pixel, the first area solve's "
+                         "measure, for judging old atlases in new units")
     ap.add_argument("--target", type=float, default=None,
                     help="solve for the tracking (px) that puts each atlas's "
                          "soft mean gap at this many pixels, and print a "
@@ -302,7 +332,7 @@ def main():
     if args.strings:
         lines = read_strings(args.strings)
         print(f"\n--- rhythm over {len(lines)} strings from {args.strings} "
-              f"(x-height-band daylight, row by row, any alpha) ---")
+              f"(x-height-band daylight, row by row, edge={args.edge}) ---")
         print(f"{'atlas':<12}{'lower':>6}{'mean':>6}{'sd':>5}{'CV':>6}"
               f"{'max lower':>11}{'closest':>10}{'min word':>11}{'ratio':>6}"
               f" guard   loosest lowercase pairs (mean)")
@@ -310,7 +340,7 @@ def main():
             glyphs, data, kern, track = load_atlas(path)
             name = os.path.basename(path).replace("nunito_", "").replace(".h", "")
             letters, words = string_gaps(glyphs, data, kern, track,
-                                         atlas_band(path), lines)
+                                         atlas_band(path), lines, args.edge)
             if not letters:
                 continue
             r = rhythm(letters, words)

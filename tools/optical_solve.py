@@ -45,18 +45,39 @@ THE OBJECTIVE, AND WHY
   measured here from the baked n at this ppem, row by row over the band, so it
   is a property of the face at the size, not a constant.
 
-  So: choose AREA such that the achieved mean lowercase daylight over the
-  strings is within TOL of the n counter, and among those, minimum sd. TOL is
-  0.25px, half the pen quantum: nothing finer is achievable, and the mean
-  moves in a staircase — several AREA values reach the same mean by rounding
-  different pairs up or down, and they differ in sd; that residual choice is
-  the only free variance left, and it is the one minimised. The whole curve
-  is printed so the staircase is visible, and so is the tighter/looser
-  trade-off if the owner wants to pin density differently.
+  So: choose AREA within TOL of the n counter, and among those, minimum
+  sd. AREA is what a straight-sided pair actually receives — 'nn' is a
+  rectangle of daylight, so its gap IS the target — which is Tracy's rule
+  stated literally. TOL is 0.25px, half the pen quantum: nothing finer is
+  achievable, and the gaps move in a staircase — several AREA values round
+  the same pairs the same way and differ only in which borderline pairs go
+  up or down; that residual choice is the only free variance left, and it
+  is the one minimised. The whole curve is printed so the staircase is
+  visible, and so is the tighter/looser trade-off if the owner wants to
+  pin density differently.
 
-  Floor: the tightest row (any alpha) must clear 1px. Pairs where the floor
-  binds (an open C against a, an F over l) keep more daylight than AREA; they
-  are the irreducible residual of the CV and are listed.
+  Why the TARGET and not the achieved mean: the first solve pinned the
+  mean over the strings to the counter. Under the any-alpha measure that
+  was reachable by accident — round letters' fringe counted as ink, so
+  their gaps under-read. Measured honestly, a round pair at the no-touch
+  floor already averages more white over the band than the counter (bowls
+  curve away above and below the tightest row), so the mean sits above
+  AREA by a residual the letterforms own, and for bold — n counter 1.74px,
+  floor-bound mean 2.02px — no AREA reaches it. Pinning the mean there
+  put every pair on the floor. The achieved mean is still reported.
+
+  Floor: the tightest row (at alpha >= 64) must clear 1px. Pairs where the
+  floor binds (an open C against a, an F over l, r's arm over y) keep more
+  daylight than AREA; they are the irreducible residual of the CV and are
+  listed. The floor stays a threshold while the measure integrates — see
+  daylight.band_daylight for why.
+
+  THE MEASURE ITSELF is tools/daylight.py — coverage-integrated white
+  between the cores. The first solve measured from any-alpha edges and
+  equalised, to an sd of 0.24px, a quantity a 17-alpha pixel could move by
+  a whole column; the visible daylight it left had an sd of 0.6-0.7px, and
+  the artist sub-line showed it ("Je remih", "Ste ely"). Same objective,
+  honest instrument.
 
 THE WORD GAP, AND ITS BOUNDS
   Lower bound — the guard against the failure e190093 shipped: for the real
@@ -90,7 +111,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import atlas_gen                                              # noqa: E402
-from text_metrics import string_gaps, rhythm, read_strings   # noqa: E402
+from daylight import counter_daylight                         # noqa: E402
+from text_metrics import (string_gaps, rhythm, read_strings,  # noqa: E402
+                          glyph_alpha_rows)
 
 REPO = os.path.dirname(HERE)
 SRC = os.path.join(REPO, "tools", "fonts-src")
@@ -111,28 +134,12 @@ def as_dict(glyphs):
 
 
 def n_counter(gd, data, band):
-    """Mean daylight between the two stems of 'n' over the band rows where
-    the row has exactly two ink runs (the arch rows have one and are skipped).
-    Any alpha counts as ink, as everywhere else in this pipeline."""
+    """Mean daylight inside 'n' over the band rows with two stems (the arch
+    rows have one and are skipped), measured with the SAME integral the
+    pair gaps use (daylight.counter_daylight) — a pin in different units
+    from the thing it pins would be a number, not a rule."""
     g = gd[ord("n") - 0x20]
-    gaps = []
-    for row in range(g["h"]):
-        y = g["oy"] + row
-        if not (band[0] <= y < band[1]):
-            continue
-        base = g["off"] + row * g["w"]
-        runs, inrun = [], False
-        for col in range(g["w"]):
-            ink = data[base + col] > 0
-            if ink and not inrun:
-                runs.append([col, col]); inrun = True
-            elif ink:
-                runs[-1][1] = col
-            else:
-                inrun = False
-        if len(runs) == 2:
-            gaps.append(runs[1][0] - runs[0][1] - 1)
-    return sum(gaps) / len(gaps) if gaps else None
+    return counter_daylight(glyph_alpha_rows(g, data), band)
 
 
 def merged_kern(font_kerns, opt):
@@ -152,23 +159,22 @@ def solve(ttf, px, symbol, bold, lines, tol, verbose, floor_alpha):
     track = atlas_gen.tracking_for(symbol, px)
     gd = as_dict(glyphs)
     target = n_counter(gd, data, band)
+    # The bitmap work is target-independent: one table, many targets.
+    table = atlas_gen.pair_table(glyphs, data, band, floor_alpha=floor_alpha)
 
     # ---- letters: sweep AREA, pin density to the n counter, minimise CV
     curve = []
     for A in frange(1.0, 5.0, 0.05):
         opt = atlas_gen.optical_kern(glyphs, data, track, 2, band,
-                                     mode="area", area_px=A,
-                                     floor_alpha=floor_alpha)
+                                     mode="area", area_px=A, table=table)
         kern = merged_kern(r["kerns"], opt)
         letters, _ = string_gaps(gd, data, kern, track, band, lines)
         rr = rhythm(letters, [])
         curve.append((A, rr["mean"], rr["sd"], rr["max_pair"], kern, letters,
                       rr["cv"], rr["max_min"]))
-    feas = [c for c in curve if abs(c[1] - target) <= tol]
-    widened = False
-    if not feas:
-        widened = True
-        feas = sorted(curve, key=lambda c: abs(c[1] - target))[:3]
+    # AREA (the target straight pairs receive) within TOL of the counter;
+    # the sweep spans 1-5px so this is never empty for a counter in range.
+    feas = [c for c in curve if abs(c[0] - target) <= tol]
     best = min(feas, key=lambda c: (c[2], c[0]))
     A, mean, sd, max_pair, kern, letters, cv, max_min = best
 
@@ -208,7 +214,7 @@ def solve(ttf, px, symbol, bold, lines, tol, verbose, floor_alpha):
                 continue
             last = key
             flag = " <-- chosen" if c[0] == A else (
-                "  feasible" if abs(c[1] - target) <= tol else "")
+                "  feasible" if abs(c[0] - target) <= tol else "")
             print(f"  {c[0]:4.2f}  {c[1]:5.2f}  {c[2]:5.3f}  {c[6]:5.3f}  "
                   f"{c[3][0]:4.1f} {c[3][2]}        {c[7][1]:4.1f} {c[7][2]}{flag}")
         print("  WORD  space adv  min word(closest)  mean word  ratio  guard(lower/all)")
@@ -224,7 +230,7 @@ def solve(ttf, px, symbol, bold, lines, tol, verbose, floor_alpha):
                        sorted((l for l in letters if l[2].islower()),
                               reverse=True)[:4])
     return dict(symbol=symbol, bold=bold, px=px, target=target, A=A,
-                mean=mean, sd=sd, cv=cv, widened=widened, max_pair=max_pair,
+                mean=mean, sd=sd, cv=cv, max_pair=max_pair,
                 max_min=max_min, strict_ok=chosen[6],
                 W=chosen[0], W_lo=lo[0] if lo else None,
                 W_hi=hi[0] if hi else None, space_adv=chosen[1],
@@ -267,7 +273,6 @@ def main():
               f"{x['min_word'][1]:>6.1f} {x['min_word'][2]:<3}"
               f"{x['ratio']:>6.2f}{('ok' if x['strict_ok'] else 'fail'):>7}"
               f"  {x['loosest']}"
-              f"{'  [mean tolerance widened]' if x['widened'] else ''}"
               f"{x['note']}")
 
     print("\nOPTICAL_SOLVED = {")
