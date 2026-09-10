@@ -58,6 +58,27 @@ size_t            mmio_mock_log_len(void);
  * bounded limit. */
 size_t            mmio_mock_dropped(void);
 
+/*
+ * Keep writes to [lo, hi) out of the recorded grammar.
+ *
+ * OPT-IN, and deliberately so. Exactly one driver needs it: power_standby()
+ * clears ~112 KB of IRAM through mmio_write32 (a raw store to 0x4000C000 is a
+ * wild pointer on the host), and those 16k stores are memory traffic, not
+ * register accesses — left in the log they bury the two I2C writes that test
+ * exists to check.
+ *
+ * It used to be unconditional for every test in the suite, which meant a
+ * driver bug that wrote a register address decoding into RAM — a dropped or
+ * altered nibble, precisely the class this harness targets — vanished from the
+ * trace while trace_expect_end() still reported an exact match. Now a test
+ * must ask, and mmio_mock_ignored() reports what was suppressed so even the
+ * asking test can tell "cleared IRAM" from "scribbled somewhere unexpected".
+ *
+ * Cleared by mmio_mock_reset(); call it AFTER the reset, not before.
+ */
+void   mmio_mock_ignore_writes(uint32_t lo, uint32_t hi);
+size_t mmio_mock_ignored(void);
+
 /* Convenience: count recorded events of a given op+addr (any width). */
 size_t mmio_mock_count(mmio_op op, uint32_t addr);
 

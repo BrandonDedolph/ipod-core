@@ -34,20 +34,19 @@ cc = meson.get_compiler('c')
 # under -Werror that is itself a hard error — so an unguarded flag added for
 # gcc 16 would break the build on gcc 14. The toolchain floor lives in
 # .tool-versions; this keeps older-but-supported toolchains working anyway.
-optional_c_args = cc.get_supported_arguments([
-  # gcc 16 added -Wunterminated-string-initialization, which fires on the
-  # deliberate `static const char hex[16] = "0123456789ABCDEF"` lookup tables
-  # in hal/hw/uart.c and hal/hw/lcd.c (exactly-sized char arrays, never used
-  # as C strings) and broke the -Werror hw build outright on the 14->16
-  # upgrade. The correct fix is __attribute__((nonstring)) on those two
-  # arrays, which lands separately in the files that own them. Until then
-  # this DEMOTES the diagnostic to a warning rather than silencing it
-  # (-Wno-error=, not -Wno-), so the build goes through and the arrays stay
-  # visible. REMOVE THIS once uart.c/lcd.c carry the attribute.
-  # tests/meson.build passes the stronger per-target -Wno- form for the same
-  # two files.
-  '-Wno-error=unterminated-string-initialization',
-])
+# Currently empty: the gcc-16 -Wunterminated-string-initialization demotion
+# that lived here is gone. It was added during the 14->16 upgrade for the
+# exactly-sized `char hex[16] = "0123456789ABCDEF"` lookup tables; uart.c now
+# declares that table unsized (17 B incl. NUL, hal/hw/uart.c) and lcd.c never
+# had one, so no first-party file trips the diagnostic any more. Leaving the
+# demotion in place would have let a genuinely truncated initializer — a char
+# array with no room for its NUL, handed to something that expects a C string
+# — through -Werror unnoticed.
+#
+# Keep the probing mechanism itself: passing an unguarded -Wno-error=<flag the
+# compiler does not know> is itself an error under -Werror, so any future
+# version-dependent suppression belongs in this list rather than inline.
+optional_c_args = cc.get_supported_arguments([])
 
 # Common warning/safety flags
 # (warning_level=3 already implies -Wall -Wextra -Wpedantic; we add specifics.)

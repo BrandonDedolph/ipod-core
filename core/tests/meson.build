@@ -178,7 +178,7 @@ if target == 'sim'
               'hw_mmio/mmio_mock.c',
               '../hal/hw/uart.c'],
     include_directories: hw_mmio_inc,
-    c_args: ['-DMMIO_MOCK', '-Wno-unterminated-string-initialization'],
+    c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,
   )
   test('hw-uart-trace', uart_trace_test, suite: 'unit')
@@ -189,7 +189,7 @@ if target == 'sim'
               'hw_mmio/mmio_mock.c',
               '../hal/hw/lcd.c'],
     include_directories: hw_mmio_inc,
-    c_args: ['-DMMIO_MOCK', '-Wno-unterminated-string-initialization'],
+    c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,
   )
   test('hw-lcd-trace', lcd_trace_test, suite: 'unit')
@@ -208,8 +208,7 @@ if target == 'sim'
               'hw_mmio/mmio_mock.c',
               '../hal/hw/lcd.c'],
     include_directories: hw_mmio_inc,
-    c_args: ['-DMMIO_MOCK', '-DLCD_RECOVER_ON_WAKE=1',
-             '-Wno-unterminated-string-initialization'],
+    c_args: ['-DMMIO_MOCK', '-DLCD_RECOVER_ON_WAKE=1'],
     override_options: test_opts,
   )
   test('hw-bcm-init', bcm_init_test, suite: 'unit')
@@ -231,8 +230,9 @@ if target == 'sim'
   # policy, compiled host-side with -DSCHED_TEST against inert stubs for
   # the two asm symbols (switch_context / task_trampoline). Proves task
   # add/bounds, round-robin selection, done-task skipping, and the
-  # single-runnable no-switch case. The context-switch asm itself is
-  # exercised end-to-end in the clicky emulator, not here.
+  # single-runnable no-switch case. The context-switch asm itself has NO
+  # automated coverage: it has only ever been run by hand in the clicky
+  # emulator, which is not wired up as a target in this repo.
   sched_test = executable(
     'sched_test',
     sources: ['hw_sched/sched_test.c',
@@ -251,7 +251,8 @@ if target == 'sim'
   # that irq_dispatch only ticks when CPU_INT_STAT shows TIMER1 pending,
   # and the sleep_ms tick math (a sched_yield stub advances the mocked
   # tick so the cooperative wait terminates). The IRQ entry asm + real
-  # interrupt delivery are exercised end-to-end in clicky.
+  # interrupt delivery have NO automated coverage — manual clicky runs only,
+  # and there is no clicky target in this repo.
   timer_test = executable(
     'timer_test',
     sources: ['hw_timer/timer_test.c',
@@ -381,6 +382,11 @@ if target == 'sim'
     include_directories: [hw_mmio_inc,
                           include_directories('../kernel', '../fs', '../ui')],
     c_args: ['-DMMIO_MOCK'],
+    # This one was missing test_opts, so the suite's highest-stakes binary —
+    # the only check of the code that WRITES to the user's disk — was the one
+    # built at -Os with LTO, exactly the settings the comment at the top of
+    # this file explains are wrong for a test.
+    override_options: test_opts,
   )
   if py.found()
     # 5. Host/device format agreement: the fixture is produced by the REAL
@@ -435,7 +441,7 @@ if target == 'sim'
               'hw_mmio/mmio_mock.c',
               '../hal/hw/lcd.c'],
     include_directories: include_directories('../hal', '../hal/hw', 'hw_mmio'),
-    c_args: ['-DMMIO_MOCK', '-Wno-unterminated-string-initialization'],
+    c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,
   )
   test('hw-lcd-present', lcd_present_test, suite: 'unit')

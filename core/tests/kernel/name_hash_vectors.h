@@ -72,24 +72,22 @@ NAME_HASH_VEC("punctuation", "Track #7 (feat. X) [Remix] {2021}!?", 0x7874BD3Fu)
 NAME_HASH_VEC("cjk-bmp", "\346\235\261\344\272\254", 0x68DEA76Fu)
 
 /*
- * --- astral plane (4-byte UTF-8) — KNOWN C BUG -------------------------
+ * --- astral plane (4-byte UTF-8) --------------------------------------
  *
- * kernel/main.c's name_hash() DECODES a 4-byte sequence correctly
- * (mn_utf8_next handles the 0xF0 lead) but its RE-ENCODER has no 4-byte
- * branch: the final `else` emits a 3-byte sequence unconditionally, so for
- * cp >= 0x10000 it shifts the codepoint into a 3-byte frame and hashes bytes
- * that no encoder would ever produce. tools/build_index.py hashes the real
- * 4-byte UTF-8. The two therefore disagree, and any track whose name contains
- * an emoji or other astral character is written into CORELIB.IDX under a hash
- * the device can never match — the track silently never resolves.
+ * These two were XFAIL: name_hash() DECODED a 4-byte sequence correctly
+ * (mn_utf8_next handles the 0xF0 lead) but its RE-ENCODER had no 4-byte
+ * branch, so for cp >= 0x10000 it folded the codepoint into a 3-byte frame
+ * and hashed bytes no encoder would produce, while tools/build_index.py
+ * hashed real 4-byte UTF-8. Any track with an emoji in its name went into
+ * CORELIB.IDX under a hash the device could never match, and resolved to
+ * nothing.
  *
- * The expected values below are the CORRECT ones (what build_index.py
- * produces). The C side is marked XFAIL because the fix belongs in
- * kernel/main.c, which this test does not own.
+ * kernel/main.c now carries the 4-byte branch (and says why), so these are
+ * ordinary vectors. Keep them that way: the expected values are what
+ * build_index.py produces, and they are the only thing pinning the two
+ * encoders together across the astral boundary.
  */
-NAME_HASH_XFAIL("astral-emoji", "\360\237\216\265 track", 0x09055436u,
-                "main.c name_hash() re-encodes cp >= 0x10000 as 3 bytes")
-NAME_HASH_XFAIL("astral-only", "\360\237\230\200", 0x33A29608u,
-                "main.c name_hash() re-encodes cp >= 0x10000 as 3 bytes")
+NAME_HASH_VEC("astral-emoji", "\360\237\216\265 track", 0x09055436u)
+NAME_HASH_VEC("astral-only", "\360\237\230\200", 0x33A29608u)
 
 #endif /* CORE_TESTS_KERNEL_NAME_HASH_VECTORS_H */

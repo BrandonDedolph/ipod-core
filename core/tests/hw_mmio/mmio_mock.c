@@ -41,6 +41,11 @@ static read_entry g_reads[MMIO_READMAP_CAP];
 /* Post-access hook; see mmio_mock.h. NULL when unused, which is the norm. */
 static mmio_mock_hook_fn g_hook;
 
+/* Opt-in suppressed write window; empty (lo == hi) unless a test asks. */
+static uint32_t g_ign_lo;
+static uint32_t g_ign_hi;
+static size_t   g_ignored;
+
 void mmio_mock_set_hook(mmio_mock_hook_fn fn)
 {
     g_hook = fn;
@@ -51,6 +56,9 @@ void mmio_mock_reset(void)
     g_log_len = 0;
     g_log_dropped = 0;
     g_hook    = NULL;
+    g_ign_lo  = 0;
+    g_ign_hi  = 0;
+    g_ignored = 0;
     for (size_t i = 0; i < MMIO_READMAP_CAP; i++) {
         g_reads[i].in_use = 0;
     }
@@ -110,30 +118,33 @@ void mmio_mock_queue_read(uint32_t addr, const uint32_t *seq, size_t n)
 }
 
 /*
- * IRAM is memory, not a peripheral.
+ * Suppressed write window — see mmio_mock_ignore_writes() in the header.
  *
- * This mock models the PERIPHERAL bus: the log is a register grammar, and every
- * trace test asserts an exact ordered sequence over it. power_standby() clears
- * ~112 KB of IRAM before sleeping (so Apple's OF doesn't take the boot-from-
- * sleep path on wake) and it does that through mmio_write32, because a raw
- * store to 0x4000C000 is a wild pointer on the host. Those 16k stores are not
- * register accesses and must not appear in a grammar — left in, they exhaust
- * the log and bury the two I2C writes the test exists to check.
- *
- * Stores here are accepted and discarded; reads fall through to the normal
- * programmed-read path, so nothing else changes.
+ * Empty unless a test opts in, so by default EVERY write a driver makes lands
+ * in the grammar, including one aimed at an address that decodes into RAM.
+ * Stores inside the window are accepted, counted and discarded; reads always
+ * fall through to the normal programmed-read path.
  */
-#define IRAM_LO 0x40000000u
-#define IRAM_HI 0x40020000u
-
-static int is_ram(uint32_t addr)
+void mmio_mock_ignore_writes(uint32_t lo, uint32_t hi)
 {
-    return addr >= IRAM_LO && addr < IRAM_HI;
+    g_ign_lo = lo;
+    g_ign_hi = hi;
+}
+
+size_t mmio_mock_ignored(void)
+{
+    return g_ignored;
+}
+
+static int is_ignored_write(uint32_t addr)
+{
+    return g_ign_lo != g_ign_hi && addr >= g_ign_lo && addr < g_ign_hi;
 }
 
 static void record(mmio_op op, int width, uint32_t addr, uint32_t value)
 {
-    if (op == MMIO_OP_WRITE && is_ram(addr)) {
+    if (op == MMIO_OP_WRITE && is_ignored_write(addr)) {
+        g_ignored++;
         return;
     }
     /*
