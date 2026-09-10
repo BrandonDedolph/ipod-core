@@ -144,6 +144,23 @@ if target == 'sim'
   )
   test('chrome', chrome_test, suite: 'unit')
 
+  # wheel: the wheel acceleration state machine and A-Z locator
+  # (core/ui/wheel.c) — the SAME source the ARM build links into core.elf.
+  # Its clock, row-initial source and click are injected, so every event here
+  # is an exact (delta, gap) pair and the assertions are the exact selection
+  # indices a spin lands on: the detent arithmetic (never 1,1,2), the flick
+  # cap, the clamps, the velocity curve event by event (1,2,5,7,8), the
+  # letter-mode latch surviving a slowdown and clearing on the idle gap, the
+  # letterless-screen fall-through, letter stepping at both ends, the plate's
+  # hold window to the microsecond, and a gap across the 32-bit clock wrap.
+  wheel_test = executable(
+    'wheel_test',
+    sources: ['ui/wheel_test.c', '../ui/wheel.c'],
+    include_directories: include_directories('../ui', '.'),
+    override_options: test_opts,
+  )
+  test('wheel', wheel_test, suite: 'unit')
+
   # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
   # — the SAME source the ARM build links into core.elf. Shrinks a loaded
   # folder.art to a list chip / album-detail cover when no folder.thm is present.

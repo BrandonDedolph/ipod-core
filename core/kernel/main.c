@@ -43,6 +43,7 @@
 #include "../library/names.h"
 #include "../library/idx.h"
 #include "../library/sort.h"
+#include "../ui/wheel.h"
 #include "hw/volume.h"
 
 /*
@@ -547,16 +548,6 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
  * (no artist repaint, no clipping of descenders). Fewer fit on screen. */
 #define ROW_H2     32
 #define LIST_ROWS2 6                       /* (240-42)/32 ~= 6                     */
-
-/* Wheel scroll feel. The driver reports the raw differenced position count (up
- * to ~half a rotation per poll), and a single slow detent crosses the wheel's
- * sensitivity gate at ~CW_WHEEL_SENSITIVITY (4) units. Dividing by 3 left a
- * remainder every detent, so the carry periodically double-stepped (move 1,1,2)
- * — felt like "it skipped, then jumped two". Matching the divisor to the
- * sensitivity makes one detent advance exactly one row; MAX_DELTA keeps the
- * 2-rows-per-event headroom (8/4) so a fast flick still scrolls quickly. */
-#define WHEEL_CLICKS_PER_ITEM CW_WHEEL_SENSITIVITY   /* = 4: one detent, one row */
-#define WHEEL_MAX_DELTA       (2 * CW_WHEEL_SENSITIVITY) /* fast flick: <=2 rows/evt */
 
 /* ---------------------------------------------------------------------------
  * Design-matched list chrome (menus.jsx): status strip, header, rows, scrollbar
@@ -3621,27 +3612,6 @@ static int list_repaint_partial(void)
     return 1;
 }
 
-/* ---------------------------------------------------------------------------
- * Wheel acceleration + the A-Z locator
- *
- * The driver reports a differenced position count, so one detent is one row no
- * matter how fast you spin — with 1200 songs that is a very long spin. Real
- * iPods accelerate: the faster the wheel turns, the more rows each detent
- * covers, with a big letter shown while it's flying so you can aim. Velocity is
- * derived from the GAP between wheel events (they arrive as fast as the wheel
- * is turned) and decays on its own.
- * ------------------------------------------------------------------------- */
-#define WHEEL_VEL_MAX   8                  /* rows per detent at full tilt      */
-/* (There is deliberately no "fast gap" threshold: the gap between drained
- * events measures the main loop's period, not the wheel. See wheel_accel_step.) */
-#define WHEEL_IDLE_US   200000u            /* > this gap => new gesture, reset  */
-#define WHEEL_AZ_VEL    3                  /* velocity at which the letter shows */
-#define WHEEL_AZ_HOLD   500000u            /* ...and how long after the last tick */
-/* In letter mode the plate is the control surface, not a hint, so it lingers
- * well past the last detent — it must not blink out while you are still
- * deciding which letter to stop on. */
-#define WHEEL_AZ_HOLD_LETTER 1200000u
-
 /* Cover loads under a moving wheel (the album-list pump in run_ui; see the
  * block comment there). A detent within SETTLE means the list is scrolling:
  * one disk read per pass, not six. A parked platter is only woken for covers
@@ -3649,118 +3619,6 @@ static int list_repaint_partial(void)
  * detent scroll (~300 ms apart) never trips a spin-up mid-gesture. */
 #define CHIP_WHEEL_SETTLE_US   150000u
 #define CHIP_SPINUP_QUIET_US   500000u
-
-static uint32_t g_wheel_last_us;
-static int      g_wheel_vel = 1;
-static int      g_wheel_letters;       /* 1 = a detent moves a whole letter    */
-
-/*
- * Called once per wheel event with that event's RAW tick delta.
- *
- * Speed is measured as ticks per second, NOT as the gap between events. The
- * gap is the wrong signal: clickwheel_service() latches motion in the 100 Hz
- * ISR and clickwheel_get_event() drains the accumulator, so an "event" arrives
- * once per main-loop pass — the gap therefore measures how long the loop took
- * (render, disk, decode), not how fast the wheel is turning. Deriving velocity
- * from it meant a fast spin during playback, when passes are longest, looked
- * SLOWER than the same spin on an idle menu, and the top of the range was
- * effectively unreachable.
- *
- * delta is ticks accumulated since the last drain, so delta/dt is real angular
- * velocity and is independent of how often we happen to drain. CW_CLICKS_PER_ROT
- * is 96, so one turn a second is ~96 ticks/s.
- */
-#define WHEEL_TPS_ACCEL   50u    /* above this, start multiplying rows      */
-#define WHEEL_TPS_SPAN   200u    /* ticks/s from vel 1 to WHEEL_VEL_MAX     */
-
-static uint32_t g_wheel_tps;     /* smoothed ticks/second                   */
-
-static int wheel_accel_step(int delta)
-{
-    uint32_t now = mmio_read32(USEC_TIMER_ADDR);
-    uint32_t dt  = now - g_wheel_last_us;
-    g_wheel_last_us = now;
-
-    if (dt > WHEEL_IDLE_US) {         /* new gesture: forget the old one */
-        g_wheel_vel     = 1;
-        g_wheel_letters = 0;
-        g_wheel_tps     = 0;
-        return 1;
-    }
-    if (dt < 1000u) {
-        dt = 1000u;                   /* floor: keep the divide sane */
-    }
-
-    uint32_t mag = (uint32_t)(delta < 0 ? -delta : delta);
-    uint32_t tps = mag * 1000000u / dt;
-    /* Light smoothing so one long loop pass can't spike or drop the estimate. */
-    g_wheel_tps = (g_wheel_tps * 3u + tps) / 4u;
-
-    if (g_wheel_tps <= WHEEL_TPS_ACCEL) {
-        g_wheel_vel = 1;
-    } else {
-        uint32_t over = g_wheel_tps - WHEEL_TPS_ACCEL;
-        uint32_t v    = 1u + (over * (WHEEL_VEL_MAX - 1u)) / WHEEL_TPS_SPAN;
-        g_wheel_vel   = (int)(v > (uint32_t)WHEEL_VEL_MAX ? (uint32_t)WHEEL_VEL_MAX : v);
-    }
-
-    /*
-     * Letter mode engages at exactly the speed the A-Z plate appears, because
-     * the plate IS the indicator for it: seeing the letter means the wheel is
-     * stepping letters. Having a second, higher threshold created a band where
-     * the letter was up but the wheel was still grinding through songs, which
-     * reads as the cue simply not working.
-     *
-     * Latched for the rest of the gesture (cleared on the idle gap at the top
-     * of this function). Re-testing the speed each detent would flip the unit
-     * back and forth mid-spin as the estimate wavers around the threshold —
-     * the control would change meaning under your thumb.
-     */
-    if (g_wheel_vel >= WHEEL_AZ_VEL) {
-        g_wheel_letters = 1;
-    }
-    return g_wheel_vel;
-}
-
-/* 1 while a detent should move a whole letter rather than a run of rows. */
-static int wheel_letter_mode(void)
-{
-    return g_wheel_letters;
-}
-
-/* Print the measured wheel speed (ticks/s) under the letter — a tuning aid for
- * calibrating WHEEL_TPS_ACCEL against a real spin. Off by default. */
-#define AZ_SHOW_TPS 0
-
-/* Smoothed wheel speed in ticks/second (96 ticks = one full rotation).
- * Only compiled in for the AZ_SHOW_TPS tuning readout. */
-#if AZ_SHOW_TPS
-static uint32_t wheel_tps(void)
-{
-    return g_wheel_tps;
-}
-#endif
-
-/* Forget the gesture entirely. Called when the UI is taken away from the user
- * (backlight off, panel wake, screen change) so a spin that ended before the
- * screen slept can't still be "in progress" when they come back to it. */
-static void wheel_accel_reset(void)
-{
-    g_wheel_vel     = 1;
-    g_wheel_letters = 0;
-    g_wheel_last_us = 0;
-    g_wheel_tps     = 0;
-}
-
-/* True while the list is flying past fast enough to want the letter cue. In
- * letter mode the plate stays up for the whole gesture: it IS the control
- * surface then, not a hint, so it must not blink out between detents. */
-static int wheel_accelerating(void)
-{
-    if (!g_wheel_letters && g_wheel_vel < WHEEL_AZ_VEL) return 0;
-    uint32_t hold = g_wheel_letters ? WHEEL_AZ_HOLD_LETTER : WHEEL_AZ_HOLD;
-    return (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - g_wheel_last_us) < hold;
-}
 
 /* The selected row's initial on the alphabetised lists (songs / artists /
  * albums), read straight off the already-sorted arrays; 0 on screens where an
@@ -3792,46 +3650,10 @@ static char list_sel_initial(void)
     return (scr_cur() == SCR_SONGS) ? list_initial_at(g_song_sel) : 0;
 }
 
-/*
- * Letter stepping: land on the FIRST entry of the next/previous letter present
- * in the list.
- *
- * Row acceleration alone tops out at WHEEL_VEL_MAX rows per detent, which on a
- * 1200-song list still means a long spin and a letter cue that only tells you
- * where you happen to have landed. Once the wheel is being spun in earnest the
- * useful unit stops being the row and becomes the letter — one detent, one
- * letter, so you can aim at "S" instead of scrubbing toward it.
- *
- * Walks the already-sorted view, so it is O(entries in the current letter) and
- * needs no index. Returns `sel` unchanged when there is no further letter, so
- * the ends of the list stop cleanly instead of wrapping under your thumb.
- */
-static int list_letter_step(int sel, int count, int dir)
+/* The wheel's clock (the ui/wheel.h seam): the free-running USEC_TIMER. */
+static uint32_t wheel_clock(void)
 {
-    if (count <= 0) {
-        return sel;
-    }
-    char cur = list_initial_at(sel);
-    if (cur == 0) {
-        return sel;                 /* screen has no alphabetised order */
-    }
-    int i = sel;
-    if (dir > 0) {
-        while (i < count - 1 && list_initial_at(i + 1) == cur) i++;
-        if (i >= count - 1) return sel;          /* already in the last letter */
-        return i + 1;                            /* first entry of the next    */
-    }
-    /* Backwards: to the head of this letter, and if already there, to the head
-     * of the previous one — so a back-step is never a no-op mid-letter. */
-    while (i > 0 && list_initial_at(i - 1) == cur) i--;
-    if (i != sel) {
-        return i;
-    }
-    if (i == 0) return sel;                      /* already in the first letter */
-    char prev = list_initial_at(i - 1);
-    i--;
-    while (i > 0 && list_initial_at(i - 1) == prev) i--;
-    return i;
+    return mmio_read32(USEC_TIMER_ADDR);
 }
 
 /* The letter itself, on a centred plate over the flying list. Its presence is
@@ -3890,63 +3712,6 @@ static void ui_click(void)
             break;
         default: break;                               /* 0 = Off                  */
     }
-}
-
-/* Apply a wheel event to a selection index in [0, count) with acceleration. */
-static int wheel_move(int sel, int count, int8_t delta, int *accum)
-{
-    /* Feed the RAW delta: it is the tick count since the last drain, which is
-     * what carries the wheel's speed. The clamp below is for the row maths and
-     * would throw exactly that information away. */
-    int vel = wheel_accel_step(delta);
-    int wd = delta;
-    if (wd >  WHEEL_MAX_DELTA) wd =  WHEEL_MAX_DELTA;
-    if (wd < -WHEEL_MAX_DELTA) wd = -WHEEL_MAX_DELTA;
-    *accum += wd;
-    int move = *accum / WHEEL_CLICKS_PER_ITEM;
-    *accum -= move * WHEEL_CLICKS_PER_ITEM;
-
-    int old = sel;
-
-    /* Sustained fast spin on an alphabetised list: one detent = one letter.
-     * Stepping rows faster still makes you scrub past everything between here
-     * and where you're going; stepping letters lets you aim. Falls through to
-     * row acceleration on screens with no alphabetical order (list_letter_step
-     * returns `sel` unchanged there). */
-    /*
-     * `list_initial_at(sel) != 0` is the load-bearing half of this guard: it
-     * asks "does THIS screen have letters to step through at all". Without it
-     * the branch was taken on every screen, list_letter_step returned `sel`
-     * unchanged on the ones with no alphabetical order (menus, settings, the
-     * queue, a tracklist), and the early return below meant the wheel never
-     * fell through to row scrolling — so spinning fast on those screens did
-     * nothing at all.
-     */
-    if (move != 0 && wheel_letter_mode() && list_initial_at(sel) != 0) {
-        int dir  = (move > 0) ? 1 : -1;
-        int step = (move > 0) ? move : -move;
-        for (int i = 0; i < step; i++) {
-            int next = list_letter_step(sel, count, dir);
-            if (next == sel) break;              /* ran out of letters */
-            sel = next;
-        }
-        if (sel != old) {
-            ui_click();
-        }
-        return sel;
-    }
-
-    /* Acceleration: one detent still moves one row when you turn the wheel
-     * deliberately (vel 1), but a fast spin covers up to WHEEL_VEL_MAX rows per
-     * detent — the difference between 1200 songs being reachable and not. */
-    move *= vel;
-    sel += move;
-    if (sel < 0)          sel = 0;
-    if (sel >= count)     sel = count - 1;
-    if (sel != old) {
-        ui_click();        /* click only when the cursor actually advances */
-    }
-    return sel;
 }
 
 /* ---------------------------------------------------------------------------
@@ -5438,7 +5203,7 @@ _Noreturn static void run_ui(fat32_t *fs)
         if (scr_cur() == SCR_BROWSER && g_dir_depth == 0) {
             uint32_t nowc = mmio_read32(USEC_TIMER_ADDR);
             int idle_now  = !player_active();
-            uint32_t since_wheel = nowc - g_wheel_last_us;
+            uint32_t since_wheel = nowc - wheel_last_us();
             int moving = since_wheel < CHIP_WHEEL_SETTLE_US;
             int budget;
             if (ata_is_parked() && since_wheel < CHIP_SPINUP_QUIET_US) {
@@ -5585,6 +5350,17 @@ _Noreturn void kernel_main(void) {
      * (as the host tests do) and titles are plainly clipped.
      */
     ui_set_scroll_text(mq_text);
+
+    /*
+     * The wheel's acceleration state machine (ui/wheel.c) is portable for the
+     * same reason and by the same means: its clock, its "what letter is row N
+     * on this screen" source and its navigation click are injected here rather
+     * than reached for. Unset, none of them can misbehave — no clock reads 0,
+     * no letter source means nothing letter-steps, no click is silent.
+     */
+    wheel_set_clock(wheel_clock);
+    wheel_set_initial_at(list_initial_at);
+    wheel_set_click(ui_click);
 
     /* Hex-path self-test: if this doesn't read 1234ABCD on the terminal,
      * distrust every register dump that follows. */
