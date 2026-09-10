@@ -158,6 +158,20 @@ if target == 'sim'
   )
   test('thumb', thumb_test, suite: 'unit')
 
+  # artcache: the album-cover cache (core/ui/artcache.c) — the SAME source the
+  # ARM build links into core.elf — driven the way the album list drives it.
+  # fat32_read_file is stubbed by the test (it is artcache.c's only FS entry
+  # point), so every cache miss is a counted, ordered "disk read": the test
+  # measures what a scroll gesture costs in reads and which covers load first,
+  # which on the device are the reads issued synchronously under the wheel.
+  artcache_test = executable(
+    'artcache_test',
+    sources: ['ui/artcache_test.c', '../ui/artcache.c', '../ui/thumb.c'],
+    include_directories: include_directories('../ui', '../fs'),
+    override_options: test_opts,
+  )
+  test('artcache', artcache_test, suite: 'unit')
+
   # settings: the Settings state model (core/ui/settings.c) — the SAME source the
   # ARM build links into core.elf. Pure model logic (no framebuffer/hardware), so
   # it compiles with plain cc. Asserts defaults, that activate() toggles Shuffle

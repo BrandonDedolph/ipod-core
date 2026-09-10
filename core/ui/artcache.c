@@ -51,10 +51,10 @@ typedef struct {
     uint16_t px[ARTCACHE_DIM * ARTCACHE_DIM];  /* 28x28 RGB565 (valid iff LOADED) */
 } way_t;
 
-/* ~28.3 KB resident, versus ~198.5 KB for the old album-indexed pixel array:
- *   directory  256 * 12                    =  3,072 B
- *   no-art bitmap                          =     32 B
- *   ways       16 * (28*28*2 + 8)          = 25,216 B
+/* ~63 KB resident, versus ~198.5 KB for the old album-indexed pixel array:
+ *   directory  1024 * 12                   = 12,288 B
+ *   no-art + retried bitmaps               =    256 B
+ *   ways       32 * (28*28*2 + 8)          = 50,432 B
  * Scratch adds ARTCACHE_SCRATCH_SZ (28,812 B) on top, shareable via
  * artcache_scratch() so the rest of the UI need not carry a second copy. */
 static album_t  g_album[ARTCACHE_SLOTS];
@@ -222,26 +222,23 @@ const uint16_t *artcache_peek(int idx)
     return (w >= 0 && g_way[w].state == WAY_LOADED) ? g_way[w].px : 0;
 }
 
-const uint16_t *artcache_get(int idx)
+/* Give `idx` a way if it has none and it is worth loading. Returns the way
+ * index (now QUEUED), or -1 when it already has one, is known to have no art,
+ * or has nothing registered. Shared by artcache_get (a row being drawn) and
+ * artcache_pump_for (a row about to be drawn). */
+static int claim(int idx)
 {
-    if (idx < 0 || idx >= ARTCACHE_SLOTS) {
-        return 0;
+    if (find(idx) >= 0) {
+        return -1;
     }
-
-    int w = find(idx);
-    if (w >= 0) {
-        g_way[w].stamp = ++g_clock;            /* still on screen */
-        return g_way[w].state == WAY_LOADED ? g_way[w].px : 0;
-    }
-
-    /* Not resident. Nothing to claim a way for if we already know this album
-     * has no usable art, or if no sidecar was ever registered for it. */
+    /* Nothing to claim a way for if we already know this album has no usable
+     * art, or if no sidecar was ever registered for it. */
     if (noart(idx) || (g_album[idx].thm_clus == 0 && g_album[idx].art_clus == 0)) {
-        return 0;
+        return -1;
     }
 
     /* Claim a way: a free one, else the least recently drawn. Because every
-     * visible row stamps its way on this same call each frame, the victim is
+     * visible row stamps its way on artcache_get each frame, the victim is
      * always something off screen. */
     int victim = 0;
     for (int i = 0; i < ARTCACHE_WAYS; i++) {
@@ -256,6 +253,21 @@ const uint16_t *artcache_get(int idx)
     g_way[victim].key   = (int16_t)idx;
     g_way[victim].state = WAY_QUEUED;
     g_way[victim].stamp = ++g_clock;
+    return victim;
+}
+
+const uint16_t *artcache_get(int idx)
+{
+    if (idx < 0 || idx >= ARTCACHE_SLOTS) {
+        return 0;
+    }
+
+    int w = find(idx);
+    if (w >= 0) {
+        g_way[w].stamp = ++g_clock;            /* still on screen */
+        return g_way[w].state == WAY_LOADED ? g_way[w].px : 0;
+    }
+    (void)claim(idx);
     return 0;                                  /* pump will fill it */
 }
 
@@ -302,35 +314,10 @@ static int load_one(fat32_t *fs, uint32_t clus, uint32_t size, uint16_t *dst)
     return 1;
 }
 
-int artcache_pump(fat32_t *fs)
+/* Load QUEUED way `pick` from disk: LOADED on success; otherwise the way is
+ * freed and the album's verdict recorded. Exactly one unit of I/O either way. */
+static void load_way(fat32_t *fs, int pick)
 {
-    /*
-     * OLDEST outstanding request first.
-     *
-     * This used to take the most recently stamped way, on the theory that it is
-     * the one the user is looking at. But every visible row is re-stamped on
-     * every pass, in row order, so the TOP row always ended up with the lowest
-     * stamp and was therefore always last in line — permanently, since the
-     * ordering is re-established each pass. Any pass that ran out of budget
-     * starved it, which is why the first album's cover stayed blank until you
-     * scrolled it out of the window and back (re-claiming it at a fresh stamp).
-     *
-     * All the candidates here are on screen anyway, so FIFO is both fair and
-     * starvation-free: a request that has waited longest cannot keep losing.
-     */
-    int pick = -1;
-    for (int i = 0; i < ARTCACHE_WAYS; i++) {
-        if (g_way[i].state != WAY_QUEUED) {
-            continue;
-        }
-        if (pick < 0 || g_way[i].stamp < g_way[pick].stamp) {
-            pick = i;
-        }
-    }
-    if (pick < 0 || fs == 0) {
-        return 0;
-    }
-
     way_t *s = &g_way[pick];
     const album_t *al = &g_album[s->key];
     /* Clusters were pre-resolved at library-load, so this is a direct file read
@@ -345,7 +332,7 @@ int artcache_pump(fat32_t *fs)
 
     if (r == 1) {
         s->state = WAY_LOADED;
-        return 1;
+        return;
     }
 
     int key = s->key;
@@ -365,11 +352,82 @@ int artcache_pump(fat32_t *fs)
          * cannot re-issue a disk read on every pump forever.
          */
         set_retried(key, 1);
-        return 1;
+        return;
     }
 
     /* No usable art, or a read that failed twice: remember it in one bit so a
      * cover-less album costs no pixels and is not retried. */
     set_noart(key, 1);
+}
+
+/* The QUEUED way that has waited longest, or -1 when nothing is queued. */
+static int oldest_queued(void)
+{
+    /*
+     * OLDEST outstanding request first.
+     *
+     * This used to take the most recently stamped way, on the theory that it is
+     * the one the user is looking at. But every visible row is re-stamped on
+     * every pass, in row order, so the TOP row always ended up with the lowest
+     * stamp and was therefore always last in line — permanently, since the
+     * ordering is re-established each pass. Any pass that ran out of budget
+     * starved it, which is why the first album's cover stayed blank until you
+     * scrolled it out of the window and back (re-claiming it at a fresh stamp).
+     *
+     * FIFO is fair and starvation-free, but it cannot tell what is on screen:
+     * after a scroll that outran the pump, the OLDEST requests are precisely
+     * the rows that have already gone past, and the visible chips wait behind
+     * every one of them. A caller that knows the window uses artcache_pump_for
+     * to put those last.
+     */
+    int pick = -1;
+    for (int i = 0; i < ARTCACHE_WAYS; i++) {
+        if (g_way[i].state != WAY_QUEUED) {
+            continue;
+        }
+        if (pick < 0 || g_way[i].stamp < g_way[pick].stamp) {
+            pick = i;
+        }
+    }
+    return pick;
+}
+
+int artcache_pump(fat32_t *fs)
+{
+    int pick = oldest_queued();
+    if (pick < 0 || fs == 0) {
+        return 0;
+    }
+    load_way(fs, pick);
     return 1;
+}
+
+int artcache_pump_for(fat32_t *fs, const int *want, int n)
+{
+    if (fs == 0) {
+        return 0;
+    }
+    /* First, in the order given, a wanted album that still needs pixels. A row
+     * the list has not drawn yet (the selection moved, the paint is pending)
+     * has no way at all: claim one for it here, so its read happens now rather
+     * than one paint later. claim() evicts by LRU, and everything on screen was
+     * stamped more recently than anything that has scrolled off, so the way it
+     * takes is never a visible row's. */
+    for (int i = 0; i < n; i++) {
+        int idx = want[i];
+        if (idx < 0 || idx >= ARTCACHE_SLOTS) {
+            continue;
+        }
+        int w = find(idx);
+        if (w < 0) {
+            w = claim(idx);
+        }
+        if (w >= 0 && g_way[w].state == WAY_QUEUED) {
+            load_way(fs, w);
+            return 1;
+        }
+    }
+    /* Everything on screen is resident (or hopeless): work through the rows
+     * that scrolled past, oldest first, so a slow reversal finds them ready. */
+    return artcache_pump(fs);
 }
