@@ -21,6 +21,9 @@
 #                     like the 14->16 one, which is what started all this
 #   sanitizers        the suite under ASan + UBSan (FAT32 and the codec
 #                     container parsers both eat untrusted disk bytes)
+#   boot-smoke        the linked ARM image booted in the clicky emulator,
+#                     its UART transcript held to a golden — the only job
+#                     that executes crt0.S / switch.S / the IRQ entry
 #   cli               the Go host CLI: build, vet, test, gofmt
 
 name: CI
@@ -226,6 +229,123 @@ jobs:
         with:
           name: meson-logs-asan
           path: core/build-asan/meson-logs/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------
+  # Boot the real image in an emulator.
+  #
+  # Every other job compiles the C around boot/crt0.S and kernel/switch.S
+  # and stubs the assembly out. Nothing executes it: not the vector table,
+  # not the COP park, not the MMAP0 remap run from an IRAM stub, not the
+  # banked-stack setup, not the IRQ entry, not the context switch. That is
+  # exactly the code whose failure is a device that will not boot,
+  # recoverable only by the Select+Play hardware reset — and until this job
+  # it had been run only by hand, in an emulator nobody had wired up.
+  #
+  # clicky (github.com/daniel5151/clicky) is a third-party PortalPlayer
+  # emulator in Rust. It is NOT vendored and nothing links against it: it
+  # carries no licence file, this tree is Apache-2.0 and cleanroom, so it is
+  # cloned at a pinned commit, built, and run as a tool, the way a compiler
+  # is. Its HLE loader puts our image in SDRAM at the native 0x10000000 with
+  # the remap undone and PC at _start — the boot-ROM handoff crt0.S is
+  # written against — and its serial model prints SER0 TX bytes on stdout.
+  # tests/scripts/clicky_smoke.py holds those bytes to
+  # tests/clicky/boot_uart.golden: the boot milestones, in order, nothing
+  # doubled (the COP-park regression) and nothing missing, then a quiet
+  # settle window during which the emulator delivers a timer IRQ through
+  # our real vector table (a broken IRQ entry panics over the same UART and
+  # fails the window). What the emulator does not model — the BCM display
+  # controller above all, so the disk/UI path is never entered — the golden
+  # does not claim.
+  #
+  # The emulator's headless build exits before executing an instruction
+  # (its main returns while the emulator thread is starting), so the GUI
+  # build runs under Xvfb. Its window libraries are all dlopen'd: only the
+  # runtime .so files are needed, no -dev packages.
+  #
+  # The emulator build is cached by (pinned commit, rustc version) and is
+  # the only thing this workflow persists between runs — it is a tool, not
+  # an output of this tree. The firmware itself is built from nothing, same
+  # as everywhere else in this file.
+  # ---------------------------------------------------------------------
+  boot-smoke:
+    name: boot smoke (clicky emulator)
+    runs-on: ubuntu-latest
+    env:
+      # Pin. Bump deliberately, re-run the smoke locally first, and expect
+      # to re-derive the golden if the serial model changes.
+      CLICKY_REPO: "https://github.com/daniel5151/clicky.git"
+      CLICKY_REV: "391c9b1a0179ea86b1424ecec7f34c8e04f1c5dd"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build tools and the emulator's runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build python3 libsdl2-dev binutils g++ \
+            xvfb libx11-6 libxcursor1 libxkbcommon0
+
+      - name: Install pinned ARM toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/arm-toolchain"
+          curl -fsSL "$ARM_TOOLCHAIN_URL" -o /tmp/arm-toolchain.tar.xz
+          tar -xf /tmp/arm-toolchain.tar.xz -C "$HOME/arm-toolchain" \
+              --strip-components=1
+          echo "$HOME/arm-toolchain/bin" >> "$GITHUB_PATH"
+
+      - name: Record the toolchains actually in use
+        id: tools
+        run: |
+          arm-none-eabi-gcc --version | head -1
+          rustc --version
+          echo "rustc=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Build the firmware from scratch
+        working-directory: core
+        run: make hw
+
+      - name: Wrap core.bin as a firmware-partition image for the emulator
+        working-directory: core
+        run: python3 tests/scripts/make_clicky_fw.py build-hw/core.bin build-hw/core.clicky.fw
+
+      - name: Restore the cached emulator build
+        id: clicky-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clicky-bin/clicky-desktop
+          key: clicky-${{ env.CLICKY_REV }}-${{ runner.os }}-${{ steps.tools.outputs.rustc }}
+
+      - name: Build the emulator (cache miss)
+        if: steps.clicky-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          git clone --no-checkout "$CLICKY_REPO" "$HOME/clicky-src"
+          git -C "$HOME/clicky-src" checkout "$CLICKY_REV"
+          cargo build --release -p clicky-desktop \
+              --manifest-path "$HOME/clicky-src/Cargo.toml"
+          mkdir -p "$HOME/clicky-bin"
+          cp "$HOME/clicky-src/target/release/clicky-desktop" "$HOME/clicky-bin/"
+
+      - name: Boot the image and hold the UART transcript to the golden
+        working-directory: core
+        run: |
+          xvfb-run -a python3 tests/scripts/clicky_smoke.py \
+            --clicky "$HOME/clicky-bin/clicky-desktop" \
+            --fw build-hw/core.clicky.fw \
+            --golden tests/clicky/boot_uart.golden \
+            --stderr build-hw/clicky-stderr.log
+
+      - name: Upload the emulator log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clicky-boot-smoke
+          path: |
+            core/build-hw/clicky-stderr.log
+            core/build-hw/core.clicky.fw
+            core/sysdump.log
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------

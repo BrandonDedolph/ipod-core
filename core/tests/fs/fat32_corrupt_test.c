@@ -27,6 +27,7 @@
  *   fat16-bpb    a genuine FAT16 boot sector offered to a FAT32 reader
  *   orphan-lfn   LFN runs with a mismatched checksum / no 8.3 entry at all
  *   truncated    the volume ends after the FAT region
+ *   long-lfn     a long name at the VFAT bound (255 units) and one past it
  *
  * Plus, on the GOOD image, injected sector faults (fail_sector): one read of
  * the root or of a file cluster fails and then the drive settles, or it never
@@ -132,7 +133,7 @@ static int budget_hit(void) { return g_reads > READ_BUDGET; }
 
 #define MAX_ENTS 16
 typedef struct {
-    char name[MAX_ENTS][256];
+    char name[MAX_ENTS][FAT32_NAME_BYTES];
     int  n;
     int  overflow;      /* the callback fired more than MAX_ENTS times */
 } collector;
@@ -157,6 +158,46 @@ static int count_forever(void *ud, const fat32_dirent_t *e)
     (void)e;
     (*(long *)ud)++;
     return 0;
+}
+
+/* The same, keeping the full dirent name and its lossy flag — the long-lfn
+ * case is precisely the one whose names do not fit `collector`. */
+typedef struct {
+    char     name[FAT32_NAME_BYTES];
+    uint8_t  lossy;
+    uint32_t clus;
+    uint32_t size;
+} wide_ent;
+
+typedef struct {
+    wide_ent e[8];
+    int      n;
+    int      overflow;
+} wide_collector;
+
+static int collect_wide(void *ud, const fat32_dirent_t *e)
+{
+    wide_collector *c = ud;
+    if (c->n < 8) {
+        snprintf(c->e[c->n].name, sizeof c->e[0].name, "%s", e->name);
+        c->e[c->n].lossy = e->name_lossy;
+        c->e[c->n].clus  = e->first_clus;
+        c->e[c->n].size  = e->size;
+        c->n++;
+        return 0;
+    }
+    c->overflow = 1;
+    return 1;
+}
+
+static const wide_ent *find_wide(const wide_collector *c, const char *want)
+{
+    for (int i = 0; i < c->n; i++) {
+        if (strcmp(c->e[i].name, want) == 0) {
+            return &c->e[i];
+        }
+    }
+    return NULL;
 }
 
 static int has_name(const collector *c, const char *want)
@@ -422,6 +463,72 @@ int main(int argc, char **argv)
         uint32_t clus = 0, size = 0;
         xpect(&c, "orphan-lfn: the stale long name does not resolve",
               fat32_open(&fs, "Ghost.flac", &clus, &size) != 0);
+    }
+
+    /* ---- 4b. the long-name bound, exactly ------------------------------ *
+     * VFAT allows 255 UTF-16 units. The reader used to stop at 128 and fall
+     * back to the 8.3 name without a word — and the library binds a file to
+     * its index entry by hashing the FULL name, so a silently mangled name
+     * was a track that could not be matched and did not play. A 255-unit
+     * name of 3-byte characters (741 bytes of UTF-8, far past the 256-byte
+     * dirent of old) must come back whole; a 256-unit one may not be
+     * reassembled, but the dirent has to SAY so. */
+    if (!open_variant(dir, "long-lfn")) {
+        return 2;
+    }
+    xpect(&c, "long-lfn: mount succeeds", fat32_mount(&fs, img_read, 0, 0) == 0);
+    {
+        /* The generator's LONG255_NAME: "LFN255-" + U+97F3 x 243 + ".flac". */
+        static char want255[FAT32_NAME_BYTES];
+        int n = snprintf(want255, sizeof want255, "LFN255-");
+        for (int i = 0; i < 243; i++) {
+            want255[n++] = (char)0xE9;
+            want255[n++] = (char)0x9F;
+            want255[n++] = (char)0xB3;
+        }
+        n += snprintf(&want255[n], sizeof want255 - (size_t)n, ".flac");
+        xpect(&c, "long-lfn: the expected name is 741 bytes of UTF-8", n == 741);
+
+        wide_collector col;
+        memset(&col, 0, sizeof col);
+        g_reads = 0;
+        int rc = fat32_readdir_root(&fs, collect_wide, &col);
+        xpect(&c, "long-lfn: readdir succeeds and is bounded",
+              rc == 0 && !budget_hit() && !col.overflow);
+        xpect(&c, "long-lfn: four entries surfaced", col.n == 4);
+
+        const wide_ent *e255 = find_wide(&col, want255);
+        xpect(&c, "long-lfn: a 255-unit name is reassembled whole", e255 != NULL);
+        xpect(&c, "long-lfn: ...and is not reported lossy",
+              e255 != NULL && e255->lossy == 0);
+        xpect(&c, "long-lfn: ...and carries its cluster and size",
+              e255 != NULL && e255->clus == 5 && e255->size == 500);
+
+        const wide_ent *e256 = find_wide(&col, "LFN256~1.FLA");
+        xpect(&c, "long-lfn: a 256-unit name falls back to its 8.3 name",
+              e256 != NULL);
+        xpect(&c, "long-lfn: ...and the fallback is NOT silent: name_lossy set",
+              e256 != NULL && e256->lossy == 1);
+        int leaked = 0;
+        for (int i = 0; i < col.n; i++) {
+            if (strncmp(col.e[i].name, "LFN256-", 7) == 0) {
+                leaked = 1;
+            }
+        }
+        xpect(&c, "long-lfn: no partial 256-unit name is surfaced", !leaked);
+
+        const wide_ent *hello = find_wide(&col, "HELLO.TXT");
+        const wide_ent *intent = find_wide(&col, "Intentions.flac");
+        xpect(&c, "long-lfn: the ordinary entries are unaffected and not lossy",
+              hello != NULL && intent != NULL &&
+              hello->lossy == 0 && intent->lossy == 0);
+
+        uint32_t clus = 0, size = 0;
+        xpect(&c, "long-lfn: the 255-unit name resolves by lookup",
+              fat32_open(&fs, want255, &clus, &size) == 0 &&
+              clus == 5 && size == 500);
+        xpect(&c, "long-lfn: the over-long file still resolves by its 8.3 name",
+              fat32_open(&fs, "LFN256~1.FLA", &clus, &size) == 0);
     }
 
     /* ---- 5. a truncated volume --------------------------------------- *

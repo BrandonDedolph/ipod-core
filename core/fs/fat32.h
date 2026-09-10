@@ -73,9 +73,21 @@ typedef struct {
  */
 int fat32_mount(fat32_t *fs, fat_read_fn read, void *ud, uint32_t part_lba);
 
+/*
+ * A VFAT long name is at most 255 UTF-16 code units: 20 LFN entries of 13
+ * units, with the specification capping the name itself at 255 (the 260th
+ * slot is padding). A unit is at most 3 bytes of UTF-8 — a surrogate pair is
+ * two units for four bytes, so it never exceeds that rate — and the dirent's
+ * name buffer holds the longest legal name whole, plus its terminator. That
+ * is a stack local in the directory walk; nothing keeps one of these in .bss.
+ */
+#define FAT32_LFN_MAX_UNITS 255
+#define FAT32_NAME_BYTES    (FAT32_LFN_MAX_UNITS * 3 + 1)
+
 /* One directory entry surfaced by enumeration. */
 typedef struct {
-    char     name[256];      /* NUL-terminated. VFAT long name if present (and
+    char     name[FAT32_NAME_BYTES];
+                             /* NUL-terminated. VFAT long name if present (and
                               * checksum-bound to this entry), else the 8.3
                               * name formatted "NAME.EXT". UTF-8.            */
     char     short_name[13]; /* the raw 8.3 name, always, same formatting —
@@ -83,6 +95,14 @@ typedef struct {
     uint32_t first_clus;     /* first cluster of the file/dir */
     uint32_t size;           /* file size in bytes; 0 for directories */
     uint8_t  is_dir;         /* 1 if subdirectory, else 0 */
+    uint8_t  name_lossy;     /* 1 when `name` is NOT this file's full long
+                              * name: a long-name run was bound to this entry
+                              * by checksum but ran past FAT32_LFN_MAX_UNITS
+                              * (no conforming writer emits one), so `name`
+                              * holds the 8.3 short name instead. A caller
+                              * that identifies files by name — the library's
+                              * locator hash — must treat such an entry as
+                              * unmatchable, not hash the mangled name.     */
 } fat32_dirent_t;
 
 /*

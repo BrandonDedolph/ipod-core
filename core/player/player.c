@@ -295,10 +295,48 @@ static int ring_source(void *ud, int16_t *buf, int frames)
 #define PRIME_FRAMES (1u << 16)          /* 65536 frames ~ 1.49 s */
 
 /* Frames ever written to the ring (monotonic, wraps like the ring's own
- * indices). `g_written - pcm_ring_fill()` is therefore how many frames the DMA
- * has actually PLAYED — which is how the prefetch below knows when the
- * previous track has finished being heard, not just finished decoding. */
+ * indices). `g_written - pcm_ring_fill()` is how many frames the DMA feeder
+ * has PULLED out of the ring. That is not how many have been heard — the HAL
+ * holds up to two buffers between the ring and the DAC; see frames_heard(). */
 static uint32_t g_written;
+
+/*
+ * What the HAL holds between the ring and the listener.
+ *
+ * hal/hw/audio.c drains the ring in whole ping-pong buffers of
+ * AUDIO_FRAMES_PER_BUF frames: a cold hal_audio_start() pulls two at once, and
+ * every completion ISR kicks the buffer already filled and pulls one more to
+ * refill the one that just finished. So the frame the DAC is clocking out is
+ * always BEHIND the last frame pulled: by exactly two buffers the instant an
+ * ISR has refilled, shrinking to one buffer just before the next completion,
+ * then two again. (Plus the 16-frame I2S FIFO, ~0.4 ms, below anything here
+ * cares about.)
+ *
+ * The DMA engine exposes no residual byte count and hal.h has no
+ * frames-played query, so the player cannot ask where the DAC actually is; it
+ * can only subtract what it knows is in flight. We subtract the FULL two
+ * buffers. A position derived that way is never ahead of what the listener
+ * hears, and is behind it by 0..186 ms (one buffer at 44.1 kHz), 93 ms on
+ * average — that is the residual error of everything built on frames_heard(),
+ * and it is stated here rather than hidden. It replaces an accounting that
+ * treated pulled frames as played and therefore ran 186..372 ms EARLY.
+ *
+ * The number describes the device. The sim's SDL backend pulls 1024 frames at
+ * a time, so there the same subtraction over-corrects by up to ~350 ms. A
+ * hal_audio_frames_played() built from the driver's completion count and kick
+ * timestamp (both of which it already keeps for the late-kick detector) would
+ * bring this down to the FIFO depth on both targets.
+ */
+#define DAC_BUF_FRAMES      8192u                /* == AUDIO_FRAMES_PER_BUF     */
+#define DAC_INFLIGHT_FRAMES (2u * DAC_BUF_FRAMES)
+
+/* Best estimate of the frame (in g_written's numbering) the DAC is clocking
+ * out now. Wraps with g_written, and reads as a large unsigned value before
+ * the first pull, so compare it with SIGNED differences, never directly. */
+static uint32_t frames_heard(void)
+{
+    return g_written - pcm_ring_fill(&g_ring) - DAC_INFLIGHT_FRAMES;
+}
 
 /* A mono file arrives as one sample per frame; the ring and the DAC are both
  * stereo. Expand in place, back to front, so no second buffer is needed. */
@@ -369,25 +407,76 @@ static void decode_pump(void)
  * the audio is already running — so the anti-skip depth is restored within a
  * second, it just is not on the critical path to first sound any more.
  */
-#define SEEK_PRIME_FRAMES (3u * 8192u)   /* ~557 ms at 44.1 kHz */
+#define SEEK_PRIME_FRAMES (3u * DAC_BUF_FRAMES)   /* ~557 ms at 44.1 kHz */
 
-/* Decode at most ONE chunk into the ring, then return. Used inside the play
- * loop so decoding never monopolizes the loop: however slow the codec is (a
- * soft-float MP3 frame can take many ms), the loop still gets back to polling
- * the wheel and repainting each pass, so the UI never appears frozen. Returns
- * the frames decoded this step (0 at EOS or when the ring is already full). */
+/*
+ * Below this many frames in the ring, decode_step stops rationing itself.
+ *
+ * The DMA feeder pulls DAC_BUF_FRAMES at a time and needs that many present
+ * at each pull, ~186 ms apart. Two pulls' worth covers the pull that may land
+ * at any instant plus the whole interval before the next one, so a ring at
+ * or above this line is safe for the duration of one pass however long that
+ * pass turns out to be — and one below it is not, unless the pass itself
+ * puts the frames back. 372 ms at 44.1 kHz.
+ */
+#define CATCH_UP_FRAMES (2u * DAC_BUF_FRAMES)
+
+/*
+ * Decode ONE step into the ring, then return — unless the ring is thin.
+ *
+ * The one-step ration exists for the UI: however slow the codec is (a
+ * soft-float MP3 frame can take many ms), the loop gets back to the wheel and
+ * the panel after ~23 ms of audio's worth of work, never after a 74 ms block.
+ *
+ * IS THE RATION A THROUGHPUT LIMIT? In the main loop, no. The loop only halts
+ * when the pump had nothing to do, so while there is decoding to do the pass
+ * rate is 1024 frames per (decode time + the pass's own cost), and the pass
+ * cost — wheel, timer and event reads, tens of microseconds — is under 1 % of
+ * the 23.2 ms one step represents. The codec sets the throughput, not the
+ * cap: the only measured figure in this tree is ~74 ms for a 4096-frame step,
+ * i.e. ~18 ms per 1024 frames, 78 % of real time, and the ring keeps up at
+ * any cost below 100 % whether the step is 1024 or 4096. The tightest DMA
+ * deadline is just after a seek, where the HAL's two pulls leave one buffer
+ * in the ring: the second completion, 372 ms out, needs 8 more steps —
+ * ~145 ms of decode plus one ~70 ms read-ahead fill — a 1.7x margin.
+ *
+ * Where the ration DOES starve the ring is a caller that blocks between
+ * pumps. The library scan (the no-index fallback, reachable from every Music
+ * entry while a track plays, and documented as "anti-skip covers audio")
+ * pumps once per file it probes, and each probe is a ~16 KB PIO read plus a
+ * tag parse — ~35 ms at this drive's ~0.28 s per 128 KB. One step per ~53 ms
+ * pass is ~19k frames/s against 44.1k consumed: the ring loses ~25k frames a
+ * second, so a full 5.94 s ring is gone ~10 s into a scan and a 1.49 s prime
+ * in ~2.6 s. Scans take longer than that. Not a worst case: the arithmetic.
+ *
+ * So: one step while the ring is healthy, and below CATCH_UP_FRAMES keep
+ * decoding until it is back above the line (at most the watermark's worth of
+ * steps, ~290 ms at the measured cost). The UI stalls for that long only when
+ * the alternative is silence, and a blocking caller then self-stabilises —
+ * each pass puts back what the DMA pulled during it, which is sustainable at
+ * any decode cost below real time. The healthy-ring path is unchanged.
+ *
+ * Returns the frames decoded this pass (0 at EOS or when the ring is full).
+ */
 static int decode_step(void)
 {
-    if (g_eos || pcm_ring_free(&g_ring) < PLAY_STEP_FRAMES) {
-        return 0;
+    int total = 0;
+    for (unsigned steps = 0; steps < CATCH_UP_FRAMES / PLAY_STEP_FRAMES; steps++) {
+        if (g_eos || pcm_ring_free(&g_ring) < PLAY_STEP_FRAMES) {
+            break;
+        }
+        int got = decode_chunk(PLAY_STEP_FRAMES);
+        if (got <= 0) {
+            g_eos = 1;
+            break;
+        }
+        g_written += pcm_ring_write(&g_ring, decode_buf, (uint32_t)got);
+        total += got;
+        if (pcm_ring_fill(&g_ring) >= CATCH_UP_FRAMES) {
+            break;                       /* healthy: one step is the ration */
+        }
     }
-    int got = decode_chunk(PLAY_STEP_FRAMES);
-    if (got <= 0) {
-        g_eos = 1;
-        return 0;
-    }
-    g_written += pcm_ring_write(&g_ring, decode_buf, (uint32_t)got);
-    return got;
+    return total;
 }
 
 /* FAT32 block callback: read absolute 512-byte LBAs off the disk.
@@ -566,10 +655,10 @@ static uint32_t       g_out_rate;
  *
  * What must NOT happen immediately is the PRESENTATION switch — the title,
  * elapsed clock and artwork belong to whatever is audible, and that is still
- * the old track for several seconds. g_written (frames ever queued) minus the
- * ring fill is the number of frames the DMA has actually played, so we record
- * the queue position of the handover in g_boundary and commit the UI-visible
- * state only once playback crosses it.
+ * the old track for several seconds. We record the queue position of the
+ * handover in g_boundary and commit the UI-visible state only once
+ * frames_heard() — what has been queued, less what the ring and the HAL still
+ * hold — crosses it.
  *
  * Only one track is ever prefetched (a track shorter than the ring would
  * otherwise stack up handovers); a second EOS simply waits for the commit.
@@ -1086,6 +1175,36 @@ static void prefetch_next(void)
 }
 
 /*
+ * Has the hand-over reached the listener?
+ *
+ * Gapless: the next track's frames follow the old ones through the ring and
+ * the HAL, so the boundary is audible once frames_heard() crosses it. Pulled
+ * is not heard — committing when the feeder PULLED the boundary frame, which
+ * this used to do, flipped the title, the art and the elapsed clock 186..372
+ * ms before the new track could be heard, and re-anchored the clock there, so
+ * it read that far ahead for the whole of every gapless track.
+ *
+ * Two cases cannot wait for that crossing, because pulling has STOPPED and
+ * frames_heard() will never move again:
+ *   - a format change: decode is held back until the old track is out, so
+ *     the ring runs dry at exactly the boundary and nothing more is pulled.
+ *     pending_commit drains the HAL's own buffers before re-clocking, so the
+ *     old track's tail is still heard in full.
+ *   - an empty ring under a gapless hand-over: a next track shorter than what
+ *     the HAL holds (~370 ms) has been pulled in its entirety, and the feeder
+ *     is padding silence. Committing here is at most that much early, and the
+ *     listener is hearing an underrun regardless.
+ * Both are "the ring is empty and the boundary has been pulled".
+ */
+static int handover_audible(uint32_t fill)
+{
+    if ((int32_t)(frames_heard() - g_boundary) >= 0) {
+        return 1;
+    }
+    return fill == 0u && (int32_t)((g_written - fill) - g_boundary) >= 0;
+}
+
+/*
  * The prefetched track has now reached the speakers: switch everything
  * user-visible over to it. When the format changed, the ring has just run dry
  * at exactly this point, so this is where the DAC is re-clocked (and the
@@ -1093,6 +1212,23 @@ static void prefetch_next(void)
  */
 static void pending_commit(void)
 {
+    /*
+     * How far past the boundary the DAC already is. The pump only looks
+     * between passes and frames_heard() moves a whole buffer at a time, so the
+     * crossing is never caught on the exact frame; anchoring the clock at zero
+     * here would make every gapless track's clock late by that overshoot on
+     * top of the estimate's own 0..186 ms. Credit it instead. Negative (the
+     * ring-empty fall-through in handover_audible) means nothing has been
+     * heard yet, so zero. The format-change path re-primes the DAC cold below
+     * and its first frame is at the FIFO within ~0.4 ms of the start, so there
+     * the overshoot is genuinely zero.
+     */
+    int32_t  over    = (int32_t)(frames_heard() - g_boundary);
+    uint32_t over_us = 0;
+    if (g_pending_gapless && over > 0 && g_out_rate != 0) {
+        over_us = (uint32_t)(((uint64_t)(uint32_t)over * 1000000u) / g_out_rate);
+    }
+
     g_queue_idx  = g_pending_idx;
     g_cur_meta   = g_pending_meta;
     g_pl_total_s = g_pending_total_s;
@@ -1121,7 +1257,7 @@ static void pending_commit(void)
             return;
         }
     }
-    g_pl_start_us = mmio_read32(USEC_TIMER_ADDR);
+    g_pl_start_us = mmio_read32(USEC_TIMER_ADDR) - over_us;
     g_pl_low_fill = RING_FRAMES;
     g_last_err    = PLAYER_OK;
     g_open_seq++;
@@ -1266,17 +1402,23 @@ void player_pump(void)
 
     uint32_t fill = pcm_ring_fill(&g_ring);
 
-    /* Has the prefetched track reached the speakers yet? g_written - fill is
-     * the frame the DMA is playing; g_boundary is where the handover sits in
-     * that stream. Committing on the DECODE finishing instead would flip the
-     * title and clock up to 6 s early. The compare is a SIGNED difference so
-     * it stays correct across the 32-bit wrap the ring indices also ride. */
-    if (g_pending && (int32_t)((g_written - fill) - g_boundary) >= 0) {
+    /* Has the prefetched track reached the speakers yet? g_boundary is where
+     * the hand-over sits in the queued stream; handover_audible() decides
+     * whether the DAC has got there. Committing on the DECODE finishing
+     * instead would flip the title and clock up to 6 s early; committing on
+     * the feeder PULLING the boundary, 186..372 ms early. */
+    if (g_pending && handover_audible(fill)) {
         pending_commit();
-        if (!g_pl_active) {
-            return;                      /* commit failed (unclockable rate) */
-        }
-        fill = pcm_ring_fill(&g_ring);
+        /* That was this pass's work. A commit already reads the new track's
+         * art off the disk and, on a format change, drains and re-clocks the
+         * codec — the longest pass the pump has — so it does not also decode.
+         * The next pass is one loop iteration away, and it is the one that
+         * prefetches the track after this one if this one turns out to be
+         * fully decoded already: one event per pass keeps a commit and the
+         * prefetch it enables from landing in the same call. (A commit that
+         * failed on an unclockable rate has left the player inactive, and
+         * returning covers that too.) */
+        return;
     }
 
     /* Decode, unless a format-changing handover is waiting: those frames must
