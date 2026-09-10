@@ -37,6 +37,7 @@
 #include "../ui/thumb.h"
 #include "../ui/artcache.h"
 #include "../ui/screen_charging.h"
+#include "../ui/screen_battery.h"
 #include "../ui/settings.h"
 #include "../ui/palette.h"
 #include "../ui/chrome.h"
@@ -731,6 +732,13 @@ static int battery_refresh(int force)
     g_bat_mv_filt = battery_filtered_mv();
     g_bat_pct     = battery_percent_from_mv(g_bat_mv_filt);
 
+    /* Same sample, same cadence, feeds what the USER is told. Everything the
+     * warning UI does about flapping keys off the FILTERED millivolts and the
+     * policy's own level, never a raw reading — see ui/screen_battery.c. */
+    battwarn_feed(battery_filter_ready() ? g_bat_mv_filt : -1,
+                  (int)battery_policy_level(), g_bat_ext,
+                  mmio_read32(USEC_TIMER_ADDR));
+
     /*
      * One line per sample, so a full discharge can be logged over UART and
      * turned into numbers. There is otherwise NO way to see either half of the
@@ -811,6 +819,29 @@ static int battery_refresh(int force)
 
     case BATTERY_EVENT_SHUTOFF:
         uart_puts("core: batt SHUTOFF: entering standby\n");
+        /*
+         * Say goodbye before the lights go out.
+         *
+         * Without this the panel went straight from whatever was on it to
+         * black — from the outside indistinguishable from a crash, which is
+         * the worst thing a device can look like when the real answer is
+         * "plug me in". Pause first so the message is read in quiet rather
+         * than over a note cut mid-way, and light the backlight: a device
+         * that dies face-up on a desk should be legible.
+         *
+         * The hold is a USEC_TIMER spin, not cpu_wait_ms(): that takes a
+         * uint8_t of milliseconds and may wake early on an IRQ, and this is
+         * the one message the user gets.
+         */
+        player_pause();
+        backlight_set(g_settings.backlight_bright);
+        screen_battery_render(BATTWARN_SHUTOFF);
+        lcd_present_fb(console_framebuffer());
+        {
+            uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
+            while ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - t0) < 1500000u) {
+            }
+        }
         /* The documented power-off path: stop the player, blank the panel,
          * PMU deep-sleep with wake sources set. Its own settings_commit(1)
          * is the reason the DISKSAFE flush above exists: by now the write
@@ -3143,7 +3174,9 @@ static void music_menu_render(void)
  * ------------------------------------------------------------------------- */
 typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_SONGS, SCR_GENRES,
                SCR_BROWSER, SCR_NOWPLAYING, SCR_QUEUE, SCR_SETTINGS,
-               SCR_CHARGING } screen_t;
+               SCR_BATTERY, SCR_CHARGING } screen_t;
+/* Exactly reached by the deepest legal path: MENU, MUSIC, ARTISTS, BROWSER,
+ * NOWPLAYING, QUEUE, BATTERY, CHARGING. A new screen needs this bumped. */
 #define SCR_STACK_MAX 8
 static screen_t g_scr[SCR_STACK_MAX];
 static int      g_scr_n;
@@ -3978,6 +4011,9 @@ static void paint_current_screen(void)
         nowplaying_render(player_track_name(), player_elapsed_s(),
                           player_total_s(), player_buf_pct());
         break;
+    case SCR_BATTERY:
+        screen_battery_render(BATTWARN_DISKSAFE);
+        break;
     case SCR_CHARGING:
         screen_charging_render(g_bat_pct, power_is_charging(), power_is_external());
         break;
@@ -4238,6 +4274,7 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      ext_prev  = power_is_external() ? 1 : 0; /* seed plug-in edge detect */
     int      lock_flashing = 0;          /* a lock/unlock plate is on screen     */
     char     az_prev = 0;                /* A-Z locator letter on screen         */
+    int      toast_prev = 0;             /* low-battery toast on screen          */
     int      play_held = 0;              /* PLAY currently down (long-press off)  */
     uint32_t play_down_us = 0;           /* when PLAY went down                   */
     g_locked = hold_prev;
@@ -4397,6 +4434,21 @@ _Noreturn static void run_ui(fat32_t *fs)
         }
         ext_prev = ext;
 
+        /* The low-battery modal. Raised once per OK->DISKSAFE crossing and
+         * held until a button dismisses it; the charging screen outranks it,
+         * because a plugged-in device has already answered the warning. This
+         * is idempotent per pass, so it self-heals if anything else truncates
+         * the screen stack underneath it. */
+        if (battwarn_screen() == BATTWARN_DISKSAFE &&
+            scr_cur() != SCR_BATTERY && scr_cur() != SCR_CHARGING) {
+            scr_push(SCR_BATTERY);
+            dirty = 1;
+        } else if (scr_cur() == SCR_BATTERY &&
+                   battwarn_screen() != BATTWARN_DISKSAFE) {
+            scr_pop();
+            dirty = 1;
+        }
+
         /* Long-press PLAY (~2s) sleeps the device (suspend: drive spun down,
          * screen dark, but CPU+RAM alive so wake is INSTANT and skips ipl2).
          * Holding on to ~5s escalates to a true PMU power-down. LIVE button
@@ -4471,7 +4523,11 @@ _Noreturn static void run_ui(fat32_t *fs)
              * saw the same event and paused/skipped the music you were only
              * trying to get the modal off the screen for. Same swallow pattern as
              * the backlight wake above. */
-            if (scr_cur() == SCR_CHARGING && ev.buttons) {
+            /* Any input dismisses a live toast (not consumed — the press was
+             * meant for whatever is underneath) and marks the modal seen. */
+            battwarn_input(mmio_read32(USEC_TIMER_ADDR));
+            if ((scr_cur() == SCR_CHARGING || scr_cur() == SCR_BATTERY) &&
+                ev.buttons) {
                 scr_pop();
                 dirty = 1;
                 ev.buttons     = 0;
@@ -4827,7 +4883,12 @@ _Noreturn static void run_ui(fat32_t *fs)
                             settings_defaults(&g_settings);
                             settings_apply();
                             settings_touch();              /* persist the reset */
-                        } else {                           /* toggled/cycled    */
+                        } else if (act == SETTINGS_ACTION_NONE) {
+                            /* Only a row that actually CHANGED the record gets
+                             * persisted. SELECT on About/Diagnostics, or on the
+                             * theme already selected, used to mark the config
+                             * dirty and spin the drive up three seconds later to
+                             * write a byte-identical record. */
                             settings_apply();
                             settings_touch();
                         }
@@ -4859,6 +4920,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                 break;
             }
 
+            case SCR_BATTERY:
             case SCR_CHARGING:
                 break;                        /* dismissal is handled above */
             }
@@ -5027,6 +5089,10 @@ _Noreturn static void run_ui(fat32_t *fs)
          * row's initial so you can aim at a letter instead of reading rows that
          * are flying past. Its appearance/disappearance is itself a repaint. */
         char az_letter = wheel_accelerating() ? list_sel_initial() : 0;
+        /* Suppressed with the backlight: a toast nobody can see is only a
+         * repaint. It reappears on the next sample if the cell is still low. */
+        int  toast     = (bl_state != BL_OFF) &&
+                         battwarn_toast_up(mmio_read32(USEC_TIMER_ADDR));
 
         /* Render the current screen (skipped entirely when the screen is off —
          * saves the IRQ-masked present while music plays dark). Now Playing
@@ -5046,7 +5112,7 @@ _Noreturn static void run_ui(fat32_t *fs)
              * (elapsed/remaining/progress) and presents only its band, instead of
              * re-rendering the whole screen — art, metadata and two anti-aliased
              * bars — once a second and throwing all of it above y=128 away. */
-            int want_full = dirty || expiring;
+            int want_full = dirty || expiring || toast != toast_prev;
             if (want_full) {
                 if (np_first || !player_active() ||
                     (uint32_t)(nowv - last_present) >= present_gap_us()) {
@@ -5054,6 +5120,11 @@ _Noreturn static void run_ui(fat32_t *fs)
                     console_damage_reset();
                     nowplaying_render(player_track_name(), elapsed,
                                       player_total_s(), player_buf_pct());
+                    if (toast) {
+                        screen_battery_toast_render();
+                        g_mq.active = 0;      /* see the list branch below */
+                    }
+                    toast_prev = toast;
                     ui_present_damage();
                     np_first = 0;
                     np_last  = elapsed;
@@ -5074,7 +5145,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                 np_vol_prev = vol_active;
                 player_note_presented();
             }
-        } else if (dirty || az_letter != az_prev) {
+        } else if (dirty || az_letter != az_prev || toast != toast_prev) {
             /* Repaints are paced by what the LAST present actually cost (see
              * present_gap_us), not by a fixed 150 ms: a selection move now
              * repaints two rows and pushes only those, so it can run several
@@ -5092,7 +5163,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                  * render, which console_clear marks as whole-screen damage. The
                  * A-Z plate covers arbitrary rows, so while it is up (or in the
                  * frame that clears it) the full render is the honest option. */
-                int partial = !az_letter && !az_prev && list_repaint_partial();
+                int partial = !az_letter && !az_prev && !toast && !toast_prev &&
+                              list_repaint_partial();
                 if (!partial) {
                     switch (scr_cur()) {
                     case SCR_MENU:    main_menu_render();            break;
@@ -5103,6 +5175,9 @@ _Noreturn static void run_ui(fat32_t *fs)
                     case SCR_BROWSER: browse_render(g_dir_depth ? g_det_sel : g_br_sel);   break;
                     case SCR_QUEUE:   queue_render(g_queue_sel);     break;
                     case SCR_SETTINGS: settings_render_cur();        break;
+                    case SCR_BATTERY:
+                        screen_battery_render(BATTWARN_DISKSAFE);
+                        break;
                     case SCR_CHARGING:
                         screen_charging_render(g_bat_pct, power_is_charging(),
                                                power_is_external());
@@ -5111,6 +5186,11 @@ _Noreturn static void run_ui(fat32_t *fs)
                     }
                 }
                 if (az_letter) az_overlay_render(az_letter);
+                if (toast) screen_battery_toast_render();
+                /* The plate owns the screen. The repaint above re-registered
+                 * the selected row with the marquee, whose tick would then
+                 * punch a hole straight through whatever is covering it. */
+                if (az_letter || toast) g_mq.active = 0;
                 /* Render and present timed apart: `now` was read before the
                  * paint, so the delta here is the CPU the renderer took. */
                 g_ui_render_us = mmio_read32(USEC_TIMER_ADDR) - now;
@@ -5120,6 +5200,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                 if (partial) g_ui_partial++; else g_ui_full++;
                 list_paint_note();
                 az_prev = az_letter;
+                toast_prev = toast;
                 dirty = 0;
                 last_present = now;
             }
