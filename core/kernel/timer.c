@@ -161,6 +161,17 @@ uint32_t current_tick(void)
  */
 #define SLEEP_HALT_US  200u
 
+/*
+ * The count is the LOW 8 BITS of CPU_CTL (01-soc-pp5022.md, "Sleep / wake":
+ * "[7:0] Read: cycles remaining; write: cycles to skip"). A value that does
+ * not fit is TRUNCATED SILENTLY by the hardware, not rejected — writing 1000
+ * here would program 1000 & 0xFF = 232 us, a halt that still looks plausible
+ * and still passes a deadline check, so nothing downstream would notice the
+ * number was not the one written. Catch it at compile time instead.
+ */
+_Static_assert(SLEEP_HALT_US <= 0xFFu,
+               "SLEEP_HALT_US must fit the 8-bit CPU_CTL count field");
+
 static void tick_halt(void)
 {
     mmio_write32(CPU_CTL_ADDR, PROC_WAIT_CNT | PROC_CNT_USEC | SLEEP_HALT_US);
