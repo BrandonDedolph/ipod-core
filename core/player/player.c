@@ -912,7 +912,13 @@ static void pending_commit(void)
     if (!g_pending_gapless) {
         /* Different sample rate: the ring is empty here by construction (we
          * held decode back until the old track finished playing), so re-clock
-         * the DAC and prime before letting it run again. */
+         * the DAC and prime before letting it run again.
+         *
+         * Drain first. "Ring empty" is not "track finished" — the HAL still
+         * holds up to two buffers the DAC has not clocked out, and stopping
+         * discards them, which cut the last ~186-370 ms off the outgoing track
+         * every time the rate changed between tracks. */
+        hal_audio_drain(500u);
         hal_audio_stop();
         decode_pump();
         if (audio_bringup(g_dec.sample_rate) != 0) {
@@ -946,6 +952,12 @@ static void player_advance(void)
      * unconditional g_dec.ops->close() there dereferenced a NULL/stale ops and
      * hard-froze the device. g_pl_active is the "decoder open + running" flag. */
     if (g_pl_active) {
+        /* The track played to its end: let the HAL's two in-flight buffers
+         * reach the DAC before cutting it. Bounded, so a wedged DMA cannot
+         * hang the advance. Only the AUTOMATIC paths come through here — a
+         * user pressing Next skips straight to hal_audio_stop(), because
+         * waiting a third of a second on a button press reads as lag. */
+        hal_audio_drain(500u);
         hal_audio_stop();
         g_pl_active = 0;                  /* no close: next open resets the arena */
     }
@@ -1113,6 +1125,7 @@ void player_pump(void)
             /* Play out what is already decoded, then stop and SAY so rather
              * than advancing as if the track had simply finished. */
             if (fill == 0u) {
+                hal_audio_drain(500u);   /* the decoded tail is still playable */
                 hal_audio_stop();
                 g_pl_active = 0;
                 g_pending   = 0;
@@ -1242,6 +1255,11 @@ void player_next(void)
          * the UI closes the codec, leaves the dead player views, and drops the
          * saved resume position.
          */
+        /* No drain here, deliberately: this is a BUTTON PRESS. Waiting a
+         * third of a second for the in-flight buffers to play out would read
+         * as the device being slow to respond, and the listener asked for the
+         * track to end. The automatic end-of-queue path (player_advance) does
+         * drain, because nobody is waiting on it. */
         hal_audio_stop();
         g_pl_active = 0;
         g_pl_paused = 0;
@@ -1311,23 +1329,90 @@ void player_prev(void)
  *   - a backward seek drives diskbuf_seek outside its window, which resets the
  *     window and rewinds fat_src — now served from the cluster-chain
  *     checkpoints in fat_src_t instead of re-walking the FAT from cluster 0;
- *   - FLAC lands on a SEEKTABLE seekpoint (dr_flac parses and binary-searches
- *     it at open), so it is O(log n) plus one frame. MP3 has no seek table and
- *     falls back to dr_mp3's brute-force scan — accurate but linear; see the
- *     note in mp3.c.
+ *   - FLAC with no SEEKTABLE (which is most of them — encoders only emit one
+ *     on request) binary-searches the frame stream, O(log n) probes plus one
+ *     frame decode. dr_flac only offers that search when CRC checking is
+ *     compiled IN; with DR_FLAC_NO_CRC it silently degrades to a linear scan,
+ *     which is why flac.c leaves CRC on. MP3 has no seek table either and
+ *     falls back to dr_mp3's brute-force scan — see the note in mp3.c.
  *
  * The DAC is stopped across the seek so the ISR can't drain PCM belonging to
- * the old position, and hal_audio_init is deliberately NOT re-issued: the
- * format hasn't changed, and re-initialising would reset the codec's gain.
+ * the old position, hal_audio_flush() drops what the HAL had already buffered
+ * from it, and hal_audio_init is deliberately NOT re-issued: the format hasn't
+ * changed, and re-initialising would reset the codec's gain.
  */
-int player_seek_to(uint32_t sec)
+
+/*
+ * Re-open the CURRENT queue entry from scratch, for a seek that cannot trust
+ * the live decoder.
+ *
+ * Once a track hits decoder EOS the pump prefetches its successor, and
+ * track_open() re-points the whole byte-source chain (g_fsrc / g_dbuf / g_ra)
+ * at that next file and resets the arena. Two states follow, both hostile to
+ * an in-place seek, and both reachable for the last ~6 s of every track —
+ * the ring holds that much decoded audio, so the listener is still hearing
+ * this track and may well scrub inside it:
+ *
+ *   - prefetch SUCCEEDED (g_pending): g_dec is now the NEXT track's decoder.
+ *     Seeking it would seek the wrong file. This used to be refused outright,
+ *     so dragging the scrubber back during the last six seconds did nothing
+ *     and the position snapped forward again.
+ *   - prefetch FAILED (next file corrupt, truncated, or gone): g_pending stays
+ *     0 and g_dec is left as the OLD decoder — but the chain underneath it now
+ *     routes to the file that failed to open, over an arena that was reset out
+ *     from under its state. Seeking there ran the old decoder across another
+ *     file's bytes.
+ *
+ * Reopening is the honest fix for both: it costs a metadata read and drops the
+ * anti-skip window, but it only happens in the end-of-track window, and it
+ * reclaims the prefetched decoder's memory via the arena reset it performs
+ * anyway. Returns 0, or -1 with the player left inactive (the file we were
+ * playing has become unreadable, which is not something to paper over).
+ */
+static int seek_reopen_current(void)
 {
-    if (!g_pl_active || !g_dec.ops || !g_dec.ops->seek) {
+    flac_meta_t meta;
+
+    g_pending        = 0;    /* the prefetched hand-over is abandoned */
+    g_prefetch_tried = 0;
+    if (track_open(g_queue_idx, &meta) != 0) {
+        g_last_err  = PLAYER_ERR_OPEN;
+        g_pl_active = 0;
+        g_eos       = 1;
         return -1;
     }
-    if (g_pending) {
-        return -1;                       /* mid-handover: refuse rather than guess */
+    g_cur_meta   = meta;
+    g_pl_total_s = track_total_s(&g_dec);
+    return 0;
+}
+
+int player_seek_to(uint32_t sec)
+{
+    if (!g_pl_active) {
+        return -1;
     }
+    int was_paused = g_pl_paused;
+    int reopened   = 0;
+
+    hal_audio_stop();
+
+    /* Past EOS the decoder may not be this track's any more — see above. Do
+     * this BEFORE reading g_dec.sample_rate, so the target is computed against
+     * the file we are actually going to seek. */
+    if (g_prefetch_tried || g_pending) {
+        if (seek_reopen_current() != 0) {
+            hal_audio_flush();           /* nothing left to resume into */
+            return -1;
+        }
+        reopened = 1;
+    }
+    if (!g_dec.ops || !g_dec.ops->seek) {
+        if (!reopened && !was_paused) {
+            hal_audio_start();           /* unchanged stream: resume as we were */
+        }
+        return -1;
+    }
+
     uint32_t rate   = g_dec.sample_rate ? g_dec.sample_rate : 44100u;
     uint64_t target = (uint64_t)sec * rate;
     if (g_dec.total_frames > 0 && target >= g_dec.total_frames) {
@@ -1335,19 +1420,38 @@ int player_seek_to(uint32_t sec)
         sec    = (uint32_t)(target / rate);
     }
 
-    int was_paused = g_pl_paused;
-    hal_audio_stop();
     if (g_dec.ops->seek(&g_dec, target) != DECODER_OK) {
+        if (reopened) {
+            /* We already tore the stream down to reopen it; the buffered PCM
+             * is from a decoder that no longer exists. Restart from the top of
+             * the track rather than resuming into it. */
+            hal_audio_flush();
+            pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
+            g_written  = 0;
+            g_boundary = 0;
+            g_eos      = 0;
+            decode_pump_upto(SEEK_PRIME_FRAMES);
+            g_pl_start_us = mmio_read32(USEC_TIMER_ADDR);
+        }
         if (!was_paused) {
             hal_audio_start();
         }
         return -1;
     }
+
     pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
     g_written        = 0;
     g_boundary       = 0;
     g_eos            = 0;
     g_prefetch_tried = 0;
+    /*
+     * Drop what the HAL still holds. The ring above is ours; the ping-pong
+     * buffers inside the backend are not, and they are full of the position we
+     * just left. Without this the resume path in hal_audio_start() kicked them
+     * first and the listener heard up to ~370 ms of the OLD spot before the
+     * jump landed — on every single scrub.
+     */
+    hal_audio_flush();
     /* Only enough to restart cleanly — the play loop fills the rest while the
      * audio runs, so first sound is not gated on the full anti-skip depth. */
     decode_pump_upto(SEEK_PRIME_FRAMES);

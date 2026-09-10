@@ -456,6 +456,121 @@ int main(void)
     player_play_queue(ents, 4, 0, 0, 0);
     xpect(&c, "play_queue takes the whole (short) queue", player_queue_len() == 4);
 
+    /* ---- 13b. seek: what the HAL is left holding ----------------------- *
+     *
+     * These four exist because an audit found that every scrub replayed up to
+     * ~370 ms of the OLD position before jumping, and this suite could not see
+     * it: hal_audio_start/stop were bare counters, so "stopped and started
+     * again" looked the same whether or not the backend's ping-pong buffers
+     * still held the pre-seek audio. The stubs now model that buffer
+     * (stub_audio_primed), which is what makes a missing flush observable. */
+    stub_reset();
+    /* A 10 s track: the default fake is 8192 frames (~0.19 s), so any seek
+     * target would clamp to 0 and the clock assertion below would pass for the
+     * wrong reason. */
+    stub_set_track_frames(44100u * 10u);
+    make_entries(ents, 4, 0);
+    player_play_queue(ents, 4, 0, 0, 0);
+    set_usec(0);
+
+    int seeks_before = stub_seeks;
+    xpect(&c, "seek reports success", player_seek_to(3u) == 0);
+    xpect(&c, "seek reaches the decoder", stub_seeks == seeks_before + 1);
+    xpect(&c, "seek discards the PCM the HAL had buffered from the old "
+              "position", stub_audio_flushes >= 1 && stub_audio_primed == 0);
+    xpect(&c, "seek restarts the DAC", stub_audio_running == 1);
+    xpect(&c, "seek moves the elapsed clock to the target",
+          player_elapsed_s() == 3u);
+
+    /* A seek the decoder refuses must leave playback exactly as it was, not
+     * stopped and not silently repositioned. */
+    stub_reset();
+    player_play_queue(ents, 4, 0, 0, 0);
+    set_usec(0);
+    stub_set_seek_ok(0);
+    xpect(&c, "a refused seek reports failure", player_seek_to(3u) == -1);
+    xpect(&c, "a refused seek leaves the DAC running", stub_audio_running == 1);
+    xpect(&c, "a refused seek leaves the track playing", player_active() == 1);
+    stub_set_seek_ok(1);
+
+    /* Seeking while PAUSED must not start the DAC — and must not corrupt the
+     * resume position, which is what hal_audio_stop's unguarded recompute did
+     * when it ran against an already-stopped engine. */
+    stub_reset();
+    player_play_queue(ents, 4, 0, 0, 0);
+    set_usec(0);
+    player_pause();
+    xpect(&c, "a paused seek succeeds", player_seek_to(2u) == 0);
+    xpect(&c, "a paused seek leaves the DAC stopped", stub_audio_running == 0);
+    xpect(&c, "a paused seek stays paused", player_paused() == 1);
+    xpect(&c, "a paused seek still flushes the stale PCM",
+          stub_audio_primed == 0);
+    xpect(&c, "a paused seek repositions the frozen clock",
+          player_elapsed_s() == 2u);
+    stub_set_track_frames(8192u);          /* back to the short default */
+
+    /* ---- 13c. seek inside the end-of-track window ---------------------- *
+     *
+     * Once a track reaches decoder EOS the pump prefetches the next one, which
+     * re-points the byte-source chain and leaves g_dec owned by a different
+     * file. Seek used to refuse outright for that whole window — the last ~6 s
+     * of EVERY track, during which the listener is still hearing it — so
+     * dragging the scrubber back did nothing and the position snapped forward.
+     * It must now reopen the current track and land the seek. */
+    stub_reset();
+    make_entries(ents, 4, 0);
+    player_play_queue(ents, 4, 0, 0, 0);
+    set_usec(0);
+    {
+        /* Pump until the prefetch has happened but the hand-over has not:
+         * stub_opens goes up while the presented track is still index 0. */
+        int guard = 0;
+        while (stub_opens < 2 && player_queue_current() == 0 && guard++ < 200) {
+            player_pump();
+        }
+        xpect(&c, "the next track really was prefetched behind the current one",
+              stub_opens >= 2 && player_queue_current() == 0);
+
+        int opens_at_prefetch = stub_opens;
+        xpect(&c, "a seek inside the prefetch window succeeds instead of "
+                  "being refused", player_seek_to(1u) == 0);
+        xpect(&c, "it reopens the CURRENT track rather than seeking the "
+                  "prefetched one", stub_opens == opens_at_prefetch + 1);
+        xpect(&c, "the presented track is still the one being listened to",
+              player_queue_current() == 0);
+        xpect(&c, "it flushes the stale PCM too", stub_audio_primed == 0);
+    }
+
+    /* ---- 13d. the tail of a track reaches the DAC ---------------------- *
+     *
+     * The player advances on ring-empty, but at that instant the HAL still
+     * holds up to two un-clocked buffers. hal_audio_drain() was written for
+     * exactly this, documented as required before stop at end-of-track, and
+     * called from nowhere — so the last fraction of a second of every album
+     * was discarded. It must be drained on the AUTOMATIC end, and deliberately
+     * NOT on a button press. */
+    stub_reset();
+    make_entries(ents, 2, 0);
+    player_play_queue(ents, 2, 0, 0, 0);
+    set_usec(0);
+    for (int i = 0; i < 400 && player_active(); i++) {
+        player_pump();
+        stub_drain(4096);
+    }
+    xpect(&c, "the queue ran out on its own", player_active() == 0);
+    xpect(&c, "the automatic end drains the in-flight buffers BEFORE cutting "
+              "the DAC", stub_audio_drained_while_running >= 1);
+
+    stub_reset();
+    make_entries(ents, 2, 0);
+    player_play_queue(ents, 2, 0, 0, 0);
+    set_usec(0);
+    player_next();                    /* -> track 1 */
+    player_next();                    /* past the last track, Repeat off */
+    xpect(&c, "Next past the last track ends playback", player_active() == 0);
+    xpect(&c, "a button press does NOT wait for the buffers to drain",
+          stub_audio_drains == 0);
+
     /* ---- 14. calls with nothing loaded are safe ------------------------ */
     stub_reset();
     player_queue_begin();          /* stops playback, empties the queue */

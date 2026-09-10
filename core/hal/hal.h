@@ -240,6 +240,25 @@ void hal_audio_start(void);
 void hal_audio_stop(void);
 
 /*
+ * hal_audio_flush discards PCM the HAL has buffered but not yet played, so the
+ * next hal_audio_start begins from the source rather than resuming.
+ *
+ * This is the counterpart hal_audio_stop's resume behaviour needs. Stop keeps
+ * the internal buffer deliberately — that is what makes unpause seamless — but
+ * a caller that has just replaced the CONTENT of the source (a seek, most
+ * obviously) must be able to say so, or the listener hears the old position
+ * play out first. Without it, every scrub replayed up to a full internal
+ * buffer of audio from where the track used to be and then cut abruptly to the
+ * new position.
+ *
+ * Call it between stop and start. Calling it while running is a no-op request
+ * the backend may ignore; calling it when nothing is buffered is harmless.
+ * It does not touch the codec, the rate, or the volume — after a flush the
+ * stream is the same stream, just without a past.
+ */
+void hal_audio_flush(void);
+
+/*
  * hal_audio_close releases the output device. After this hal_audio_init
  * must be called again before further audio is possible.
  */

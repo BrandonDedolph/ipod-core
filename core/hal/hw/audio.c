@@ -394,6 +394,8 @@ void hal_audio_stop(void)
      * mid-waveform — the click on every stop and every skip. wm8758_mute()
      * has existed since bring-up and was called from nowhere.
      */
+    int was_running = g_running;
+
     wm8758_mute(true);
     g_running = 0;
     mmio_write32(CPU_INT_DIS_ADDR, DMA_MASK);   /* mask IRQ 26 */
@@ -404,8 +406,14 @@ void hal_audio_stop(void)
      * I2C transfer, milliseconds of audio at 44.1 kHz), and before any more
      * time can pass. Rounded DOWN to a whole frame so L/R phase cannot
      * invert.
+     *
+     * ONLY when we were actually running. Stopping an already-stopped engine
+     * used to recompute this from now - g_kick_us, which counts the entire
+     * time we sat stopped: g_stop_done saturated at g_kick_bytes and the next
+     * resume skipped the whole buffer the listener was paused inside. Any
+     * stop-while-paused hit it — seeking while paused, most visibly.
      */
-    {
+    if (was_running) {
         uint32_t elapsed = mmio_read32(USEC_TIMER_ADDR) - g_kick_us;
         uint32_t frames  = (uint32_t)(((uint64_t)elapsed * g_rate) / 1000000u);
         uint32_t done    = frames * 4u;
@@ -416,7 +424,31 @@ void hal_audio_stop(void)
     }
     clock_set_audio_dma_active(0);              /* clocks may move again */
     /* g_primed deliberately survives: the buffers still hold unplayed PCM and
-     * hal_audio_start() resumes into them (see there). */
+     * hal_audio_start() resumes into them (see there). A caller that has
+     * replaced what the source will produce — a seek — says so with
+     * hal_audio_flush(). */
+}
+
+void hal_audio_flush(void)
+{
+    /*
+     * Drop the ping-pong contents so the next hal_audio_start() COLD-primes
+     * from the source instead of resuming into them.
+     *
+     * hal_audio_stop() keeps g_primed on purpose — that is what makes unpause
+     * seamless — but the two buffers hold up to 2 x 186 ms of already-decoded
+     * PCM, and after a seek that PCM belongs to the position the listener just
+     * left. player_seek_to stopped, re-primed the ring at the new offset and
+     * started again, so the resume path kicked the remainder of the old active
+     * buffer, the ISR kicked the other old buffer, and only the third came
+     * from the new position: up to ~370 ms of the old spot, then a hard cut.
+     *
+     * Only the flag is cleared. The PCM itself is overwritten by fill_buffer
+     * during the cold prime, and zeroing 64 KB here would just be slower.
+     * g_stop_done goes too so a stale resume offset cannot outlive it.
+     */
+    g_primed    = 0;
+    g_stop_done = 0;
 }
 
 void hal_audio_close(void)

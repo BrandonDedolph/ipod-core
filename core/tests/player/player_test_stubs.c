@@ -60,8 +60,16 @@ int  stub_closes;
 int  stub_audio_starts;
 int  stub_audio_stops;
 int  stub_audio_running;
+int  stub_audio_primed;   /* HAL still holds unplayed PCM (survives a stop)  */
+int  stub_audio_flushes;
+int  stub_audio_drains;
+int  stub_audio_drained_while_running;  /* drains issued BEFORE the stop      */
 int  stub_ata_standbys;
 int  stub_meta_reads;
+int  stub_seeks;
+static int g_seek_ok = 1;   /* stub_set_seek_ok(): force the decoder to refuse */
+
+void stub_set_seek_ok(int ok) { g_seek_ok = ok ? 1 : 0; }
 
 /* Frames the fake decoder produces before reporting end-of-stream. Small, so a
  * track ends after a bounded number of player_pump() calls. */
@@ -74,7 +82,11 @@ void stub_reset(void)
     g_last_open_clus = 0;
     stub_opens = stub_open_attempts = stub_closes = 0;
     stub_audio_starts = stub_audio_stops = stub_audio_running = 0;
+    stub_audio_primed = stub_audio_flushes = stub_audio_drains = 0;
+    stub_audio_drained_while_running = 0;
     stub_ata_standbys = stub_meta_reads = 0;
+    stub_seeks = 0;
+    g_seek_ok  = 1;
     g_frames_left = 0;
 }
 
@@ -228,11 +240,26 @@ static int fake_decode(decoder_t *d, int16_t *out, int max_frames)
     return (int)n;
 }
 
+/*
+ * A working seek, so the seek path is reachable at all.
+ *
+ * It used to return ERR_UNSUPPORTED unconditionally, which meant every
+ * player_seek_to() bailed at its first guard and none of the seek logic — the
+ * ring re-prime, the HAL flush, the end-of-track reopen — was ever executed by
+ * a test. Landing the decoder at `frame` also makes the post-seek decode
+ * produce the right NUMBER of frames, so a test can tell a real seek from a
+ * no-op.
+ */
 static int fake_seek(decoder_t *d, uint64_t frame)
 {
     (void)d;
-    (void)frame;
-    return DECODER_ERR_UNSUPPORTED;
+    stub_seeks++;
+    if (!g_seek_ok) {
+        return DECODER_ERR_UNSUPPORTED;
+    }
+    g_frames_left = (frame < g_track_frames)
+                  ? (uint32_t)(g_track_frames - frame) : 0u;
+    return DECODER_OK;
 }
 
 static void fake_close(decoder_t *d)
@@ -367,6 +394,27 @@ void hal_audio_stop(void)
 {
     stub_audio_stops++;
     stub_audio_running = 0;
+    /* Modelled, because the bug this suite missed lived here: the real backend
+     * KEEPS its buffered PCM across a stop so unpause is seamless, and a
+     * caller that has changed what the source will produce has to say so. A
+     * stub that forgets that cannot see a missing flush. */
+    stub_audio_primed = 1;
+}
+
+void hal_audio_flush(void)
+{
+    stub_audio_flushes++;
+    stub_audio_primed = 0;
+}
+
+int hal_audio_drain(uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    stub_audio_drains++;
+    /* Ordering is what matters to the tests: a drain is only meaningful while
+     * the engine is still running, i.e. before the stop it precedes. */
+    stub_audio_drained_while_running += stub_audio_running ? 1 : 0;
+    return 0;
 }
 
 void hal_audio_close(void)
