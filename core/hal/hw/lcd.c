@@ -482,6 +482,59 @@ static void bcm_stream_pixels(const uint16_t *src, uint32_t pixels)
     }
 }
 
+/*
+ * Stream `pixels` with the interrupt-masked window bounded to one chunk.
+ *
+ * WHY THIS EXISTS. The whole pixel stream used to run inside a single
+ * arch_irq_save/restore pair: 38,400 32-bit stores for a full frame, all with
+ * the I-bit set. Meanwhile the audio DMA is a single-shot channel re-kicked
+ * from its own completion ISR, with no chained descriptor — so when a transfer
+ * completes, the only audio still in flight is the 16-frame I2S TX FIFO, about
+ * 363 us at 44.1 kHz. A masked region longer than that means the re-kick lands
+ * after the FIFO has drained, and the DAC clocks out whatever it last held.
+ * That is an audible tick, it happens while the screen is repainting, and it
+ * HAS been heard on the device.
+ *
+ * The original masking was added with the reasoning that "an ISR stalling the
+ * BCM pixel push can abort the frame", weighed against a 46 ms audio slack.
+ * That slack figure was wrong by two orders of magnitude — it described the
+ * buffer duration, not the re-kick deadline, which audio.c now documents
+ * properly. The frame-abort half was never observed; it is stated as a
+ * premise, and no test or symptom is cited for it.
+ *
+ * So this does not remove the protection, it BOUNDS it. Pixels go out in
+ * chunks, each chunk masked, with the I-bit released between them. The gap is
+ * long enough for a pending DMA completion to be serviced and short enough
+ * that the BCM sees, at worst, an ISR-length pause rather than a millisecond
+ * one. Nothing re-points the write port between chunks: the BCM's write
+ * address auto-increments and the audio ISR does not touch the BCM, so the run
+ * continues exactly where it left off.
+ *
+ * Tuning: BCM_STREAM_CHUNK_PIXELS is one panel row. Raising it to a full frame
+ * restores the previous behaviour exactly, which is the fallback if the panel
+ * ever does tear.
+ */
+#define BCM_STREAM_CHUNK_PIXELS  ((uint32_t)LCD_WIDTH)
+#define BCM_STREAM_CHUNK_WORDS   (BCM_STREAM_CHUNK_PIXELS / 2u)
+
+static void bcm_stream_pixels_chunked(const uint16_t *src, uint32_t pixels)
+{
+    uint32_t done = 0;
+    while (done < pixels) {
+        uint32_t n = pixels - done;
+        if (n > BCM_STREAM_CHUNK_PIXELS) {
+            n = BCM_STREAM_CHUNK_PIXELS;
+        }
+        /* n stays even: the chunk size is the panel width and the total is
+         * even, so the final partial chunk is even too — bcm_stream_pixels
+         * requires whole 32-bit pairs. */
+        LCD_IRQ_ENTER();
+        bcm_stream_pixels(src + done, n);
+        LCD_IRQ_EXIT();
+        done += n;
+    }
+}
+
 void lcd_fill(uint16_t rgb565)
 {
     /* Solid color: both packed halves are the same pixel, so the
@@ -500,19 +553,34 @@ void lcd_fill(uint16_t rgb565)
      * back-to-back presents starve the audio DMA ISR (glitches) and, worst case,
      * stall the tick + audio long enough to hard-freeze mid-present. The audio
      * ISR touches no BCM state, so it is safe to fire during the spin/commit. */
-    LCD_IRQ_ENTER();
-    bcm_frame_begin();
+    /* Braced: LCD_IRQ_ENTER declares its saved-CPSR local in the enclosing
+     * scope, so the per-chunk pairs below would shadow one left open here. */
+    {
+        LCD_IRQ_ENTER();
+        bcm_frame_begin();
+        LCD_IRQ_EXIT();
+    }
 
     /* (3) Stream the full 320x240 frame as 32-bit stores, two RGB565
      * pixels per store, no per-store handshake — the BCM's undecoded
      * low address bits consume each word as two consecutive 16-bit
      * pushes (02-lcd.md, "Memory-mapped BCM interface"; verified
-     * against Rockbox lcd-video.c / ipodloader2 fb.c, 2026-06-11). */
-    while (n-- != 0) {
-        mmio_write32(BCM_DATA_ADDR, pair);
+     * against Rockbox lcd-video.c / ipodloader2 fb.c, 2026-06-11).
+     *
+     * Chunked for the same reason lcd_present_rect is: a whole frame in one
+     * masked region is ~38,400 stores, far past the ~363 us the I2S FIFO can
+     * cover for a late DMA re-kick. See bcm_stream_pixels_chunked. */
+    while (n != 0) {
+        uint32_t chunk = (n > BCM_STREAM_CHUNK_WORDS) ? BCM_STREAM_CHUNK_WORDS
+                                                      : n;
+        n -= chunk;
+        LCD_IRQ_ENTER();
+        while (chunk-- != 0) {
+            mmio_write32(BCM_DATA_ADDR, pair);
+        }
+        LCD_IRQ_EXIT();
     }
 
-    LCD_IRQ_EXIT();                       /* unmask before the idle-wait spin */
     bcm_frame_commit();
 }
 
@@ -583,10 +651,9 @@ void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h)
         return;
     }
 
-    /* Mask ONLY the pixel stream (see lcd_fill's note); the wait-for-idle in
-     * bcm_frame_commit runs unmasked so the audio DMA ISR can preempt it. */
-    LCD_IRQ_ENTER();
-
+    /* The pixel stream masks interrupts in bounded CHUNKS (see
+     * bcm_stream_pixels_chunked); the wait-for-idle in bcm_frame_commit runs
+     * unmasked so the audio DMA ISR can preempt it. */
     if (w == LCD_WIDTH) {
         /* Full-width band: the rect's rows are contiguous in BCM memory
          * (no inter-row gap), so a single write-addr + one contiguous
@@ -594,8 +661,8 @@ void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h)
          * frame (x=0,y=0,w=W,h=H) the offset is 0 and the pixel count is
          * W*H, so this reproduces the proven path byte-for-byte. */
         bcm_write_addr(BCMA_CMDPARAM + (uint32_t)y * BCM_ROW_STRIDE_BYTES);
-        bcm_stream_pixels(fb + (uint32_t)y * LCD_WIDTH,
-                          (uint32_t)w * (uint32_t)h);
+        bcm_stream_pixels_chunked(fb + (uint32_t)y * LCD_WIDTH,
+                                  (uint32_t)w * (uint32_t)h);
     } else {
         /* Narrower rect: each destination row is separated by a
          * full-width gap in BCM memory, so re-point the write port at the
@@ -606,12 +673,16 @@ void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h)
             uint32_t row = (uint32_t)(y + r);
             bcm_write_addr(BCMA_CMDPARAM + row * BCM_ROW_STRIDE_BYTES +
                            (uint32_t)x * 2u);
+            /* One row per masked window already — a narrow rect is at most
+             * LCD_WIDTH pixels wide, so this is the chunk size by
+             * construction. Mask per row rather than around the whole loop. */
+            LCD_IRQ_ENTER();
             bcm_stream_pixels(fb + row * (uint32_t)LCD_WIDTH + (uint32_t)x,
                               (uint32_t)w);
+            LCD_IRQ_EXIT();
         }
     }
 
-    LCD_IRQ_EXIT();                       /* unmask before the idle-wait spin */
     bcm_frame_commit();
 }
 

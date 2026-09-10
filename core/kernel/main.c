@@ -20,6 +20,7 @@
 #include "hw/battery.h"
 #include "hw/i2c.h"
 #include "hw/power.h"
+#include "hw/audio.h"
 #include "hw/piezo.h"
 #include "hal.h"
 #include "../fs/fat32.h"
@@ -795,6 +796,11 @@ static int      g_bat_mv_raw = -1;           /* mV before the plausibility clamp
 /* Defined further down with the other formatters; needed by the battery log. */
 static int u32_to_dec(char *dst, unsigned v);
 
+/* Measured cost of the last full-frame present; defined with the present
+ * throttle further down. Reported on the stats line below so the number the
+ * repaint throttle has always been guessing at becomes observable. */
+static uint32_t g_present_cost_us;
+
 /* Decimal to UART. Signed, because every battery field reads -1 on a bus
  * failure and printing that as 4294967295 would defeat the purpose. */
 static void uart_dec(int v)
@@ -868,6 +874,24 @@ static int battery_refresh(int force)
      * fixed for the duration of a measurement run instead. */
     uart_puts(" parked ");          uart_dec(ata_is_parked());
     uart_puts(" up ");              uart_dec((int)(now / 1000000u));
+    uart_putc('\n');
+
+    /*
+     * Audio health, on the same 5 s cadence.
+     *
+     * `late` is the counter that did not exist until the LCD IRQ-masking work:
+     * completions serviced past the ~363 us the I2S FIFO can cover. It is the
+     * ONLY machine-readable signal for the tick-while-the-screen-is-busy
+     * failure — audio_underruns() cannot see it, because a late ISR produces
+     * no short read, and until now the only detector was a person listening.
+     * `present` is the measured cost of the last full present, which every
+     * throughput argument about the UI has been reasoning against blind: it
+     * starts life as a GUESS of 30000 us and has never been printed.
+     */
+    uart_puts("core: audio late ");  uart_dec((int)audio_late_kicks());
+    uart_puts(" worst_us ");         uart_dec((int)audio_late_worst_us());
+    uart_puts(" underruns ");        uart_dec((int)audio_underruns());
+    uart_puts(" present_us ");       uart_dec((int)g_present_cost_us);
     uart_putc('\n');
     return 1;
 }
@@ -3090,6 +3114,8 @@ static void detail_load_meta(fat32_t *fs)
 
 /* Measured cost of the last present, used to pace the next one. Seeded to a
  * full-frame-ish value so the first push is paced conservatively. */
+/* Declared up with the stats line; seeded to a deliberate over-estimate so
+ * the first present is throttled conservatively before it is measured. */
 static uint32_t g_present_cost_us = 30000u;
 
 /* Present whatever has been drawn since the last console_damage_reset(), then

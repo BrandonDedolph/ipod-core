@@ -47,4 +47,18 @@ uint32_t audio_underruns(void);
  */
 int hal_audio_drain(uint32_t timeout_ms);
 
+/*
+ * Completions serviced too late to be covered by the I2S FIFO, and the worst
+ * overshoot seen, since hal_audio_init().
+ *
+ * This is the OTHER way audio breaks, and until it was counted the firmware
+ * was blind to it. audio_underruns() sees decode starvation (the ring came up
+ * short). These see the ring being full and the CPU arriving late anyway —
+ * which is what a long interrupt-masked region does, and what a listener
+ * hears as a tick while the screen is busy. Nonzero here means something is
+ * holding IRQs past ~363 us; the pixel stream in lcd.c is the usual suspect.
+ */
+uint32_t audio_late_kicks(void);
+uint32_t audio_late_worst_us(void);
+
 #endif /* CORE_HAL_HW_AUDIO_H */

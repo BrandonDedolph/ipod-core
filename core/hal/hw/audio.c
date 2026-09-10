@@ -107,6 +107,40 @@ static uint32_t          g_rate     = 44100u;
 static volatile int      g_primed;
 static volatile uint32_t g_kick_us;
 static volatile uint32_t g_kick_bytes;   /* byte count of the outstanding kick */
+
+/*
+ * LATE RE-KICKS — the one audio failure this driver could not see.
+ *
+ * audio_underruns() counts SHORT READS: the ring had less PCM than a buffer
+ * needed. That is decode starvation, and it is not the only way the sound
+ * breaks. The other way is that the ring is perfectly full and the CPU simply
+ * does not reach audio_dma_isr in time: the channel is SINGLE|WAIT_REQ with no
+ * chained descriptor, so once a transfer completes the only audio still in
+ * flight is the 16-frame I2S FIFO (~363 us at 44.1 kHz). Miss that window and
+ * the DAC clocks out whatever the FIFO last held.
+ *
+ * From the outside those two look identical — a tick or a hiccup — but nothing
+ * in the firmware distinguished them, because a late ISR produces no short
+ * read. Anything that masks interrupts for longer than the FIFO can cause it;
+ * the LCD pixel stream is the obvious suspect, and until now the only detector
+ * was a person listening.
+ *
+ * At ISR entry we know when the transfer was kicked and how many bytes it
+ * carried, so we know when it should have completed. Anything past that is
+ * latency we did not have. Cheap: two timer reads and a compare per buffer,
+ * about five times a second.
+ */
+/*
+ * The I2S TX FIFO is 16 frames (05-audio.md). At 44.1 kHz that is ~363 us of
+ * cover; at 48 kHz ~333. Use the tighter figure as the threshold so the
+ * counter does not under-report on a 48 kHz album, and treat anything beyond
+ * it as a real miss rather than jitter — a few microseconds of ISR entry
+ * latency is normal and uninteresting.
+ */
+#define AUDIO_FIFO_SLACK_US  333u
+
+static volatile uint32_t g_late_kicks;   /* completions serviced past the FIFO */
+static volatile uint32_t g_late_worst_us;/* worst overshoot seen, microseconds */
 /*
  * Bytes of the outstanding kick already clocked out when hal_audio_stop() cut
  * the DMA — sampled THERE, not recomputed on resume.
@@ -249,6 +283,8 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels)
     g_primed      = 0;
     g_completions = 0;
     g_underruns   = 0;
+    g_late_kicks  = 0;
+    g_late_worst_us = 0;
 
     /*
      * Propagate codec bring-up failure. Without this the UI shows a moving
@@ -341,6 +377,29 @@ void audio_dma_isr(void)
     if (!g_running) {
         return;
     }
+
+    /*
+     * How late are we? The kick was stamped at g_kick_us and carried
+     * g_kick_bytes (4 bytes per stereo frame), so it should have drained after
+     * frames/rate seconds. Past that, the FIFO is the only thing still holding
+     * the output up. See g_late_kicks.
+     */
+    {
+        uint32_t now     = mmio_read32(USEC_TIMER_ADDR);
+        uint32_t elapsed = now - g_kick_us;
+        uint32_t frames  = g_kick_bytes >> 2;
+        uint32_t due_us  = (uint32_t)(((uint64_t)frames * 1000000u) / g_rate);
+        if (elapsed > due_us) {
+            uint32_t over = elapsed - due_us;
+            if (over > AUDIO_FIFO_SLACK_US) {
+                g_late_kicks++;
+                if (over > g_late_worst_us) {
+                    g_late_worst_us = over;
+                }
+            }
+        }
+    }
+
     int just = g_active;
     int next = just ^ 1;
 
@@ -458,6 +517,9 @@ void hal_audio_close(void)
     i2s_disable();           /* then gate the I2S + codec-MCLK clocks              */
     g_primed = 0;            /* buffers are no longer related to any live stream   */
 }
+
+uint32_t audio_late_kicks(void)    { return g_late_kicks; }
+uint32_t audio_late_worst_us(void) { return g_late_worst_us; }
 
 uint32_t audio_dma_completions(void)
 {
