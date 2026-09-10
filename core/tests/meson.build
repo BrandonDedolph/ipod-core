@@ -313,8 +313,10 @@ if target == 'sim'
               '../hal/hw/i2c.c',
               '../hal/hw/wm8758.c',
               '../hal/hw/i2s.c',
-              '../hal/hw/dma.c',
-              '../hal/hw/ata.c'],
+              '../hal/hw/dma.c'],
+              # No ata.c: the two ATA cases that were misfiled in this suite
+              # moved to hw_ata. Linking a driver a test does not exercise
+              # invites exactly that kind of drift back.
     include_directories: hw_mmio_inc,
     c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,

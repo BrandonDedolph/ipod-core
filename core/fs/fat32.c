@@ -91,10 +91,19 @@ static int       fat_cache_valid = 0;
  * disk read total.
  *
  * Tagged by (fs, FS-sector) exactly like the FAT cache, so a second mounted
- * volume can never be served a stale sector. The volume is read-only, so no
- * write invalidation is needed — a write path landing later (ata.c's
- * appended write primitive is not wired to anything yet) MUST invalidate
- * both this and fat_cache. */
+ * volume can never be served a stale sector.
+ *
+ * NEITHER CACHE HAS WRITE INVALIDATION, and ata.c's write primitive IS now
+ * wired up — kernel/config.c:625 calls it to persist settings, and config.c's
+ * banner records it as qualified on hardware. This comment used to say the
+ * write path was "not wired to anything yet", which stopped being true and is
+ * exactly the kind of stale reassurance that gets a stale-cache bug written.
+ *
+ * It is not live today, and the reason is narrow: config.c does its own reads
+ * through the raw block callback (config.c:516-521), deliberately bypassing
+ * these caches, and it is the only writer. Any SECOND writer, or any attempt
+ * to route config's reads back through fat32, must invalidate both this cache
+ * and fat_cache first. */
 static uint8_t   dat_cache[4096];
 static fat32_t  *dat_cache_fs    = 0;
 static uint32_t  dat_cache_sec   = 0;
