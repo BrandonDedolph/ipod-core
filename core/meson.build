@@ -229,10 +229,14 @@ if target == 'hw'
   # uncompilable on the host — which is why tests/kernel kept a verbatim copy
   # of name_hash() with a Python script diffing it against main.c. Pure string
   # code, no hardware; player.h for NAME_MAX only. Same names.c the host
-  # name-hash, resume and names tests compile.
+  # name-hash, resume and names tests compile. idx.c is the CORELIB.IDX header
+  # validator and record CRC-32 — the part of the index loader that decides
+  # whether to trust a file off the user's disk — likewise extracted from
+  # main.c, where the host test had to carry verbatim copies of it. Same
+  # idx.c the host idx test compiles.
   library_hw_lib = static_library(
     'core_library_hw',
-    sources: ['library/names.c'],
+    sources: ['library/names.c', 'library/idx.c'],
     c_args: ['-DCORE_FREESTANDING'],
   )
 

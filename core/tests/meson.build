@@ -672,24 +672,23 @@ if target == 'sim'
   )
   test('resume', resume_test, suite: 'unit')
 
-  # index: the CORELIB.IDX header validation and record CRC in kernel/main.c
-  # (idx_header_parse / crc32_update). The loader used to read the magic and
-  # the record size and trust the rest — the version bytes were never looked
-  # at and nothing checked that the file held the records it claimed, so a
-  # half-copied index or a future layout loaded as plausible garbage. Covers
-  # the CRC against its published check value and batch-splitting, every
-  # accepted header shape (v1 without CRC, v2 with), and each refusal: magic,
-  # unknown version, record size, a truncated or padded file, a count that
-  # wraps the size arithmetic. Verbatim copies, like resume_test.c;
-  # hw-index-parity below diffs them against main.c and checks the loader
-  # actually calls them.
-  index_test = executable(
-    'index_test',
-    sources: ['kernel/index_test.c'],
-    include_directories: include_directories('kernel', '.'),
+  # idx: the CORELIB.IDX header validation and record CRC (core/library/idx.c)
+  # — the SAME source the ARM build links into core.elf. The loader used to
+  # read the magic and the record size and trust the rest — the version bytes
+  # were never looked at and nothing checked that the file held the records it
+  # claimed, so a half-copied index or a future layout loaded as plausible
+  # garbage. Covers the CRC against its published check value and
+  # batch-splitting, every accepted header shape (v1 without CRC, v2 with),
+  # and each refusal: magic, unknown version, record size, a truncated or
+  # padded file, a count that wraps the size arithmetic. hw-index-loader below
+  # checks that main.c's loader actually calls these.
+  idx_test = executable(
+    'idx_test',
+    sources: ['library/idx_test.c', '../library/idx.c'],
+    include_directories: include_directories('.'),
     override_options: test_opts,
   )
-  test('index', index_test, suite: 'unit')
+  test('idx', idx_test, suite: 'unit')
 
   # player-queue: the queue / auto-advance / repeat / shuffle logic of
   # core/player/player.c — 753 lines with no test at all, and the part users
@@ -762,13 +761,13 @@ if target == 'sim'
                 'check_resume_parity.py'],
          suite: 'unit')
 
-    # hw-index-parity: the same guard for the index validator — the copies in
-    # tests/kernel/index_test.c must not drift from kernel/main.c — plus a
-    # check that library_load_index() actually calls them, since a validator
-    # the loader does not consult tests nothing.
-    test('hw-index-parity', py,
+    # hw-index-loader: library_load_index() in kernel/main.c must actually
+    # call the validator idx_test covers (idx_header_parse with the directory
+    # entry's size, crc32_update, a refusal on IDX_ECRC) — a validator the
+    # loader does not consult tests nothing.
+    test('hw-index-loader', py,
          args: [meson.current_source_dir() / 'scripts' /
-                'check_index_parity.py'],
+                'check_index_loader.py'],
          suite: 'unit')
 
     # build-index: the host tool that writes CORELIB.IDX, run over a synthetic

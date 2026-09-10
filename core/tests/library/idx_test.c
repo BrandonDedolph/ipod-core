@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
- * tests/kernel/index_test.c — host tests for the CORELIB.IDX header and
- * integrity checks in kernel/main.c: which files may the library loader
+ * tests/library/idx_test.c — host tests for the CORELIB.IDX header and
+ * integrity checks in library/idx.c: which files may the library loader
  * parse records out of?
  *
  * The loader used to check the magic and that rec_size was 256, and then
@@ -15,19 +15,21 @@
  *   - the file must be exactly header + count * 256 bytes;
  *   - a v2 header carries a CRC-32 (zlib's) over the records.
  *
- * WHY A COPY: as with resume_test.c and name_hash_ref.c, the functions are
- * `static` in kernel/main.c, which cannot be linked into a host test, so the
- * bodies below are VERBATIM COPIES, diffed against main.c by
- * tests/scripts/check_index_parity.py (from `meson test` and `make
- * verify-hw`). That script also checks that library_load_index() actually
- * CALLS them — a validator the loader does not consult is decoration. Do not
- * reformat or rename anything between the BEGIN/END markers; if you change
- * main.c, paste the new text in here.
+ * This compiles the REAL library/idx.c — the same source the ARM build links.
+ * (Until idx.c existed the functions were statics in kernel/main.c, which the
+ * host cannot compile, and this file carried verbatim copies kept honest by a
+ * diff script.) What a unit test of the validator cannot show is that the
+ * loader consults it: tests/scripts/check_index_loader.py checks that
+ * library_load_index() in main.c actually calls idx_header_parse() with the
+ * directory entry's size and refuses on IDX_ECRC — a validator the loader
+ * does not consult is decoration.
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+
+#include "../../library/idx.h"
 
 static int g_fails;
 
@@ -38,86 +40,6 @@ static void check(const char *label, int cond)
         g_fails++;
     }
 }
-
-/* ---- the environment the copied functions read -------------------------- */
-
-/* Restated from main.c (they are not part of the copied text). The test
- * asserts on the symbolic names, so the numbering is free to change there;
- * what must not change is which situations are refused. */
-#define IDX_REC_SIZE 256u
-#define IDX_HDR_V1   12u
-#define IDX_HDR_V2   16u
-
-enum {
-    IDX_OK = 0,
-    IDX_EMAGIC,
-    IDX_EVERSION,
-    IDX_ERECSIZE,
-    IDX_ESIZE,
-    IDX_ECRC,
-    IDX_EREAD,
-};
-
-typedef struct {
-    uint32_t hdr_len;
-    uint32_t count;
-    uint32_t crc;
-    int      has_crc;
-} idx_hdr_t;
-
-static uint32_t g_crc_tab[256];
-static int      g_crc_tab_ready;
-
-/* ---- BEGIN VERBATIM COPY OF core/kernel/main.c ------------------------- */
-
-static uint32_t idx_rd32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static int idx_header_parse(const uint8_t *h, uint32_t file_size, idx_hdr_t *out)
-{
-    if (h[0] != 'C' || h[1] != 'I' || h[2] != 'D' || h[3] != 'X') return IDX_EMAGIC;
-    uint32_t ver = (uint32_t)h[4] | ((uint32_t)h[5] << 8);
-    uint32_t rec = (uint32_t)h[6] | ((uint32_t)h[7] << 8);
-    if (ver != 1 && ver != 2) return IDX_EVERSION;
-    if (rec != IDX_REC_SIZE) return IDX_ERECSIZE;
-    out->count   = idx_rd32(h + 8);
-    out->hdr_len = (ver == 2) ? IDX_HDR_V2 : IDX_HDR_V1;
-    out->has_crc = (ver == 2);
-    out->crc     = (ver == 2) ? idx_rd32(h + 12) : 0;
-    /* count * 256 must not wrap: a count of 0x01000000 would otherwise pass
-     * the size check against a 16-byte file and set the loop up to read 16M
-     * records that are not there. */
-    if (out->count > (0xFFFFFFFFu - IDX_HDR_V2) / IDX_REC_SIZE) return IDX_ESIZE;
-    if (file_size != out->hdr_len + out->count * IDX_REC_SIZE) return IDX_ESIZE;
-    return IDX_OK;
-}
-
-static void crc32_tab_init(void)
-{
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int b = 0; b < 8; b++) {
-            uint32_t mask = (uint32_t)0u - (c & 1u);
-            c = (c >> 1) ^ (0xEDB88320u & mask);
-        }
-        g_crc_tab[i] = c;
-    }
-    g_crc_tab_ready = 1;
-}
-
-static uint32_t crc32_update(uint32_t crc, const uint8_t *p, uint32_t n)
-{
-    if (!g_crc_tab_ready) crc32_tab_init();
-    for (uint32_t i = 0; i < n; i++) {
-        crc = g_crc_tab[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-    }
-    return crc;
-}
-
-/* ---- END VERBATIM COPY -------------------------------------------------- */
 
 /* ---- header fixtures ---------------------------------------------------- */
 
@@ -262,7 +184,7 @@ int main(void)
     test_accept();
     test_refuse();
 
-    printf("index_test: %s (%d failure%s)\n",
+    printf("idx_test: %s (%d failure%s)\n",
            g_fails == 0 ? "PASS" : "FAIL", g_fails, g_fails == 1 ? "" : "s");
     return g_fails == 0 ? 0 : 1;
 }

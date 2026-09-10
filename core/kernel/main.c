@@ -41,6 +41,7 @@
 #include "../ui/palette.h"
 #include "../ui/chrome.h"
 #include "../library/names.h"
+#include "../library/idx.h"
 #include "hw/volume.h"
 
 /*
@@ -1958,118 +1959,6 @@ static void library_resolve_art(fat32_t *fs)
         load_bar("Loading Library", 75 + (n ? p * 25 / n : 25));
         (void)album_resolve(fs, i);    /* failure is recorded on the album */
     }
-}
-
-/* ---------------------------------------------------------------------------
- * CORELIB.IDX: header validation and integrity
- *
- * The loader used to check the magic and that rec_size was 256, and nothing
- * else: the version bytes were never read, and there was no check that the
- * bytes after the header were the records the header claimed. A half-copied
- * index (a copy that stopped mid-file, or a tool that pre-sized the file and
- * never filled it) or a future layout with a bumped version parsed field by
- * field as plausible garbage — durations, titles and hashes from wherever
- * the offsets happened to land. Now:
- *
- *   - the version must be one this loader was written for (1 or 2); anything
- *     else is rejected before a record is read, so a v3 that moves fields
- *     falls back to the tag scan instead of loading nonsense;
- *   - the file size must be exactly header + count * 256 — so a truncated
- *     copy is refused up front, whatever its version;
- *   - a v2 header carries a CRC-32 (zlib's, the same one config.c checks its
- *     record with) over the records, verified as they stream past.
- *
- * v1 (the 12-byte header build_index.py wrote before the CRC existed) is
- * still accepted, on the size check alone, so an index already on a device
- * keeps loading; the host writes v2 now. The functions are copied verbatim
- * into tests/kernel/index_test.c (check_index_parity.py holds them in step)
- * because, like everything in this file, they cannot be linked into a host
- * test directly.
- * ------------------------------------------------------------------------- */
-#define IDX_REC_SIZE 256u
-#define IDX_HDR_V1   12u
-#define IDX_HDR_V2   16u
-
-enum {
-    IDX_OK = 0,
-    IDX_EMAGIC,          /* not a CIDX file                                   */
-    IDX_EVERSION,        /* a version this loader does not know               */
-    IDX_ERECSIZE,        /* record size is not 256                            */
-    IDX_ESIZE,           /* file size != header + count * 256 (truncated)     */
-    IDX_ECRC,            /* the records are not the ones the header signed    */
-    IDX_EREAD,           /* the stream came up short                          */
-};
-
-typedef struct {
-    uint32_t hdr_len;    /* 12 or 16                                          */
-    uint32_t count;
-    uint32_t crc;        /* records' CRC-32 from the header (v2)              */
-    int      has_crc;    /* v2: verify `crc`; v1: size check only             */
-} idx_hdr_t;
-
-static uint32_t idx_rd32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-/*
- * Validate a header. `h` holds at least IDX_HDR_V1 bytes, and IDX_HDR_V2 when
- * the version word says v2 (the caller reads the four extra bytes only then,
- * because on a v1 file they would be the first bytes of record 0 and the
- * stream has no way back). `file_size` is the directory entry's size.
- */
-static int idx_header_parse(const uint8_t *h, uint32_t file_size, idx_hdr_t *out)
-{
-    if (h[0] != 'C' || h[1] != 'I' || h[2] != 'D' || h[3] != 'X') return IDX_EMAGIC;
-    uint32_t ver = (uint32_t)h[4] | ((uint32_t)h[5] << 8);
-    uint32_t rec = (uint32_t)h[6] | ((uint32_t)h[7] << 8);
-    if (ver != 1 && ver != 2) return IDX_EVERSION;
-    if (rec != IDX_REC_SIZE) return IDX_ERECSIZE;
-    out->count   = idx_rd32(h + 8);
-    out->hdr_len = (ver == 2) ? IDX_HDR_V2 : IDX_HDR_V1;
-    out->has_crc = (ver == 2);
-    out->crc     = (ver == 2) ? idx_rd32(h + 12) : 0;
-    /* count * 256 must not wrap: a count of 0x01000000 would otherwise pass
-     * the size check against a 16-byte file and set the loop up to read 16M
-     * records that are not there. */
-    if (out->count > (0xFFFFFFFFu - IDX_HDR_V2) / IDX_REC_SIZE) return IDX_ESIZE;
-    if (file_size != out->hdr_len + out->count * IDX_REC_SIZE) return IDX_ESIZE;
-    return IDX_OK;
-}
-
-/*
- * CRC-32 (reflected, polynomial 0xEDB88320, init/final 0xFFFFFFFF): what
- * zlib.crc32 computes, so build_index.py can stamp it. Table-driven, unlike
- * config.c's bitwise crc32_buf: that one runs over a 1 KB record, this one
- * over the whole index — up to 1.5 MB at LIB_MAX_SONGS — and eight shift
- * steps per byte at 80 MHz would be most of a second on the boot path. The
- * table is 1 KB of .bss, filled on first use. Incremental: seed with
- * 0xFFFFFFFF, feed the batches as they stream in, invert at the end.
- */
-static uint32_t g_crc_tab[256];
-static int      g_crc_tab_ready;
-
-static void crc32_tab_init(void)
-{
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int b = 0; b < 8; b++) {
-            uint32_t mask = (uint32_t)0u - (c & 1u);
-            c = (c >> 1) ^ (0xEDB88320u & mask);
-        }
-        g_crc_tab[i] = c;
-    }
-    g_crc_tab_ready = 1;
-}
-
-static uint32_t crc32_update(uint32_t crc, const uint8_t *p, uint32_t n)
-{
-    if (!g_crc_tab_ready) crc32_tab_init();
-    for (uint32_t i = 0; i < n; i++) {
-        crc = g_crc_tab[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-    }
-    return crc;
 }
 
 /* Why the last index load was refused (an IDX_* code), for the About screen
