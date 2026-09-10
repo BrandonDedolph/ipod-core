@@ -26,6 +26,7 @@ Example:
         core/apps/ui/atlas/nunito_regular_13.h
 """
 import argparse
+import math
 import os
 import sys
 
@@ -40,7 +41,8 @@ from PIL import Image, ImageDraw, ImageFont
 # The one definition of daylight between two glyphs, shared with the solver
 # and the judge. Read its docstring before touching any spacing number here.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from daylight import glyph_rows, core_span, band_daylight   # noqa: E402
+from daylight import (glyph_rows, core_span, band_daylight,   # noqa: E402
+                      counter_daylight)
 
 # The generated headers declare `uint16_t data_offset`, so the concatenated
 # glyph bitmap cannot exceed 64 KiB — past that the offsets wrap and every
@@ -331,10 +333,32 @@ def pair_table(glyphs, glyph_data, band, floor_px=None, floor_alpha=None):
     keyed by the characters. Pairs that share no core row at any height are
     absent: they are never adjacent and keep the font's own kern.
 
-    The floor is the tightest row at floor_alpha ink clearing floor_px — the
-    same test as before — and the table starts no lower than the step at
-    which the >=CORE_ALPHA cores stop overlapping, so its first entry is a
-    real daylight and not a collision count.
+    Two floors, because two kinds of contact:
+
+    A POINT contact — r's arm tip against y, f's hook against a stem, a
+    serif — is one row nearly touching while the rest of the pair is open.
+    The eye reads the pair by its shapes and accepts the tuck; e190093
+    treated every one as a collision and split words. So the tightest row
+    at floor_alpha ink need only clear floor_px (1px), as before.
+
+    An EDGE contact — e's bowl against s's spine, o against o at their
+    widest — is two or more consecutive rows at the minimum. That IS the
+    pair's distance to the eye however open the band is above and below,
+    and the coverage mean, honest about the open rows, let such pairs sit
+    at one pixel core to core at 12px. Regular 12 is the unhighlighted
+    menu row, dark ink on the light surface, and the owner read it as
+    crowded; the count of pairs at <=1px core clearance had gone 27 -> 92.
+    So an edge contact keeps at least half the n counter between the cores,
+    rounded up to the pen (edge_floor). Half of 1.97 at regular 9 is one
+    pixel — already guaranteed by the point floor, so 9px, bold 12 and
+    bold 13 are untouched by this rule; 11, 12 and 18 have counters past
+    2px and get two. The 9px counter sits 0.03px under that boundary:
+    if the face, size or rasteriser ever moves it, re-check the artist
+    sub-line before believing the numbers.
+
+    The table starts no lower than the step at which the cores stop
+    overlapping, so its first entry is a real daylight and not a
+    collision count.
     """
     floor_px = OPTICAL_FLOOR_PX if floor_px is None else floor_px
     floor_alpha = OPTICAL_FLOOR_ALPHA if floor_alpha is None else floor_alpha
@@ -351,6 +375,8 @@ def pair_table(glyphs, glyph_data, band, floor_px=None, floor_alpha=None):
                     ((y, core_span(r)) for y, r in rows[ch].items())
                     if c is not None}
         meta[ch] = ox
+    counter = counter_daylight(rows["n"], band) if band else None
+    edge_floor = max(1, math.ceil(counter / 2.0)) if counter else 1
     table = {}
     for a in rows:
         ra, oxa = rows[a], meta[a]
@@ -359,16 +385,22 @@ def pair_table(glyphs, glyph_data, band, floor_px=None, floor_alpha=None):
             cshared = set(core[a]) & set(core[b])
             if not cshared:
                 continue                      # no core row in common
+            # core clearance per shared row at step 0: at step s it is +s
+            cc = {y: core[b][y][0] - core[a][y][1] - 1 + oxb - oxa
+                  for y in cshared}
             # cores just apart: the table's first entry is a real daylight
-            mc = (min(core[b][y][0] - core[a][y][1] for y in cshared)
-                  + oxb - oxa)
-            s0 = 1 - mc
+            s0 = -min(cc.values())
             fshared = set(extf[a]) & set(extf[b])
             if fshared:
                 # closest approach at step s is s + mf - 1; keep it >= floor
                 mf = (min(extf[b][y][0] - extf[a][y][1] for y in fshared)
                       + oxb - oxa)
                 s0 = max(s0, floor_px + 1 - mf)
+            # edge contact: no two consecutive rows both under edge_floor.
+            # Rows (y, y+1) both violate at step s iff max(cc) + s < floor.
+            for y in cshared:
+                if y + 1 in cshared:
+                    s0 = max(s0, edge_floor - max(cc[y], cc[y + 1]))
             dl = []
             for s in range(s0, s0 + PAIR_TABLE_STEPS):
                 d = band_daylight(ra, oxa, rb, s + oxb, band)
