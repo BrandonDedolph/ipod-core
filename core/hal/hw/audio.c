@@ -107,6 +107,40 @@ static uint32_t          g_rate     = 44100u;
 static volatile int      g_primed;
 static volatile uint32_t g_kick_us;
 static volatile uint32_t g_kick_bytes;   /* byte count of the outstanding kick */
+
+/*
+ * LATE RE-KICKS — the one audio failure this driver could not see.
+ *
+ * audio_underruns() counts SHORT READS: the ring had less PCM than a buffer
+ * needed. That is decode starvation, and it is not the only way the sound
+ * breaks. The other way is that the ring is perfectly full and the CPU simply
+ * does not reach audio_dma_isr in time: the channel is SINGLE|WAIT_REQ with no
+ * chained descriptor, so once a transfer completes the only audio still in
+ * flight is the 16-frame I2S FIFO (~363 us at 44.1 kHz). Miss that window and
+ * the DAC clocks out whatever the FIFO last held.
+ *
+ * From the outside those two look identical — a tick or a hiccup — but nothing
+ * in the firmware distinguished them, because a late ISR produces no short
+ * read. Anything that masks interrupts for longer than the FIFO can cause it;
+ * the LCD pixel stream is the obvious suspect, and until now the only detector
+ * was a person listening.
+ *
+ * At ISR entry we know when the transfer was kicked and how many bytes it
+ * carried, so we know when it should have completed. Anything past that is
+ * latency we did not have. Cheap: two timer reads and a compare per buffer,
+ * about five times a second.
+ */
+/*
+ * The I2S TX FIFO is 16 frames (05-audio.md). At 44.1 kHz that is ~363 us of
+ * cover; at 48 kHz ~333. Use the tighter figure as the threshold so the
+ * counter does not under-report on a 48 kHz album, and treat anything beyond
+ * it as a real miss rather than jitter — a few microseconds of ISR entry
+ * latency is normal and uninteresting.
+ */
+#define AUDIO_FIFO_SLACK_US  333u
+
+static volatile uint32_t g_late_kicks;   /* completions serviced past the FIFO */
+static volatile uint32_t g_late_worst_us;/* worst overshoot seen, microseconds */
 /*
  * Bytes of the outstanding kick already clocked out when hal_audio_stop() cut
  * the DMA — sampled THERE, not recomputed on resume.
@@ -119,6 +153,18 @@ static volatile uint32_t g_kick_bytes;   /* byte count of the outstanding kick *
  * one. Audible as a stutter/skip on every unpause (device, 2026-07-27).
  */
 static volatile uint32_t g_stop_done;
+
+/*
+ * The codec is powered down and the I2S/MCLK clocks are gated — set by
+ * hal_audio_suspend() and hal_audio_close(), cleared by hal_audio_wake() and
+ * hal_audio_init(). It exists so the power-down sequence runs exactly once:
+ * the UI closes the HAL on the active->inactive edge, and a stop that follows
+ * a suspended pause would otherwise run wm8758_powerdown() against a codec
+ * whose rails are already off and gate clocks that are already gated —
+ * harmless register-wise, but a second I2C sequence for nothing, and a
+ * hal_audio_wake() has to know whether there is anything to wake.
+ */
+static volatile int      g_cold;
 
 /*
  * DMA-visible physical address of a buffer. SDRAM is dual-mapped: our .bss
@@ -247,8 +293,11 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels)
     g_active      = 0;
     g_running     = 0;
     g_primed      = 0;
+    g_cold        = 0;       /* wm8758_init + i2s_init just brought it all up */
     g_completions = 0;
     g_underruns   = 0;
+    g_late_kicks  = 0;
+    g_late_worst_us = 0;
 
     /*
      * Propagate codec bring-up failure. Without this the UI shows a moving
@@ -341,6 +390,29 @@ void audio_dma_isr(void)
     if (!g_running) {
         return;
     }
+
+    /*
+     * How late are we? The kick was stamped at g_kick_us and carried
+     * g_kick_bytes (4 bytes per stereo frame), so it should have drained after
+     * frames/rate seconds. Past that, the FIFO is the only thing still holding
+     * the output up. See g_late_kicks.
+     */
+    {
+        uint32_t now     = mmio_read32(USEC_TIMER_ADDR);
+        uint32_t elapsed = now - g_kick_us;
+        uint32_t frames  = g_kick_bytes >> 2;
+        uint32_t due_us  = (uint32_t)(((uint64_t)frames * 1000000u) / g_rate);
+        if (elapsed > due_us) {
+            uint32_t over = elapsed - due_us;
+            if (over > AUDIO_FIFO_SLACK_US) {
+                g_late_kicks++;
+                if (over > g_late_worst_us) {
+                    g_late_worst_us = over;
+                }
+            }
+        }
+    }
+
     int just = g_active;
     int next = just ^ 1;
 
@@ -394,6 +466,8 @@ void hal_audio_stop(void)
      * mid-waveform — the click on every stop and every skip. wm8758_mute()
      * has existed since bring-up and was called from nowhere.
      */
+    int was_running = g_running;
+
     wm8758_mute(true);
     g_running = 0;
     mmio_write32(CPU_INT_DIS_ADDR, DMA_MASK);   /* mask IRQ 26 */
@@ -404,8 +478,14 @@ void hal_audio_stop(void)
      * I2C transfer, milliseconds of audio at 44.1 kHz), and before any more
      * time can pass. Rounded DOWN to a whole frame so L/R phase cannot
      * invert.
+     *
+     * ONLY when we were actually running. Stopping an already-stopped engine
+     * used to recompute this from now - g_kick_us, which counts the entire
+     * time we sat stopped: g_stop_done saturated at g_kick_bytes and the next
+     * resume skipped the whole buffer the listener was paused inside. Any
+     * stop-while-paused hit it — seeking while paused, most visibly.
      */
-    {
+    if (was_running) {
         uint32_t elapsed = mmio_read32(USEC_TIMER_ADDR) - g_kick_us;
         uint32_t frames  = (uint32_t)(((uint64_t)elapsed * g_rate) / 1000000u);
         uint32_t done    = frames * 4u;
@@ -416,16 +496,108 @@ void hal_audio_stop(void)
     }
     clock_set_audio_dma_active(0);              /* clocks may move again */
     /* g_primed deliberately survives: the buffers still hold unplayed PCM and
-     * hal_audio_start() resumes into them (see there). */
+     * hal_audio_start() resumes into them (see there). A caller that has
+     * replaced what the source will produce — a seek — says so with
+     * hal_audio_flush(). */
+}
+
+void hal_audio_flush(void)
+{
+    /*
+     * Drop the ping-pong contents so the next hal_audio_start() COLD-primes
+     * from the source instead of resuming into them.
+     *
+     * hal_audio_stop() keeps g_primed on purpose — that is what makes unpause
+     * seamless — but the two buffers hold up to 2 x 186 ms of already-decoded
+     * PCM, and after a seek that PCM belongs to the position the listener just
+     * left. player_seek_to stopped, re-primed the ring at the new offset and
+     * started again, so the resume path kicked the remainder of the old active
+     * buffer, the ISR kicked the other old buffer, and only the third came
+     * from the new position: up to ~370 ms of the old spot, then a hard cut.
+     *
+     * Only the flag is cleared. The PCM itself is overwritten by fill_buffer
+     * during the cold prime, and zeroing 64 KB here would just be slower.
+     * g_stop_done goes too so a stale resume offset cannot outlive it.
+     */
+    g_primed    = 0;
+    g_stop_done = 0;
+}
+
+/*
+ * Codec off, clocks gated, everything else untouched. Shared by suspend and
+ * close; see g_cold for why it runs at most once between bring-ups.
+ */
+static void codec_power_off(void)
+{
+    if (g_cold) {
+        return;
+    }
+    wm8758_powerdown();      /* codec cold (mute+VMID discharge) — MCLK still live */
+    i2s_disable();           /* then gate the I2S + codec-MCLK clocks              */
+    g_cold = 1;
+}
+
+void hal_audio_suspend(void)
+{
+    /*
+     * Only over a stop. Powering the codec down under a running DMA would
+     * leave the engine streaming into a FIFO nothing clocks out — the
+     * completion IRQ would simply stop arriving and the player would sit in
+     * hal_audio_drain's timeout. Refusing is right: the caller pauses first,
+     * and a suspend that lands while playing is a caller bug, not a request.
+     *
+     * Deliberately NOT touching g_primed, g_stop_done, g_active, g_kick_bytes
+     * or the source: they are what hal_audio_start() resumes into, and keeping
+     * them is the entire difference between this and hal_audio_close(). See
+     * audio.h.
+     */
+    if (g_running) {
+        return;
+    }
+    codec_power_off();
+}
+
+int hal_audio_wake(void)
+{
+    if (!g_cold) {
+        return 0;
+    }
+    /*
+     * The same bring-up hal_audio_init performs, minus the state reset. The
+     * rate preset is still latched inside wm8758.c from the last set_rate, so
+     * wm8758_init programs the PLL for the stream we paused; i2s_init
+     * re-pulses the block out of reset and re-ungates DEV_I2S + DEV_EXTCLOCKS;
+     * dma_playback_init re-arms the channel's static config (the engine itself
+     * kept nothing across the stop — every kick reprograms address and count).
+     *
+     * The I2S TX FIFO is cleared by i2s_init. That loses nothing: the FIFO's
+     * ~16 frames were already written off when hal_audio_stop() sampled the
+     * resume offset (it rounds to the frame the DMA had handed over, and the
+     * FIFO tail is the ~0.4 ms of slack that offset is documented to carry).
+     *
+     * The restore hook is re-registered rather than assumed, for the same
+     * reason hal_audio_init registers it every time: wm8758_init's first act
+     * is a WM_RESET, and the user's volume/balance/tone must come back with
+     * the codec, not a track change later.
+     */
+    i2c_init();
+    i2s_init();
+    wm8758_set_restore(hal_codec_restore);
+    int codec_bad = wm8758_init();
+    dma_playback_init();
+    g_cold = 0;
+    return codec_bad != 0 ? -2 : 0;
 }
 
 void hal_audio_close(void)
 {
     hal_audio_stop();
-    wm8758_powerdown();      /* codec cold (mute+VMID discharge) — MCLK still live */
-    i2s_disable();           /* then gate the I2S + codec-MCLK clocks              */
+    codec_power_off();       /* no-op if a suspended pause already did it        */
     g_primed = 0;            /* buffers are no longer related to any live stream   */
 }
+
+uint32_t audio_late_kicks(void)    { return g_late_kicks; }
+uint32_t audio_late_worst_us(void) { return g_late_worst_us; }
 
 uint32_t audio_dma_completions(void)
 {

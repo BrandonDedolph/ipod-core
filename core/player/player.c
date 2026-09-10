@@ -497,14 +497,48 @@ static int            g_queue_n;
 static int            g_queue_idx;
 static int            g_pl_active;        /* a track is loaded (playing OR paused) */
 static int            g_pl_paused;         /* DMA suspended, position held          */
+/*
+ * The codec has been powered down UNDER the current pause (hal_audio_suspend)
+ * and must be woken before the DAC can run again. Cleared by every bring-up
+ * (audio_bringup, i.e. every open and every rate change) and by the wake in
+ * player_resume. It mirrors the HAL's own state; the player keeps a copy so
+ * the pump powers down once per pause rather than re-issuing the sequence on
+ * every pass, and so resume knows whether a wake is owed.
+ */
+static int            g_pl_codec_cold;
 static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start    */
 static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (freezes clock) */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
-static int            g_shuffle;          /* pick the next track at random         */
+static int            g_shuffle;          /* walk g_order instead of the queue     */
 static int            g_repeat;           /* 0 off, 1 all (loop queue), 2 one       */
 static flac_meta_t    g_cur_meta;         /* tags/duration of the current track     */
 static uint32_t       g_rng = 0x2545F491u;/* LCG state for shuffle (varies w/ USEC) */
+
+/*
+ * The shuffle ORDER: every playable queue index, dealt into a random
+ * permutation. Shuffle is then simply "walk this array instead of the queue".
+ *
+ * It used to be a mechanism instead: every advance drew a fresh random index,
+ * avoiding only an immediate repeat. That is sampling WITH replacement, and
+ * the listener heard it — on a 12-track album the expected number of tracks
+ * before the first repeat is about five, while others never came up at all.
+ * Worse, a random draw always succeeds, so a shuffled queue could never reach
+ * the "nothing left" branch: Repeat Off and Repeat All were indistinguishable,
+ * player_end_seq() never bumped, the saved resume position was never dropped
+ * when an album finished, and Prev went to an unrelated track instead of the
+ * one just heard. A permutation fixes all of that at once, because Repeat,
+ * Prev and end-of-queue only ever asked "what is before/after this entry" —
+ * they just need that question answered against a different order.
+ *
+ * uint16_t rather than int: QUEUE_MAX is 6000, and at 6000 entries this is
+ * 12 KB of .bss instead of 24 KB. The image is inside its budget either way
+ * (see tests/scripts/check_size.sh), but the array is dead weight whenever
+ * shuffle is off, so it should cost as little as it can.
+ */
+_Static_assert(QUEUE_MAX <= 65535, "g_order indexes the queue with uint16_t");
+static uint16_t       g_order[QUEUE_MAX];
+static int            g_order_n;          /* playable entries in g_order (0 = none) */
 static int            g_last_err;         /* why the last open/skip failed          */
 
 /* Format the DAC is currently clocked at. hal_audio_init is only re-issued
@@ -561,39 +595,169 @@ static int            g_queue_art_shared;
  * and a single-track shuffle all reopen the SAME index. */
 static uint32_t       g_open_seq;
 
-void player_set_shuffle(int on)   { g_shuffle = on ? 1 : 0; }
 void player_set_repeat(int mode)  { g_repeat  = mode; }
 
-/* Count playable (non-dir) entries in the queue. */
-static int queue_playable_count(void)
+/* ---------------------------------------------------------------------------
+ * Playback order
+ *
+ * Two orders exist over the same queue: the queue itself (the folder's file
+ * order, or whatever Shuffle Songs enqueued) and g_order, a permutation of
+ * its playable indices. Every caller that needs "the entry after/before this
+ * one" goes through successor()/predecessor(), which consult whichever order
+ * g_shuffle selects. Nothing else in the player knows shuffle exists.
+ *
+ * Invariant: whenever g_shuffle is set and the queue is non-empty, g_order is
+ * a permutation of exactly the playable queue indices. It is dealt at every
+ * queue (re)start (player_play_queue / player_queue_commit) and on every
+ * off->on toggle, so it can never be stale against the queue it indexes.
+ * ------------------------------------------------------------------------- */
+
+/* The one LCG, stirred with the free-running microsecond timer so two boots
+ * (and two toggles) don't deal the same order. The low bits of an LCG are
+ * the least random, hence the >> 8. */
+static uint32_t rng_next(void)
 {
-    int c = 0;
-    for (int i = 0; i < g_queue_n; i++) {
-        if (!g_queue[i].is_dir) c++;
-    }
-    return c;
+    g_rng = g_rng * 1103515245u + 12345u + mmio_read32(USEC_TIMER_ADDR);
+    return g_rng >> 8;
 }
 
-/* Pick a random playable index, preferring one != `avoid` when possible. */
-static int queue_random_playable(int avoid)
+/* The next playable index AFTER `from` in QUEUE order: forward, wrapping
+ * only under Repeat All. -1 when there is none. Ignores Repeat-One (a
+ * deliberate skip always moves). */
+static int next_playable(int from)
 {
-    int n = queue_playable_count();
-    if (n <= 0) return -1;
-    g_rng = g_rng * 1103515245u + 12345u + mmio_read32(USEC_TIMER_ADDR);
-    int target = (int)((g_rng >> 8) % (uint32_t)n);      /* 0..n-1 among playable  */
-    int pick = -1, seen = 0;
-    for (int i = 0; i < g_queue_n; i++) {
-        if (g_queue[i].is_dir) continue;
-        if (seen == target) { pick = i; break; }
-        seen++;
+    for (int j = from + 1; j < g_queue_n; j++) {
+        if (!g_queue[j].is_dir) return j;
     }
-    if (n > 1 && pick == avoid) {                         /* avoid an immediate repeat */
-        for (int i = 1; i < g_queue_n; i++) {
-            int j = (pick + i) % g_queue_n;
-            if (!g_queue[j].is_dir) { pick = j; break; }
+    if (g_repeat == 1) {                  /* Repeat All: wrap to the first */
+        for (int j = 0; j < g_queue_n; j++) {
+            if (!g_queue[j].is_dir) return j;
         }
     }
-    return pick;
+    return -1;
+}
+
+/* The previous playable index before `from` in QUEUE order, wrapping to the
+ * last entry. -1 only when the queue holds no playable entry at all. */
+static int prev_playable(int from)
+{
+    for (int j = from - 1; j >= 0; j--) {
+        if (!g_queue[j].is_dir) return j;
+    }
+    for (int j = g_queue_n - 1; j >= 0; j--) {   /* wrap to last */
+        if (!g_queue[j].is_dir) return j;
+    }
+    return -1;
+}
+
+/* Where queue index `idx` sits in g_order, or -1 if it isn't there (a folder,
+ * or a current index the order was never dealt over). A linear search, but
+ * it runs once per track change over at most QUEUE_MAX halfwords, and it
+ * saves keeping a cursor in step with every path that assigns g_queue_idx —
+ * the prefetch hand-over in particular sets it seconds after the choice. */
+static int order_pos_of(int idx)
+{
+    for (int p = 0; p < g_order_n; p++) {
+        if (g_order[p] == idx) return p;
+    }
+    return -1;
+}
+
+static void order_swap(int a, int b)
+{
+    uint16_t t = g_order[a];
+    g_order[a] = g_order[b];
+    g_order[b] = t;
+}
+
+/*
+ * Deal a fresh order: every playable index, Fisher-Yates shuffled. When
+ * `keep` is a playable index it is moved to the FRONT afterwards, so the
+ * track that is playing right now stays current and the shuffle only decides
+ * what comes after it — turning Shuffle on mid-album must not restart or
+ * change the song. Moving one element to the front of a uniform permutation
+ * leaves the remainder uniformly random, so nothing is biased by it.
+ */
+static void shuffle_build(int keep)
+{
+    int n = 0;
+    for (int i = 0; i < g_queue_n; i++) {
+        if (!g_queue[i].is_dir) g_order[n++] = (uint16_t)i;
+    }
+    g_order_n = n;
+    for (int i = n - 1; i > 0; i--) {
+        int j = (int)(rng_next() % (uint32_t)(i + 1));
+        order_swap(i, j);
+    }
+    if (keep >= 0) {
+        int p = order_pos_of(keep);
+        if (p > 0) order_swap(0, p);
+    }
+}
+
+/* The entry after `from` in SHUFFLE order. -1 once the order is used up and
+ * Repeat is off — that is the end of the queue, exactly as in plain order.
+ * Under Repeat All a used-up order is re-dealt, so the loop is a new
+ * sequence each time round instead of the same one forever; the only
+ * constraint carried across is that the new first track isn't the one that
+ * just finished, which would sound like Repeat One for a moment.
+ *
+ * Known edge: the re-deal happens when the successor is ASKED for, and the
+ * prefetch asks up to ~6 s before the last track of a pass is audibly over
+ * (see the hand-over note above the globals). A Prev pressed inside that
+ * window walks the new order, not the old one. Deferring the re-deal to the
+ * commit would need a second order array to hold both; not worth 12 KB for
+ * a few seconds once per pass. */
+static int shuffle_next(int from)
+{
+    if (g_order_n == 0) return -1;
+    int pos = order_pos_of(from);         /* -1 (not in the order) starts at the top */
+    if (pos + 1 < g_order_n) return g_order[pos + 1];
+    if (g_repeat != 1) return -1;
+    shuffle_build(-1);
+    if (g_order_n > 1 && g_order[0] == from) {
+        order_swap(0, 1 + (int)(rng_next() % (uint32_t)(g_order_n - 1)));
+    }
+    return g_order[0];
+}
+
+/* The entry before `from` in SHUFFLE order, wrapping to the tail the way
+ * prev_playable wraps — so Prev is always "the track I just heard". */
+static int shuffle_prev(int from)
+{
+    if (g_order_n == 0) return -1;
+    int pos = order_pos_of(from);
+    if (pos > 0) return g_order[pos - 1];
+    return g_order[g_order_n - 1];
+}
+
+/* The entry a manual or automatic skip lands on after/before `from`, in
+ * whichever order is in force. Both ignore Repeat-One; see auto_next_index
+ * for the replay case. */
+static int successor(int from)
+{
+    return g_shuffle ? shuffle_next(from) : next_playable(from);
+}
+
+static int predecessor(int from)
+{
+    return g_shuffle ? shuffle_prev(from) : prev_playable(from);
+}
+
+/*
+ * Toggle shuffle. Only an off->on transition deals a new order, and it keeps
+ * the current track current: settings_apply() in the UI re-pushes this on
+ * EVERY settings change (volume included), so "on while already on" must be
+ * a no-op or adjusting the volume would silently re-deal the album. Turning
+ * it off needs nothing beyond the flag — the queue order is always there.
+ */
+void player_set_shuffle(int on)
+{
+    on = on ? 1 : 0;
+    if (on && !g_shuffle) {
+        shuffle_build(g_queue_n > 0 ? g_queue_idx : -1);
+    }
+    g_shuffle = on;
 }
 
 void player_init(fat32_t *fs)
@@ -707,8 +871,40 @@ static int audio_bringup(uint32_t rate)
     hal_balance_set(hal_balance_get());
     hal_audio_set_source(ring_source, 0);
     hal_audio_start();
-    g_out_rate = rate;
+    g_out_rate      = rate;
+    g_pl_codec_cold = 0;                 /* init is a full bring-up */
     return 0;
+}
+
+/*
+ * Bring a codec that a persistent pause powered down back to life, without
+ * touching the stream. The counterpart of the suspend in player_pump.
+ *
+ * Only the codec is re-initialised — NOT hal_audio_init, which would clear the
+ * HAL's ping-pong buffers and lose up to ~370 ms of PCM that was pulled from
+ * the ring before the pause and never heard (the listener would resume a
+ * third of a second ahead of where they stopped). hal_audio_wake keeps those
+ * buffers and the mid-buffer offset; the hal_audio_start that follows resumes
+ * into them exactly as a plain unpause does.
+ *
+ * Volume and balance are re-applied here for the same reason audio_bringup
+ * does it: the wake is a WM_RESET and the codec comes back at 0 dB. The HAL's
+ * own restore hook covers it too, so this is belt-and-braces — but the hook
+ * is a HAL courtesy and the gain is the player's responsibility, so it is
+ * applied explicitly, BEFORE the DMA is kicked, on every path into playback.
+ *
+ * A wake failure (-2: the codec did not answer on I2C) is not fatal to the
+ * transport: the DMA still runs and the position stays honest, the listener
+ * simply hears nothing — the same outcome a wedged bus gives a track change,
+ * and the next open reports it through player_last_error() where the UI can
+ * see it. Leaving the player paused forever would be no more informative.
+ */
+static void codec_wake(void)
+{
+    (void)hal_audio_wake();
+    hal_volume_set(hal_volume_get());
+    hal_balance_set(hal_balance_get());
+    g_pl_codec_cold = 0;
 }
 
 /* Open g_queue[g_queue_idx] and start the DAC. Returns 0, or -1 on failure;
@@ -773,7 +969,12 @@ static int open_current_keep_pause(int was_paused)
 }
 
 /* Pause: suspend the DMA but keep the decoder, ring, and position — resume
- * re-primes the DAC from the still-full ring. Freezes the elapsed clock. */
+ * re-primes the DAC from the still-full ring. Freezes the elapsed clock.
+ *
+ * The codec stays UP here on purpose: an unpause within a moment must be
+ * instant and silent, and the power-down is a codec reset on the way back.
+ * player_pump powers it down once the pause has persisted
+ * (PLAYER_PAUSE_CODEC_OFF_US), timed from g_pl_pause_us. */
 void player_pause(void)
 {
     if (!g_pl_active || g_pl_paused) {
@@ -785,7 +986,13 @@ void player_pause(void)
 }
 
 /* Resume from pause: shift the track start forward by the paused duration so the
- * elapsed clock is continuous, then restart the DAC (re-primes from the ring). */
+ * elapsed clock is continuous, then restart the DAC (re-primes from the ring).
+ *
+ * If the pause lasted long enough for the pump to power the codec down, wake
+ * it first — the HAL's buffers and offset are intact underneath, so the
+ * hal_audio_start that follows is the same seamless resume either way. The
+ * clock shift is unaffected: it is computed from the pause timestamp, which
+ * the power-down never touches. */
 void player_resume(void)
 {
     if (!g_pl_active || !g_pl_paused) {
@@ -793,6 +1000,9 @@ void player_resume(void)
     }
     g_pl_start_us += mmio_read32(USEC_TIMER_ADDR) - g_pl_pause_us;
     g_pl_paused    = 0;
+    if (g_pl_codec_cold) {
+        codec_wake();
+    }
     hal_audio_start();
 }
 
@@ -825,22 +1035,6 @@ void player_stop(void)
     g_pl_active = 0;
 }
 
-/* The next playable index AFTER `from` for a manual skip: forward, wrapping
- * only under Repeat All. -1 when there is none. Ignores Repeat-One (a
- * deliberate skip always moves). */
-static int next_playable(int from)
-{
-    for (int j = from + 1; j < g_queue_n; j++) {
-        if (!g_queue[j].is_dir) return j;
-    }
-    if (g_repeat == 1) {                  /* Repeat All: wrap to the first */
-        for (int j = 0; j < g_queue_n; j++) {
-            if (!g_queue[j].is_dir) return j;
-        }
-    }
-    return -1;
-}
-
 /* The index AUTO-advance should play after `from` (Repeat-One / Shuffle /
  * Repeat-All aware). -1 when the queue is finished. */
 static int auto_next_index(int from)
@@ -848,10 +1042,7 @@ static int auto_next_index(int from)
     if (g_repeat == 2) {                  /* Repeat One: the same track again */
         return from;
     }
-    if (g_shuffle) {
-        return queue_random_playable(from);
-    }
-    return next_playable(from);
+    return successor(from);
 }
 
 /*
@@ -878,7 +1069,7 @@ static void prefetch_next(void)
             /* Step FORWARD past the broken entry rather than re-asking
              * auto_next_index, which under Repeat-One would hand back the same
              * unopenable file forever. */
-            nxt = next_playable(nxt);
+            nxt = successor(nxt);
             continue;
         }
         g_pending          = 1;
@@ -912,7 +1103,13 @@ static void pending_commit(void)
     if (!g_pending_gapless) {
         /* Different sample rate: the ring is empty here by construction (we
          * held decode back until the old track finished playing), so re-clock
-         * the DAC and prime before letting it run again. */
+         * the DAC and prime before letting it run again.
+         *
+         * Drain first. "Ring empty" is not "track finished" — the HAL still
+         * holds up to two buffers the DAC has not clocked out, and stopping
+         * discards them, which cut the last ~186-370 ms off the outgoing track
+         * every time the rate changed between tracks. */
+        hal_audio_drain(500u);
         hal_audio_stop();
         decode_pump();
         if (audio_bringup(g_dec.sample_rate) != 0) {
@@ -946,6 +1143,12 @@ static void player_advance(void)
      * unconditional g_dec.ops->close() there dereferenced a NULL/stale ops and
      * hard-froze the device. g_pl_active is the "decoder open + running" flag. */
     if (g_pl_active) {
+        /* The track played to its end: let the HAL's two in-flight buffers
+         * reach the DAC before cutting it. Bounded, so a wedged DMA cannot
+         * hang the advance. Only the AUTOMATIC paths come through here — a
+         * user pressing Next skips straight to hal_audio_stop(), because
+         * waiting a third of a second on a button press reads as lag. */
+        hal_audio_drain(500u);
         hal_audio_stop();
         g_pl_active = 0;                  /* no close: next open resets the arena */
     }
@@ -955,8 +1158,7 @@ static void player_advance(void)
         return;
     }
     for (int tries = 0; tries <= g_queue_n; tries++) {
-        int nxt = g_shuffle ? queue_random_playable(g_queue_idx)
-                            : next_playable(g_queue_idx);
+        int nxt = successor(g_queue_idx);
         if (nxt < 0) {
             /* Queue done → idle. Bump the end counter so the UI can tell
              * "the album finished on its own" apart from "still playing" —
@@ -985,6 +1187,9 @@ void player_play_queue(const browse_entry_t *src, int n, int start,
     }
     g_queue_n   = (n < QUEUE_MAX) ? n : QUEUE_MAX;
     g_queue_idx = start;
+    if (g_shuffle) {
+        shuffle_build(start);            /* the picked track first, then the rest */
+    }
     /* One album, one cover: every entry shares it, so per-track art loading is
      * suppressed for the life of this queue. */
     g_queue_art_shared = (art_clus != 0);
@@ -999,6 +1204,7 @@ void player_queue_begin(void)
 {
     player_stop();
     g_queue_n = 0;
+    g_order_n = 0;                       /* indexes the queue just emptied */
 }
 
 void player_queue_add(const browse_entry_t *e)
@@ -1014,6 +1220,9 @@ void player_queue_commit(int start)
         return;
     }
     g_queue_idx = (start >= 0 && start < g_queue_n) ? start : 0;
+    if (g_shuffle) {
+        shuffle_build(g_queue_idx);
+    }
     /* Mixed queue: each entry carries its own art_clus, and a zero one means
      * "this album has no cover" — NOT "keep whatever is loaded". Without this
      * distinction every coverless album in a Shuffle Songs queue displayed the
@@ -1029,8 +1238,30 @@ void player_queue_commit(int start)
  * main-loop pass, so audio runs in the background while the UI is elsewhere. */
 void player_pump(void)
 {
-    if (!g_pl_active || g_pl_paused) {
-        return;                          /* paused: hold the ring + position     */
+    if (!g_pl_active) {
+        return;
+    }
+    if (g_pl_paused) {
+        /*
+         * Paused: hold the ring + position. The only work is the codec
+         * power-down once the pause has persisted (see player.h for why not
+         * at once and why this long). Timed from the pause timestamp, as a
+         * wrap-safe difference — USEC_TIMER rolls over every ~71 minutes and a
+         * pause can easily outlive that. Once per pause: the HAL's suspend is
+         * idempotent, but the flag keeps this from re-walking the I2C
+         * power-down sequence 100 times a second for the rest of the pause.
+         *
+         * hal_audio_suspend, not hal_audio_close: close discards the HAL's
+         * two buffers of already-pulled PCM and resume would jump ahead by
+         * that much. Suspend keeps them. codec_wake() undoes this on resume.
+         */
+        if (!g_pl_codec_cold &&
+            (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - g_pl_pause_us)
+                >= PLAYER_PAUSE_CODEC_OFF_US) {
+            hal_audio_suspend();
+            g_pl_codec_cold = 1;
+        }
+        return;
     }
 
     uint32_t fill = pcm_ring_fill(&g_ring);
@@ -1113,6 +1344,7 @@ void player_pump(void)
             /* Play out what is already decoded, then stop and SAY so rather
              * than advancing as if the track had simply finished. */
             if (fill == 0u) {
+                hal_audio_drain(500u);   /* the decoded tail is still playable */
                 hal_audio_stop();
                 g_pl_active = 0;
                 g_pending   = 0;
@@ -1133,7 +1365,8 @@ void player_pump(void)
     }
 }
 
-int player_active(void) { return g_pl_active; }
+int player_active(void)  { return g_pl_active; }
+int player_playing(void) { return g_pl_active && !g_pl_paused; }
 
 const char *player_track_name(void) { return g_queue[g_queue_idx].name; }
 
@@ -1223,8 +1456,7 @@ void player_next(void)
     if (g_queue_n == 0) {
         return;
     }
-    int nxt = g_shuffle ? queue_random_playable(g_queue_idx)
-                        : next_playable(g_queue_idx);
+    int nxt = successor(g_queue_idx);
     if (nxt < 0) {
         /*
          * Past the last track with Repeat off. This used to return and leave
@@ -1242,6 +1474,11 @@ void player_next(void)
          * the UI closes the codec, leaves the dead player views, and drops the
          * saved resume position.
          */
+        /* No drain here, deliberately: this is a BUTTON PRESS. Waiting a
+         * third of a second for the in-flight buffers to play out would read
+         * as the device being slow to respond, and the listener asked for the
+         * track to end. The automatic end-of-queue path (player_advance) does
+         * drain, because nobody is waiting on it. */
         hal_audio_stop();
         g_pl_active = 0;
         g_pl_paused = 0;
@@ -1256,38 +1493,28 @@ void player_next(void)
         if (open_current_keep_pause(was_paused) == 0) {
             return;
         }
-        nxt = g_shuffle ? queue_random_playable(g_queue_idx)
-                        : next_playable(g_queue_idx);
+        nxt = successor(g_queue_idx);
     }
-}
-
-/* The previous playable index before `from`, wrapping to the last entry.
- * -1 only when the queue holds no playable entry at all. */
-static int prev_playable(int from)
-{
-    for (int j = from - 1; j >= 0; j--) {
-        if (!g_queue[j].is_dir) return j;
-    }
-    for (int j = g_queue_n - 1; j >= 0; j--) {   /* wrap to last */
-        if (!g_queue[j].is_dir) return j;
-    }
-    return -1;
 }
 
 /* Manual skip to the previous track — or restart the current one if we're more
  * than ~3s in (the familiar iPod behaviour). Wraps at the start. Keeps a
- * paused transport paused. */
+ * paused transport paused.
+ *
+ * The restart applies under Shuffle too. It used to be gated on !g_shuffle
+ * only because a shuffled Prev was a fresh random draw, so "go back" had no
+ * meaning worth protecting; now that it returns to the track just heard, the
+ * two orders behave the same way here. */
 void player_prev(void)
 {
     if (g_queue_n == 0) {
         return;
     }
-    if (!g_shuffle && player_elapsed_s() > 3u) {         /* restart current */
+    if (player_elapsed_s() > 3u) {                       /* restart current */
         player_jump(g_queue_idx);
         return;
     }
-    int prv = g_shuffle ? queue_random_playable(g_queue_idx)
-                        : prev_playable(g_queue_idx);
+    int prv = predecessor(g_queue_idx);
     if (prv < 0) {
         return;
     }
@@ -1299,8 +1526,7 @@ void player_prev(void)
         if (open_current_keep_pause(was_paused) == 0) {
             return;
         }
-        prv = g_shuffle ? queue_random_playable(g_queue_idx)
-                        : prev_playable(g_queue_idx);
+        prv = predecessor(g_queue_idx);
     }
 }
 
@@ -1311,23 +1537,112 @@ void player_prev(void)
  *   - a backward seek drives diskbuf_seek outside its window, which resets the
  *     window and rewinds fat_src — now served from the cluster-chain
  *     checkpoints in fat_src_t instead of re-walking the FAT from cluster 0;
- *   - FLAC lands on a SEEKTABLE seekpoint (dr_flac parses and binary-searches
- *     it at open), so it is O(log n) plus one frame. MP3 has no seek table and
- *     falls back to dr_mp3's brute-force scan — accurate but linear; see the
- *     note in mp3.c.
+ *   - FLAC with no SEEKTABLE (which is most of them — encoders only emit one
+ *     on request) binary-searches the frame stream, O(log n) probes plus one
+ *     frame decode. dr_flac only offers that search when CRC checking is
+ *     compiled IN; with DR_FLAC_NO_CRC it silently degrades to a linear scan,
+ *     which is why flac.c leaves CRC on. MP3 has no seek table either and
+ *     falls back to dr_mp3's brute-force scan — see the note in mp3.c.
  *
  * The DAC is stopped across the seek so the ISR can't drain PCM belonging to
- * the old position, and hal_audio_init is deliberately NOT re-issued: the
- * format hasn't changed, and re-initialising would reset the codec's gain.
+ * the old position, hal_audio_flush() drops what the HAL had already buffered
+ * from it, and hal_audio_init is deliberately NOT re-issued: the format hasn't
+ * changed, and re-initialising would reset the codec's gain.
  */
-int player_seek_to(uint32_t sec)
+
+/*
+ * Re-anchor the elapsed clock so it reads `sec` NOW.
+ *
+ * While paused the clock is (g_pl_pause_us - g_pl_start_us), and resume adds
+ * (now - g_pl_pause_us) onto the start. A paused seek used to move only the
+ * start, leaving the pause stamp where the pause began — so the frozen clock
+ * read `sec` minus however long the listener had already been paused, and
+ * resuming then added that same paused stretch back on top, landing the
+ * clock short of the target by the length of the pause. Invisible when the
+ * seek lands in the same instant as the pause (which is all the earlier test
+ * exercised); a scrub a minute into a pause was wrong by a minute. Moving the
+ * pause stamp with the start keeps both identities true.
+ */
+static void clock_anchor(uint32_t sec)
 {
-    if (!g_pl_active || !g_dec.ops || !g_dec.ops->seek) {
+    uint32_t now = mmio_read32(USEC_TIMER_ADDR);
+    g_pl_start_us = now - sec * 1000000u;
+    if (g_pl_paused) {
+        g_pl_pause_us = now;
+    }
+}
+
+/*
+ * Re-open the CURRENT queue entry from scratch, for a seek that cannot trust
+ * the live decoder.
+ *
+ * Once a track hits decoder EOS the pump prefetches its successor, and
+ * track_open() re-points the whole byte-source chain (g_fsrc / g_dbuf / g_ra)
+ * at that next file and resets the arena. Two states follow, both hostile to
+ * an in-place seek, and both reachable for the last ~6 s of every track —
+ * the ring holds that much decoded audio, so the listener is still hearing
+ * this track and may well scrub inside it:
+ *
+ *   - prefetch SUCCEEDED (g_pending): g_dec is now the NEXT track's decoder.
+ *     Seeking it would seek the wrong file. This used to be refused outright,
+ *     so dragging the scrubber back during the last six seconds did nothing
+ *     and the position snapped forward again.
+ *   - prefetch FAILED (next file corrupt, truncated, or gone): g_pending stays
+ *     0 and g_dec is left as the OLD decoder — but the chain underneath it now
+ *     routes to the file that failed to open, over an arena that was reset out
+ *     from under its state. Seeking there ran the old decoder across another
+ *     file's bytes.
+ *
+ * Reopening is the honest fix for both: it costs a metadata read and drops the
+ * anti-skip window, but it only happens in the end-of-track window, and it
+ * reclaims the prefetched decoder's memory via the arena reset it performs
+ * anyway. Returns 0, or -1 with the player left inactive (the file we were
+ * playing has become unreadable, which is not something to paper over).
+ */
+static int seek_reopen_current(void)
+{
+    flac_meta_t meta;
+
+    g_pending        = 0;    /* the prefetched hand-over is abandoned */
+    g_prefetch_tried = 0;
+    if (track_open(g_queue_idx, &meta) != 0) {
+        g_last_err  = PLAYER_ERR_OPEN;
+        g_pl_active = 0;
+        g_eos       = 1;
         return -1;
     }
-    if (g_pending) {
-        return -1;                       /* mid-handover: refuse rather than guess */
+    g_cur_meta   = meta;
+    g_pl_total_s = track_total_s(&g_dec);
+    return 0;
+}
+
+int player_seek_to(uint32_t sec)
+{
+    if (!g_pl_active) {
+        return -1;
     }
+    int was_paused = g_pl_paused;
+    int reopened   = 0;
+
+    hal_audio_stop();
+
+    /* Past EOS the decoder may not be this track's any more — see above. Do
+     * this BEFORE reading g_dec.sample_rate, so the target is computed against
+     * the file we are actually going to seek. */
+    if (g_prefetch_tried || g_pending) {
+        if (seek_reopen_current() != 0) {
+            hal_audio_flush();           /* nothing left to resume into */
+            return -1;
+        }
+        reopened = 1;
+    }
+    if (!g_dec.ops || !g_dec.ops->seek) {
+        if (!reopened && !was_paused) {
+            hal_audio_start();           /* unchanged stream: resume as we were */
+        }
+        return -1;
+    }
+
     uint32_t rate   = g_dec.sample_rate ? g_dec.sample_rate : 44100u;
     uint64_t target = (uint64_t)sec * rate;
     if (g_dec.total_frames > 0 && target >= g_dec.total_frames) {
@@ -1335,23 +1650,42 @@ int player_seek_to(uint32_t sec)
         sec    = (uint32_t)(target / rate);
     }
 
-    int was_paused = g_pl_paused;
-    hal_audio_stop();
     if (g_dec.ops->seek(&g_dec, target) != DECODER_OK) {
+        if (reopened) {
+            /* We already tore the stream down to reopen it; the buffered PCM
+             * is from a decoder that no longer exists. Restart from the top of
+             * the track rather than resuming into it. */
+            hal_audio_flush();
+            pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
+            g_written  = 0;
+            g_boundary = 0;
+            g_eos      = 0;
+            decode_pump_upto(SEEK_PRIME_FRAMES);
+            clock_anchor(0);
+        }
         if (!was_paused) {
             hal_audio_start();
         }
         return -1;
     }
+
     pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
     g_written        = 0;
     g_boundary       = 0;
     g_eos            = 0;
     g_prefetch_tried = 0;
+    /*
+     * Drop what the HAL still holds. The ring above is ours; the ping-pong
+     * buffers inside the backend are not, and they are full of the position we
+     * just left. Without this the resume path in hal_audio_start() kicked them
+     * first and the listener heard up to ~370 ms of the OLD spot before the
+     * jump landed — on every single scrub.
+     */
+    hal_audio_flush();
     /* Only enough to restart cleanly — the play loop fills the rest while the
      * audio runs, so first sound is not gated on the full anti-skip depth. */
     decode_pump_upto(SEEK_PRIME_FRAMES);
-    g_pl_start_us = mmio_read32(USEC_TIMER_ADDR) - sec * 1000000u;
+    clock_anchor(sec);
     g_pl_low_fill = RING_FRAMES;
     if (!was_paused) {
         hal_audio_start();

@@ -147,7 +147,7 @@ static const uint16_t battery_v_curve[BATTERY_CURVE_POINTS] = {
 /* Linear interpolation between the curve points, integer math with
  * round-to-nearest (+span/2 before the divide). Below the 0% point -> 0,
  * at/above the 100% point -> 100. */
-static int battery_pct_from_mv(int mv)
+int battery_percent_from_mv(int mv)
 {
     if (mv <= battery_v_curve[0]) {
         return 0;
@@ -167,14 +167,17 @@ static int battery_pct_from_mv(int mv)
 
 void battery_init(void)
 {
-    /* No-op: the shared I2C controller is initialized in the boot path
-     * (i2c_init, needed for the codec too) and each read re-selects the
-     * ADC channel. Present so a future settling/calibration step has a
-     * home callers already invoke. */
+    /* The shared I2C controller is initialized in the boot path (i2c_init,
+     * needed for the codec too) and each read re-selects the ADC channel, so
+     * there is nothing to prime on the bus. The policy state is zero-initialised
+     * anyway; resetting it here makes "boot = empty ring, level OK" explicit. */
+    battery_policy_reset();
 }
 
-int battery_millivolts(void)
+int battery_sample(battery_sample_t *out)
 {
+    out->raw = out->mv_raw = out->mv = -1;
+
     /* Select channel ADCVIN1 and start the conversion (ADCC1 = 0x05). */
     uint8_t select[2] = { PMU_ADCC1, PMU_ADC_START_VIN1 };
     if (i2c_send(PMU_ADDR, select, 2) != 0) {
@@ -193,24 +196,201 @@ int battery_millivolts(void)
 
     /* Assemble the 10-bit sample and scale to millivolts. */
     int raw = ((int)data[0] << 2) | (data[1] & PMU_ADC_LOW_MASK);
+
+    /*
+     * An all-zero result is a FAILED read, not a measurement. i2c_read()
+     * checks only that the controller went idle, never that the PMU acked,
+     * so a transfer the PMU did not answer returns whatever the data
+     * registers hold and reports success. A code of 0 is 0 V on a cell that
+     * is, demonstrably, running this CPU — impossible as a reading, and
+     * dangerous as one: the plausibility clamp below pins it to the 3300 mV
+     * floor, which is the shutoff line, and three of those in a row would
+     * carry the low-battery policy straight through DISKSAFE to a power-off
+     * on a healthy battery. Returned as -1, it enters nothing anywhere.
+     */
+    if (raw == 0) {
+        return -1;
+    }
     int mv  = (raw * PMU_ADC_FULLSCALE_MV) >> PMU_ADC_BITS;
 
-    /* Sanity-clamp to the cell's real operating band (see PMU_MV_MIN/MAX). */
+    out->raw    = raw;
+    out->mv_raw = mv;
+
+    /* Sanity-clamp to the cell's real operating band (see PMU_MV_MIN/MAX).
+     * mv_raw above keeps the unclamped value, because the clamp is exactly what
+     * makes a bus glitch and a flat cell indistinguishable. */
     if (mv < PMU_MV_MIN) {
         mv = PMU_MV_MIN;
     } else if (mv > PMU_MV_MAX) {
         mv = PMU_MV_MAX;
     }
-    return mv;
+    out->mv = mv;
+    return 0;
+}
+
+int battery_millivolts(void)
+{
+    battery_sample_t s;
+    return (battery_sample(&s) == 0) ? s.mv : -1;
 }
 
 int battery_percent(void)
 {
-    int mv = battery_millivolts();
-    if (mv < 0) {
+    battery_sample_t s;
+    if (battery_sample(&s) != 0) {
         return -1;
     }
-    return battery_pct_from_mv(mv);
+    return battery_percent_from_mv(s.mv);
+}
+
+/* ---------- Filter + low-battery policy -----------------------------
+ *
+ * WHY A MEDIAN AND NOT AN EMA. The disturbance we are defending against is a
+ * short, deep, one-sided excursion: the drive spins up, the cell sags by 50 to
+ * a few hundred millivolts for ~2 s, and at a 5 s cadence that lands on at most
+ * one sample, occasionally two. An EMA is pulled by every sample in proportion
+ * to its depth — with alpha = 1/4 a 200 mV sag moves the output 50 mV, which is
+ * more than the whole 30 mV/10 % plateau step (a visible gauge jump) and, near
+ * a threshold, a false crossing. A median of five ignores up to two outliers
+ * COMPLETELY: the filtered value does not move at all until a majority of the
+ * window agrees. That majority rule is also the debounce the policy needs —
+ * the disk-safe line cannot be crossed by fewer than 3 of the last 5 samples
+ * (15 s of agreement), and no single sample of any depth can do it.
+ *
+ * The cost is lag: the median trails a genuine monotonic decline by ~2
+ * samples (10 s). Add the shutoff confirm and the worst-case response from
+ * the true 3300 mV crossing to the power-off decision is ~25-30 s. That is
+ * safe: below the shutoff line there is still >= 200 mV before the PMU or the
+ * cell's own protection cuts power, and at this end of the discharge curve
+ * that is minutes even at the ~300 mA a spinning drive draws — an order of
+ * magnitude more than we spend deciding. What is NOT safe is the other
+ * direction: powering the user's device off because a spin-up happened to
+ * coincide with a sample.
+ *
+ * Only the clamped mv is filtered, so the ring holds values in 3300..4200 by
+ * construction and the arithmetic below is trivially in range.
+ */
+
+static int      bat_ring[BATTERY_FILTER_N];
+static int      bat_ring_n;         /* good samples held, 0..N               */
+static int      bat_ring_head;      /* next slot to overwrite once full      */
+static battery_level_t bat_level = BATTERY_LEVEL_OK;
+static int      bat_shutoff_run;    /* consecutive evaluations <= shutoff    */
+
+void battery_policy_reset(void)
+{
+    bat_ring_n       = 0;
+    bat_ring_head    = 0;
+    bat_level        = BATTERY_LEVEL_OK;
+    bat_shutoff_run  = 0;
+}
+
+/* Median of the samples held. Insertion sort on a copy — N is 5, this runs
+ * once every 5 s, and it keeps the ring itself in arrival order. For an even
+ * count (only before the ring first fills) the two middles are averaged. */
+int battery_filtered_mv(void)
+{
+    if (bat_ring_n == 0) {
+        return -1;
+    }
+    int tmp[BATTERY_FILTER_N];
+    for (int i = 0; i < bat_ring_n; i++) {
+        int v = bat_ring[i];
+        int j = i;
+        while (j > 0 && tmp[j - 1] > v) {
+            tmp[j] = tmp[j - 1];
+            j--;
+        }
+        tmp[j] = v;
+    }
+    if (bat_ring_n & 1) {
+        return tmp[bat_ring_n / 2];
+    }
+    return (tmp[bat_ring_n / 2 - 1] + tmp[bat_ring_n / 2]) / 2;
+}
+
+int battery_filter_ready(void)
+{
+    return bat_ring_n == BATTERY_FILTER_N;
+}
+
+battery_level_t battery_policy_level(void)
+{
+    return bat_level;
+}
+
+int battery_disk_writes_allowed(void)
+{
+    return bat_level == BATTERY_LEVEL_OK;
+}
+
+battery_event_t battery_policy_feed(int mv)
+{
+    /* Bus failure is not a flat battery. Nothing changes: the ring keeps its
+     * history, the level keeps its state, and the caller keeps showing the
+     * last good value. Letting -1 in here would be a 0 in the ring, and three
+     * I2C hiccups in a row would power the device off. */
+    if (mv < 0) {
+        return BATTERY_EVENT_NONE;
+    }
+
+    if (bat_ring_n < BATTERY_FILTER_N) {
+        bat_ring[bat_ring_n++] = mv;
+    } else {
+        bat_ring[bat_ring_head] = mv;
+        bat_ring_head = (bat_ring_head + 1) % BATTERY_FILTER_N;
+    }
+
+    /* Not armed until the window is full — a policy decision on a partial
+     * window is a decision on fewer samples than the filter was designed to
+     * need, and the first 20 s after boot are the mount + index spin-up. */
+    if (!battery_filter_ready()) {
+        return BATTERY_EVENT_NONE;
+    }
+
+    int filt = battery_filtered_mv();
+
+    /* Second debounce, for the one irreversible action. Counts evaluations
+     * whose MEDIAN is at/below the line, so each count already represents a
+     * majority of the window; it resets the moment the median lifts. */
+    if (filt <= BATTERY_MV_SHUTOFF) {
+        bat_shutoff_run++;
+    } else {
+        bat_shutoff_run = 0;
+    }
+
+    switch (bat_level) {
+    case BATTERY_LEVEL_OK:
+        if (filt <= BATTERY_MV_DISKSAFE) {
+            /* Always the first stage, even if the median is already below the
+             * shutoff line (a flat cell at boot): the caller gets to flush and
+             * park BEFORE the confirm window for power-off starts running. */
+            bat_level = BATTERY_LEVEL_DISKSAFE;
+            return BATTERY_EVENT_DISKSAFE;
+        }
+        break;
+
+    case BATTERY_LEVEL_DISKSAFE:
+        if (filt >= BATTERY_MV_RECOVER) {
+            /* Charger plugged in, or the load-release rebound turned out to be
+             * larger than the hysteresis — either way the cell is above the
+             * line by a margin, and latching DISKSAFE forever would refuse
+             * every settings save until the next reboot. */
+            bat_level = BATTERY_LEVEL_OK;
+            return BATTERY_EVENT_RECOVERED;
+        }
+        if (bat_shutoff_run >= BATTERY_SHUTOFF_CONFIRM) {
+            bat_level = BATTERY_LEVEL_SHUTOFF;
+            return BATTERY_EVENT_SHUTOFF;
+        }
+        break;
+
+    case BATTERY_LEVEL_SHUTOFF:
+        /* Terminal. The caller is powering off; if it somehow did not, the
+         * next boot starts from battery_policy_reset() state anyway. */
+        break;
+    }
+    return BATTERY_EVENT_NONE;
 }
 
 int power_is_external(void)

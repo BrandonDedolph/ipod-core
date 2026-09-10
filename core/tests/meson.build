@@ -126,6 +126,24 @@ if target == 'sim'
   )
   test('text', text_test, suite: 'unit')
 
+  # chrome: the shared list/panel chrome (core/ui/chrome.c) — the SAME source
+  # the ARM build links into core.elf. This target is the reason chrome.c
+  # exists: every function in it was a `static` inside kernel/main.c, which
+  # meson builds only for target == 'hw', so none of the list geometry,
+  # selection bars, scroll clamps or header layout could be checked without
+  # flashing the device. Draws into console.c's back buffer and measures glyphs
+  # through text.c; the marquee's clock is injected and left unset here, so
+  # overflowing titles clip. Assertions read pixels back out of the
+  # framebuffer rather than trusting return values.
+  chrome_test = executable(
+    'chrome_test',
+    sources: ['ui/chrome_test.c', '../ui/chrome.c', '../ui/text.c',
+              '../ui/palette.c', '../kernel/console.c'],
+    include_directories: include_directories('../ui', '../kernel', '../hal'),
+    override_options: test_opts,
+  )
+  test('chrome', chrome_test, suite: 'unit')
+
   # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
   # — the SAME source the ARM build links into core.elf. Shrinks a loaded
   # folder.art to a list chip / album-detail cover when no folder.thm is present.
@@ -178,7 +196,7 @@ if target == 'sim'
               'hw_mmio/mmio_mock.c',
               '../hal/hw/uart.c'],
     include_directories: hw_mmio_inc,
-    c_args: ['-DMMIO_MOCK', '-Wno-unterminated-string-initialization'],
+    c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,
   )
   test('hw-uart-trace', uart_trace_test, suite: 'unit')
@@ -189,7 +207,7 @@ if target == 'sim'
               'hw_mmio/mmio_mock.c',
               '../hal/hw/lcd.c'],
     include_directories: hw_mmio_inc,
-    c_args: ['-DMMIO_MOCK', '-Wno-unterminated-string-initialization'],
+    c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,
   )
   test('hw-lcd-trace', lcd_trace_test, suite: 'unit')
@@ -208,8 +226,7 @@ if target == 'sim'
               'hw_mmio/mmio_mock.c',
               '../hal/hw/lcd.c'],
     include_directories: hw_mmio_inc,
-    c_args: ['-DMMIO_MOCK', '-DLCD_RECOVER_ON_WAKE=1',
-             '-Wno-unterminated-string-initialization'],
+    c_args: ['-DMMIO_MOCK', '-DLCD_RECOVER_ON_WAKE=1'],
     override_options: test_opts,
   )
   test('hw-bcm-init', bcm_init_test, suite: 'unit')
@@ -231,8 +248,9 @@ if target == 'sim'
   # policy, compiled host-side with -DSCHED_TEST against inert stubs for
   # the two asm symbols (switch_context / task_trampoline). Proves task
   # add/bounds, round-robin selection, done-task skipping, and the
-  # single-runnable no-switch case. The context-switch asm itself is
-  # exercised end-to-end in the clicky emulator, not here.
+  # single-runnable no-switch case. The context-switch asm itself has NO
+  # automated coverage: it has only ever been run by hand in the clicky
+  # emulator, which is not wired up as a target in this repo.
   sched_test = executable(
     'sched_test',
     sources: ['hw_sched/sched_test.c',
@@ -251,7 +269,8 @@ if target == 'sim'
   # that irq_dispatch only ticks when CPU_INT_STAT shows TIMER1 pending,
   # and the sleep_ms tick math (a sched_yield stub advances the mocked
   # tick so the cooperative wait terminates). The IRQ entry asm + real
-  # interrupt delivery are exercised end-to-end in clicky.
+  # interrupt delivery have NO automated coverage — manual clicky runs only,
+  # and there is no clicky target in this repo.
   timer_test = executable(
     'timer_test',
     sources: ['hw_timer/timer_test.c',
@@ -294,8 +313,10 @@ if target == 'sim'
               '../hal/hw/i2c.c',
               '../hal/hw/wm8758.c',
               '../hal/hw/i2s.c',
-              '../hal/hw/dma.c',
-              '../hal/hw/ata.c'],
+              '../hal/hw/dma.c'],
+              # No ata.c: the two ATA cases that were misfiled in this suite
+              # moved to hw_ata. Linking a driver a test does not exercise
+              # invites exactly that kind of drift back.
     include_directories: hw_mmio_inc,
     c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,
@@ -381,6 +402,11 @@ if target == 'sim'
     include_directories: [hw_mmio_inc,
                           include_directories('../kernel', '../fs', '../ui')],
     c_args: ['-DMMIO_MOCK'],
+    # This one was missing test_opts, so the suite's highest-stakes binary —
+    # the only check of the code that WRITES to the user's disk — was the one
+    # built at -Os with LTO, exactly the settings the comment at the top of
+    # this file explains are wrong for a test.
+    override_options: test_opts,
   )
   if py.found()
     # 5. Host/device format agreement: the fixture is produced by the REAL
@@ -435,7 +461,7 @@ if target == 'sim'
               'hw_mmio/mmio_mock.c',
               '../hal/hw/lcd.c'],
     include_directories: include_directories('../hal', '../hal/hw', 'hw_mmio'),
-    c_args: ['-DMMIO_MOCK', '-Wno-unterminated-string-initialization'],
+    c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,
   )
   test('hw-lcd-present', lcd_present_test, suite: 'unit')
@@ -529,6 +555,30 @@ if target == 'sim'
     override_options: test_opts,
   )
   test('hw-power-standby', power_trace_test, suite: 'unit')
+
+  # hw-ata: the PIO ATA driver (hal/hw/ata.c) — the code every music byte,
+  # FAT sector and settings save goes through — host-side under -DMMIO_MOCK.
+  # Its only host coverage used to be two happy-path cases misfiled in
+  # hw-audio (init with RDY pre-set, one read with RDY|DRQ pre-set so no poll
+  # ever spun). Those moved here, joined by what was missing: both bounded
+  # polls proven to spin and to give up after exactly their budget; the timed
+  # DRQ deadline; the ERR path with the recovery grammar (ERROR latched before
+  # the reset, residual DRQ drained, soft reset) that stops a retry returning
+  # shifted data as success; the >256-sector command split; standby/wakeup
+  # and the parked flag; the write+flush grammar with every data word
+  # checked and its failure paths routed through the same recovery; and the
+  # LBA28 guard. clicky models no drive, so the device is the only other
+  # place any of this runs.
+  ata_trace_test = executable(
+    'ata_trace_test',
+    sources: ['hw_ata/ata_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/ata.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+    override_options: test_opts,
+  )
+  test('hw-ata', ata_trace_test, suite: 'unit')
 
   # hw-audio-pingpong: the ping-pong PCM buffer state machine in
   # hal/hw/audio.c. audio_trace_test asserts the register grammar of the

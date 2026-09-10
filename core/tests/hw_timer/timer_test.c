@@ -139,6 +139,76 @@ static int test_sleep_ms(void)
     return fails;
 }
 
+/*
+ * Case 5: no single halt sleep_ms programs may outlast the audio DMA
+ * deadline.
+ *
+ * sleep_ms is reachable mid-track (player.c's disk-retry backoff), and
+ * playback is a single-shot DMA re-kicked from its completion ISR with
+ * only the 16-frame I2S FIFO — ~363 us at 44.1 kHz — covering a late
+ * re-kick (kernel/main.c, cpu_wait_us). The doc describes PROC_WAIT_CNT
+ * as "Sleep until countdown" and does NOT promise an early wake on an
+ * interrupt, so the halt length IS the worst-case ISR latency. This
+ * decodes every CPU_CTL write the sleep emits — unit bit and 8-bit
+ * count — and checks it against the deadline; it FAILS on the previous
+ * PROC_CNT_MSEC | 1 (1000 us) halt. The count of halts is asserted too,
+ * so the check cannot pass vacuously on an empty log.
+ */
+#define AUDIO_DMA_DEADLINE_US  363u
+
+/* Duration in microseconds a PROC_WAIT_CNT word halts for; UINT32_MAX for
+ * a word this test does not understand (no unit bit, or PROC_SLEEP —
+ * which would never wake without an interrupt controller). */
+static uint32_t halt_word_us(uint32_t v)
+{
+    uint32_t count = v & PROC_CNT_MASK;
+    if (!(v & PROC_WAIT_CNT) || (v & PROC_SLEEP)) {
+        return 0xFFFFFFFFu;
+    }
+    if (v & PROC_CNT_USEC) {
+        return count;
+    }
+    if (v & PROC_CNT_MSEC) {
+        return count * 1000u;
+    }
+    return 0xFFFFFFFFu;
+}
+
+static int test_sleep_halt_under_audio_deadline(void)
+{
+    int fails = 0;
+
+    mmio_mock_reset();
+    timer_test_set_tick(0);
+    sched_yield_calls = 0;
+    sleep_ms(25);                               /* 3 ticks -> 3 halts */
+
+    const mmio_event *log = mmio_mock_log();
+    size_t len   = mmio_mock_log_len();
+    size_t halts = 0;
+    uint32_t longest = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (log[i].op != MMIO_OP_WRITE || log[i].addr != CPU_CTL_ADDR) {
+            continue;
+        }
+        halts++;
+        uint32_t us = halt_word_us(log[i].value);
+        if (us > longest) {
+            longest = us;
+        }
+    }
+
+    fails += check("sleep halt: one halt per loop trip (non-vacuous)",
+                   halts == 3 && halts == (size_t)sched_yield_calls);
+    printf("[sleep halt] longest programmed halt = %u us (deadline %u us)\n",
+           (unsigned)longest, (unsigned)AUDIO_DMA_DEADLINE_US);
+    fails += check("sleep halt: every halt inside the audio DMA deadline",
+                   longest <= AUDIO_DMA_DEADLINE_US);
+    fails += check("sleep halt: total sleep unchanged (still 3 ticks)",
+                   current_tick() == 3u);
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
@@ -146,6 +216,7 @@ int main(void)
     fails += test_tick_isr();
     fails += test_irq_dispatch();
     fails += test_sleep_ms();
+    fails += test_sleep_halt_under_audio_deadline();
 
     if (fails == 0) {
         printf("ALL PASS\n");

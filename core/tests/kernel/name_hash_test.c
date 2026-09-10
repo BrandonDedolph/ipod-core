@@ -44,6 +44,15 @@ static void vec(const char *label, const char *utf8, uint32_t want)
     fails++;
 }
 
+/*
+ * No vector uses this today — every known bug in the table has been fixed and
+ * promoted to NAME_HASH_VEC. It stays (marked unused, so -Werror is happy)
+ * because the NAME_HASH_XFAIL marker is how the NEXT one gets recorded: a
+ * vector whose expected value is what build_index.py produces, failing on the
+ * C side, with the reason attached. Deleting it would mean the next person to
+ * find a hash mismatch has nowhere to put it but a comment.
+ */
+__attribute__((unused))
 static void xfail_vec(const char *label, const char *utf8, uint32_t want,
                       const char *why)
 {
@@ -61,11 +70,12 @@ static void xfail_vec(const char *label, const char *utf8, uint32_t want,
         xfails++;
         return;
     }
-    /* The upstream bug got fixed. Say so loudly, but do not fail: the fix
-     * lands in kernel/main.c, which this test does not own, and breaking the
-     * build the moment someone fixes it would be perverse. Re-paste the
-     * function into name_hash_ref.c and promote this vector to NAME_HASH_VEC. */
-    printf("[name-hash %s] XPASS — the known bug is FIXED (%s).\n"
+    /* The upstream bug got fixed — FAIL until the vector is promoted. An
+     * XFAIL that passes asserts nothing: the golden value is no longer
+     * checked against anything, so a regression in name_hash() would sail
+     * through a green suite. Breaking the build here is not perverse, it is
+     * the only thing that gets the vector promoted. */
+    fprintf(stderr, "[name-hash %s] XPASS — the known bug is FIXED (%s).\n"
            "    ACTION: re-copy name_hash() into tests/kernel/name_hash_ref.c\n"
            "    and change this vector from NAME_HASH_XFAIL to NAME_HASH_VEC.\n",
            label, why);
@@ -150,5 +160,5 @@ int main(void)
 
     printf("name-hash: %d failure(s), %d xfail(s), %d xpass(es)\n",
            fails, xfails, xpasses);
-    return fails == 0 ? 0 : 1;
+    return (fails == 0 && xpasses == 0) ? 0 : 1;
 }

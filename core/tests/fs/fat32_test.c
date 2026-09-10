@@ -8,6 +8,14 @@
  * 8.3 lookup (case-insensitive, hit + miss), the VFAT long-name lookup
  * (Intentions.flac, only findable by long name), and the file read (full
  * and partial). The image path is argv[1] (passed by meson).
+ *
+ * Two further volumes are hand-built in RAM below: one with a subdirectory
+ * (descent, "." / ".." hiding), and one holding the file shapes a corrupt or
+ * half-written disk hands the STREAMING reader — an empty file, a garbage
+ * first cluster, a chain shorter than the size — served through a block
+ * callback that can be told to fail a given sector once or forever. Those
+ * cases pin down that 0 from fat32_stream_read means end-of-file and nothing
+ * else, and that a failed read leaves the cursor where it was.
  */
 
 #include "fat32.h"
@@ -120,6 +128,21 @@ static void build_subdir_image(void)
     /* sub[96..] stays 0x00 => end of directory */
 }
 
+/* Fault injection for the memory image: any read touching g_fail_lba fails
+ * while g_fail_left > 0 (each failure consumes one), or forever when it is
+ * negative. Everything else, including a read that merely spans a different
+ * sector, succeeds. This is how a "transient" sector error is staged: fail
+ * once, then let the retry through. */
+#define NO_FAIL 0xFFFFFFFFu
+static uint32_t g_fail_lba  = NO_FAIL;
+static int      g_fail_left = 0;
+
+static void fail_sector(uint32_t lba, int times)   /* times < 0: forever */
+{
+    g_fail_lba  = lba;
+    g_fail_left = times;
+}
+
 /* Memory-backed 512-byte block read over g_mem (part_lba 0). */
 static int mem_read(void *ud, uint32_t lba, uint32_t count, void *buf)
 {
@@ -127,9 +150,87 @@ static int mem_read(void *ud, uint32_t lba, uint32_t count, void *buf)
     if ((lba + count) * 512u > sizeof g_mem) {
         return -1;
     }
+    if (g_fail_lba != NO_FAIL && lba <= g_fail_lba && g_fail_lba < lba + count &&
+        g_fail_left != 0) {
+        if (g_fail_left > 0) {
+            g_fail_left--;
+        }
+        return -1;
+    }
     memcpy(buf, &g_mem[lba * 512u], count * 512u);
     return 0;
 }
+
+/* ---- third image: the file shapes a corrupt or half-written volume hands
+ * the streaming reader, on the same 512-byte geometry (cluster N == sector N,
+ * data from sector 2). All in the root, so nothing here disturbs the
+ * subdirectory assertions above:
+ *
+ *   EMPTY.TXT    cluster 0, size 0        a legitimately empty file
+ *   BADCLUS.TXT  cluster 0x1000, size 100 a real size, an unaddressable first
+ *                                         cluster (the volume tops out at 128)
+ *   SHORT.TXT    cluster 3 -> EOC, size 1034
+ *                                         the chain ends after ONE cluster but
+ *                                         the size claims three
+ *   TWO.TXT      clusters 4 -> 5, size 1000, byte[i] = (i * 7) & 0xFF
+ *                                         a healthy two-cluster file, for the
+ *                                         transient-error cases
+ *   BADDIR       a subdirectory whose cluster is 0x1000
+ */
+#define BAD_CLUS 0x1000u
+
+static void build_stream_image(void)
+{
+    memset(g_mem, 0, sizeof g_mem);
+
+    uint8_t *bs = g_mem;
+    bs[0] = 0xEB; bs[1] = 0x58; bs[2] = 0x90;
+    memcpy(&bs[3], "MSDOS5.0", 8);
+    put16(&bs[11], MEM_BPS);
+    bs[13] = 1;
+    put16(&bs[14], 1);
+    bs[16] = 1;
+    bs[21] = 0xF8;
+    put32(&bs[36], 1);
+    put32(&bs[44], 2);
+    bs[510] = 0x55; bs[511] = 0xAA;
+
+    uint8_t *fat = &g_mem[1 * MEM_BPS];
+    put32(&fat[0 * 4], 0x0FFFFFF8u);
+    put32(&fat[1 * 4], 0x0FFFFFFFu);
+    put32(&fat[2 * 4], 0x0FFFFFFFu);   /* root            EOC */
+    put32(&fat[3 * 4], 0x0FFFFFFFu);   /* SHORT.TXT       EOC after one cluster */
+    put32(&fat[4 * 4], 5);             /* TWO.TXT 4 -> 5 */
+    put32(&fat[5 * 4], 0x0FFFFFFFu);   /* TWO.TXT 5      EOC */
+
+    uint8_t *root = &g_mem[2 * MEM_BPS];
+    put_dirent(&root[0],   "EMPTY   TXT", 0x20, 0,        0);
+    put_dirent(&root[32],  "BADCLUS TXT", 0x20, BAD_CLUS, 100);
+    put_dirent(&root[64],  "SHORT   TXT", 0x20, 3,        1034);
+    put_dirent(&root[96],  "TWO     TXT", 0x20, 4,        1000);
+    put_dirent(&root[128], "BADDIR     ", 0x10, BAD_CLUS, 0);
+
+    for (int i = 0; i < 1000; i++) {
+        g_mem[4 * MEM_BPS + i] = (uint8_t)((i * 7) & 0xFF);   /* 4 then 5 */
+    }
+    for (int i = 0; i < 512; i++) {
+        g_mem[3 * MEM_BPS + i] = (uint8_t)(0xA5 ^ i);
+    }
+}
+
+static int two_ok(const uint8_t *p, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (p[i] != (uint8_t)((i * 7) & 0xFF)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* One mount per fault-injection case, so each starts with COLD fat32.c
+ * caches (they are tagged by fat32_t pointer — see the comment at the tests). */
+static fat32_t g_fs_fatfail, g_fs_datfail, g_fs_persist;
 
 static int check(const char *label, int cond)
 {
@@ -412,6 +513,217 @@ int main(int argc, char **argv)
     fails += check("MUSIC/SONG.TXT: is_dir=0, size=100, clus=4",
                    song && song->is_dir == 0 && song->size == 100 &&
                    song->first_clus == 4);
+
+    /* ---- the streaming reader on corrupt and half-written files ----
+     *
+     * THE BUG. fat32_stream_open on a garbage first cluster with a nonzero
+     * size succeeded, and the first fat32_stream_read returned 0 — the same
+     * answer as a legitimately empty file. fat32_read_file had already been
+     * changed to return FAT32_ECORRUPT for exactly this, and player.c tells
+     * an error from EOF, but the stream (the path the player actually uses)
+     * never handed it an error to distinguish: a corrupt entry played as a
+     * zero-length track and the player moved on. The same collapse happened
+     * mid-file: after a FAT read failure the cursor was zeroed, so the retry
+     * got EOF for a file with bytes left.
+     *
+     * A FRESH fat32_t (sfs) rather than mfs, and one more per fault-injection
+     * block below: fat32.c's FAT and data caches are tagged by the fs
+     * POINTER, so a sector already cached for one fat32_t is never fetched
+     * again for it — and a fault staged on that sector would never reach the
+     * block callback. Each block that injects a fault mounts its own object,
+     * so its caches are cold. They are distinct file-scope objects, not
+     * block-scoped locals, because the compiler may give sequential locals
+     * the same stack slot, i.e. the same pointer, i.e. the same cache tag. */
+    build_stream_image();
+    fat32_t sfs;
+    fails += check("stream-image mount returns 0",
+                   fat32_mount(&sfs, mem_read, NULL, 0) == 0);
+    fails += check("stream-image: the bad cluster really is unaddressable",
+                   BAD_CLUS >= sfs.max_clus);
+    {
+        struct { fat32_dirent_t v[8]; int n; } r = { .n = 0 };
+        fails += check("stream-image root lists all 5 entries",
+                       fat32_readdir(&sfs, sfs.root_clus, dir_collect, &r) == 0 &&
+                       r.n == 5);
+    }
+
+    /* A genuinely empty file is a clean EOF: 0, and 0 again, and skip skips
+     * nothing. This is the other half of "distinguishable": the fix must not
+     * turn empty files into errors. */
+    {
+        fat32_stream_t es;
+        uint8_t b[16];
+        fat32_stream_open(&es, &sfs, 0, 0);
+        fails += check("empty file: first stream_read is a clean EOF (0)",
+                       fat32_stream_read(&es, b, sizeof b) == 0);
+        fails += check("empty file: stream_skip skips nothing",
+                       fat32_stream_skip(&es, 10) == 0);
+        fails += check("empty file: stream_read stays a clean EOF",
+                       fat32_stream_read(&es, b, sizeof b) == 0);
+    }
+
+    /* A bad first cluster with bytes to deliver is ECORRUPT, not EOF — on the
+     * first read, on the next read (no sticky "EOF" state), and after a skip,
+     * which has no error channel and so must defer to the read. */
+    {
+        fat32_stream_t bs;
+        uint8_t b[128];
+        memset(b, 0xCC, sizeof b);
+        fat32_stream_open(&bs, &sfs, BAD_CLUS, 100);
+        int32_t r1 = fat32_stream_read(&bs, b, sizeof b);
+        fails += check("bad first cluster: stream_read returns ECORRUPT, not 0",
+                       r1 == FAT32_ECORRUPT);
+        fails += check("bad first cluster: nothing was written to the buffer",
+                       b[0] == 0xCC);
+        fails += check("bad first cluster: a second read is still ECORRUPT",
+                       fat32_stream_read(&bs, b, sizeof b) == FAT32_ECORRUPT);
+        fails += check("bad first cluster: stream_skip skips nothing",
+                       fat32_stream_skip(&bs, 50) == 0);
+        fails += check("bad first cluster: the read after a skip is ECORRUPT",
+                       fat32_stream_read(&bs, b, sizeof b) == FAT32_ECORRUPT);
+        fails += check("bad first cluster: read_file agrees (ECORRUPT)",
+                       fat32_read_file(&sfs, BAD_CLUS, b, 100) == FAT32_ECORRUPT);
+    }
+
+    /* A chain that ends before the size does: the first cluster reads, then
+     * the step to the next finds EOC with 522 bytes still owed. That is
+     * corruption (metadata and allocation disagree), and it used to surface
+     * as a short read followed by a clean EOF — the tail of the track just
+     * gone. The cursor must not move on the failure. */
+    {
+        fat32_stream_t ss;
+        uint8_t b[512];
+        fat32_stream_open(&ss, &sfs, 3, 1034);
+        int32_t got = fat32_stream_read(&ss, b, 512);
+        int first_ok = (got == 512);
+        for (int i = 0; i < 512 && first_ok; i++) {
+            first_ok = b[i] == (uint8_t)(0xA5 ^ i);
+        }
+        fails += check("short chain: the one real cluster reads correctly",
+                       first_ok);
+        fails += check("short chain: the next read is ECORRUPT, not EOF",
+                       fat32_stream_read(&ss, b, 512) == FAT32_ECORRUPT);
+        fails += check("short chain: the failed read left the cursor alone",
+                       ss.remaining == 522 && ss.clus == 3);
+        fails += check("short chain: skip stops at the break",
+                       fat32_stream_skip(&ss, 522) == 0);
+        fails += check("short chain: still ECORRUPT after the skip",
+                       fat32_stream_read(&ss, b, 512) == FAT32_ECORRUPT);
+    }
+
+    /* TRANSIENT FAT FAILURE. TWO.TXT: 512 bytes from cluster 4, then the FAT
+     * (sector 1) is unreadable when the reader steps to cluster 5. The call
+     * must fail (not return 512 short, which reads as EOF-ish), leave the
+     * cursor exactly where it was, and — once the sector reads again — the
+     * SAME call must succeed without a reopen. Under the old code the cursor
+     * was zeroed by the failure and the retry returned 0: silent EOF. */
+    {
+        fat32_stream_t ts;
+        static uint8_t b[1000];
+        fails += check("transient FAT error: fresh mount (cold caches)",
+                       fat32_mount(&g_fs_fatfail, mem_read, NULL, 0) == 0);
+        fat32_stream_open(&ts, &g_fs_fatfail, 4, 1000);
+        fail_sector(1, 1);                          /* the FAT, once */
+        int32_t r1 = fat32_stream_read(&ts, b, 1000);
+        fails += check("transient FAT error: stream_read reports EIO",
+                       r1 == FAT32_EIO);
+        fails += check("transient FAT error: the cursor is unchanged",
+                       ts.clus == 4 && ts.clus_off == 0 && ts.remaining == 1000);
+        fails += check("transient FAT error: the fault was consumed",
+                       g_fail_left == 0);
+        memset(b, 0xCC, sizeof b);
+        int32_t r2 = fat32_stream_read(&ts, b, 1000);
+        fails += check("transient FAT error: the retry delivers all 1000 bytes",
+                       r2 == 1000 && two_ok(b, 1000));
+        fails += check("transient FAT error: then a clean EOF",
+                       fat32_stream_read(&ts, b, 16) == 0);
+        fail_sector(NO_FAIL, 0);
+    }
+
+    /* TRANSIENT DATA FAILURE, mid-call: cluster 4 reads, cluster 5 (sector 5)
+     * fails. The bytes already copied are NOT counted — the call fails as a
+     * whole and the cursor is back at the start, so the caller's own byte
+     * position (player.c keeps one) stays true. */
+    {
+        fat32_stream_t ds;
+        static uint8_t b[1000];
+        fails += check("transient data error: fresh mount (cold caches)",
+                       fat32_mount(&g_fs_datfail, mem_read, NULL, 0) == 0);
+        fat32_stream_open(&ds, &g_fs_datfail, 4, 1000);
+        fail_sector(5, 1);
+        int32_t r1 = fat32_stream_read(&ds, b, 1000);
+        fails += check("transient data error: stream_read reports EIO",
+                       r1 == FAT32_EIO);
+        fails += check("transient data error: the cursor is unchanged",
+                       ds.clus == 4 && ds.clus_off == 0 && ds.remaining == 1000);
+        memset(b, 0xCC, sizeof b);
+        fails += check("transient data error: the retry delivers all 1000 bytes",
+                       fat32_stream_read(&ds, b, 1000) == 1000 && two_ok(b, 1000));
+        fail_sector(NO_FAIL, 0);
+    }
+
+    /* PERSISTENT data failure: every call is an error, never an EOF. */
+    {
+        fat32_stream_t ps;
+        static uint8_t b[1000];
+        fails += check("persistent data error: fresh mount (cold caches)",
+                       fat32_mount(&g_fs_persist, mem_read, NULL, 0) == 0);
+        fat32_stream_open(&ps, &g_fs_persist, 4, 1000);
+        fail_sector(4, -1);
+        fails += check("persistent data error: first read is EIO",
+                       fat32_stream_read(&ps, b, 1000) == FAT32_EIO);
+        fails += check("persistent data error: second read is EIO, not EOF",
+                       fat32_stream_read(&ps, b, 1000) == FAT32_EIO);
+        fails += check("persistent data error: nothing was consumed",
+                       ps.remaining == 1000);
+        fail_sector(NO_FAIL, 0);
+    }
+
+    /* ---- directory reads: what the library loader has to act on ----
+     *
+     * The loader ignored every readdir return code, so a failed album walk
+     * was indistinguishable from an empty album. The loader's retry lives in
+     * kernel/main.c (static; not reachable from here), but the contract it
+     * relies on is testable: a failing walk must SAY so, and a walk retried
+     * after the fault clears must deliver the full listing — the reader
+     * keeps no state that would make the second attempt fail. And a
+     * directory whose cluster is unaddressable is ECORRUPT, not empty. */
+    {
+        struct { fat32_dirent_t v[8]; int n; } r = { .n = 0 };
+        fail_sector(2, 1);                          /* the root, once */
+        int rc1 = fat32_readdir(&sfs, sfs.root_clus, dir_collect, &r);
+        fails += check("transient dir error: readdir reports EIO",
+                       rc1 == FAT32_EIO);
+        fails += check("transient dir error: no entries were surfaced",
+                       r.n == 0);
+        int rc2 = fat32_readdir(&sfs, sfs.root_clus, dir_collect, &r);
+        fails += check("transient dir error: the retry lists everything",
+                       rc2 == 0 && r.n == 5);
+        fail_sector(NO_FAIL, 0);
+    }
+    {
+        struct { fat32_dirent_t v[8]; int n; } r = { .n = 0 };
+        fail_sector(2, -1);
+        fails += check("persistent dir error: readdir is EIO",
+                       fat32_readdir(&sfs, sfs.root_clus, dir_collect, &r) == FAT32_EIO);
+        fails += check("persistent dir error: still EIO on retry, no entries",
+                       fat32_readdir(&sfs, sfs.root_clus, dir_collect, &r) == FAT32_EIO &&
+                       r.n == 0);
+        fail_sector(NO_FAIL, 0);
+    }
+    {
+        struct { fat32_dirent_t v[8]; int n; } r = { .n = 0 };
+        fails += check("readdir on an unaddressable cluster is ECORRUPT, not empty",
+                       fat32_readdir(&sfs, BAD_CLUS, dir_collect, &r) == FAT32_ECORRUPT &&
+                       r.n == 0);
+        fails += check("readdir on cluster 0 is ECORRUPT, not empty",
+                       fat32_readdir(&sfs, 0, dir_collect, &r) == FAT32_ECORRUPT &&
+                       r.n == 0);
+        /* And the lookup built on it agrees: not "no such file". */
+        uint32_t c = 0, s = 0;
+        fails += check("open_in on an unaddressable directory is ECORRUPT, not ENOENT",
+                       fat32_open_in(&sfs, BAD_CLUS, "X.TXT", &c, &s) == FAT32_ECORRUPT);
+    }
 
     if (fails == 0) {
         printf("ALL PASS\n");

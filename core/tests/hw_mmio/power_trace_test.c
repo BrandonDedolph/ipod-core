@@ -185,6 +185,14 @@ int main(void)
      * byte count, strobe. Two payload bytes: the register pointer then the
      * value. */
     mmio_mock_reset();
+    /* power_standby() zeroes ~112 KB of IRAM through mmio_write32 before it
+     * talks to the PMU (a raw store to 0x4000C000 is a wild pointer on the
+     * host). Those are memory stores, not register accesses: keep them out of
+     * the grammar so they cannot bury the two I2C writes below. This is the
+     * ONLY test that needs the suppression — every other trace test records
+     * writes to every address, so a register write that decodes into RAM
+     * shows up as the anomaly it is. */
+    mmio_mock_ignore_writes(0x40000000u, 0x40020000u);
     mmio_mock_set_read(I2C_STATUS_ADDR, 0x00);   /* controller idle          */
     mmio_mock_set_read(I2C_CTRL_ADDR,   0x00);   /* read-modify-write base   */
     standby_outcome out = run_standby();
@@ -274,6 +282,7 @@ int main(void)
      * must never fall through and pretend it slept — and it must not hang:
      * the spin is bounded, so this call has to terminate. */
     mmio_mock_reset();
+    mmio_mock_ignore_writes(0x40000000u, 0x40020000u);
     mmio_mock_set_read(I2C_STATUS_ADDR, I2C_BUSY);  /* permanently busy */
     mmio_mock_set_read(I2C_CTRL_ADDR,   0x00);
     out = run_standby();

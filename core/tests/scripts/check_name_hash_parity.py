@@ -23,9 +23,9 @@ This script performs two checks:
      the same table the C test asserts against (2) — plus the collision pairs
      the fold exists for (case, smart quotes, dashes) and one non-collision.
 
-Exits non-zero on any mismatch. Vectors tagged NAME_HASH_XFAIL are known C-side
-bugs (see the header); Python must still produce the CORRECT value for them,
-so they are asserted normally here.
+Exits non-zero on any mismatch. NAME_HASH_XFAIL still parses (the marker stays
+available for the next known C-side bug), but Python is held to the CORRECT
+value either way, so both forms are asserted identically here.
 """
 
 import importlib.util

@@ -1,13 +1,15 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
- * core/hal/hw/ata.h — minimal PIO-polled ATA sector reader (PP5022).
+ * core/hal/hw/ata.h — minimal PIO-polled ATA sector driver (PP5022).
  *
- * Read-only, 512-byte LBA28 sectors. Reuses the drive state the
- * chainloading bootloader left behind (powered, spun, PIO-timed), so init
- * is just "select master, wait ready" — see core/docs/hw/04-ata.md. The
- * 80 GB 5.5G is addressed in plain 512-byte sectors here; the "2048-byte
- * sector" is a FAT-layer virtual-sector detail handled above this driver.
- * Asm-free (host-trace-testable).
+ * 512-byte LBA28 sectors: a read path used by everything, and a write path
+ * with exactly one caller (the settings save in kernel/config.c). We boot
+ * directly as the OSOS image, so the drive state we inherit is the Apple
+ * boot ROM's (powered, spun, PIO-timed) and init is just a soft reset plus
+ * "select master, wait ready" — see core/docs/hw/04-ata.md. The 80 GB 5.5G
+ * is addressed in plain 512-byte sectors here; the "2048-byte sector" is a
+ * FAT-layer virtual-sector detail handled above this driver. Asm-free
+ * (host-trace-testable: tests/hw_ata/ata_trace_test.c).
  */
 #ifndef CORE_HAL_HW_ATA_H
 #define CORE_HAL_HW_ATA_H
@@ -59,9 +61,12 @@ int ata_init(void);
 #define ATA_SECTOR_SZ 512u
 
 /*
- * Read `count` (1..256) 512-byte sectors starting at LBA `lba` into `buf`
- * (must be 16-bit aligned; needs count*512 bytes). Returns 0 on success,
- * negative per the code table above.
+ * Read `count` 512-byte sectors starting at LBA `lba` into `buf` (must be
+ * 16-bit aligned; needs count*512 bytes). Any count: the driver splits the
+ * request into READ SECTORS commands of at most 256 and hides the drive's
+ * physical-sector alignment rule. Returns 0 on success, negative per the code
+ * table above; a range that would cross the 28-bit LBA address space is
+ * rejected with -1 rather than silently aliased onto a lower sector.
  */
 int ata_read_sectors(uint32_t lba, uint32_t count, void *buf);
 
@@ -105,11 +110,20 @@ int ata_is_parked(void);
  * is enabled by default — without the flush, a battery pull between the write
  * and the drive's own writeback loses it silently).
  *
- * *** UNVERIFIED ON HARDWARE, AND DELIBERATELY UNWIRED. *** Nothing in the
- * firmware calls this. It is a reviewed primitive; the calling layer lands
- * separately, and whoever writes it must first prove this on device against a
- * scratch LBA (write, read back, compare). Unlike a bad read, a bad write
- * destroys data.
+ * PROVEN ON HARDWARE (2026-07-27) and wired to ONE caller: config_save() in
+ * kernel/config.c, whose banner records the qualification procedure (resolve
+ * the LBA three ways, write, read back raw, fsck). That procedure is owed by
+ * anyone adding a second caller, because unlike a bad read, a bad write
+ * destroys data. The fs layer (fs/fat32.c) is still read-only and keeps no
+ * write-invalidation for its sector caches — a caller that writes a sector
+ * the fs may have cached must deal with that itself, as config.c does by
+ * reading its slots back through the volume's raw block callback rather than
+ * the cached file path.
+ *
+ * On a failure after the command is issued the driver runs the same
+ * recovery as the read path (latch ERROR, drain DRQ, soft reset) — the
+ * next command after a settings save is usually the player's refill read,
+ * which must not be issued on top of a half-finished write.
  *
  * ALIGNMENT: `lba` and `count` must BOTH be multiples of the drive's logical-
  * sectors-per-physical-sector (2 on the stock 80 GB MK8010GAH, which returns
@@ -119,8 +133,9 @@ int ata_is_parked(void);
  * widens the power-loss window over data that was previously safe.
  *
  * Returns 0 on success; -1 on a bad argument (misaligned LBA/count/buffer,
- * zero count, drive not ready), -2 on a timeout, -3 on a drive error (ERR/DF,
- * e.g. IDNF for a bad LBA).
+ * zero count, an LBA range past the 28-bit address space, drive not ready),
+ * -2 on a timeout, -3 on a drive error (ERR/DF), ATA_ERR_IDNF when the drive
+ * reported the LBA does not exist.
  */
 int ata_write_sectors(uint32_t lba, uint32_t count, const void *buf);
 

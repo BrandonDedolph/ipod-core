@@ -41,6 +41,9 @@
 
 /* Count of cache_commit() calls, from audio_test_stubs.c. */
 unsigned audio_test_cache_commits(void);
+/* Count of codec state-restore callbacks — one per wm8758_init, i.e. one per
+ * codec RESET. Lets a test see that a wake really re-initialised the codec. */
+unsigned audio_test_codec_restores(void);
 
 /* ---- counting source ------------------------------------------------
  * Every frame it produces carries a globally unique, monotonically increasing
@@ -450,6 +453,83 @@ int main(void)
     audio_dma_isr();
     xpect(&c, "each buffer fill is followed by a cache flush",
           audio_test_cache_commits() - commits_before == (unsigned)g_calls);
+
+    /* --- 9. suspend/wake keeps the resume position; close does not ---- *
+     * A pause that persists has the codec powered down (audio.h,
+     * hal_audio_suspend). The requirement on the way back is the same one
+     * case 5 puts on a plain stop/start: resume INSIDE the chunk the DMA was
+     * part-way through, dropping nothing. hal_audio_close() cannot deliver
+     * that — it severs the buffers, so a close/init/start comes back two
+     * chunks AHEAD — which is exactly why suspend exists and why the player
+     * must not reach for close on a pause. Both halves are asserted so that
+     * the contrast is on record, not just the happy path. */
+    fresh_start();
+    audio_dma_isr();
+    audio_dma_isr();                  /* part-way through the chunk at 2*frames */
+    hal_audio_stop();
+    bus_ready();
+    hal_audio_suspend();
+    unsigned restores_before = audio_test_codec_restores();
+    bus_ready();
+    xpect(&c, "wake after suspend reports the codec came up",
+          hal_audio_wake() == 0);
+    xpect(&c, "wake re-latches the user's codec state (it is a reset)",
+          audio_test_codec_restores() == restores_before + 1);
+    int calls_before_start = g_calls;
+    bus_ready();
+    hal_audio_start();
+    collect_kicks();
+    xpect(&c, "suspend/wake/start kicks the DMA again", g_kicks >= 1);
+    xpect(&c, "suspend/wake/start resumes exactly where the pause left off",
+          last_kick_first_sample() == sample_for(2u * (uint32_t)frames));
+    xpect(&c, "suspend/wake/start pulls nothing new from the source",
+          g_calls == calls_before_start);
+
+    /* The contrast: close discards what suspend keeps. */
+    fresh_start();
+    audio_dma_isr();
+    audio_dma_isr();
+    hal_audio_stop();
+    hal_audio_close();
+    bus_ready();
+    hal_audio_init(44100u, 2u);
+    hal_audio_set_source(counting_source, 0);
+    bus_ready();
+    hal_audio_start();
+    xpect(&c, "close/init/start comes back AHEAD of the pause point (why "
+              "suspend exists)",
+          last_kick_first_sample() == sample_for(4u * (uint32_t)frames));
+
+    /* Suspend refuses to act under a running DMA: nothing is powered down,
+     * and the completion path is untouched. */
+    fresh_start();
+    restores_before = audio_test_codec_restores();
+    hal_audio_suspend();              /* running: must be refused */
+    xpect(&c, "wake after a refused suspend is a no-op",
+          hal_audio_wake() == 0 &&
+          audio_test_codec_restores() == restores_before);
+    audio_dma_isr();
+    collect_kicks();
+    xpect(&c, "a suspend issued while running does not disturb playback",
+          g_kicks == 2 && last_kick_first_sample() == sample_for((uint32_t)frames));
+
+    /* Suspend, then close: the power-down runs once, and close still severs
+     * the buffers — the UI closes on the active->inactive edge and a stop that
+     * follows a suspended pause must not double-walk the codec sequence. */
+    hal_audio_stop();
+    hal_audio_suspend();
+    restores_before = audio_test_codec_restores();
+    hal_audio_close();
+    bus_ready();
+    hal_audio_init(44100u, 2u);
+    xpect(&c, "close after suspend still brings the next init up as a reset",
+          audio_test_codec_restores() == restores_before + 1);
+    source_reset();
+    bus_ready();
+    hal_audio_set_source(counting_source, 0);
+    hal_audio_start();
+    xpect(&c, "close after suspend severed the buffers: start primes cold",
+          g_calls == 2 && last_kick_first_sample() == sample_for(0));
 
     return xfail_done(&c);
 }

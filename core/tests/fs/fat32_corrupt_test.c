@@ -28,6 +28,11 @@
  *   orphan-lfn   LFN runs with a mismatched checksum / no 8.3 entry at all
  *   truncated    the volume ends after the FAT region
  *
+ * Plus, on the GOOD image, injected sector faults (fail_sector): one read of
+ * the root or of a file cluster fails and then the drive settles, or it never
+ * does. That is the failure the library loader actually meets at boot, and
+ * the reader's answers to it are what the loader's retry is built on.
+ *
  * Assertions that today's fs/fat32.c does not meet are marked XFAIL (see
  * tests/xfail.h) with the specific missing check named, rather than being
  * weakened until they pass. Run with CORE_TEST_STRICT_XFAIL=1 to see whether a
@@ -59,11 +64,35 @@ static long     g_img_blocks;    /* size of the image in 512-byte blocks */
 static long     g_reads;
 static long     g_oob_reads;     /* reads that fell outside the image     */
 
+/*
+ * Sector fault injection, on top of the budget. Any read touching g_fail_lba
+ * fails while g_fail_left is nonzero (each failure consumes one; negative
+ * means forever). A GOOD volume with one flaky sector is the realistic
+ * failure the library loader meets — the drive still settling from spin-up
+ * during "Loading Library" — and it is what the loader's retry is for.
+ */
+#define NO_FAIL 0xFFFFFFFFu
+static uint32_t g_fail_lba  = NO_FAIL;
+static int      g_fail_left = 0;
+
+static void fail_sector(uint32_t lba, int times)   /* times < 0: forever */
+{
+    g_fail_lba  = lba;
+    g_fail_left = times;
+}
+
 static int img_read(void *ud, uint32_t lba, uint32_t count, void *buf)
 {
     (void)ud;
     if (++g_reads > READ_BUDGET) {
         return -1;               /* budget exhausted: report a dead drive */
+    }
+    if (g_fail_lba != NO_FAIL && lba <= g_fail_lba && g_fail_lba < lba + count &&
+        g_fail_left != 0) {
+        if (g_fail_left > 0) {
+            g_fail_left--;
+        }
+        return -1;               /* the injected fault */
     }
     if ((long)lba + (long)count > g_img_blocks) {
         g_oob_reads++;
@@ -167,6 +196,72 @@ int main(int argc, char **argv)
     xpect(&c, "reported cluster count is plausible for the image",
           fs.total_clus <= (uint32_t)g_img_blocks);
 
+    /* ---- 0b. a GOOD volume with one flaky sector ----------------------- *
+     * The realistic "Loading Library" failure: nothing on disk is wrong, one
+     * read of the root directory (FS-sector 4 = LBA 16..19 on this 2048-byte
+     * volume) fails, then the drive settles. The library loader used to
+     * ignore readdir's return code entirely, so this looked like an empty
+     * album (or, at the root, an empty library). What the loader's retry
+     * (kernel/main.c, static — not linkable here) needs from fat32.c is
+     * asserted instead: a failing walk REPORTS, the retried walk after the
+     * fault clears is complete, and a persistently failing walk keeps
+     * reporting rather than ever collapsing into "0 entries, success". */
+    {
+        collector col = { { { 0 } }, 0, 0 };
+        fail_sector(16, 1);                         /* the root, once */
+        int rc1 = fat32_readdir_root(&fs, collect, &col);
+        xpect(&c, "flaky: a root read that fails once is reported as EIO",
+              rc1 == FAT32_EIO);
+        xpect(&c, "flaky: the failed walk surfaced no entries", col.n == 0);
+        int rc2 = fat32_readdir_root(&fs, collect, &col);
+        xpect(&c, "flaky: the retried walk succeeds with the full listing",
+              rc2 == 0 && col.n == 2 &&
+              has_name(&col, "HELLO.TXT") && has_name(&col, "Intentions.flac"));
+        xpect(&c, "flaky: the retry cost no more reads than a clean walk",
+              !budget_hit());
+        fail_sector(NO_FAIL, 0);
+    }
+    {
+        collector col = { { { 0 } }, 0, 0 };
+        fail_sector(16, -1);                        /* the root, forever */
+        int rc1 = fat32_readdir_root(&fs, collect, &col);
+        int rc2 = fat32_readdir_root(&fs, collect, &col);
+        xpect(&c, "dead sector: every walk of the root is EIO, never success",
+              rc1 == FAT32_EIO && rc2 == FAT32_EIO && col.n == 0);
+        /* The lookup built on the walk must not say "no such file" for a
+         * file it could not look for. */
+        uint32_t clus = 0, size = 0;
+        xpect(&c, "dead sector: open reports EIO, not ENOENT",
+              fat32_open(&fs, "HELLO.TXT", &clus, &size) == FAT32_EIO);
+        fail_sector(NO_FAIL, 0);
+    }
+    {
+        /* And the same one-shot fault on a FILE read: the stream must fail
+         * the call, hold its position, and deliver everything on the retry.
+         * HELLO.TXT's second cluster is FS-sector 6 = LBA 24. */
+        uint32_t clus = 0, size = 0;
+        xpect(&c, "flaky: HELLO.TXT opens on the good volume",
+              fat32_open(&fs, "HELLO.TXT", &clus, &size) == 0 && size == 3000);
+        fat32_stream_t st;
+        fat32_stream_open(&st, &fs, clus, size);
+        fail_sector(24, 1);
+        int32_t got = fat32_stream_read(&st, big, 3000);
+        xpect(&c, "flaky: a stream read hitting the bad sector reports EIO",
+              got == FAT32_EIO);
+        xpect(&c, "flaky: the failed stream read did not move the cursor",
+              st.remaining == 3000 && st.clus == clus && st.clus_off == 0);
+        got = fat32_stream_read(&st, big, 3000);
+        int content = (got == 3000);
+        for (int i = 0; i < 3000 && content; i++) {
+            content = big[i] == (uint8_t)(i & 0xFF);
+        }
+        xpect(&c, "flaky: the retried stream read delivers all 3000 bytes",
+              content);
+        xpect(&c, "flaky: then a clean EOF",
+              fat32_stream_read(&st, big, 16) == 0);
+        fail_sector(NO_FAIL, 0);
+    }
+
     /* ---- 1. cyclic FAT chain ---------------------------------------- *
      * Both the root directory's chain and HELLO.TXT's chain loop back on
      * themselves. Nothing here may run forever. */
@@ -225,6 +320,41 @@ int main(int argc, char **argv)
             xpect(&c, "oob: reading it returns an error, not data", got < 0);
             xpect(&c, "oob: the cluster is rejected before any disk read",
                   g_oob_reads == 0);
+
+            /* THE STREAM PATH — the one the player uses. read_file above was
+             * fixed to reject this cluster; the stream still opened it and
+             * returned 0 from the first read, which is what an EMPTY file
+             * returns, so the player treated a corrupt entry as a zero-length
+             * track and advanced. It must be ECORRUPT, and it must stay
+             * ECORRUPT (no latching into EOF), and skip must not pretend. */
+            fat32_stream_t st;
+            memset(big, 0xAB, 64);
+            fat32_stream_open(&st, &fs, clus, size);
+            g_oob_reads = 0;
+            int32_t sg = fat32_stream_read(&st, big, 64);
+            xpect(&c, "oob: stream_read on the bad first cluster is ECORRUPT, "
+                      "not a 0-byte EOF",
+                  sg == FAT32_ECORRUPT);
+            xpect(&c, "oob: the stream wrote nothing", big[0] == 0xAB);
+            xpect(&c, "oob: the stream issued no disk read for it",
+                  g_oob_reads == 0);
+            xpect(&c, "oob: a second stream_read is still ECORRUPT",
+                  fat32_stream_read(&st, big, 64) == FAT32_ECORRUPT);
+            xpect(&c, "oob: stream_skip over it skips nothing",
+                  fat32_stream_skip(&st, 100) == 0);
+            xpect(&c, "oob: the read after the skip is still ECORRUPT",
+                  fat32_stream_read(&st, big, 64) == FAT32_ECORRUPT);
+
+            /* A DIRECTORY at that cluster is likewise corrupt, not empty:
+             * this is what an album folder with a bad entry looks like to
+             * the library loader, which used to list it with no tracks. */
+            collector col = { { { 0 } }, 0, 0 };
+            g_oob_reads = 0;
+            xpect(&c, "oob: readdir of a directory at the bad cluster is "
+                      "ECORRUPT, not an empty listing",
+                  fat32_readdir(&fs, clus, collect, &col) == FAT32_ECORRUPT &&
+                  col.n == 0);
+            xpect(&c, "oob: that readdir issued no disk read", g_oob_reads == 0);
         }
     }
     {
@@ -238,6 +368,10 @@ int main(int argc, char **argv)
             int32_t got = fat32_read_file(&fs, clus, big, sizeof big);
             xpect(&c, "oob: a cluster below 2 yields no data",
                   got <= 0);
+            fat32_stream_t st;
+            fat32_stream_open(&st, &fs, clus, size);
+            xpect(&c, "oob: a stream on a cluster below 2 is ECORRUPT, not EOF",
+                  fat32_stream_read(&st, big, 64) == FAT32_ECORRUPT);
         }
     }
 

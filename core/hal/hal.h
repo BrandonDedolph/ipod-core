@@ -234,10 +234,33 @@ void hal_audio_start(void);
  *
  * Stop does NOT power the codec down — PLL, VMID and the DAC stay live, which
  * is the full analog budget. A device left paused indefinitely should be shut
- * down with hal_audio_close() after a timeout and re-opened with
- * hal_audio_init() on resume; init is idempotent and per-track anyway.
+ * down after a timeout, but NOT with hal_audio_close(): close discards the
+ * HAL's buffered PCM, so resuming from it lands ahead of where the listener
+ * paused, by up to a full internal buffer. The hw backend offers
+ * hal_audio_suspend()/hal_audio_wake() for exactly this — the same
+ * pop-suppressed power-down, without dropping the buffers. The player uses
+ * them after a pause persists.
  */
 void hal_audio_stop(void);
+
+/*
+ * hal_audio_flush discards PCM the HAL has buffered but not yet played, so the
+ * next hal_audio_start begins from the source rather than resuming.
+ *
+ * This is the counterpart hal_audio_stop's resume behaviour needs. Stop keeps
+ * the internal buffer deliberately — that is what makes unpause seamless — but
+ * a caller that has just replaced the CONTENT of the source (a seek, most
+ * obviously) must be able to say so, or the listener hears the old position
+ * play out first. Without it, every scrub replayed up to a full internal
+ * buffer of audio from where the track used to be and then cut abruptly to the
+ * new position.
+ *
+ * Call it between stop and start. Calling it while running is a no-op request
+ * the backend may ignore; calling it when nothing is buffered is harmless.
+ * It does not touch the codec, the rate, or the volume — after a flush the
+ * stream is the same stream, just without a past.
+ */
+void hal_audio_flush(void);
 
 /*
  * hal_audio_close releases the output device. After this hal_audio_init

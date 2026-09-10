@@ -20,6 +20,7 @@
 #include "hw/battery.h"
 #include "hw/i2c.h"
 #include "hw/power.h"
+#include "hw/audio.h"
 #include "hw/piezo.h"
 #include "hal.h"
 #include "../fs/fat32.h"
@@ -38,6 +39,7 @@
 #include "../ui/screen_charging.h"
 #include "../ui/settings.h"
 #include "../ui/palette.h"
+#include "../ui/chrome.h"
 #include "hw/volume.h"
 
 /*
@@ -94,130 +96,8 @@ static int ui_window_up(ui_window_t *w, uint32_t span, uint32_t now)
  * Linen theme + Nunito faces
  * ------------------------------------------------------------------------- */
 
-/* Theme palette. The tokens keep their LINEN_ names but now resolve to the
- * live, theme-selected palette (ui/palette.h): g_pal[] is swapped as a block by
- * theme_set() when Settings -> Theme changes (Linen / Onyx dark). The names are
- * historical — under Onyx these carry the dark values. SEL_BG/SEL_FG stay
- * derived from INK/SURFACE so the inverted selection bar reads right in both. */
-#define LINEN_SURFACE g_pal[PAL_SURFACE]
-#define LINEN_INK     g_pal[PAL_INK]
-#define LINEN_MUTED   g_pal[PAL_MUTED]
-#define LINEN_ACCENT  g_pal[PAL_ACCENT]
-#define LINEN_BORDER  g_pal[PAL_BORDER]
-#define LINEN_SEL_BG  g_pal[PAL_INK]     /* selection bar = ink (inverts w/ theme)*/
-#define LINEN_SEL_FG  g_pal[PAL_SURFACE] /* selection text = surface              */
-#define LINEN_MUTED2  g_pal[PAL_MUTED2]
-#define LINEN_MUTED_D g_pal[PAL_MUTED_D]
-#define LINEN_SEL_SUB g_pal[PAL_SEL_SUB]
-#define LINEN_CHEVRON g_pal[PAL_CHEVRON]
-#define LINEN_SB_TRK  g_pal[PAL_SB_TRK]
-#define LINEN_SB_THMB g_pal[PAL_SB_THMB]
-#define LINEN_PLATE   g_pal[PAL_PLATE]   /* raised plate (volume overlay)         */
-#define LINEN_TRK     g_pal[PAL_TRK]     /* slider / meter track                  */
-
-/* Nunito faces (freestanding renderer, core/ui/text.h). */
-#define FONT_HEADER   text_font_bold_13()
-#define FONT_ROW      text_font_regular_12()
-#define FONT_TITLE    text_font_bold_18()
-#define FONT_SUB      text_font_regular_11()
-#define FONT_SMALL    text_font_regular_9()
-
-/* The Nunito renderer writes straight through console_fb(), which console.c's
- * damage tracker can't see — so every text draw reports its own ink box, or a
- * damage-only present would drop the glyphs. `y` is the baseline. */
-static void ui_text_damage(int x, int y, int w, const text_font_t *font)
-{
-    int asc = text_ascent(font), desc = text_descent(font);
-    console_damage_add(x, y - asc, w, asc + desc);
-}
-
-/* Draw a NUL-terminated string; thin wrapper over text_draw with the panel
- * dimensions baked in. `y` is the text baseline. Returns the advance. */
-static int ui_text(int x, int y, const char *s, const text_font_t *font,
-                   uint16_t ink)
-{
-    int end = text_draw(console_fb(), LCD_WIDTH, LCD_HEIGHT, x, y, s, font, ink);
-    ui_text_damage(x, y, end - x, font);
-    return end;
-}
-
-/* text_draw_clip with the panel dimensions baked in + damage reporting. */
-static int ui_text_clip(int x, int y, const char *s, const text_font_t *font,
-                        uint16_t ink, int cx0, int cx1)
-{
-    int end = text_draw_clip(console_fb(), LCD_WIDTH, LCD_HEIGHT, x, y, s, font,
-                             ink, cx0, cx1);
-    int x0 = (x > cx0) ? x : cx0, x1 = (end < cx1) ? end : cx1;
-    ui_text_damage(x0, y, x1 - x0, font);
-    return end;
-}
-
-/* Centre a string horizontally at baseline `y`. */
-static void ui_text_centered(int y, const char *s, const text_font_t *font,
-                             uint16_t ink)
-{
-    int w = text_width(s, font);
-    ui_text((LCD_WIDTH - w) / 2, y, s, font, ink);
-}
-
-/* Filled rounded rectangle (radius `r`) — the design's selection bars (r=4) and
- * plates (r=6) are rounded, not square; this replaces the hard console_fill_rect
- * at those spots. Each corner row is inset along a quarter-circle. */
-static int isqrt_i(int v)
-{
-    /* Bitwise integer sqrt: ~4 iterations for the radii we use, no multiply in
-     * the loop. The old form stepped r up one at a time WITH a multiply, and it
-     * ran per scanline of every rounded rect — including the selection bar on
-     * every single list repaint. */
-    unsigned x = (unsigned)(v < 0 ? 0 : v), res = 0, bit = 1u << 16;
-    while (bit > x) bit >>= 2;
-    while (bit) {
-        if (x >= res + bit) {
-            x   -= res + bit;
-            res  = (res >> 1) + bit;
-        } else {
-            res >>= 1;
-        }
-        bit >>= 2;
-    }
-    return (int)res;
-}
-
-/* Corner inset per corner row for one radius, memoized. Consecutive calls use
- * the SAME radius (r=4 for every selection bar, r=3 for the load bar…), so a
- * one-entry cache turns the per-scanline sqrt into a table read. */
-#define RR_MAX_R 16
-static int     g_rr_r = -1;
-static uint8_t g_rr_inset[RR_MAX_R];
-
-static const uint8_t *rr_insets(int r)
-{
-    if (r != g_rr_r) {
-        for (int k = 0; k < r; k++) {
-            int dy = r - k;
-            g_rr_inset[k] = (uint8_t)(r - isqrt_i(r * r - dy * dy));
-        }
-        g_rr_r = r;
-    }
-    return g_rr_inset;
-}
-
-static void fill_round_rect(int x, int y, int w, int h, int r, uint16_t c)
-{
-    if (r < 1) { console_fill_rect(x, y, w, h, c); return; }
-    if (2 * r > w) r = w / 2;
-    if (2 * r > h) r = h / 2;
-    if (r > RR_MAX_R) r = RR_MAX_R;
-    const uint8_t *ins = rr_insets(r);
-    for (int ry = 0; ry < h; ry++) {
-        int inset = 0, k = -1;
-        if (ry < r)            k = ry;
-        else if (ry >= h - r)  k = h - 1 - ry;
-        if (k >= 0) inset = ins[k];
-        console_fill_rect(x + inset, y + ry, w - 2 * inset, 1, c);
-    }
-}
-
+/* Theme tokens (LINEN_*) and the Nunito face macros moved to ui/chrome.h,
+ * next to the list chrome that consumes them. */
 /* Linear RGB565 blend: fg over bg by alpha a (0..256). Cheap (no gamma) — fine
  * for the subtle 1px anti-alias fringe on modal corners. */
 static uint16_t blend565(uint16_t bg, uint16_t fg, int a)
@@ -235,7 +115,7 @@ static uint16_t blend565(uint16_t bg, uint16_t fg, int a)
  * of every paint, for a radius that is always one of a handful of values. */
 #define AA_SS 16                            /* S*S sub-samples, S = 4          */
 static int     g_aa_r = -1;
-static uint8_t g_aa_mask[RR_MAX_R * RR_MAX_R];
+static uint8_t g_aa_mask[UI_RR_MAX_R * UI_RR_MAX_R];
 
 static const uint8_t *aa_corner_mask(int r)
 {
@@ -251,7 +131,7 @@ static const uint8_t *aa_corner_mask(int r)
                         if (dx * dx + dy * dy <= cN * cN) inside++;
                     }
                 }
-                g_aa_mask[ry * RR_MAX_R + rx] = (uint8_t)inside;
+                g_aa_mask[ry * UI_RR_MAX_R + rx] = (uint8_t)inside;
             }
         }
         g_aa_r = r;
@@ -270,7 +150,7 @@ static void fill_round_rect_aa(int x, int y, int w, int h, int r, uint16_t c)
     if (r < 1) { console_fill_rect(x, y, w, h, c); return; }
     if (2 * r > w) r = w / 2;
     if (2 * r > h) r = h / 2;
-    if (r > RR_MAX_R) r = RR_MAX_R;
+    if (r > UI_RR_MAX_R) r = UI_RR_MAX_R;
     console_fill_rect(x, y + r, w, h - 2 * r, c);          /* solid middle band  */
     /* The corner quadrants are blended straight into the framebuffer below, so
      * they'd be invisible to the damage tracker (the edge fills stop at x+r).
@@ -282,7 +162,7 @@ static void fill_round_rect_aa(int x, int y, int w, int h, int r, uint16_t c)
         console_fill_rect(x + r, y + ry,         w - 2 * r, 1, c);   /* top edge */
         console_fill_rect(x + r, y + h - 1 - ry, w - 2 * r, 1, c);   /* bot edge */
         for (int rx = 0; rx < r; rx++) {
-            int inside = mask[ry * RR_MAX_R + rx];
+            int inside = mask[ry * UI_RR_MAX_R + rx];
             if (inside == 0) continue;
             int a = inside * 256 / AA_SS;
             int xs[2] = { x + rx, x + w - 1 - rx };
@@ -487,6 +367,12 @@ typedef struct {
     uint32_t clus;                       /* album folder cluster                  */
     uint32_t art_clus, art_size;         /* folder.art (120x120) — now-playing    */
     uint32_t thm_clus, thm_size;         /* folder.thm (28x28)  — list chip       */
+    uint8_t  unreadable;                 /* the folder's directory could not be
+                                          * read at load, even after retries. Its
+                                          * songs have file_clus == 0 — NOT because
+                                          * they left the disk, but because we never
+                                          * got to look. Cleared (and the songs
+                                          * bound) when a later open reads it. */
 } lib_album_t;
 static lib_album_t g_albums[LIB_MAX_ALBUMS];
 static int         g_albums_n;
@@ -497,6 +383,36 @@ static int         g_albumview_n;
  * LIB_MAX_ALBUMS / ARTISTS_MAX / LIB_MAX_GENRES / FOLDER_MAP_MAX), so the
  * truncation isn't silent — the About screen says the library didn't fit. */
 static int         g_lib_truncated;
+
+/*
+ * The other ways a load can come up short, kept SEPARATE from g_lib_truncated
+ * because "Library too large" is the wrong thing to tell the user for any of
+ * them — and until these existed, every one of them was silent: the tracks
+ * were simply absent, or present and dead, with nothing to say why.
+ *
+ *   g_lib_unreadable  albums whose folder could not be read (disk error, or a
+ *                     corrupt directory cluster) after the retries in
+ *                     lib_readdir. Each such album has .unreadable set and all
+ *                     its songs unresolved (file_clus == 0), so they list in
+ *                     Songs/Genres but cannot play. Opening the album retries
+ *                     the read and, on success, resolves it and decrements
+ *                     this. UI: About should say "N albums could not be read";
+ *                     the album's tracklist should say so instead of showing
+ *                     an empty list (see g_browse_err).
+ *   g_lib_orphaned    CORELIB.IDX records whose album folder is not on the
+ *                     disk at all — a stale index, not a disk fault. Nothing
+ *                     to retry; the fix is re-running the host importer. UI:
+ *                     "index out of date, N tracks skipped".
+ *   g_lib_load_err    nonzero (a FAT32_* code) when the library ROOT itself
+ *                     could not be enumerated, so there is no library at all
+ *                     this session. The counts above are then meaningless
+ *                     (0 songs). UI: a "could not read the disk" screen in
+ *                     place of an empty Music menu; to retry, clear
+ *                     g_lib_scanned and call library_ensure again.
+ */
+static int         g_lib_unreadable;
+static int         g_lib_orphaned;
+static int         g_lib_load_err;
 static uint32_t     g_lib_load_ms;   /* boot library load time, shown on About */
 
 /*
@@ -910,6 +826,63 @@ static int      g_bat_mv  = -1;
 static int      g_bat_pct = -1;
 static int      g_bat_ext = 0;               /* external power present            */
 static uint32_t g_bat_last_us;
+static int      g_bat_raw = -1;              /* 10-bit ADC code, for calibration  */
+static int      g_bat_mv_raw = -1;           /* mV before the plausibility clamp  */
+static int      g_bat_mv_filt = -1;          /* median of recent samples (policy) */
+
+/* Defined further down with the other formatters; needed by the battery log. */
+static int u32_to_dec(char *dst, unsigned v);
+
+/* Defined further down; the low-battery policy in battery_refresh() acts
+ * through them. Forward-declared here rather than moving battery_refresh(),
+ * which sits with the status-strip state it feeds. */
+static void settings_commit(int force);
+static void resume_capture(void);
+_Noreturn static void enter_standby(void);
+
+/*
+ * settings_commit() modes.
+ *
+ *   CFG_COMMIT_IDLE   the main loop: debounced, deferred while the drive is
+ *                     parked under a live player, refused below the
+ *                     disk-safe battery line.
+ *   CFG_COMMIT_FORCE  now (suspend, power-off): no debounce, no parked
+ *                     check — still refused below the disk-safe line.
+ *   CFG_COMMIT_LAST   the ONE write the low-battery policy makes at the
+ *                     DISKSAFE edge, exempt from the battery gate.
+ *
+ * The exemption is not optional. battery_policy_feed() latches DISKSAFE
+ * BEFORE it returns the edge, so by the time battery_refresh() acts on that
+ * edge battery_disk_writes_allowed() is already 0 — and a gated commit there
+ * refuses the very flush the policy exists to make while the cell still has
+ * the energy for it. That is exactly what happened when the flush and the
+ * gate landed as two separate changes, each written without the other: the
+ * DISKSAFE handler called settings_commit(1), the gate turned it away, and a
+ * low-battery shutdown persisted nothing at all — no resume position, no
+ * pending setting — while both commit messages described a flush that
+ * never ran.
+ */
+#define CFG_COMMIT_IDLE   0
+#define CFG_COMMIT_FORCE  1
+#define CFG_COMMIT_LAST   2
+
+/* Measured cost of the last full-frame present; defined with the present
+ * throttle further down. Reported on the stats line below so the number the
+ * repaint throttle has always been guessing at becomes observable. */
+static uint32_t g_present_cost_us;
+
+/* Decimal to UART. Signed, because every battery field reads -1 on a bus
+ * failure and printing that as 4294967295 would defeat the purpose. */
+static void uart_dec(int v)
+{
+    char b[12];
+    if (v < 0) {
+        uart_putc('-');
+        v = -v;
+    }
+    u32_to_dec(b, (unsigned)v);
+    uart_puts(b);
+}
 
 /* Volume capacity / free (MB), computed once from the FS after mount for the
  * About screen. g_free_mb == 0xFFFFFFFF means the FSInfo free count was absent. */
@@ -923,9 +896,137 @@ static int battery_refresh(int force)
         return 0;
     }
     g_bat_last_us = now;
-    g_bat_mv  = battery_millivolts();
-    g_bat_pct = battery_percent();
-    g_bat_ext = power_is_external();
+
+    /*
+     * ONE conversion. This used to call battery_millivolts() and then
+     * battery_percent(), which runs its own — two I2C round trips, two settling
+     * delays, and two DIFFERENT samples, so the millivolts on screen did not
+     * necessarily correspond to the percentage next to them. It also left
+     * nowhere to put a filter later.
+     */
+    battery_sample_t bs;
+    if (battery_sample(&bs) != 0) {
+        /* Bus failure is NOT a flat battery. Hold the last good reading rather
+         * than reporting -1, which draw_battery() clamps to 0% — i.e. an empty
+         * red battery for an I2C hiccup. The policy is told the same thing:
+         * battery_policy_feed(-1) touches neither the filter nor the level, so
+         * a flaky bus can neither power the device off nor clear a genuine
+         * DISKSAFE. */
+        (void)battery_policy_feed(-1);
+        uart_puts("core: batt read failed\n");
+        return 1;
+    }
+    g_bat_raw    = bs.raw;
+    g_bat_mv_raw = bs.mv_raw;
+    g_bat_mv     = bs.mv;
+    g_bat_ext    = power_is_external();
+
+    /*
+     * Low-battery policy (battery.h). The sample goes into the median filter
+     * and the policy decides; we act on the EDGE it returns, so each action
+     * happens once per crossing. The displayed percentage is converted from
+     * the FILTERED millivolts too — same curve, same mapping, just not
+     * re-evaluated on a single spin-up-sagged sample every 5 s.
+     */
+    battery_event_t ev = battery_policy_feed(bs.mv);
+    g_bat_mv_filt = battery_filtered_mv();
+    g_bat_pct     = battery_percent_from_mv(g_bat_mv_filt);
+
+    /*
+     * One line per sample, so a full discharge can be logged over UART and
+     * turned into numbers. There is otherwise NO way to see either half of the
+     * battery story on this device: the percent curve is transcribed from a
+     * 2005 cell and has never been checked against the one actually fitted,
+     * and per-state drain (idle / paused / playing) has never been measured at
+     * all. The state flags are on the line because the drain question is
+     * entirely "what was the device doing while it fell".
+     *
+     * raw is the ground truth (no scaling assumed); mv_raw vs mv shows when the
+     * plausibility clamp is engaging, which is the difference between a flat
+     * cell and a bad read.
+     */
+    uart_puts("core: batt raw ");   uart_dec(g_bat_raw);
+    uart_puts(" mv ");              uart_dec(g_bat_mv_raw);
+    uart_puts(" clamped ");         uart_dec(g_bat_mv);
+    uart_puts(" filt ");            uart_dec(g_bat_mv_filt);
+    uart_puts(" lvl ");             uart_dec((int)battery_policy_level());
+    uart_puts(" pct ");             uart_dec(g_bat_pct);
+    uart_puts(" ext ");             uart_dec(g_bat_ext);
+    uart_puts(" chg ");             uart_dec(power_is_charging());
+    uart_puts(" play ");            uart_dec(player_active());
+    uart_puts(" paused ");          uart_dec(player_paused());
+    /* No backlight state: it is a local in the main loop, not a global, and
+     * hoisting it just for a log line is not worth it — hold the backlight
+     * fixed for the duration of a measurement run instead. */
+    uart_puts(" parked ");          uart_dec(ata_is_parked());
+    uart_puts(" up ");              uart_dec((int)(now / 1000000u));
+    uart_putc('\n');
+
+    /*
+     * Audio health, on the same 5 s cadence.
+     *
+     * `late` is the counter that did not exist until the LCD IRQ-masking work:
+     * completions serviced past the ~363 us the I2S FIFO can cover. It is the
+     * ONLY machine-readable signal for the tick-while-the-screen-is-busy
+     * failure — audio_underruns() cannot see it, because a late ISR produces
+     * no short read, and until now the only detector was a person listening.
+     * `present` is the measured cost of the last full present, which every
+     * throughput argument about the UI has been reasoning against blind: it
+     * starts life as a GUESS of 30000 us and has never been printed.
+     */
+    uart_puts("core: audio late ");  uart_dec((int)audio_late_kicks());
+    uart_puts(" worst_us ");         uart_dec((int)audio_late_worst_us());
+    uart_puts(" underruns ");        uart_dec((int)audio_underruns());
+    uart_puts(" present_us ");       uart_dec((int)g_present_cost_us);
+    uart_putc('\n');
+
+    /*
+     * Act on the policy's edge. Logged BEFORE acting, because the shutoff
+     * branch never returns and the UART line is the only record of why the
+     * device went dark.
+     */
+    switch (ev) {
+    case BATTERY_EVENT_DISKSAFE:
+        uart_puts("core: batt DISKSAFE: flushing settings, parking drive\n");
+        /*
+         * The LAST write. Persist the resume position + any pending change
+         * NOW, while the filtered cell is still at ~3500 mV and has the
+         * energy to finish one sector plus the FLUSH. From here down nothing
+         * else writes: the policy latched DISKSAFE before handing us this
+         * edge, so battery_disk_writes_allowed() is ALREADY 0 — which is why
+         * this one commit is CFG_COMMIT_LAST (exempt from the gate) and every
+         * other one, enter_standby()'s included, is refused until RECOVERED.
+         * This mirrors suspend_to_ram()'s "last chance to persist": after
+         * this the drive is parked and the next event is power-off.
+         */
+        resume_capture();
+        settings_commit(CFG_COMMIT_LAST);
+        /* Park, unless the player is mid-stream: it parks between its own
+         * refill bursts (player.c) and its next read would only spin the
+         * platters straight back up. Same guard as the main loop's idle
+         * spin-down. Reads are harmless to data; writes are what matters. */
+        if (!ata_is_parked() && (!player_active() || player_paused())) {
+            ata_standby();
+        }
+        break;
+
+    case BATTERY_EVENT_SHUTOFF:
+        uart_puts("core: batt SHUTOFF: entering standby\n");
+        /* The documented power-off path: stop the player, blank the panel,
+         * PMU deep-sleep with wake sources set. Its own settings_commit(1)
+         * is the reason the DISKSAFE flush above exists: by now the write
+         * gate should refuse it (see battery_disk_writes_allowed). */
+        enter_standby();                  /* does not return */
+
+    case BATTERY_EVENT_RECOVERED:
+        uart_puts("core: batt RECOVERED: writes allowed again\n");
+        /* Nothing else to do: a change left pending by the gate rides out on
+         * the main loop's next settings_commit(0). */
+        break;
+
+    case BATTERY_EVENT_NONE:
+        break;
+    }
     return 1;
 }
 
@@ -994,121 +1095,11 @@ static void status_strip_render(void)
 
 /* Titled header with an optional back chevron and a right-aligned count/value,
  * plus the divider under it (menus.jsx ScreenHeader). */
-static void header_render(const char *title, const char *right, int back)
-{
-    int x = 12;
-    if (back) {
-        x = ui_text(x, HDR_BASE, UI_GLYPH_LAQUO, FONT_HEADER, LINEN_MUTED2) + 4;
-    }
-    ui_text(x, HDR_BASE, title, FONT_HEADER, LINEN_INK);
-    if (right && right[0]) {
-        int w = text_width(right, FONT_SMALL);
-        ui_text(LCD_WIDTH - 12 - w, HDR_BASE - 1, right, FONT_SMALL, LINEN_MUTED2);
-    }
-    console_fill_rect(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, LINEN_BORDER);
-}
-
-/* One list row (menus.jsx Row) at list origin `y0`. Selected = filled ink bar +
- * light bold text; greyed = muted (inactive menu item). Optional sub-line, right
- * value, chevron, and a leading 22x22 art chip (RGB565, or NULL). */
-static void list_row_at(int y0, int r, const char *text, const char *sub,
-                        const char *right, int chevron, int selected, int greyed,
-                        const uint16_t *chip, int title_priority, int rh)
-{
-    int ry = y0 + r * rh;
-    int rowmid = ry + rh / 2 + 3;         /* vertical centre for value/chevron   */
-    uint16_t fg, subc, rightc, chevc;
-    if (selected) {
-        fill_round_rect(6, ry + 1, LCD_WIDTH - 16, rh - 2, 4, LINEN_SEL_BG);
-        fg = LINEN_SEL_FG; subc = LINEN_SEL_SUB; rightc = LINEN_SEL_SUB;
-        chevc = LINEN_SEL_SUB;
-    } else {
-        fg = greyed ? LINEN_MUTED : LINEN_INK;
-        subc = LINEN_MUTED2; rightc = LINEN_MUTED_D; chevc = LINEN_CHEVRON;
-    }
-
-    int tx = 14;
-    if (chip) {
-        int cd = ARTCACHE_DIM;                 /* cached chip is cd x cd RGB565 */
-        int cy = ry + (rh - cd) / 2;
-        console_blit565(12, cy, cd, cd, chip);
-        /* Round the chip's corners (~2px, menus.jsx Chip radius) by knocking the
-         * outer corner pixels back to the row background. Written straight into
-         * the framebuffer: these are 12 single pixels, and a 1x1 console_fill_rect
-         * each ran the whole clamp preamble per pixel, per row, per frame. The
-         * chip sits inside the blit above, so it is on-panel by construction —
-         * bounds are still checked once for the row band. */
-        uint16_t cbg = selected ? LINEN_SEL_BG : LINEN_SURFACE;
-        if (cy >= 0 && cy + cd <= LCD_HEIGHT) {
-            uint16_t *fb = console_fb();
-            for (int dy = 0; dy < 2; dy++) {
-                uint16_t *top = &fb[(cy + dy) * LCD_WIDTH + 12];
-                uint16_t *bot = &fb[(cy + cd - 1 - dy) * LCD_WIDTH + 12];
-                for (int dx = 0; dx < 2 - dy; dx++) {
-                    top[dx] = top[cd - 1 - dx] = cbg;
-                    bot[dx] = bot[cd - 1 - dx] = cbg;
-                }
-            }
-        }
-        tx = 12 + cd + 8;
-    }
-    const text_font_t *tf = selected ? FONT_HEADER : FONT_ROW;
-    /* Where the title must stop (before the right value / chevron). Measure the
-     * right-hand value ONCE — it used to be walked twice per row per frame. */
-    int title_right;
-    int show_right = (right && right[0]);
-    int right_w    = show_right ? text_width(right, text_font_bold_12()) : 0;
-    if (show_right) {
-        int reserved = LCD_WIDTH - 16 - right_w - 6;
-        /* title_priority: the title owns the row. Reserve the value column only
-         * while the title still fits inside it; once it's too long the title
-         * spans the full width (over where the value was) and the value drops —
-         * so it clips at the row edge and marquees on select, instead of being
-         * cramped into a short column. */
-        if (title_priority && text_width(text, tf) > reserved - tx) {
-            title_right = LCD_WIDTH - 16;
-            show_right = 0;
-        } else {
-            title_right = reserved;
-        }
-    } else if (chevron) {
-        title_right = LCD_WIDTH - 18 - 4;
-    } else {
-        title_right = LCD_WIDTH - 16;
-    }
-    int avail = title_right - tx;
-    /* Two-line rows: title sits a little below the row top (there's room in the
-     * 32px row) with the artist near the bottom; single-line rows centre it. */
-    int base  = sub ? ry + 16 : rowmid;
-    int sub_y = ry + rh - 4;                   /* artist baseline, near row bottom */
-    /* Marquee vertical clip. Top = the selection bar's interior (ry+1), NOT
-     * y-ascent: the font ascent (14) reaches 1px ABOVE the bar, and the clear
-     * would paint a sel-coloured line there ("clips above"). Bottom = just above
-     * the artist baseline's cap (sub_y-10) so the scroll tick's clear can't erase
-     * the static artist line. Single-line rows clip to the bar bottom. */
-    int mqy0 = ry + 1;
-    int mqy1 = sub ? (sub_y - 10) : (ry + rh - 1);
-    if (selected) {
-        mq_text(tx, base, avail, text, tf, fg, LINEN_SEL_BG, mqy0, mqy1);
-    } else {
-        ui_text_clip(tx, base, text, tf, fg, tx, tx + avail);
-    }
-    if (sub) {
-        ui_text(tx, sub_y, sub, FONT_SMALL, subc);
-    }
-    if (show_right) {
-        ui_text(LCD_WIDTH - 16 - right_w, rowmid, right, text_font_bold_12(),
-                rightc);
-    } else if (chevron) {
-        ui_text(LCD_WIDTH - 18, rowmid, UI_GLYPH_RAQUO, FONT_ROW, chevc);
-    }
-}
-
 /* Convenience: a single-line (24px) row. */
 static void list_row(int r, const char *text, const char *sub, const char *right,
                      int chevron, int selected, int greyed, const uint16_t *chip)
 {
-    list_row_at(LIST_Y0, r, text, sub, right, chevron, selected, greyed, chip, 0, ROW_H);
+    ui_list_row(LIST_Y0, r, text, sub, right, chevron, selected, greyed, chip, 0, ROW_H);
 }
 
 /* A taller (28px) two-line row for the album list: title + artist sub with a
@@ -1116,7 +1107,7 @@ static void list_row(int r, const char *text, const char *sub, const char *right
 static void list_row_tall(int r, const char *text, const char *sub, const char *right,
                           int chevron, int selected, int greyed, const uint16_t *chip)
 {
-    list_row_at(LIST_Y0, r, text, sub, right, chevron, selected, greyed, chip, 0, ROW_H2);
+    ui_list_row(LIST_Y0, r, text, sub, right, chevron, selected, greyed, chip, 0, ROW_H2);
 }
 
 /* Like list_row_tall, but the title takes priority over the right-hand value: a
@@ -1124,40 +1115,11 @@ static void list_row_tall(int r, const char *text, const char *sub, const char *
 static void list_row_titled(int r, const char *text, const char *sub,
                             const char *right, int selected, const uint16_t *chip)
 {
-    list_row_at(LIST_Y0, r, text, sub, right, 0, selected, 0, chip, 1, ROW_H2);
+    ui_list_row(LIST_Y0, r, text, sub, right, 0, selected, 0, chip, 1, ROW_H2);
 }
 
 /* Slim right-edge scrollbar (menus.jsx Scrollbar); no-op when everything fits.
  * `y0` is the list origin (differs between the full list and the detail view). */
-static void scrollbar_render(int y0, int top, int visible, int total)
-{
-    if (total <= visible) {
-        return;
-    }
-    int track_y = y0;
-    int track_h = LCD_HEIGHT - y0 - 4;
-    console_fill_rect(LCD_WIDTH - 4, track_y, 3, track_h, LINEN_SB_TRK);
-    int thumb_h = (visible * track_h) / total;
-    if (thumb_h < 16) thumb_h = 16;
-    int denom = total - visible;
-    if (denom < 1) denom = 1;
-    int thumb_y = track_y + (top * (track_h - thumb_h)) / denom;
-    console_fill_rect(LCD_WIDTH - 4, thumb_y, 3, thumb_h, LINEN_SB_THMB);
-}
-
-/* Windowed-list scroll origin (menus.jsx useScrollWindow): keep the selection
- * about 1/3 from the top, clamped to the ends. Pure function — the browser
- * derives the visible window from the selection each paint (no separate top
- * state to keep in sync). */
-static int scroll_window(int sel, int total, int visible)
-{
-    if (total <= visible) return 0;
-    int start = sel - visible / 3;
-    if (start < 0) start = 0;
-    if (start > total - visible) start = total - visible;
-    return start;
-}
-
 /* Write unsigned `v` as decimal into `dst`, return the length. The one decimal
  * writer — replaces the do/while digit-reversal that was open-coded ~8 times. */
 static int u32_to_dec(char *dst, unsigned v)
@@ -1300,7 +1262,7 @@ static void detail_row_draw(int r, int vi)
     const browse_entry_t *e = &g_browse[idx];
     int is_sel = (idx == g_det_sel);
     if (is_sel) {
-        fill_round_rect(6, ry + 1, LCD_WIDTH - 16, ROW_H - 2, 4, LINEN_SEL_BG);
+        ui_round_rect(6, ry + 1, LCD_WIDTH - 16, ROW_H - 2, 4, LINEN_SEL_BG);
     }
     uint16_t fg = is_sel ? LINEN_SEL_FG : LINEN_INK;
     uint16_t nc = is_sel ? LINEN_SEL_SUB : LINEN_MUTED2;
@@ -1359,7 +1321,7 @@ static void detail_render(int sel)
     status_strip_render();
     char right[12];
     fmt_count(right, sel + 1, g_browse_n > 0 ? g_browse_n : 1);
-    header_render("Albums", right, 1);
+    ui_header("Albums", right, 1);
 
     /* Hero art (or a placeholder tile when the folder has no folder.art). */
     if (g_detail_art_ok) {
@@ -1401,13 +1363,13 @@ static void detail_render(int sel)
     }
     /* Scroll over the display view (tracks + any "Disc N" headers), centered on
      * the selected track's position within it. */
-    int top = scroll_window(detail_sel_view(sel), g_det_view_n, DET_ROWS);
+    int top = ui_scroll_window(detail_sel_view(sel), g_det_view_n, DET_ROWS);
     for (int r = 0; r < DET_ROWS; r++) {
         int vi = top + r;
         if (vi >= g_det_view_n) break;
         detail_row_draw(r, vi);
     }
-    scrollbar_render(DET_LIST_Y0, top, DET_ROWS, g_det_view_n);
+    ui_scrollbar(DET_LIST_Y0, top, DET_ROWS, g_det_view_n);
 }
 
 /* A neutral tile shown in a row's chip slot until its real cover loads, so the
@@ -1528,19 +1490,19 @@ static void albumlist_render(int sel)
         right[0] = '\0';
     }
     /* Header title = the artist when drilled in from Artists, else "Albums". */
-    header_render(g_artist_filter[0] ? g_artist_filter : "Albums", right, 1);
+    ui_header(g_artist_filter[0] ? g_artist_filter : "Albums", right, 1);
 
     if (total == 0) {
         ui_text(14, LIST_Y0 + 20, "No albums", FONT_ROW, LINEN_MUTED);
         return;
     }
-    int top = scroll_window(sel, total, LIST_ROWS2);
+    int top = ui_scroll_window(sel, total, LIST_ROWS2);
     for (int r = 0; r < LIST_ROWS2; r++) {
         int idx = top + r;
         if (idx >= total) break;
         albumlist_row_draw(r, idx);
     }
-    scrollbar_render(LIST_Y0, top, LIST_ROWS2, total);
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS2, total);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1650,19 +1612,19 @@ static void artists_render(int sel)
     char right[12];
     if (g_artists_n > 0) fmt_count(right, sel + 1, g_artists_n);
     else                 right[0] = '\0';
-    header_render("Artists", right, 1);
+    ui_header("Artists", right, 1);
 
     if (g_artists_n == 0) {
         ui_text(14, LIST_Y0 + 20, "No artists", FONT_ROW, LINEN_MUTED);
         return;
     }
-    int top = scroll_window(sel, g_artists_n, LIST_ROWS);
+    int top = ui_scroll_window(sel, g_artists_n, LIST_ROWS);
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
         if (idx >= g_artists_n) break;
         artists_row_draw(r, idx);
     }
-    scrollbar_render(LIST_Y0, top, LIST_ROWS, g_artists_n);
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS, g_artists_n);
 }
 
 static void browse_render(int sel)
@@ -1773,6 +1735,7 @@ static void album_intern(const char *folder, uint32_t clus)
     for (; folder[k] && k < NAME_MAX; k++) g_albums[g_albums_n].folder[k] = folder[k];
     g_albums[g_albums_n].folder[k] = '\0';
     g_albums[g_albums_n].clus = clus;
+    g_albums[g_albums_n].unreadable = 0;     /* until the resolve pass says so */
     g_albums_n++;
 }
 
@@ -1898,11 +1861,11 @@ static void load_bar(const char *title, int pct)
     console_clear(LINEN_SURFACE);
     ui_text_centered(112, title, FONT_TITLE, LINEN_INK);
     int bx = 60, by = 138, bw = LCD_WIDTH - 120, bh = 6;
-    fill_round_rect(bx, by, bw, bh, 3, LINEN_BORDER);
+    ui_round_rect(bx, by, bw, bh, 3, LINEN_BORDER);
     if (pct > 0) {
         int fw = bw * pct / 100;
         if (fw < bh) fw = bh;                 /* keep the rounded cap visible */
-        fill_round_rect(bx, by, fw, bh, 3, LINEN_ACCENT);
+        ui_round_rect(bx, by, fw, bh, 3, LINEN_ACCENT);
     }
     lcd_present_fb(console_framebuffer());
 }
@@ -1999,6 +1962,70 @@ static int album_by_clus(uint32_t dc)
     return -1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Directory reads the library depends on.
+ *
+ * Every fat32_readdir in the loader used to ignore its return code. The walk
+ * can fail — FAT32_EIO when a sector read fails even after player_disk_read's
+ * six attempts, FAT32_ECORRUPT for a cyclic or unaddressable chain — and not
+ * one caller looked. The consequence was never a crash, which is why it went
+ * unnoticed: a failed album walk in the resolve pass just left every song in
+ * that album with file_clus == 0, and every later path reads that as "indexed
+ * but no longer on disk". The tracks stayed listed in Songs and Genres and
+ * did nothing when picked, until reboot; opening the album showed an empty
+ * tracklist. The trigger is mundane — the drive still settling from spin-up
+ * during "Loading Library" — so this is a bug users hit, not a hypothetical.
+ *
+ * lib_readdir is fat32_readdir with the two things the loader needs:
+ *
+ *   1. A RETRY. player_disk_read already retries each sector six times with
+ *      short backoffs, so a walk that failed has already burned ~200 ms on
+ *      the failing sector; a further LIB_READDIR_RETRY_MS pause and a fresh
+ *      walk gives a drive that was mid-settle its second chance. Only an EIO
+ *      is retried: ECORRUPT is structural (the bytes are wrong, not late) and
+ *      re-walking a cyclic chain costs the full bounded scan again for
+ *      nothing. The retry re-runs the callback from the top of the directory,
+ *      so the caller's accumulator is REWOUND first (`acc_n`) — otherwise the
+ *      entries seen before the failure would be listed twice.
+ *
+ *   2. A BUDGET. A dead drive fails every read; with a thousand albums to
+ *      resolve, retrying each one would turn a failed boot into minutes of
+ *      sleeping before the user even sees an error. g_lib_retry_budget is the
+ *      number of retries a whole load may spend: a spin-up is one event and a
+ *      couple of retries ride it out, so if the budget is gone and reads are
+ *      still failing, this is not spin-up and the remaining albums are marked
+ *      unreadable at the cost of one plain (already-retried) walk each.
+ *
+ * The common case — the walk succeeds first time — pays one compare. The
+ * loader is not slower for it.
+ *
+ * On a final failure the accumulator is rewound too: a half-listed directory
+ * is not "the files in this album", and presenting it as such is a subtler
+ * version of the bug this replaces. The return is the last FAT32_* code.
+ * ------------------------------------------------------------------------- */
+#define LIB_READDIR_RETRIES   2      /* re-walks per directory, after the first  */
+#define LIB_READDIR_RETRY_MS  250    /* settle time before each re-walk           */
+#define LIB_LOAD_RETRY_BUDGET 6      /* re-walks a whole library load may spend   */
+
+static int g_lib_retry_budget;
+
+static int lib_readdir(fat32_t *fs, uint32_t clus, fat32_dir_cb cb, void *ud,
+                       int *acc_n)
+{
+    int base = acc_n ? *acc_n : 0;
+    int rc   = fat32_readdir(fs, clus, cb, ud);
+    for (int attempt = 0;
+         rc == FAT32_EIO && attempt < LIB_READDIR_RETRIES && g_lib_retry_budget > 0;
+         attempt++) {
+        g_lib_retry_budget--;
+        sleep_ms(LIB_READDIR_RETRY_MS);
+        if (acc_n) *acc_n = base;
+        rc = fat32_readdir(fs, clus, cb, ud);
+    }
+    if (rc != 0 && acc_n) *acc_n = base;
+    return rc;
+}
+
 /* Resolve pass: ONE readdir per album at load time captures both the folder's
  * cover clusters (folder.art/.thm) AND every track file's own cluster into
  * g_songs — so later cover loads, playing a song, and shuffling the WHOLE
@@ -2045,9 +2072,48 @@ static int resolve_art_cb(void *ud, const fat32_dirent_t *e)
     }
     return 0;
 }
+/*
+ * Resolve ONE album: read its folder, bind its songs' clusters and capture its
+ * art. Returns the readdir result. This is the one place an album is marked
+ * unreadable or cleared again, so the count in g_lib_unreadable can never
+ * drift from the flags — the load-time pass and a later browse_load both come
+ * through here.
+ *
+ * On failure the art fields are left cleared (there is nothing to show) and
+ * songs that happened to be bound before the walk failed KEEP their binding:
+ * those entries were read correctly, and unbinding a playable track because a
+ * sibling's sector was bad would be manufacturing a second failure.
+ */
+static int album_resolve(fat32_t *fs, int i)
+{
+    g_res_art_clus = g_res_art_size = g_res_thm_clus = g_res_thm_size = 0;
+    g_res_album_clus = g_albums[i].clus;
+    int rc = lib_readdir(fs, g_albums[i].clus, resolve_art_cb, 0, 0);
+    if (rc != 0) {
+        if (!g_albums[i].unreadable) {
+            g_albums[i].unreadable = 1;
+            g_lib_unreadable++;
+        }
+        g_albums[i].art_clus = g_albums[i].art_size = 0;
+        g_albums[i].thm_clus = g_albums[i].thm_size = 0;
+        return rc;
+    }
+    if (g_albums[i].unreadable) {
+        g_albums[i].unreadable = 0;
+        g_lib_unreadable--;
+    }
+    g_albums[i].art_clus = g_res_art_clus;
+    g_albums[i].art_size = g_res_art_size;
+    g_albums[i].thm_clus = g_res_thm_clus;
+    g_albums[i].thm_size = g_res_thm_size;
+    return 0;
+}
+
 static void library_resolve_art(fat32_t *fs)
 {
     for (int s = 0; s < g_songs_n; s++) g_songs[s].file_clus = 0;
+    for (int a = 0; a < g_albums_n; a++) g_albums[a].unreadable = 0;
+    g_lib_unreadable = 0;
 
     /*
      * Walk the albums in ASCENDING CLUSTER order, not menu order.
@@ -2082,13 +2148,7 @@ static void library_resolve_art(fat32_t *fs)
         /* load_bar is time-throttled, so calling it per album is free and the
          * bar advances smoothly instead of in 4-album jumps. */
         load_bar("Loading Library", 75 + (n ? p * 25 / n : 25));
-        g_res_art_clus = g_res_art_size = g_res_thm_clus = g_res_thm_size = 0;
-        g_res_album_clus = g_albums[i].clus;
-        fat32_readdir(fs, g_albums[i].clus, resolve_art_cb, 0);
-        g_albums[i].art_clus = g_res_art_clus;
-        g_albums[i].art_size = g_res_art_size;
-        g_albums[i].thm_clus = g_res_thm_clus;
-        g_albums[i].thm_size = g_res_thm_size;
+        (void)album_resolve(fs, i);    /* failure is recorded on the album */
     }
 }
 
@@ -2114,7 +2174,12 @@ static int lib_root_cb(void *ud, const fat32_dirent_t *e)
 static uint32_t lib_root(fat32_t *fs)
 {
     g_lib_root_clus = 0;
-    fat32_readdir(fs, fs->root_clus, lib_root_cb, 0);
+    /* If the volume root cannot be read there is no finding Music/, and the
+     * fallback to the root cluster below will fail the same way one call later.
+     * Record it so the load reports "could not read the disk" rather than
+     * quietly producing a library of zero songs. */
+    int rc = lib_readdir(fs, fs->root_clus, lib_root_cb, 0, 0);
+    if (rc != 0) g_lib_load_err = rc;
     return g_lib_root_clus ? g_lib_root_clus : fs->root_clus;
 }
 
@@ -2122,7 +2187,16 @@ static int library_load_index(fat32_t *fs)
 {
     g_idx_clus = 0;
     g_folder_n = 0;
-    fat32_readdir(fs, lib_root(fs), index_root_cb, 0);
+    /* This one walk is the whole folder map: if it fails, every index record
+     * resolves to "album not on disk" and the library silently loads EMPTY —
+     * the whole-library version of the per-album bug. Rewinding g_folder_n
+     * on failure (lib_readdir does) matters here for the same reason: a
+     * half-built map would resolve half the library and orphan the rest. */
+    int rc = lib_readdir(fs, lib_root(fs), index_root_cb, 0, &g_folder_n);
+    if (rc != 0) {
+        g_lib_load_err = rc;
+        return 0;
+    }
     if (g_idx_clus == 0) return 0;
 
     fat32_stream_t st;
@@ -2159,7 +2233,15 @@ static int library_load_index(fat32_t *fs)
             uint32_t file_hash   = (uint32_t)r[252] | ((uint32_t)r[253] << 8) |
                                    ((uint32_t)r[254] << 16) | ((uint32_t)r[255] << 24);
             uint32_t dc = folder_clus_h(folder_hash, folder);
-            if (dc == 0) continue;             /* album not present on disk */
+            if (dc == 0) {
+                /* The index names an album folder the disk does not have: a
+                 * stale CORELIB.IDX (album deleted, importer not re-run), not
+                 * a read fault — the folder map above was read in full. The
+                 * record is dropped, but counted, so the user can be told the
+                 * index is out of date rather than wondering where it went. */
+                g_lib_orphaned++;
+                continue;
+            }
             lib_song_t *s = &g_songs[g_songs_n];
             s->dir_clus   = dc;
             s->file_hash  = file_hash;
@@ -2200,12 +2282,21 @@ static void library_scan(fat32_t *fs)
     if (g_lib_scanned) return;
     g_songs_n = g_genres_n = g_scan_dirs_n = g_albums_n = 0;
     g_lib_truncated = 0;
-    fat32_readdir(fs, lib_root(fs), scan_dirs_cb, 0);
+    /* album_intern de-dupes by cluster, so the retry's re-walk of the folder
+     * list is idempotent for g_albums; only g_scan_dirs needs the rewind. */
+    int rc = lib_readdir(fs, lib_root(fs), scan_dirs_cb, 0, &g_scan_dirs_n);
+    if (rc != 0) g_lib_load_err = rc;
     if (g_scan_dirs_n >= BROWSE_MAX) g_lib_truncated = 1;   /* folder list full */
     for (int d = 0; d < g_scan_dirs_n && g_songs_n < LIB_MAX_SONGS; d++) {
         g_scan_files_n = 0;
         g_scan_art_clus = g_scan_art_size = 0;
-        fat32_readdir(fs, g_scan_dirs[d], scan_files_cb, 0);
+        /* A failed file walk leaves this album with no songs in the scan; the
+         * resolve pass below reads the folder again and is where it gets
+         * marked unreadable (or not, if the disk has settled by then — in
+         * which case the album browses fine but its tracks are missing from
+         * Songs until the next boot; the index path, which ships, has no such
+         * gap because its song list does not come from this walk). */
+        (void)lib_readdir(fs, g_scan_dirs[d], scan_files_cb, 0, &g_scan_files_n);
         for (int i = 0; i < g_scan_files_n && g_songs_n < LIB_MAX_SONGS; i++) {
             player_pump();                 /* keep audio fed during the scan     */
             if ((g_songs_n & 31) == 0) {   /* live progress every 32 tracks       */
@@ -2357,8 +2448,19 @@ static void library_ensure(fat32_t *fs)
      * whether a change actually helped instead of judging it by feel. */
     uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
     load_bar("Loading Library", 0);       /* the load phases fill this in */
-    if (!library_load_index(fs))          /* host-built CORELIB.IDX */
+    g_lib_load_err     = 0;
+    g_lib_orphaned     = 0;
+    g_lib_unreadable   = 0;
+    g_lib_retry_budget = LIB_LOAD_RETRY_BUDGET;
+    if (!library_load_index(fs) &&        /* host-built CORELIB.IDX */
+        !g_lib_load_err)                  /* ...absent, not unreadable: */
         library_scan(fs);                  /* fallback: per-file tag scan     */
+    /* A root that could not be read leaves neither path having run to the
+     * end. Mark the load done anyway: library_ensure is called from every
+     * Music menu entry, and re-running the retries and sleeps on each
+     * keypress against a failing disk would make the whole UI crawl. The
+     * error is in g_lib_load_err; a deliberate retry clears g_lib_scanned. */
+    g_lib_scanned = 1;
     build_artists();                       /* so About/Artists count is live */
     g_lib_load_ms = (mmio_read32(USEC_TIMER_ADDR) - t0) / 1000u;
 }
@@ -2552,19 +2654,19 @@ static void songs_render(int sel)
     char right[12];
     if (g_songview_n > 0) fmt_count(right, sel + 1, g_songview_n);
     else                  right[0] = '\0';
-    header_render(g_songview_artist[0] ? g_songview_artist : "Songs",
+    ui_header(g_songview_artist[0] ? g_songview_artist : "Songs",
                   right, 1);
     if (g_songview_n == 0) {
         ui_text(14, LIST_Y0 + 20, "No songs", FONT_ROW, LINEN_MUTED);
         return;
     }
-    int top = scroll_window(sel, g_songview_n, LIST_ROWS2);
+    int top = ui_scroll_window(sel, g_songview_n, LIST_ROWS2);
     for (int r = 0; r < LIST_ROWS2; r++) {
         int idx = top + r;
         if (idx >= g_songview_n) break;
         songs_row_draw(r, idx);
     }
-    scrollbar_render(LIST_Y0, top, LIST_ROWS2, g_songview_n);
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS2, g_songview_n);
 }
 
 static void genres_row_draw(int r, int idx)
@@ -2581,18 +2683,18 @@ static void genres_render(int sel)
     char right[12];
     if (g_genres_n > 0) fmt_count(right, sel + 1, g_genres_n);
     else                right[0] = '\0';
-    header_render("Genres", right, 1);
+    ui_header("Genres", right, 1);
     if (g_genres_n == 0) {
         ui_text(14, LIST_Y0 + 20, "No genres", FONT_ROW, LINEN_MUTED);
         return;
     }
-    int top = scroll_window(sel, g_genres_n, LIST_ROWS);
+    int top = ui_scroll_window(sel, g_genres_n, LIST_ROWS);
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
         if (idx >= g_genres_n) break;
         genres_row_draw(r, idx);
     }
-    scrollbar_render(LIST_Y0, top, LIST_ROWS, g_genres_n);
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS, g_genres_n);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2624,19 +2726,19 @@ static void queue_render(int sel)
     char right[12];
     if (n > 0) fmt_count(right, cur + 1, n);
     else       right[0] = '\0';
-    header_render("Now Playing", right, 1);
+    ui_header("Now Playing", right, 1);
 
     if (n == 0) {
         ui_text(14, LIST_Y0 + 20, "Queue empty", FONT_ROW, LINEN_MUTED);
         return;
     }
-    int top = scroll_window(sel, n, LIST_ROWS);
+    int top = ui_scroll_window(sel, n, LIST_ROWS);
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
         if (idx >= n) break;
         queue_row_draw(r, idx);
     }
-    scrollbar_render(LIST_Y0, top, LIST_ROWS, n);
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS, n);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2681,6 +2783,7 @@ static void settings_apply(void)
 #define CFG_SAVE_DEBOUNCE_US  3000000u    /* 3 s after the last change */
 
 static int      g_cfg_dirty;              /* a change is pending a write   */
+static int      g_cfg_save_deferred;      /* gate refusal already logged   */
 static uint32_t g_cfg_dirty_us;           /* when the last change happened */
 
 static void settings_touch(void)
@@ -2717,6 +2820,38 @@ static void settings_commit(int force)
             return;
         }
     }
+    /*
+     * Refuse the write when the cell is too low to guarantee finishing it.
+     *
+     * config_save() is the ONLY thing in the firmware that writes to the
+     * user's disk, and settings_commit is its only caller, so this one check
+     * is the whole write gate. Below the disk-safe threshold the policy in
+     * battery.c has already flushed pending changes and parked the drive; a
+     * write starting after that would spin the platters back up on a cell that
+     * may not have the energy to see it through, and a cut mid-sector is how a
+     * config record gets torn.
+     *
+     * Deliberately BEFORE clearing g_cfg_dirty: the change stays pending, so
+     * it lands on the next commit if the charger goes in and the policy
+     * recovers. Refusing to write is not the same as discarding the edit.
+     *
+     * This also covers the forced commit inside enter_standby(): at the
+     * shutoff threshold that path would otherwise attempt a write at 3300 mV,
+     * which is exactly the moment there is least energy to complete one.
+     */
+    if (force != CFG_COMMIT_LAST && !battery_disk_writes_allowed()) {
+        /* Logged ONCE per refusal, not once per pass. This runs from the main
+         * loop — 100 Hz idle, thousands of passes a second while playing —
+         * and a UART line is milliseconds of blocking TX at 115200 baud;
+         * printed on every pass it would have dragged the whole UI for as
+         * long as the cell stayed below the line with a change pending. */
+        if (!g_cfg_save_deferred) {
+            uart_puts("core: cfg save deferred — battery below disk-safe\n");
+            g_cfg_save_deferred = 1;
+        }
+        return;
+    }
+    g_cfg_save_deferred = 0;
     g_cfg_dirty = 0;
     if (!config_writable()) {
         return;                            /* no CORECFG.DAT — nothing to do */
@@ -2732,7 +2867,7 @@ static void settings_commit(int force)
 static void settings_render_cur(void)
 {
     if (g_set_screen == SETTINGS_ABOUT) {
-        settings_about_render(g_bat_pct, g_bat_mv, g_total_mb, g_free_mb,
+        settings_about_render(g_bat_pct, g_bat_mv, g_bat_raw, g_total_mb, g_free_mb,
                               g_songs_n, g_albums_n, g_artists_n);
         /* The counts above are capped (LIB_MAX_SONGS/ALBUMS, ARTISTS_MAX,
          * LIB_MAX_GENRES). When a load actually hit one of those caps, say so —
@@ -2801,7 +2936,7 @@ static void fmt_time(char *buf, uint32_t s)
 static void draw_arc_thin(int cx, int cy, int R, int span, uint16_t c)
 {
     for (int dy = -span; dy <= span; dy++) {
-        int dx = isqrt_i(R * R - dy * dy);
+        int dx = ui_isqrt(R * R - dy * dy);
         console_fill_rect(cx + dx, cy + dy, 1, 1, c);
     }
 }
@@ -2811,9 +2946,9 @@ static void draw_arc_thin(int cx, int cy, int R, int span, uint16_t c)
 static void draw_ring_top(int cx, int cy, int Ro, int Ri, uint16_t c)
 {
     for (int dy = -Ro; dy <= 0; dy++) {
-        int xo = isqrt_i(Ro * Ro - dy * dy);
+        int xo = ui_isqrt(Ro * Ro - dy * dy);
         if (-dy <= Ri) {
-            int xi = isqrt_i(Ri * Ri - dy * dy);
+            int xi = ui_isqrt(Ri * Ri - dy * dy);
             console_fill_rect(cx - xo, cy + dy, xo - xi + 1, 1, c);   /* left band  */
             console_fill_rect(cx + xi, cy + dy, xo - xi + 1, 1, c);   /* right band */
         } else {
@@ -2826,7 +2961,7 @@ static void draw_ring_top(int cx, int cy, int Ro, int Ri, uint16_t c)
  * scale with `vol` — two waves loud, one wave quiet, and a mute "X" at 0. */
 static void draw_speaker(int sx, int sy, uint16_t c, int vol)
 {
-    fill_round_rect(sx - 8, sy - 3, 4, 6, 1, c);          /* cabinet             */
+    ui_round_rect(sx - 8, sy - 3, 4, 6, 1, c);          /* cabinet             */
     for (int dx = 0; dx <= 4; dx++) {                     /* cone, opening right */
         int half = 2 + dx;
         console_fill_rect(sx - 4 + dx, sy - half, 1, 2 * half, c);
@@ -2892,7 +3027,7 @@ static void draw_shackle(int sx, int ay, int Ro, int Ri,
 /* Minimal keyhole: a small round hole + short slot, punched in the plate bg. */
 static void draw_keyhole(int kx, int ky, uint16_t bg)
 {
-    fill_round_rect(kx - 3, ky - 3, 6, 6, 3, bg);    /* round hole (~d6)      */
+    ui_round_rect(kx - 3, ky - 3, 6, 6, 3, bg);    /* round hole (~d6)      */
     console_fill_rect(kx - 1, ky + 2, 2, 4, bg);     /* short slot            */
 }
 
@@ -2907,7 +3042,7 @@ static void draw_lock_icon(int cx, int cy, int open, uint16_t c, uint16_t bg)
     else
         draw_shackle(cx, cy - 9,  10, 6, 8, 8, c);   /* latched              */
 
-    fill_round_rect(cx - 16, cy - 3, 32, 22, 4, c);  /* body, over prong feet */
+    ui_round_rect(cx - 16, cy - 3, 32, 22, 4, c);  /* body, over prong feet */
     draw_keyhole(cx, cy + 7, bg);
 }
 
@@ -3168,7 +3303,7 @@ static void menu_render_list(const char *title, const menu_item_t *items,
     g_menu_sel   = sel;
     console_clear(LINEN_SURFACE);
     status_strip_render();
-    header_render(title, "", back);
+    ui_header(title, "", back);
     for (int i = 0; i < n && i < LIST_ROWS; i++) {
         menu_row_draw(i, i);
     }
@@ -3209,6 +3344,13 @@ static void      scr_pop(void)        { g_list_epoch++;
                                         if (g_scr_n > 1) g_scr_n--; }
 static screen_t  scr_cur(void)        { return g_scr[g_scr_n - 1]; }
 
+/* Why the last browse_load produced what it did: 0, or the FAT32_* code of a
+ * directory read that failed even after retries. An empty g_browse with a
+ * nonzero code is an album that COULD NOT BE READ, not an album with no
+ * tracks; the tracklist screen should say so (and offer Back), because the
+ * two look identical otherwise and one of them is a disk fault. */
+static int g_browse_err;
+
 /* Read an album's tracklist (the folder at `dir_clus`) into g_browse. Only ever
  * called at depth 1 now — the album LIST is the index-driven g_albums. */
 static void browse_load(fat32_t *fs, uint32_t dir_clus)
@@ -3218,7 +3360,20 @@ static void browse_load(fat32_t *fs, uint32_t dir_clus)
     g_browse_n = 0;
     g_art_clus = 0;                      /* re-captured by browse_collect below */
     g_art_size = 0;
-    fat32_readdir(fs, dir_clus, browse_collect, 0);
+    /* One directory, opened by hand: give it the full set of retries rather
+     * than whatever the boot load left in the budget — the budget exists to
+     * bound a thousand-album boot, not a single user-initiated open. */
+    g_lib_retry_budget = LIB_READDIR_RETRIES;
+    g_browse_err = lib_readdir(fs, dir_clus, browse_collect, 0, &g_browse_n);
+    if (g_browse_err != 0) {
+        g_art_clus = g_art_size = 0;     /* nothing from a walk we don't trust */
+        return;
+    }
+    /* The folder just read cleanly. If the load-time pass could not read it,
+     * this is the re-attempt the flag promised: resolve it now, so its songs
+     * become playable from Songs/Genres/shuffle and the About count drops. */
+    int ai = album_by_clus(dir_clus);
+    if (ai >= 0 && g_albums[ai].unreadable) (void)album_resolve(fs, ai);
 }
 
 /* After entering an album folder: load its hero art, pull each track's
@@ -3286,6 +3441,8 @@ static void detail_load_meta(fat32_t *fs)
 
 /* Measured cost of the last present, used to pace the next one. Seeded to a
  * full-frame-ish value so the first push is paced conservatively. */
+/* Declared up with the stats line; seeded to a deliberate over-estimate so
+ * the first present is throttled conservatively before it is measured. */
 static uint32_t g_present_cost_us = 30000u;
 
 /* Present whatever has been drawn since the last console_damage_reset(), then
@@ -3444,7 +3601,7 @@ static void list_paint_note(void)
     g_lp.depth   = g_dir_depth;
     g_lp.sel     = v.sel;
     g_lp.count   = v.count;
-    g_lp.top     = scroll_window(v.sel, v.count, v.visible);
+    g_lp.top     = ui_scroll_window(v.sel, v.count, v.visible);
     g_lp.right_w = v.right[0] ? text_width(v.right, FONT_SMALL) : 0;
     g_lp.chrome  = chrome_key();
     g_lp.epoch   = g_list_epoch;
@@ -3462,7 +3619,7 @@ static int list_repaint_partial(void)
     if (g_lp.epoch != g_list_epoch)                              return 0;
     if (g_lp.count != v.count || g_lp.chrome != chrome_key())    return 0;
     if (v.sel == g_lp.sel)                                       return 0;
-    int top = scroll_window(v.sel, v.count, v.visible);
+    int top = ui_scroll_window(v.sel, v.count, v.visible);
     if (top != g_lp.top) return 0;        /* window scrolled: every row moved   */
 
     int r_old = g_lp.sel - top, r_new = v.sel - top;
@@ -3491,7 +3648,7 @@ static int list_repaint_partial(void)
         int idx = top + r;
         if (idx < v.count) v.row(r, idx);
     }
-    scrollbar_render(v.y0, top, v.visible, v.count);
+    ui_scrollbar(v.y0, top, v.visible, v.count);
     return 1;
 }
 
@@ -4171,6 +4328,22 @@ static void suspend_to_ram(uint32_t play_down_us)
          * unaffected — it only lets the deferred bring-up actually run.
          */
         while (clickwheel_get_event(&drain)) { }
+        /*
+         * Pump while suspended, so the codec actually powers down.
+         *
+         * The pause above stops the DMA but leaves the WM8758 fully powered —
+         * PLL, VMID, DACs, headphone amps — and the thing that shuts it off is
+         * the persistent-pause timeout inside player_pump(). This loop never
+         * called pump, so a device "asleep" via Play-hold held the codec live
+         * for the entire suspend, which is the most expensive way to do
+         * nothing that this firmware is capable of.
+         *
+         * Safe to call here: pump's paused branch does the codec-off check and
+         * returns immediately. No decode, no disk, no ring work — which
+         * matters, because the drive is parked by this point and waking it
+         * would defeat the whole exercise.
+         */
+        player_pump();
         cpu_wait_ms(30);
     }
     /* Swallow the wake press so it isn't also acted on as navigation. */
@@ -4943,11 +5116,21 @@ _Noreturn static void run_ui(fat32_t *fs)
          * 80. Restore the instant there's life again: any wake back to BL_FULL, or
          * playback starting. Rides the same refcounted boost the boot path took, so
          * it stays balanced (idle unboost 1->0, wake boost 0->1) and re-boosts
-         * before the render/decode work later in this same iteration. */
-        if (cpu_idled && (bl_state != BL_OFF || player_active())) {
+         * before the render/decode work later in this same iteration.
+         *
+         * "Playing" means the DAC is running — player_playing(), NOT
+         * player_active(). Active stays set across a pause (the UI needs it to,
+         * every transport control is gated on it), so keying this on active
+         * meant a PAUSED device with the screen off held 80 MHz indefinitely:
+         * the single largest idle-power miss in the firmware, since pause-and-
+         * pocket is the common way to stop listening. A paused pump does no
+         * decode and feeds no DMA, so 30 MHz is plenty; the resume itself
+         * always arrives through a wake press that has already re-lit the
+         * screen (and so re-boosted here) one pass earlier. */
+        if (cpu_idled && (bl_state != BL_OFF || player_playing())) {
             cpu_boost();
             cpu_idled = 0;
-        } else if (!cpu_idled && bl_state == BL_OFF && !player_active()) {
+        } else if (!cpu_idled && bl_state == BL_OFF && !player_playing()) {
             cpu_unboost();
             cpu_idled = 1;
         }
@@ -4971,8 +5154,7 @@ _Noreturn static void run_ui(fat32_t *fs)
         settings_commit(0);
 
         const uint32_t disk_idle_us = 20000000u;   /* 20 s: saves ~100 mA, no thrash */
-        if ((!player_active() || player_paused())
-            && !ata_is_parked() && idle > disk_idle_us) {
+        if (!player_playing() && !ata_is_parked() && idle > disk_idle_us) {
             ata_standby();
         }
 
@@ -5052,8 +5234,9 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
             lock_flashing = 1;
             /* Only throttle when idle; keep audio paced while playing. Halt the
-             * core (self-waking ~10 ms, one tick) instead of a busy-spin. */
-            if (!player_active()) {
+             * core (self-waking ~10 ms, one tick) instead of a busy-spin. Same
+             * gate as the main halt below: a PAUSED player has no DMA to pace. */
+            if (!player_playing()) {
                 cpu_wait_ms(10);
             }
             continue;                     /* skip the normal render this pass      */
@@ -5176,7 +5359,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                 int sv = 0;
                 for (int i = 0; i < g_det_view_n; i++)
                     if (g_det_view[i] == (int16_t)g_det_sel) { sv = i; break; }
-                int top = scroll_window(sv, g_det_view_n, DET_ROWS);
+                int top = ui_scroll_window(sv, g_det_view_n, DET_ROWS);
                 const char *pn = player_track_name();
                 for (int r = 0; r < DET_ROWS; r++) {
                     int vi = top + r;
@@ -5204,7 +5387,7 @@ _Noreturn static void run_ui(fat32_t *fs)
             if ((uint32_t)(nowb - last_bars) >= 110000u) {
                 int n = player_queue_len();
                 int cur = player_queue_current();
-                int top = scroll_window(g_queue_sel, n, LIST_ROWS);
+                int top = ui_scroll_window(g_queue_sel, n, LIST_ROWS);
                 int r = cur - top;
                 if (cur < n && r >= 0 && r < LIST_ROWS) {
                     int ry = LIST_Y0 + r * ROW_H;
@@ -5253,7 +5436,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                  * for rows nobody was looking at. Snapshot the visible rows'
                  * chips, pump, and repaint only if one of THOSE appeared. */
                 const uint16_t *before[LIST_ROWS2];
-                int vtop = scroll_window(g_br_sel, albumlist_count(), LIST_ROWS2);
+                int vtop = ui_scroll_window(g_br_sel, albumlist_count(), LIST_ROWS2);
                 /* PEEK, not get: this loop is only observing. artcache_get
                  * claims a way and re-stamps the LRU, so using it here (12
                  * times a pass, always in row order) is what pinned the top
@@ -5284,16 +5467,26 @@ _Noreturn static void run_ui(fat32_t *fs)
          * an interrupt, and the audio DMA ISR has only the ~363 us I2S FIFO of
          * slack — 200 us stays inside that budget while still parking the core
          * for the overwhelming majority of an idle pass. Input is latched by the
-         * tick ISR and every animation here ticks at >= 33 ms, so nothing is lost. */
-        if (player_active() && !dirty && pump_us < 200u) {
+         * tick ISR and every animation here ticks at >= 33 ms, so nothing is lost.
+         *
+         * Gated on player_playing(), not player_active(). The 200 us figure is a
+         * DMA-feeding budget, and a PAUSED player has no DMA to feed — but
+         * active() stays 1 across a pause, so a paused device used to take this
+         * branch and spin the loop ~5,000 times a second (each pass a
+         * player_pump call, several USEC_TIMER reads, GPIO reads and an event
+         * drain) for as long as it sat paused. Paused is idle: it belongs in
+         * the 10 ms halt below, fifty times fewer wakeups. */
+        if (player_playing() && !dirty && pump_us < 200u) {
             cpu_wait_us(200);
         }
 
         /* Only throttle when idle; while playing, player_pump's decode_step
          * paces the loop and the wheel stays responsive. Halt the core until the
          * next tick (self-waking ~10 ms) instead of a busy-spin: input is latched
-         * by the 100 Hz timer ISR, so this costs no responsiveness. */
-        if (!player_active()) {
+         * by the 100 Hz timer ISR, so this costs no responsiveness. "Idle"
+         * includes paused (see above); the paused pump's only job — the codec
+         * power-down timeout — is seconds long, so 100 Hz is ample for it. */
+        if (!player_playing()) {
             cpu_wait_ms(10);
         }
 
@@ -5340,6 +5533,17 @@ _Noreturn void kernel_main(void) {
     uart_init();
 
     uart_puts("core: kernel alive (iPod 5G/5.5G, PP5022)\n");
+
+    /*
+     * Hand the shared list chrome its scrolling-title implementation.
+     *
+     * ui_list_row() draws an overflowing title through this hook. The marquee
+     * needs USEC_TIMER, and a time source is exactly what ui/chrome.c must not
+     * reach for if it is to build on the host — so the dependency is injected
+     * here instead. Registered once, before anything can paint; leave it unset
+     * (as the host tests do) and titles are plainly clipped.
+     */
+    ui_set_scroll_text(mq_text);
 
     /* Hex-path self-test: if this doesn't read 1234ABCD on the terminal,
      * distrust every register dump that follows. */

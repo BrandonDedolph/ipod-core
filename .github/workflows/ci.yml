@@ -35,6 +35,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # An XFAIL that still fails is a hard failure in CI. Locally an XFAIL is
+  # informational — it lets you run the suite while a known bug is open — but
+  # a known bug that survives a merge is just an untested bug, so the shared
+  # build refuses to inherit one silently. Clearing this needs a deliberate
+  # edit here, which is the point.
+  CORE_TEST_STRICT_XFAIL: "1"
   # Pinned ARM toolchain. Keep in step with .tool-versions — that file is the
   # human-readable record, this is what CI actually installs.
   ARM_TOOLCHAIN_VERSION: "14.2.rel1"

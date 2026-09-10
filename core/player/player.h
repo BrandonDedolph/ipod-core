@@ -76,14 +76,56 @@ void player_resume(void);
 void player_toggle_pause(void);
 int  player_paused(void);              /* 1 while paused */
 
-/* Playback order/looping (driven by Settings). shuffle: pick the next track at
- * random. repeat: 0 = off (stop at queue end), 1 = all (loop the queue), 2 = one
- * (replay the current track). */
+/* Playback order/looping (driven by Settings). shuffle: play the queue in a
+ * random PERMUTATION — every playable entry once, then the queue ends (or,
+ * under Repeat All, a new permutation is dealt). Turning it on mid-track keeps
+ * that track current and shuffles the rest; turning it off resumes plain
+ * queue order from the current entry; re-setting it while already on is a
+ * no-op (no re-deal). repeat: 0 = off (stop at queue end), 1 = all (loop the
+ * queue), 2 = one (replay the current track). */
 void player_set_shuffle(int on);
 void player_set_repeat(int mode);
 
-/* 1 while a track is loaded (playing OR paused). */
+/* 1 while a track is loaded (playing OR paused). This is the UI's notion:
+ * every transport control, the Now Playing entry, the resume-position save
+ * and the queue view are gated on it, and "paused" must keep all of those
+ * alive. It is the WRONG gate for a power decision — see player_playing(). */
 int  player_active(void);
+
+/*
+ * 1 while the DAC is actually running: a track is loaded AND not paused.
+ *
+ * This is what the power gates in the main loop want, and what they used to
+ * get wrong. They keyed off player_active(), which stays 1 across a pause, so
+ * a paused device was treated exactly like a playing one: the CPU never left
+ * 80 MHz once the screen went dark, and the loop took the 200 us "keep the
+ * DMA fed" halt instead of the 10 ms idle one — around 5,000 passes a second
+ * of player_pump, timer reads, GPIO reads and event drains, feeding a DMA that
+ * was stopped. A paused, screen-off iPod plausibly drew 2-3x true idle.
+ *
+ * Nothing about the transport keys off this; the UI keeps player_active().
+ */
+int  player_playing(void);
+
+/*
+ * How long a pause has to PERSIST before the player powers the codec down.
+ *
+ * hal_audio_stop() — the pause — only mutes and cuts the DMA; the WM8758's
+ * PLL, VMID, DACs and headphone amps stay live and the I2S/MCLK clocks stay
+ * ungated, which is most of the analog budget. Once a pause has lasted this
+ * long the player suspends the codec (hal_audio_suspend) and wakes it again on
+ * resume, re-latching volume/balance/tone, resuming from the exact position
+ * and without a click.
+ *
+ * Why not immediately: the wake is a codec reset plus a ~40 ms VMID settle,
+ * which a pause/unpause to answer a question should never pay. Why 5 s and not
+ * 30: the cases split cleanly by duration. A pause that is about to be undone
+ * is undone within a couple of seconds; anything longer is the device being
+ * put down, and the first five seconds of a thirty-minute pause is a rounding
+ * error against what the other twenty-nine minutes would have cost. Anything
+ * much shorter risks the reset on a fumbled double-press.
+ */
+#define PLAYER_PAUSE_CODEC_OFF_US (5u * 1000000u)
 
 /* Why the last open / auto-advance failed, so the UI can eventually say why a
  * track was skipped instead of silently scrolling past it. Valid after any

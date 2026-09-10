@@ -25,6 +25,48 @@
  */
 #define UART_TX_SPIN_LIMIT  (1u << 16)
 
+/*
+ * How long DEV_RS holds SER0 in reset. The reference holds it for one
+ * ~10 ms scheduler tick (08-boot-dock.md, "Init sequence").
+ */
+#define UART_RESET_HOLD_US  10000u
+
+/*
+ * Trip cap on the reset-hold wait. USEC_TIMER is a free-running 1 MHz
+ * counter clocked independently of the PLL and the cache (01-soc-pp5022.md,
+ * "Timers"), so on silicon the elapsed test always terminates; the cap is
+ * the HAL's "no unbounded loops, ever" rule. 1<<20 trips is chosen so that
+ * the failure mode — a dead counter — degrades to EXACTLY the iteration-
+ * counted loop this wait replaced, i.e. no worse than the firmware that
+ * already booted on the device. Under the host mock bus the counter only
+ * advances when the test scripts it, so the cap is small there: large
+ * enough that a scripted wait exits on TIME, not on the guard, and small
+ * enough that a stuck-counter test cannot flood the recording bus's
+ * fixed-capacity event log. Same MMIO_MOCK split as wm8758_settle_us and
+ * the PLL-lock spin in kernel/clock.c.
+ */
+#ifdef MMIO_MOCK
+#define UART_RESET_GUARD_TRIPS  64u
+#else
+#define UART_RESET_GUARD_TRIPS  (1u << 20)
+#endif
+
+/*
+ * Wait `us` microseconds on USEC_TIMER, bounded. Wrap-safe: the counter
+ * wraps every ~71.6 min, so this compares an unsigned ELAPSED difference,
+ * never "now >= deadline". At boot the counter is nowhere near the wrap,
+ * but a warm reset (Select+Play) or a long-running unit reusing this
+ * helper later should not have to care, so it is written correctly now.
+ */
+static void uart_wait_us(uint32_t us)
+{
+    uint32_t t0    = mmio_read32(USEC_TIMER_ADDR);
+    uint32_t guard = UART_RESET_GUARD_TRIPS;
+    while ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - t0) < us && --guard != 0) {
+        /* wait */
+    }
+}
+
 static void uart_tx_byte(uint8_t b)
 {
     uint32_t spin = UART_TX_SPIN_LIMIT;
@@ -53,14 +95,25 @@ void uart_init(void)
 
     /* Power the UART block, then pulse its reset (08-boot-dock.md,
      * "Init sequence"; DEV_SER0 = bit 6). The reference holds reset
-     * for one ~10 ms scheduler tick; with no timer driver yet we
-     * busy-wait a conservatively long bounded loop instead (1M
-     * iterations is multiple ms even at 80 MHz). */
+     * for one ~10 ms scheduler tick. We have no tick yet — uart_init is
+     * the first thing kernel_main does — but we do not need one:
+     * USEC_TIMER is free-running from power-on, so the hold is timed
+     * against it directly.
+     *
+     * This used to be a 1M-iteration `volatile` counting loop, sized on
+     * the estimate "multiple ms even at 80 MHz". That estimate was off
+     * by more than an order of magnitude for where this code actually
+     * runs: BEFORE clock_init() and cache_init(), i.e. on the 24 MHz
+     * boot crystal with the cache off and every one of the loop's seven
+     * instructions fetched from SDRAM with wait states. Measured from
+     * the linked image the loop was ldr/add/b + str/ldr/cmp/bcc per
+     * trip — ~16 cycles even with zero-wait-state memory, several times
+     * that uncached — so the "10 ms" hold was really on the order of a
+     * second, all of it spent before the first byte of boot log. Ten
+     * milliseconds on the microsecond counter is what was intended. */
     mmio_write32(DEV_EN_ADDR, mmio_read32(DEV_EN_ADDR) | DEV_SER0);
     mmio_write32(DEV_RS_ADDR, mmio_read32(DEV_RS_ADDR) | DEV_SER0);
-    for (volatile uint32_t i = 0; i < (1u << 20); i++) {
-        /* hold reset */
-    }
+    uart_wait_us(UART_RESET_HOLD_US);
     mmio_write32(DEV_RS_ADDR, mmio_read32(DEV_RS_ADDR) & ~DEV_SER0);
 
     /* Program the divisor latch for 115200 on the 24 MHz reference:

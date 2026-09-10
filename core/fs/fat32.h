@@ -128,7 +128,16 @@ int fat32_open(fat32_t *fs, const char *name,
  * LFN entries the same way fat32_open does (ASCII; if a long name is absent use
  * the 8.3 name with the standard "NAME.EXT" formatting — trailing spaces
  * trimmed, '.' inserted only when an extension exists). Returns 0 on success
- * (including early stop when cb returns nonzero), negative on a disk read error.
+ * (including early stop when cb returns nonzero), FAT32_EIO on a disk read
+ * error, FAT32_ECORRUPT on a cyclic chain OR when `dir_clus` itself is not a
+ * cluster this volume can address — that used to return 0 with no entries,
+ * indistinguishable from an empty directory.
+ *
+ * A NONZERO RETURN MEANS THE LISTING IS INCOMPLETE. Entries surfaced before
+ * the failure were real, but the caller has no way to know how many were
+ * not, so a caller building a list must treat the result as "unreadable",
+ * not as "these are the files". Ignoring the return here is exactly how a
+ * failed album read used to show up as an album with no tracks.
  */
 int fat32_readdir(fat32_t *fs, uint32_t dir_clus, fat32_dir_cb cb, void *ud);
 
@@ -157,7 +166,12 @@ int32_t fat32_read_file(fat32_t *fs, uint32_t first_clus,
  */
 typedef struct {
     fat32_t *fs;
-    uint32_t clus;      /* current cluster (>=2 while data remains, else 0) */
+    uint32_t clus;      /* current cluster: the one clus_off indexes into. May
+                         * be fully consumed (clus_off == cluster size) with
+                         * bytes remaining — the step to the next cluster is
+                         * taken lazily by the next read/skip. 0 for an empty
+                         * file. Whatever fat32_stream_open was handed for a
+                         * corrupt entry, so the first read can reject it.   */
     uint32_t clus_off;  /* bytes already consumed within the current cluster */
     uint32_t remaining; /* file bytes not yet returned                       */
 } fat32_stream_t;
@@ -173,9 +187,22 @@ void fat32_stream_open(fat32_stream_t *st, fat32_t *fs,
 /*
  * Read up to `len` bytes forward from the cursor into `buf`, following the
  * cluster chain as needed. Returns the number of bytes read (0 once the
- * file is exhausted), or negative on a disk read error. A short *non-zero*
+ * file is exhausted), FAT32_EIO on a disk read error, or FAT32_ECORRUPT when
+ * bytes remain but the chain cannot supply them — the first cluster is not
+ * addressable, or the chain ends before the size does. A short *non-zero*
  * return happens only at end-of-file; mid-file the call always fills `len`.
- * Advances the cursor by the number of bytes returned.
+ *
+ * 0 MEANS END OF FILE AND NOTHING ELSE. A stream opened on a corrupt entry
+ * used to return 0 on its first read, which every caller — the player in
+ * particular, which was written to tell EOF from error — read as a clean,
+ * empty file. It now returns FAT32_ECORRUPT. A genuinely empty file (size 0)
+ * still returns 0, so the two stay distinguishable.
+ *
+ * On success the cursor advances by the number of bytes returned. ON ANY
+ * ERROR THE CURSOR IS UNCHANGED: bytes copied before the failure are not
+ * counted, the cursor is not moved past them, and the same call can simply
+ * be retried. (It used to move the cursor and then report failure, leaving
+ * the stream ahead of the caller's own position.)
  */
 int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len);
 
@@ -183,7 +210,11 @@ int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len);
  * Advance the cursor forward by up to `n` bytes WITHOUT returning data —
  * walking the cluster chain (reading only FAT entries, never cluster data),
  * so skipping a large region (e.g. an embedded-art metadata block) is cheap.
- * Returns the number of bytes actually skipped (< n only at end-of-file).
+ * Returns the number of bytes actually skipped: < n at end-of-file, or when
+ * the chain could not be followed (FAT read error, or a chain that ends or
+ * starts on an unaddressable cluster). This call has no error channel — it
+ * stops short and the NEXT fat32_stream_read reports the FAT32_* code, so a
+ * caller that skips then reads always learns what happened.
  */
 uint32_t fat32_stream_skip(fat32_stream_t *st, uint32_t n);
 

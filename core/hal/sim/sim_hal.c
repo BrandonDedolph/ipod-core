@@ -373,6 +373,16 @@ void hal_audio_stop(void) {
     if (g_audio_dev != 0) SDL_PauseAudioDevice(g_audio_dev, 1);
 }
 
+void hal_audio_flush(void) {
+    /* Nothing to discard. SDL is driving us through a pull CALLBACK, so the
+     * only PCM in flight is whatever it already copied out of g_audio_src —
+     * a few milliseconds, not the ~370 ms the hw backend's ping-pong pair
+     * holds, and not reachable from here (SDL_ClearQueuedAudio applies to
+     * queued-audio devices, which this is not). The contract is still
+     * satisfied: the next callback pulls from the source, which is where the
+     * caller has just put the new position. */
+}
+
 void hal_audio_close(void) {
     /* Lock so we don't race with a final in-flight callback. After
      * SDL_CloseAudioDevice returns, no more callbacks fire — but

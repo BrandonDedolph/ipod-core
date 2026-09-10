@@ -34,20 +34,19 @@ cc = meson.get_compiler('c')
 # under -Werror that is itself a hard error — so an unguarded flag added for
 # gcc 16 would break the build on gcc 14. The toolchain floor lives in
 # .tool-versions; this keeps older-but-supported toolchains working anyway.
-optional_c_args = cc.get_supported_arguments([
-  # gcc 16 added -Wunterminated-string-initialization, which fires on the
-  # deliberate `static const char hex[16] = "0123456789ABCDEF"` lookup tables
-  # in hal/hw/uart.c and hal/hw/lcd.c (exactly-sized char arrays, never used
-  # as C strings) and broke the -Werror hw build outright on the 14->16
-  # upgrade. The correct fix is __attribute__((nonstring)) on those two
-  # arrays, which lands separately in the files that own them. Until then
-  # this DEMOTES the diagnostic to a warning rather than silencing it
-  # (-Wno-error=, not -Wno-), so the build goes through and the arrays stay
-  # visible. REMOVE THIS once uart.c/lcd.c carry the attribute.
-  # tests/meson.build passes the stronger per-target -Wno- form for the same
-  # two files.
-  '-Wno-error=unterminated-string-initialization',
-])
+# Currently empty: the gcc-16 -Wunterminated-string-initialization demotion
+# that lived here is gone. It was added during the 14->16 upgrade for the
+# exactly-sized `char hex[16] = "0123456789ABCDEF"` lookup tables; uart.c now
+# declares that table unsized (17 B incl. NUL, hal/hw/uart.c) and lcd.c never
+# had one, so no first-party file trips the diagnostic any more. Leaving the
+# demotion in place would have let a genuinely truncated initializer — a char
+# array with no room for its NUL, handed to something that expects a C string
+# — through -Werror unnoticed.
+#
+# Keep the probing mechanism itself: passing an unguarded -Wno-error=<flag the
+# compiler does not know> is itself an error under -Werror, so any future
+# version-dependent suppression belongs in this list rather than inline.
+optional_c_args = cc.get_supported_arguments([])
 
 # Common warning/safety flags
 # (warning_level=3 already implies -Wall -Wextra -Wpedantic; we add specifics.)
@@ -207,6 +206,20 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Shared list/panel chrome (ours): the header, list rows, selection bar,
+  # scrollbar, scroll window, rounded rect and text wrappers that every screen
+  # is built from. EXTRACTED OUT OF kernel/main.c, where it was file-local
+  # static and therefore uncompilable on the host (main.c is hw-only), and
+  # where ui/screen_settings.c kept a hand-maintained second copy that had
+  # already drifted. Pure: console.h + text.h + palette.h, no hardware — the
+  # marquee's time source is injected via ui_set_scroll_text(). Same chrome.c
+  # the host chrome_test compiles.
+  chrome_hw_lib = static_library(
+    'core_chrome_hw',
+    sources: ['ui/chrome.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Full-screen "charging" battery view (ours): renders design_reference's
   # ChargingScreen into the RGB565 console framebuffer with fill_rect shapes +
   # the Nunito text renderer. Pure integer rendering — no libc/libm/malloc, no
@@ -259,7 +272,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

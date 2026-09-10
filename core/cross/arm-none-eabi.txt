@@ -27,7 +27,16 @@
 [binaries]
 c          = 'arm-none-eabi-gcc'
 cpp        = 'arm-none-eabi-g++'
-ar         = 'arm-none-eabi-ar'
+# gcc-ar, NOT ar. core/meson.build builds with b_lto=true, so every object in
+# the static libraries is a slim LTO object whose symbols only the GCC plugin
+# can see. Arch's binutils installs that plugin into lib/bfd-plugins/, so a
+# plain `ar` there happens to index them; the Arm GNU Toolchain tarball CI
+# pins (14.2.rel1) ships no such link, its `ar` writes an archive whose
+# symbol table is empty for every LTO member, and the final link pulls
+# nothing out of any library: hundreds of 'undefined reference' errors for
+# symbols that are plainly in the tree. gcc-ar is the driver's wrapper that
+# loads the plugin explicitly, and it works on both toolchains.
+ar         = 'arm-none-eabi-gcc-ar'
 strip      = 'arm-none-eabi-strip'
 objcopy    = 'arm-none-eabi-objcopy'
 ld         = 'arm-none-eabi-ld'

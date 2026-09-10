@@ -127,17 +127,54 @@ uint32_t current_tick(void)
 }
 
 /*
- * Halt this core until its countdown expires (or an interrupt arrives).
- * PROC_WAIT_CNT self-wakes on the countdown, so unlike PROC_SLEEP it is safe
- * even if no interrupt is pending (01-soc-pp5022.md, "Sleep / wake"). Three
- * NOPs after the write per the doc's pipeline rule. 1 ms keeps sleep_ms's
- * effective granularity well inside one 10 ms tick.
+ * Halt this core until its countdown expires. PROC_WAIT_CNT self-wakes on
+ * the countdown, so unlike PROC_SLEEP it is safe even if no interrupt is
+ * pending (01-soc-pp5022.md, "Sleep / wake"). Three NOPs after the write per
+ * the doc's pipeline rule.
+ *
+ * WHY 200 us AND NOT 1 ms. sleep_ms is reachable while audio is playing:
+ * player.c backs off with sleep_ms(60) after a failed disk read, mid-track.
+ * Playback is a single-shot DMA transfer re-kicked from its completion ISR,
+ * with no chained descriptor; only the 16-frame I2S FIFO (~363 us at 44.1 kHz)
+ * covers a late re-kick. A halt that outlasts that window is an underrun.
+ * So no single halt may be longer than the FIFO, and kernel/main.c already
+ * sizes its own idle halts at 200 us on exactly this basis. This used to be
+ * 1 ms — one transient PIO error mid-track became 60 back-to-back 1 ms
+ * halts, and any DMA completion landing inside one was serviced up to 1 ms
+ * late, an underrun stacked on top of the disk hiccup. The total sleep is
+ * unchanged (it is bounded by the tick count, not the halt length); only
+ * the granularity is.
+ *
+ * OPEN QUESTION — does PROC_WAIT_CNT wake early on an interrupt? The doc
+ * table says only "Sleep until countdown" for PROC_WAIT_CNT and reserves
+ * "Sleep until interrupt" for PROC_SLEEP; it promises nothing about an
+ * interrupt cutting a countdown short, and an earlier version of this
+ * comment asserted that it does. That assertion was not backed by the doc
+ * and is not relied on here: 200 us is inside the FIFO deadline whether the
+ * core wakes on the DMA IRQ (best case: latency ~0) or sleeps the full
+ * countdown (worst case: latency 200 us, deadline 363 us). It is on the
+ * device-test list — measure DMA-ISR latency under sleep_ms(60) with a
+ * scope or the USEC_TIMER stamp — and until then nothing in this file may
+ * be sized on the optimistic reading.
+ *
+ * 200 fits the 8-bit count field; PROC_CNT_USEC selects the 1 us unit.
  */
-#define SLEEP_HALT_MS  1u
+#define SLEEP_HALT_US  200u
+
+/*
+ * The count is the LOW 8 BITS of CPU_CTL (01-soc-pp5022.md, "Sleep / wake":
+ * "[7:0] Read: cycles remaining; write: cycles to skip"). A value that does
+ * not fit is TRUNCATED SILENTLY by the hardware, not rejected — writing 1000
+ * here would program 1000 & 0xFF = 232 us, a halt that still looks plausible
+ * and still passes a deadline check, so nothing downstream would notice the
+ * number was not the one written. Catch it at compile time instead.
+ */
+_Static_assert(SLEEP_HALT_US <= 0xFFu,
+               "SLEEP_HALT_US must fit the 8-bit CPU_CTL count field");
 
 static void tick_halt(void)
 {
-    mmio_write32(CPU_CTL_ADDR, PROC_WAIT_CNT | PROC_CNT_MSEC | SLEEP_HALT_MS);
+    mmio_write32(CPU_CTL_ADDR, PROC_WAIT_CNT | PROC_CNT_USEC | SLEEP_HALT_US);
 #ifndef MMIO_MOCK
     __asm__ volatile("nop\n\tnop\n\tnop");
 #endif
@@ -164,7 +201,7 @@ void sleep_ms(uint32_t ms)
          * immediate return and this loop a flat-out 80 MHz busy-spin for the
          * whole delay. Every sleep_ms burned full power for nothing.
          *
-         * Halting first costs at most SLEEP_HALT_MS of scheduling latency when
+         * Halting first costs at most SLEEP_HALT_US of scheduling latency when
          * a scheduler IS running (the only task there is an idle task that
          * halts anyway) and turns the shipping path into an actual sleep. We
          * cannot ask the scheduler whether it is live — kernel/sched.c is not

@@ -19,6 +19,7 @@
  */
 
 #include "settings.h"
+#include "chrome.h"
 #include "palette.h"                          /* live theme palette (g_pal[]) */
 
 #include "text.h"
@@ -58,11 +59,10 @@
 #define F_SUB    text_font_regular_11()
 #define F_SMALL  text_font_regular_9()
 
-/* Geometry — identical to kernel/main.c so screens line up across the UI. */
-#define HDR_BASE   30
-#define HDR_DIV_Y  38
-#define LIST_Y0    42
-#define ROW_H      24
+/* Geometry comes from ui/chrome.h — the single definition every screen shares.
+ * These were duplicated here as a "matched copy", and the copy had already
+ * fallen behind: the taller two-line row work (ROW_H2/LIST_ROWS2) landed only
+ * in main.c, so Settings kept scrolling with the old feel. */
 #define TH_ROW_H   40                          /* taller theme-picker rows    */
 
 /* ---------------------------------------------------------------------------
@@ -84,43 +84,11 @@ static void st_text_right(int pad, int y, const char *s,
     st_text(LCD_WIDTH - pad - w, y, s, font, ink);
 }
 
-/* Titled header with an optional back chevron and right-aligned value, plus the
- * divider (menus.jsx ScreenHeader). */
-static void header_render(const char *title, const char *right, int back)
-{
-    int x = 12;
-    if (back) {
-        x = st_text(x, HDR_BASE, UI_GLYPH_LAQUO, F_HEADER, S_MUTED2) + 4;
-    }
-    st_text(x, HDR_BASE, title, F_HEADER, S_INK);
-    if (right && right[0]) {
-        st_text_right(12, HDR_BASE - 1, right, F_SMALL, S_MUTED2);
-    }
-    console_fill_rect(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, S_BORDER);
-}
-
-/* Filled rounded rect (radius rr) — the design rounds selection bars (4) and
- * pills (end-caps). Each corner row is inset along a quarter-circle. */
-static int st_isqrt(int v) { int q = 0; while ((q + 1) * (q + 1) <= v) q++; return q; }
-static void st_round_rect(int x, int y, int w, int h, int rr, uint16_t c)
-{
-    if (rr < 1) { console_fill_rect(x, y, w, h, c); return; }
-    if (2 * rr > w) rr = w / 2;
-    if (2 * rr > h) rr = h / 2;
-    for (int yy = 0; yy < h; yy++) {
-        int inset = 0, k = -1;
-        if (yy < rr)           k = yy;
-        else if (yy >= h - rr) k = h - 1 - yy;
-        if (k >= 0) { int dy = rr - k; inset = rr - st_isqrt(rr * rr - dy * dy); }
-        console_fill_rect(x + inset, y + yy, w - 2 * inset, 1, c);
-    }
-}
-
 /* The dark-ink selection bar behind row `r` (menus.jsx selected Row, radius 4). */
 static void sel_bar(int y0, int rowh, int r)
 {
     int ry = y0 + r * rowh;
-    st_round_rect(6, ry + 1, LCD_WIDTH - 16, rowh - 2, 4, S_SEL_BG);
+    ui_round_rect(6, ry + 1, LCD_WIDTH - 16, rowh - 2, 4, S_SEL_BG);
 }
 
 /* Toggle pill (menus.jsx SettingsPlayback toggle): a 22x12 track with a 9x9
@@ -135,9 +103,9 @@ static void draw_toggle(int ry, int selected, int on)
                         : (selected ? S_SEL_SUB : S_PILL_OFF);
     uint16_t knob  = on ? (selected ? S_INK : S_SURFACE)
                         : (selected ? S_SURFACE : S_SURFACE);
-    st_round_rect(px, py, pw, ph, ph / 2, track);      /* rounded pill end-caps */
+    ui_round_rect(px, py, pw, ph, ph / 2, track);      /* rounded pill end-caps */
     int kx = on ? px + pw - 2 - 9 : px + 2;
-    st_round_rect(kx, py + 2, 9, 9, 4, knob);          /* round knob            */
+    ui_round_rect(kx, py + 2, 9, 9, 4, knob);          /* round knob            */
 }
 
 /* Slider fill bar for a value fraction num/den (menus.jsx SettingsSound bar):
@@ -299,7 +267,7 @@ void settings_render(int screen, const settings_t *s, int sel)
     if (screen == SETTINGS_ABOUT) {
         /* main.c should call settings_about_render() with live values; this
          * placeholder path keeps settings_render total over every screen. */
-        settings_about_render(-1, -1, 0, 0xFFFFFFFFu, 0, 0, 0);
+        settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0);
         return;
     }
 
@@ -315,7 +283,7 @@ void settings_render(int screen, const settings_t *s, int sel)
     case SETTINGS_CLICKER:  title = "Clicker"; break;
     default:                title = "Settings"; break;
     }
-    header_render(title, right, 1);
+    ui_header(title, right, 1);
 
     if (screen == SETTINGS_THEME) {
         theme_render(s, sel);
@@ -368,13 +336,12 @@ static void su_append(char *d, const char *w)
 
 /* About — a little device dashboard: three big library stats, a storage bar
  * (used vs free), and a device footer, instead of a plain key/value list. */
-void settings_about_render(int battery_pct, int battery_mv,
+void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
                            int n_songs, int n_albums, int n_artists)
 {
-    (void)battery_mv;
     console_clear(S_SURFACE);
-    header_render("About", "", 1);
+    ui_header("About", "", 1);
 
     char v[48];
 
@@ -400,7 +367,7 @@ void settings_about_render(int battery_pct, int battery_mv,
     {
         int cw = text_width("Core", F_SUB);
         int chw = cw + 16, chx = LCD_WIDTH - 16 - chw, chy = 140;
-        st_round_rect(chx, chy, chw, 15, 7, S_ACCENT);
+        ui_round_rect(chx, chy, chw, 15, 7, S_ACCENT);
         st_text(chx + 8, 151, "Core", F_SUB, S_SURFACE);
     }
 
@@ -411,13 +378,13 @@ void settings_about_render(int battery_pct, int battery_mv,
         st_text_right(16, 176, v, F_SUB, S_MUTED_D);
     }
     int bx = 16, by = 182, bw = LCD_WIDTH - 32, bh = 8;
-    st_round_rect(bx, by, bw, bh, 4, S_TRK);
+    ui_round_rect(bx, by, bw, bh, 4, S_TRK);
     if (total_mb > 0 && free_mb != 0xFFFFFFFFu) {
         uint32_t used = (total_mb > free_mb) ? total_mb - free_mb : 0;
         int fw = (int)(((unsigned long long)used * bw) / total_mb);
         if (fw < bh && used > 0) fw = bh;
         if (fw > bw) fw = bw;
-        st_round_rect(bx, by, fw, bh, 4, S_ACCENT);
+        ui_round_rect(bx, by, fw, bh, 4, S_ACCENT);
     }
 
     /* --- battery: a little battery pictogram with proportional fill --- */
@@ -426,15 +393,39 @@ void settings_about_render(int battery_pct, int battery_mv,
         su_to_str(v, (unsigned)battery_pct); su_append(v, "%");
         st_text_right(16, 212, v, F_SUB, S_INK);
     }
+    /*
+     * Millivolts and the raw ADC code, next to the percentage.
+     *
+     * battery.h's own instruction is to "display raw millivolts and sanity-
+     * check the ~3300..4200 mV range before trusting battery_percent() or any
+     * shutdown threshold" — and this function was RECEIVING battery_mv and
+     * discarding it with a (void) cast, so that step was not performable from
+     * a shipped build. The percent above is interpolated off a curve
+     * transcribed from a 2005 cell; on a replacement cell it is a guess until
+     * these two numbers are checked against a meter. Muted and small: this is
+     * a diagnostic sharing a row with the real readout, not a design element.
+     */
+    if (battery_mv > 0) {
+        char rb[16];
+        su_to_str(v, (unsigned)battery_mv);
+        su_append(v, "mV");
+        if (battery_raw >= 0) {
+            su_to_str(rb, (unsigned)battery_raw);
+            su_append(v, " / ");
+            su_append(v, rb);
+        }
+        st_text(16 + text_width("BATTERY", F_SMALL) + 8, 212, v,
+                F_SMALL, S_MUTED_D);
+    }
     {
         int gx = 16, gy = 218, gw = LCD_WIDTH - 32 - 5, gh = 12;   /* body */
-        st_round_rect(gx, gy, gw, gh, 3, S_TRK);                   /* shell */
+        ui_round_rect(gx, gy, gw, gh, 3, S_TRK);                   /* shell */
         console_fill_rect(gx + gw, gy + 3, 4, gh - 6, S_TRK);      /* + nub */
         if (battery_pct >= 0) {
             int pct = battery_pct > 100 ? 100 : battery_pct;
             int fw  = (gw - 4) * pct / 100;
             if (fw < 2 && pct > 0) fw = 2;
-            st_round_rect(gx + 2, gy + 2, fw, gh - 4, 2, S_ACCENT);
+            ui_round_rect(gx + 2, gy + 2, fw, gh - 4, 2, S_ACCENT);
         }
     }
 }
@@ -501,7 +492,7 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
 {
     char v[48];
     console_clear(S_SURFACE);
-    header_render("Boot Details", "", 1);
+    ui_header("Boot Details", "", 1);
 
     /* --- headline: label left, total right, on one line --- */
     st_text(16, 60, "COLD BOOT", F_SMALL, S_MUTED);
@@ -518,7 +509,7 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
      */
     {
         int bx = 16, by = 74, bw = LCD_WIDTH - 32, bh = 10;
-        st_round_rect(bx, by, bw, bh, 5, S_TRK);
+        ui_round_rect(bx, by, bw, bh, 5, S_TRK);
         if (total_ms > 0) {
             uint32_t seg[4] = { lcd_ms, disk_ms, lib_ms, resume_ms };
             uint16_t col[4] = { C_LCD, C_DISK, C_LIB, C_RES };

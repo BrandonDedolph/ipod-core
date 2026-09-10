@@ -73,7 +73,7 @@ typedef struct {
 /*
  * One kerning pair. `adj` is in 1/32 px (KERN scale, NOT the 1/64 of an
  * advance) so the whole entry fits 3 bytes with no padding; the renderer
- * shifts it up by one to reach 26.6. Range +/-3.97px covers the worst real
+ * doubles it to reach 26.6. Range +/-3.97px covers the worst real
  * pair (bold-17 "LT", -2.21px) at 0.03px resolution.
  *
  * Nunito carries ~1500 kern pairs across ASCII and without them every
@@ -88,8 +88,11 @@ typedef struct {
     int8_t  adj;                          /* 1/32 px, almost always negative */
 } atlas_kern_t;
 
-/* Convert a kern adj to the 26.6 the pen runs in. */
-#define ATLAS_KERN_TO_ADV(k) ((int)(k) << 1)
+/* Convert a kern adj to the 26.6 the pen runs in. A multiply, not `<< 1`:
+ * adj is almost always negative and left-shifting a negative value is
+ * undefined behaviour in C — same code on every real compiler, but the
+ * CI sanitizer job halts on it, and it did. */
+#define ATLAS_KERN_TO_ADV(k) ((int)(k) * 2)
 
 typedef struct {
     const atlas_glyph_t *glyphs;          /* 95 ASCII + non-ASCII extras */
