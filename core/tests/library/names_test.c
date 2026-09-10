@@ -198,15 +198,14 @@ int main(void)
 #else
     xpect(&c, "ext: .mp3 is skipped while MP3 is parked", classify_ext("a.mp3") == -1);
 #endif
-    /* The extension buffer holds four characters, and the match on "FLAC"
-     * tests n == 4 without checking that the extension ENDED there — so any
-     * longer extension whose first four letters are "flac" is classified as
-     * FLAC and handed to the decoder. Under CORE_TEST_STRICT_XFAIL=1 this is
-     * the suite's one hard failure until the bug is fixed or re-marked. */
-    xfail(&c, "ext: an extension that merely starts with flac is not FLAC",
-          classify_ext("song.flacc") == -1 && classify_ext("song.flacbak") == -1,
-          "library/names.c classify_ext reads at most 4 extension chars, so "
-          "'.flacc', '.flacbak' (any '.flac*') match '.flac'");
+    /* The extension buffer holds four characters, so the match on "FLAC"
+     * used to accept any longer extension beginning with those letters and
+     * hand it to the decoder. classify_ext now rejects an extension it did
+     * not consume to the end; this is what keeps that fixed. */
+    xpect(&c, "ext: an extension that merely starts with flac is not FLAC",
+          classify_ext("song.flacc") == -1 && classify_ext("song.flacbak") == -1);
+    xpect(&c, "ext: a long extension starting with a short one is not FLAC",
+          classify_ext("song.flax") == -1 && classify_ext("song.flacx") == -1);
 
     /* ---- trim_audio_ext -------------------------------------------------- */
     {

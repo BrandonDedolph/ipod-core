@@ -183,12 +183,20 @@ int classify_ext(const char *name)
 
     char ext[5];
     int n = 0;
-    for (const char *e = name + dot + 1; *e && n < 4; e++) {
+    const char *e = name + dot + 1;
+    for (; *e && n < 4; e++) {
         char c = *e;
         if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
         ext[n++] = c;
     }
     ext[n] = '\0';
+
+    /* The loop above stops after four characters, so without this an
+     * extension that merely BEGINS with a known one would match it —
+     * '.flacbak' would collect "FLAC" and be handed to the FLAC decoder.
+     * Anything left unconsumed means the extension is longer than any we
+     * recognise, which is exactly the case to reject. */
+    if (*e != '\0') return -1;
 
     if (n == 3 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A') return 0;
     if (n == 4 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A' && ext[3] == 'C') return 0;
