@@ -910,6 +910,24 @@ static int      g_bat_mv  = -1;
 static int      g_bat_pct = -1;
 static int      g_bat_ext = 0;               /* external power present            */
 static uint32_t g_bat_last_us;
+static int      g_bat_raw = -1;              /* 10-bit ADC code, for calibration  */
+static int      g_bat_mv_raw = -1;           /* mV before the plausibility clamp  */
+
+/* Defined further down with the other formatters; needed by the battery log. */
+static int u32_to_dec(char *dst, unsigned v);
+
+/* Decimal to UART. Signed, because every battery field reads -1 on a bus
+ * failure and printing that as 4294967295 would defeat the purpose. */
+static void uart_dec(int v)
+{
+    char b[12];
+    if (v < 0) {
+        uart_putc('-');
+        v = -v;
+    }
+    u32_to_dec(b, (unsigned)v);
+    uart_puts(b);
+}
 
 /* Volume capacity / free (MB), computed once from the FS after mount for the
  * About screen. g_free_mb == 0xFFFFFFFF means the FSInfo free count was absent. */
@@ -923,9 +941,55 @@ static int battery_refresh(int force)
         return 0;
     }
     g_bat_last_us = now;
-    g_bat_mv  = battery_millivolts();
-    g_bat_pct = battery_percent();
-    g_bat_ext = power_is_external();
+
+    /*
+     * ONE conversion. This used to call battery_millivolts() and then
+     * battery_percent(), which runs its own — two I2C round trips, two settling
+     * delays, and two DIFFERENT samples, so the millivolts on screen did not
+     * necessarily correspond to the percentage next to them. It also left
+     * nowhere to put a filter later.
+     */
+    battery_sample_t bs;
+    if (battery_sample(&bs) != 0) {
+        /* Bus failure is NOT a flat battery. Hold the last good reading rather
+         * than reporting -1, which draw_battery() clamps to 0% — i.e. an empty
+         * red battery for an I2C hiccup. */
+        uart_puts("core: batt read failed\n");
+        return 1;
+    }
+    g_bat_raw    = bs.raw;
+    g_bat_mv_raw = bs.mv_raw;
+    g_bat_mv     = bs.mv;
+    g_bat_pct    = battery_percent_from_mv(bs.mv);
+    g_bat_ext    = power_is_external();
+
+    /*
+     * One line per sample, so a full discharge can be logged over UART and
+     * turned into numbers. There is otherwise NO way to see either half of the
+     * battery story on this device: the percent curve is transcribed from a
+     * 2005 cell and has never been checked against the one actually fitted,
+     * and per-state drain (idle / paused / playing) has never been measured at
+     * all. The state flags are on the line because the drain question is
+     * entirely "what was the device doing while it fell".
+     *
+     * raw is the ground truth (no scaling assumed); mv_raw vs mv shows when the
+     * plausibility clamp is engaging, which is the difference between a flat
+     * cell and a bad read.
+     */
+    uart_puts("core: batt raw ");   uart_dec(g_bat_raw);
+    uart_puts(" mv ");              uart_dec(g_bat_mv_raw);
+    uart_puts(" clamped ");         uart_dec(g_bat_mv);
+    uart_puts(" pct ");             uart_dec(g_bat_pct);
+    uart_puts(" ext ");             uart_dec(g_bat_ext);
+    uart_puts(" chg ");             uart_dec(power_is_charging());
+    uart_puts(" play ");            uart_dec(player_active());
+    uart_puts(" paused ");          uart_dec(player_paused());
+    /* No backlight state: it is a local in the main loop, not a global, and
+     * hoisting it just for a log line is not worth it — hold the backlight
+     * fixed for the duration of a measurement run instead. */
+    uart_puts(" parked ");          uart_dec(ata_is_parked());
+    uart_puts(" up ");              uart_dec((int)(now / 1000000u));
+    uart_putc('\n');
     return 1;
 }
 
@@ -2732,7 +2796,7 @@ static void settings_commit(int force)
 static void settings_render_cur(void)
 {
     if (g_set_screen == SETTINGS_ABOUT) {
-        settings_about_render(g_bat_pct, g_bat_mv, g_total_mb, g_free_mb,
+        settings_about_render(g_bat_pct, g_bat_mv, g_bat_raw, g_total_mb, g_free_mb,
                               g_songs_n, g_albums_n, g_artists_n);
         /* The counts above are capped (LIB_MAX_SONGS/ALBUMS, ARTISTS_MAX,
          * LIB_MAX_GENRES). When a load actually hit one of those caps, say so —

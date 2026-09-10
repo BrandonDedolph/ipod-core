@@ -147,7 +147,7 @@ static const uint16_t battery_v_curve[BATTERY_CURVE_POINTS] = {
 /* Linear interpolation between the curve points, integer math with
  * round-to-nearest (+span/2 before the divide). Below the 0% point -> 0,
  * at/above the 100% point -> 100. */
-static int battery_pct_from_mv(int mv)
+int battery_percent_from_mv(int mv)
 {
     if (mv <= battery_v_curve[0]) {
         return 0;
@@ -173,8 +173,10 @@ void battery_init(void)
      * home callers already invoke. */
 }
 
-int battery_millivolts(void)
+int battery_sample(battery_sample_t *out)
 {
+    out->raw = out->mv_raw = out->mv = -1;
+
     /* Select channel ADCVIN1 and start the conversion (ADCC1 = 0x05). */
     uint8_t select[2] = { PMU_ADCC1, PMU_ADC_START_VIN1 };
     if (i2c_send(PMU_ADDR, select, 2) != 0) {
@@ -195,22 +197,34 @@ int battery_millivolts(void)
     int raw = ((int)data[0] << 2) | (data[1] & PMU_ADC_LOW_MASK);
     int mv  = (raw * PMU_ADC_FULLSCALE_MV) >> PMU_ADC_BITS;
 
-    /* Sanity-clamp to the cell's real operating band (see PMU_MV_MIN/MAX). */
+    out->raw    = raw;
+    out->mv_raw = mv;
+
+    /* Sanity-clamp to the cell's real operating band (see PMU_MV_MIN/MAX).
+     * mv_raw above keeps the unclamped value, because the clamp is exactly what
+     * makes a bus glitch and a flat cell indistinguishable. */
     if (mv < PMU_MV_MIN) {
         mv = PMU_MV_MIN;
     } else if (mv > PMU_MV_MAX) {
         mv = PMU_MV_MAX;
     }
-    return mv;
+    out->mv = mv;
+    return 0;
+}
+
+int battery_millivolts(void)
+{
+    battery_sample_t s;
+    return (battery_sample(&s) == 0) ? s.mv : -1;
 }
 
 int battery_percent(void)
 {
-    int mv = battery_millivolts();
-    if (mv < 0) {
+    battery_sample_t s;
+    if (battery_sample(&s) != 0) {
         return -1;
     }
-    return battery_pct_from_mv(mv);
+    return battery_percent_from_mv(s.mv);
 }
 
 int power_is_external(void)

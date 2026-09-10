@@ -48,6 +48,36 @@ int battery_millivolts(void);
 int battery_percent(void);
 
 /*
+ * One conversion, everything it produced — the calibration primitive.
+ *
+ * The two calls above each run their OWN conversion, so a caller wanting both
+ * voltage and percent paid two I2C round trips (and two settling delays) for
+ * two DIFFERENT samples that could disagree. Worse, neither exposes what
+ * calibration actually needs: the raw ADC code, and the millivolts BEFORE the
+ * plausibility clamp. Without those you cannot tell a flat cell from a bus
+ * glitch — both surface as the clamp floor — and you cannot check the x6000>>10
+ * scaling against a meter at all.
+ *
+ * Fills `out` and returns 0, or returns -1 on I2C failure (in which case every
+ * field is set to -1 rather than a plausible-looking zero). `mv_raw` is the
+ * unclamped conversion; `mv` is what the gauge should use.
+ */
+typedef struct {
+    int raw;      /* 10-bit ADC code as read (0..1023)                       */
+    int mv_raw;   /* millivolts from the raw code, BEFORE the sanity clamp   */
+    int mv;       /* millivolts after the clamp — the value the gauge uses   */
+} battery_sample_t;
+
+int battery_sample(battery_sample_t *out);
+
+/*
+ * The voltage->percent curve as a PURE function, so a caller holding a sample
+ * (or a filtered average of several) can convert without triggering another
+ * conversion. Same APPROXIMATE / DEVICE-GATED caveat as battery_percent().
+ */
+int battery_percent_from_mv(int mv);
+
+/*
  * External power present: main charger (dock/FireWire/USB power) OR a
  * USB charger is attached. Pure GPIO read, no I2C. Returns 1/0.
  */

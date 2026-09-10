@@ -299,7 +299,7 @@ void settings_render(int screen, const settings_t *s, int sel)
     if (screen == SETTINGS_ABOUT) {
         /* main.c should call settings_about_render() with live values; this
          * placeholder path keeps settings_render total over every screen. */
-        settings_about_render(-1, -1, 0, 0xFFFFFFFFu, 0, 0, 0);
+        settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0);
         return;
     }
 
@@ -368,11 +368,10 @@ static void su_append(char *d, const char *w)
 
 /* About — a little device dashboard: three big library stats, a storage bar
  * (used vs free), and a device footer, instead of a plain key/value list. */
-void settings_about_render(int battery_pct, int battery_mv,
+void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
                            int n_songs, int n_albums, int n_artists)
 {
-    (void)battery_mv;
     console_clear(S_SURFACE);
     header_render("About", "", 1);
 
@@ -425,6 +424,30 @@ void settings_about_render(int battery_pct, int battery_mv,
     if (battery_pct >= 0) {
         su_to_str(v, (unsigned)battery_pct); su_append(v, "%");
         st_text_right(16, 212, v, F_SUB, S_INK);
+    }
+    /*
+     * Millivolts and the raw ADC code, next to the percentage.
+     *
+     * battery.h's own instruction is to "display raw millivolts and sanity-
+     * check the ~3300..4200 mV range before trusting battery_percent() or any
+     * shutdown threshold" — and this function was RECEIVING battery_mv and
+     * discarding it with a (void) cast, so that step was not performable from
+     * a shipped build. The percent above is interpolated off a curve
+     * transcribed from a 2005 cell; on a replacement cell it is a guess until
+     * these two numbers are checked against a meter. Muted and small: this is
+     * a diagnostic sharing a row with the real readout, not a design element.
+     */
+    if (battery_mv > 0) {
+        char rb[16];
+        su_to_str(v, (unsigned)battery_mv);
+        su_append(v, "mV");
+        if (battery_raw >= 0) {
+            su_to_str(rb, (unsigned)battery_raw);
+            su_append(v, " / ");
+            su_append(v, rb);
+        }
+        st_text(16 + text_width("BATTERY", F_SMALL) + 8, 212, v,
+                F_SMALL, S_MUTED_D);
     }
     {
         int gx = 16, gy = 218, gw = LCD_WIDTH - 32 - 5, gh = 12;   /* body */

@@ -129,6 +129,100 @@ static int test_battery_percent(void)
     return trace_done(&tc);
 }
 
+/*
+ * battery_sample(): one conversion, and the numbers calibration needs.
+ *
+ * Two things are asserted that nothing could assert before. First that a
+ * sample costs exactly ONE channel-select + result read — battery_millivolts()
+ * followed by battery_percent() ran two conversions and returned two different
+ * samples, and the main loop was doing exactly that every 5 s. Counting the
+ * ADCC1 writes is the honest way to pin it.
+ *
+ * Second that mv_raw is the UNCLAMPED conversion. The plausibility clamp is
+ * what makes a flat cell and an I2C glitch look identical (both land on 3300),
+ * so the unclamped value is the only way a caller can tell them apart.
+ */
+static int test_battery_sample(void)
+{
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_DATA0_ADDR, 0xAA);
+    mmio_mock_set_read(I2C_DATA1_ADDR, 0xFE);
+
+    battery_sample_t bs;
+    int rc = battery_sample(&bs);
+    trace_cursor tc = trace_begin("battery_sample");
+
+    if (rc != 0 || bs.raw != 682 || bs.mv_raw != 3996 || bs.mv != 3996) {
+        fprintf(stderr, "[battery_sample] rc %d raw %d mv_raw %d mv %d; "
+                        "expected 0/682/3996/3996\n",
+                rc, bs.raw, bs.mv_raw, bs.mv);
+        tc.fails++;
+    }
+    /* Exactly one conversion: ADCC1's value byte is written once. */
+    /* DATA1 carries the ADCC1 value byte (channel | start) and nothing else in
+     * this sequence — the pointer-read phase writes only DATA0. So one write
+     * of DATA1 == one conversion; two would mean the old double-read is back. */
+    size_t starts = mmio_mock_count(MMIO_OP_WRITE, I2C_DATA1_ADDR);
+    if (starts != 1) {
+        fprintf(stderr, "[battery_sample] expected exactly one conversion "
+                        "(1 DATA1 write), saw %u\n", (unsigned)starts);
+        tc.fails++;
+    }
+    return trace_done(&tc);
+}
+
+/* A raw code BELOW the cell's operating band: the clamp must move mv but must
+ * NOT touch mv_raw, or "bad read" and "flat battery" stay indistinguishable. */
+static int test_battery_sample_clamp(void)
+{
+    mmio_mock_reset();
+    /* raw = (0x20<<2)|0 = 128 -> 128*6000>>10 = 750 mV, far below PMU_MV_MIN. */
+    mmio_mock_set_read(I2C_DATA0_ADDR, 0x20);
+    mmio_mock_set_read(I2C_DATA1_ADDR, 0x00);
+
+    battery_sample_t bs;
+    int rc = battery_sample(&bs);
+    trace_cursor tc = trace_begin("battery_sample_clamp");
+    if (rc != 0 || bs.raw != 128 || bs.mv_raw != 750 || bs.mv != 3300) {
+        fprintf(stderr, "[battery_sample_clamp] rc %d raw %d mv_raw %d mv %d; "
+                        "expected 0/128/750/3300\n",
+                rc, bs.raw, bs.mv_raw, bs.mv);
+        tc.fails++;
+    }
+    return trace_done(&tc);
+}
+
+/* The curve as a pure function: same answer as battery_percent(), with no bus
+ * traffic at all — which is what lets a caller filter several samples and
+ * convert once. */
+static int test_battery_percent_from_mv(void)
+{
+    mmio_mock_reset();
+    trace_cursor tc = trace_begin("battery_percent_from_mv");
+
+    struct { int mv, pct; } cases[] = {
+        { 3500, 0 },      /* below the 0% point                */
+        { 3600, 0 },      /* exactly the 0% point              */
+        { 3996, 77 },     /* the seeded sample above           */
+        { 4180, 100 },    /* exactly the 100% point            */
+        { 4300, 100 },    /* above it                          */
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        int got = battery_percent_from_mv(cases[i].mv);
+        if (got != cases[i].pct) {
+            fprintf(stderr, "[battery_percent_from_mv] %d mV: expected %d%%, "
+                            "got %d%%\n", cases[i].mv, cases[i].pct, got);
+            tc.fails++;
+        }
+    }
+    if (mmio_mock_log_len() != 0) {
+        fprintf(stderr, "[battery_percent_from_mv] touched the bus (%u events)"
+                        "; it must be pure\n", (unsigned)mmio_mock_log_len());
+        tc.fails++;
+    }
+    return trace_done(&tc);
+}
+
 /* Assert power_is_external() reads GPIOL_INPUT_VAL (32-bit) and returns
  * `want` for the seeded pin word. */
 static int expect_external(uint32_t gpiol, int want, const char *label)
@@ -172,6 +266,9 @@ int main(void)
     int fails = 0;
     fails += test_battery_millivolts();
     fails += test_battery_percent();
+    fails += test_battery_sample();
+    fails += test_battery_sample_clamp();
+    fails += test_battery_percent_from_mv();
 
     /* power_is_external polarity matrix:
      *   main charger bit 0x08 is ACTIVE-LOW (clear = present),

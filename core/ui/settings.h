@@ -204,7 +204,7 @@ void settings_render(int screen, const settings_t *s, int sel);
  * Render the About screen from live values (main.c owns these — do not
  * fabricate). free/total are whole megabytes; pct<0 or mv<=0 render as "--".
  */
-void settings_about_render(int battery_pct, int battery_mv,
+void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
                            int n_songs, int n_albums, int n_artists);
 
