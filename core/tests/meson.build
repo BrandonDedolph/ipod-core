@@ -158,6 +158,20 @@ if target == 'sim'
   )
   test('thumb', thumb_test, suite: 'unit')
 
+  # artcache: the album-cover cache (core/ui/artcache.c) — the SAME source the
+  # ARM build links into core.elf — driven the way the album list drives it.
+  # fat32_read_file is stubbed by the test (it is artcache.c's only FS entry
+  # point), so every cache miss is a counted, ordered "disk read": the test
+  # measures what a scroll gesture costs in reads and which covers load first,
+  # which on the device are the reads issued synchronously under the wheel.
+  artcache_test = executable(
+    'artcache_test',
+    sources: ['ui/artcache_test.c', '../ui/artcache.c', '../ui/thumb.c'],
+    include_directories: include_directories('../ui', '../fs'),
+    override_options: test_opts,
+  )
+  test('artcache', artcache_test, suite: 'unit')
+
   # settings: the Settings state model (core/ui/settings.c) — the SAME source the
   # ARM build links into core.elf. Pure model logic (no framebuffer/hardware), so
   # it compiles with plain cc. Asserts defaults, that activate() toggles Shuffle
@@ -642,6 +656,25 @@ if target == 'sim'
   )
   test('resume', resume_test, suite: 'unit')
 
+  # index: the CORELIB.IDX header validation and record CRC in kernel/main.c
+  # (idx_header_parse / crc32_update). The loader used to read the magic and
+  # the record size and trust the rest — the version bytes were never looked
+  # at and nothing checked that the file held the records it claimed, so a
+  # half-copied index or a future layout loaded as plausible garbage. Covers
+  # the CRC against its published check value and batch-splitting, every
+  # accepted header shape (v1 without CRC, v2 with), and each refusal: magic,
+  # unknown version, record size, a truncated or padded file, a count that
+  # wraps the size arithmetic. Verbatim copies, like resume_test.c;
+  # hw-index-parity below diffs them against main.c and checks the loader
+  # actually calls them.
+  index_test = executable(
+    'index_test',
+    sources: ['kernel/index_test.c'],
+    include_directories: include_directories('kernel', '.'),
+    override_options: test_opts,
+  )
+  test('index', index_test, suite: 'unit')
+
   # player-queue: the queue / auto-advance / repeat / shuffle logic of
   # core/player/player.c — 753 lines with no test at all, and the part users
   # notice when it is wrong (a queue that stops a track early, a Repeat All
@@ -712,6 +745,25 @@ if target == 'sim'
     test('hw-resume-parity', py,
          args: [meson.current_source_dir() / 'scripts' /
                 'check_resume_parity.py'],
+         suite: 'unit')
+
+    # hw-index-parity: the same guard for the index validator — the copies in
+    # tests/kernel/index_test.c must not drift from kernel/main.c — plus a
+    # check that library_load_index() actually calls them, since a validator
+    # the loader does not consult tests nothing.
+    test('hw-index-parity', py,
+         args: [meson.current_source_dir() / 'scripts' /
+                'check_index_parity.py'],
+         suite: 'unit')
+
+    # build-index: the host tool that writes CORELIB.IDX, run over a synthetic
+    # tree with ffprobe stubbed. Pins the v2 header and CRC the device
+    # verifies, the filename enumeration the files on the device were named
+    # by, and the track-number rules (tags first; a year or an artist's
+    # leading digits are not a track number; disc tags are read).
+    test('build-index', py,
+         args: [meson.current_source_dir() / 'scripts' /
+                'check_build_index.py'],
          suite: 'unit')
   endif
 endif

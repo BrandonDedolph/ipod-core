@@ -46,6 +46,8 @@ verify-hw: hw
 	python3 tests/scripts/check_hw_consistency.py
 	python3 tests/scripts/check_name_hash_parity.py
 	python3 tests/scripts/check_resume_parity.py
+	python3 tests/scripts/check_index_parity.py
+	python3 tests/scripts/check_build_index.py
 
 $(BUILD_HW)/build.ninja:
 	meson setup $(BUILD_HW) --cross-file cross/arm-none-eabi.txt -Dtarget=hw

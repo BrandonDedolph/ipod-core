@@ -1647,13 +1647,36 @@ static void browse_render(int sel)
 #define LIB_GENRE_MAX  24
 
 #define LIB_ARTIST_MAX 40
-#define LIB_FILE_MAX   64
+/* Same cap as a browse row (NAME_MAX + NUL): once a song binds to its file,
+ * file[] is the on-disk stem exactly as copy_display_name() produces it for
+ * the row and the queue, so the two are byte-identical and hash alike. */
+#define LIB_FILE_MAX   (NAME_MAX + 1)
 
 typedef struct {
     char     title[LIB_TITLE_MAX];
     char     artist[LIB_ARTIST_MAX];
-    char     file[LIB_FILE_MAX];          /* track filename, ext trimmed        */
-    uint32_t file_hash;                   /* name_hash of full filename (locator) */
+    /*
+     * The track's filename, extension trimmed — for DISPLAY (the queue entry,
+     * hence Now Playing) and nothing else. Until the record binds to a file it
+     * holds the index's copy; after, the on-disk stem (resolve_art_cb).
+     *
+     * Never a key. The index field is the first 63 bytes of a name that may be
+     * longer, and the device used to trim its extension by searching for the
+     * LAST '.' in that truncated string: past ~68 bytes the ".flac" was gone,
+     * the cut landed on an interior dot, and "16. TRAGIC (feat. ..." became
+     * "16" — a name no directory entry could ever equal. The record still
+     * played (file_hash bound it) but its row showed no duration, no title,
+     * the wrong gutter number, and resume never found it. Every binding now
+     * goes through a hash of the FULL on-disk name, or the cluster it bound.
+     */
+    char     file[LIB_FILE_MAX];
+    uint32_t file_hash;                   /* name_hash of the FULL on-disk name,  */
+                                          /* extension included: the record<->  */
+                                          /* file locator (host-stamped; the    */
+                                          /* scan path computes it at readdir)  */
+    uint32_t stem_hash;                   /* name_hash of the on-disk stem — the  */
+                                          /* resume locator. Provisional (from  */
+                                          /* file[]) until the record binds     */
     uint32_t dir_clus;                    /* album folder (queue context + play)*/
     uint32_t file_clus, file_size;        /* the track file itself (resolved at   */
                                           /* load) — play/shuffle without a scan  */
@@ -1669,7 +1692,6 @@ static char       g_genres[LIB_MAX_GENRES][LIB_GENRE_MAX];
 static int        g_genres_n;
 static int        g_genre_count[LIB_MAX_GENRES]; /* songs per genre (precomputed) */
 static int        g_lib_scanned;
-static int        g_lib_indexed;                  /* loaded from CORELIB.IDX     */
 
 /* Root-folder name -> cluster map (built once), for resolving an index record's
  * album folder to a cluster without a per-album directory read. */
@@ -1679,12 +1701,22 @@ static int        g_lib_indexed;                  /* loaded from CORELIB.IDX    
 #define FOLDER_MAP_MAX LIB_MAX_ALBUMS
 static struct { char name[NAME_MAX + 1]; uint32_t clus, hash; } g_folder_map[FOLDER_MAP_MAX];
 static int      g_folder_n;
+/* folder_hash -> g_folder_map chains (index+1, 0 = end of chain), built by
+ * folder_map_index() once the root walk is complete. folder_clus_h() used to
+ * walk the whole map for EVERY record — on a full library ~3M hash compares
+ * on the boot path, under the "Loading Library" bar. */
+#define FOLDER_HASH_BUCKETS 2048         /* power of two > FOLDER_MAP_MAX      */
+static uint16_t g_folder_hh[FOLDER_HASH_BUCKETS];
+static uint16_t g_folder_hn[FOLDER_MAP_MAX];
 static uint32_t g_idx_clus, g_idx_size;           /* CORELIB.IDX location        */
 
 /* Scan temporaries (kept off the browser's g_browse). */
 static uint32_t   g_scan_dirs[BROWSE_MAX];
 static int        g_scan_dirs_n;
-typedef struct { char name[NAME_MAX + 1]; uint32_t clus, size; } scan_file_t;
+/* hash: name_hash over the FULL on-disk name, taken while the directory entry
+ * is in hand — the same locator the index path gets from the host, so the
+ * resolve pass binds scanned songs the same way and needs no name compare. */
+typedef struct { char name[NAME_MAX + 1]; uint32_t clus, size, hash; } scan_file_t;
 static scan_file_t g_scan_files[BROWSE_MAX];
 static int         g_scan_files_n;
 static uint32_t    g_scan_art_clus, g_scan_art_size;
@@ -1723,19 +1755,67 @@ static int16_t genre_intern(const char *g)
     return -1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Lookup indexes: album by folder cluster, song by file hash
+ *
+ * Chained hash buckets, stored as index+1 so 0 means "end of chain". Both
+ * used to be built once, AFTER the load, in library_finish — which fixed the
+ * per-use lookups (the resolve pass, the queue builders) but left the load
+ * itself linear: album_intern walked every album already listed to de-dupe
+ * each record, and folder_clus_h walked the folder map for each one. On a
+ * full library that is ~3M compares apiece, on an 80 MHz ARM7, while the user
+ * watches "Loading Library". The album buckets are therefore maintained AS
+ * albums are added (and rebuilt after the sort moves them); the song buckets
+ * are built once the songs are all in, by lookup_build.
+ * ------------------------------------------------------------------------- */
+#define SONG_HASH_BUCKETS 2048           /* power of two > LIB_MAX_SONGS       */
+#define ALBUM_HASH_BUCKETS 512           /* power of two > LIB_MAX_ALBUMS      */
+
+static uint16_t g_song_hh[SONG_HASH_BUCKETS];
+static uint16_t g_song_hn[LIB_MAX_SONGS];
+static uint16_t g_album_hh[ALBUM_HASH_BUCKETS];
+static uint16_t g_album_hn[LIB_MAX_ALBUMS];
+
+static void album_bucket_add(int i)
+{
+    uint32_t b = g_albums[i].clus & (ALBUM_HASH_BUCKETS - 1);
+    g_album_hn[i] = g_album_hh[b];
+    g_album_hh[b] = (uint16_t)(i + 1);
+}
+
+/* Album index by folder cluster, or -1. O(1): the chain for a cluster holds
+ * ~2 albums on a full library. Valid at every moment — the buckets are reset
+ * with the album list (albums_reset) and updated by album_intern — so the
+ * loader can use it to de-dupe, not only the queue builders afterwards. */
+static int album_by_clus(uint32_t dc)
+{
+    for (int i = g_album_hh[dc & (ALBUM_HASH_BUCKETS - 1)]; i; i = g_album_hn[i - 1]) {
+        if (g_albums[i - 1].clus == dc) return i - 1;
+    }
+    return -1;
+}
+
+/* Empty the album list. The ONLY way to: g_albums_n = 0 alone would leave the
+ * buckets pointing at stale entries, and album_by_clus would keep answering
+ * for albums that are no longer there. */
+static void albums_reset(void)
+{
+    g_albums_n = 0;
+    for (int i = 0; i < ALBUM_HASH_BUCKETS; i++) g_album_hh[i] = 0;
+}
+
 /* Add (folder, cluster) to the index-derived album list, de-duped by cluster. */
 static void album_intern(const char *folder, uint32_t clus)
 {
     if (clus == 0) return;
-    for (int i = 0; i < g_albums_n; i++) {
-        if (g_albums[i].clus == clus) return;      /* already listed */
-    }
+    if (album_by_clus(clus) >= 0) return;          /* already listed */
     if (g_albums_n >= LIB_MAX_ALBUMS) { g_lib_truncated = 1; return; }
     int k = 0;
     for (; folder[k] && k < NAME_MAX; k++) g_albums[g_albums_n].folder[k] = folder[k];
     g_albums[g_albums_n].folder[k] = '\0';
     g_albums[g_albums_n].clus = clus;
     g_albums[g_albums_n].unreadable = 0;     /* until the resolve pass says so */
+    album_bucket_add(g_albums_n);
     g_albums_n++;
 }
 
@@ -1762,6 +1842,7 @@ static int scan_files_cb(void *ud, const fat32_dirent_t *e)
         copy_display_name(f->name, e->name, 1);
         f->clus = e->first_clus;
         f->size = e->size;
+        f->hash = name_hash(e->name);          /* the locator: FULL name, with ext */
     }
     return 0;
 }
@@ -1807,14 +1888,30 @@ static int index_root_cb(void *ud, const fat32_dirent_t *e)
     return 0;
 }
 
+/* Chain the folder map by hash. Built after the root walk rather than inside
+ * index_root_cb because lib_readdir rewinds g_folder_n and re-runs the walk
+ * on a retry, and a chain built during a walk that was then thrown away would
+ * point at entries that no longer exist. */
+static void folder_map_index(void)
+{
+    for (int i = 0; i < FOLDER_HASH_BUCKETS; i++) g_folder_hh[i] = 0;
+    for (int i = 0; i < g_folder_n; i++) {
+        uint32_t b = g_folder_map[i].hash & (FOLDER_HASH_BUCKETS - 1);
+        g_folder_hn[i] = g_folder_hh[b];
+        g_folder_hh[b] = (uint16_t)(i + 1);
+    }
+}
+
 /* Resolve an index record's album folder to a cluster. Primary: match the
  * record's precomputed folder_hash (quote/case-folded) against the on-disk
- * folder hashes. Fallback: the legacy case-insensitive name compare, so a
- * hash mismatch can never regress below the old behaviour. */
+ * folder hashes — one bucket, a chain of ~1. Fallback: the legacy
+ * case-insensitive name compare, so a hash mismatch can never regress below
+ * the old behaviour; it is linear, but only an orphaned record (or a fold
+ * disagreement the parity test exists to prevent) gets that far. */
 static uint32_t folder_clus_h(uint32_t hash, const char *name)
 {
-    for (int i = 0; i < g_folder_n; i++) {
-        if (g_folder_map[i].hash == hash) return g_folder_map[i].clus;
+    for (int i = g_folder_hh[hash & (FOLDER_HASH_BUCKETS - 1)]; i; i = g_folder_hn[i - 1]) {
+        if (g_folder_map[i - 1].hash == hash) return g_folder_map[i - 1].clus;
     }
     for (int i = 0; i < g_folder_n; i++) {
         if (name_eq_ci(g_folder_map[i].name, name)) return g_folder_map[i].clus;
@@ -1907,59 +2004,24 @@ static void load_bar_progress(const char *title, int pct)
     load_bar(title, pct);
 }
 
-/* ---------------------------------------------------------------------------
- * Load-time lookup indexes
- *
- * Two hot loops used to be O(n^2) over the whole library: the per-album resolve
- * pass scanned all 1200 songs for every file in every album (~1.4M compares at
- * boot), and the queue builders called album_by_clus per song. Both get a hash
- * bucket built once, in library_finish, so the lookups are O(1).
- * ------------------------------------------------------------------------- */
-#define SONG_HASH_BUCKETS 2048           /* power of two > LIB_MAX_SONGS       */
-#define ALBUM_HASH_BUCKETS 512           /* power of two > LIB_MAX_ALBUMS      */
-
-/* Chained buckets, stored as index+1 so 0 means "end of chain". */
-static uint16_t g_song_hh[SONG_HASH_BUCKETS];
-static uint16_t g_song_hn[LIB_MAX_SONGS];
-static uint16_t g_album_hh[ALBUM_HASH_BUCKETS];
-static uint16_t g_album_hn[LIB_MAX_ALBUMS];
-static int      g_lookup_built;
-
-/* Songs are keyed by the folded hash of their EXT-TRIMMED filename — the one
- * form both callers have (the index record's file[] and the on-disk name after
- * copy_display_name). */
+/* Songs are keyed by file_hash — the folded hash of the FULL on-disk
+ * filename, extension included, which is the one form both sides have
+ * exactly: the host stamped it from the name it gave the file, the resolve
+ * pass hashes the directory entry. (They used to be keyed by a hash of the
+ * ext-trimmed file[] field, which for a long name is a hash of a truncated
+ * string that nothing on the disk produces — the bucket missed and a linear
+ * sweep quietly made up the difference.) Albums: rebuilt here because the
+ * album sort in library_finish has just moved them. */
 static void lookup_build(void)
 {
     for (int i = 0; i < SONG_HASH_BUCKETS; i++)  g_song_hh[i]  = 0;
     for (int i = 0; i < ALBUM_HASH_BUCKETS; i++) g_album_hh[i] = 0;
     for (int i = 0; i < g_songs_n; i++) {
-        uint32_t b = name_hash(g_songs[i].file) & (SONG_HASH_BUCKETS - 1);
+        uint32_t b = g_songs[i].file_hash & (SONG_HASH_BUCKETS - 1);
         g_song_hn[i] = g_song_hh[b];
         g_song_hh[b] = (uint16_t)(i + 1);
     }
-    for (int i = 0; i < g_albums_n; i++) {
-        uint32_t b = g_albums[i].clus & (ALBUM_HASH_BUCKETS - 1);
-        g_album_hn[i] = g_album_hh[b];
-        g_album_hh[b] = (uint16_t)(i + 1);
-    }
-    g_lookup_built = 1;
-}
-
-/* Album index by folder cluster, or -1. Used to attach each shuffled song's
- * cover (and elsewhere a track needs its album without a scan). */
-static int album_by_clus(uint32_t dc)
-{
-    if (g_lookup_built) {
-        for (int i = g_album_hh[dc & (ALBUM_HASH_BUCKETS - 1)]; i; ) {
-            if (g_albums[i - 1].clus == dc) return i - 1;
-            i = g_album_hn[i - 1];
-        }
-        return -1;
-    }
-    for (int i = 0; i < g_albums_n; i++) {      /* pre-index: linear */
-        if (g_albums[i].clus == dc) return i;
-    }
-    return -1;
+    for (int i = 0; i < g_albums_n; i++) album_bucket_add(i);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2043,32 +2105,29 @@ static int resolve_art_cb(void *ud, const fat32_dirent_t *e)
         g_res_art_clus = e->first_clus; g_res_art_size = e->size; return 0;
     }
     if (classify_ext(e->name) < 0) return 0;      /* a playable track: bind its cluster */
-    uint32_t fh = name_hash(e->name);             /* over the FULL name incl ext */
-    char nm[NAME_MAX + 1];
-    copy_display_name(nm, e->name, 1);            /* ext-trimmed, matches s->file */
-    /* O(1) candidate list: songs whose trimmed filename folds to the same hash.
-     * The match test itself is unchanged — primary is the record's file_hash
-     * (index path), fallback the ext-trimmed name compare (scan path, whose
-     * file_hash is 0) — so a name too long to have been stored identically on
-     * both sides still falls through to the linear sweep below. */
-    for (int i = g_song_hh[name_hash(nm) & (SONG_HASH_BUCKETS - 1)]; i; ) {
-        int s = i - 1;
-        i = g_song_hn[s];
-        if (g_songs[s].file_clus || g_songs[s].dir_clus != g_res_album_clus) continue;
-        if ((g_songs[s].file_hash && g_songs[s].file_hash == fh) ||
-            name_eq_ci(g_songs[s].file, nm)) {
-            g_songs[s].file_clus = e->first_clus;
-            g_songs[s].file_size = e->size;
-            return 0;
-        }
-    }
-    for (int s = 0; s < g_songs_n; s++) {         /* rare: hash didn't line up */
-        if (g_songs[s].file_clus || g_songs[s].dir_clus != g_res_album_clus) continue;
-        if (g_songs[s].file_hash && g_songs[s].file_hash == fh) {
-            g_songs[s].file_clus = e->first_clus;
-            g_songs[s].file_size = e->size;
-            break;
-        }
+    /* The locator, and the only test: the folded hash of the FULL on-disk name
+     * equals the record's file_hash (stamped by build_index.py over the name it
+     * gave the file; computed at readdir for a scanned song), within this
+     * album, for a record not yet bound. No name compare and no fallback — a
+     * record that hashes to no file in its folder is not on the disk. The old
+     * "hash didn't line up" sweep over all songs existed to rescue the long
+     * names whose truncated file[] could not match the bucket key; that was
+     * ~6000 compares per such file at every boot, and it is what let the
+     * truncation stay invisible for as long as it did. */
+    uint32_t fh = name_hash(e->name);
+    if (fh == 0) return 0;                        /* 0 is "no locator", never a match */
+    for (int i = g_song_hh[fh & (SONG_HASH_BUCKETS - 1)]; i; i = g_song_hn[i - 1]) {
+        lib_song_t *s = &g_songs[i - 1];
+        if (s->file_clus || s->dir_clus != g_res_album_clus || s->file_hash != fh) continue;
+        s->file_clus = e->first_clus;
+        s->file_size = e->size;
+        /* Bound. From here on the song is shown and located by its ON-DISK name:
+         * the stem, capped exactly as a browse row is (same function, same
+         * NAME_MAX), so the queue entry, the tracklist row and this field are
+         * the same bytes — and its hash is what resume_capture will store. */
+        copy_display_name(s->file, e->name, 1);
+        s->stem_hash = name_hash(s->file);
+        return 0;
     }
     return 0;
 }
@@ -2152,11 +2211,160 @@ static void library_resolve_art(fat32_t *fs)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * CORELIB.IDX: header validation and integrity
+ *
+ * The loader used to check the magic and that rec_size was 256, and nothing
+ * else: the version bytes were never read, and there was no check that the
+ * bytes after the header were the records the header claimed. A half-copied
+ * index (a copy that stopped mid-file, or a tool that pre-sized the file and
+ * never filled it) or a future layout with a bumped version parsed field by
+ * field as plausible garbage — durations, titles and hashes from wherever
+ * the offsets happened to land. Now:
+ *
+ *   - the version must be one this loader was written for (1 or 2); anything
+ *     else is rejected before a record is read, so a v3 that moves fields
+ *     falls back to the tag scan instead of loading nonsense;
+ *   - the file size must be exactly header + count * 256 — so a truncated
+ *     copy is refused up front, whatever its version;
+ *   - a v2 header carries a CRC-32 (zlib's, the same one config.c checks its
+ *     record with) over the records, verified as they stream past.
+ *
+ * v1 (the 12-byte header build_index.py wrote before the CRC existed) is
+ * still accepted, on the size check alone, so an index already on a device
+ * keeps loading; the host writes v2 now. The functions are copied verbatim
+ * into tests/kernel/index_test.c (check_index_parity.py holds them in step)
+ * because, like everything in this file, they cannot be linked into a host
+ * test directly.
+ * ------------------------------------------------------------------------- */
+#define IDX_REC_SIZE 256u
+#define IDX_HDR_V1   12u
+#define IDX_HDR_V2   16u
+
+enum {
+    IDX_OK = 0,
+    IDX_EMAGIC,          /* not a CIDX file                                   */
+    IDX_EVERSION,        /* a version this loader does not know               */
+    IDX_ERECSIZE,        /* record size is not 256                            */
+    IDX_ESIZE,           /* file size != header + count * 256 (truncated)     */
+    IDX_ECRC,            /* the records are not the ones the header signed    */
+    IDX_EREAD,           /* the stream came up short                          */
+};
+
+typedef struct {
+    uint32_t hdr_len;    /* 12 or 16                                          */
+    uint32_t count;
+    uint32_t crc;        /* records' CRC-32 from the header (v2)              */
+    int      has_crc;    /* v2: verify `crc`; v1: size check only             */
+} idx_hdr_t;
+
+static uint32_t idx_rd32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/*
+ * Validate a header. `h` holds at least IDX_HDR_V1 bytes, and IDX_HDR_V2 when
+ * the version word says v2 (the caller reads the four extra bytes only then,
+ * because on a v1 file they would be the first bytes of record 0 and the
+ * stream has no way back). `file_size` is the directory entry's size.
+ */
+static int idx_header_parse(const uint8_t *h, uint32_t file_size, idx_hdr_t *out)
+{
+    if (h[0] != 'C' || h[1] != 'I' || h[2] != 'D' || h[3] != 'X') return IDX_EMAGIC;
+    uint32_t ver = (uint32_t)h[4] | ((uint32_t)h[5] << 8);
+    uint32_t rec = (uint32_t)h[6] | ((uint32_t)h[7] << 8);
+    if (ver != 1 && ver != 2) return IDX_EVERSION;
+    if (rec != IDX_REC_SIZE) return IDX_ERECSIZE;
+    out->count   = idx_rd32(h + 8);
+    out->hdr_len = (ver == 2) ? IDX_HDR_V2 : IDX_HDR_V1;
+    out->has_crc = (ver == 2);
+    out->crc     = (ver == 2) ? idx_rd32(h + 12) : 0;
+    /* count * 256 must not wrap: a count of 0x01000000 would otherwise pass
+     * the size check against a 16-byte file and set the loop up to read 16M
+     * records that are not there. */
+    if (out->count > (0xFFFFFFFFu - IDX_HDR_V2) / IDX_REC_SIZE) return IDX_ESIZE;
+    if (file_size != out->hdr_len + out->count * IDX_REC_SIZE) return IDX_ESIZE;
+    return IDX_OK;
+}
+
+/*
+ * CRC-32 (reflected, polynomial 0xEDB88320, init/final 0xFFFFFFFF): what
+ * zlib.crc32 computes, so build_index.py can stamp it. Table-driven, unlike
+ * config.c's bitwise crc32_buf: that one runs over a 1 KB record, this one
+ * over the whole index — up to 1.5 MB at LIB_MAX_SONGS — and eight shift
+ * steps per byte at 80 MHz would be most of a second on the boot path. The
+ * table is 1 KB of .bss, filled on first use. Incremental: seed with
+ * 0xFFFFFFFF, feed the batches as they stream in, invert at the end.
+ */
+static uint32_t g_crc_tab[256];
+static int      g_crc_tab_ready;
+
+static void crc32_tab_init(void)
+{
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int b = 0; b < 8; b++) {
+            uint32_t mask = (uint32_t)0u - (c & 1u);
+            c = (c >> 1) ^ (0xEDB88320u & mask);
+        }
+        g_crc_tab[i] = c;
+    }
+    g_crc_tab_ready = 1;
+}
+
+static uint32_t crc32_update(uint32_t crc, const uint8_t *p, uint32_t n)
+{
+    if (!g_crc_tab_ready) crc32_tab_init();
+    for (uint32_t i = 0; i < n; i++) {
+        crc = g_crc_tab[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+/* Why the last index load was refused (an IDX_* code), for the About screen
+ * and the UART. A refused index is not silent: the device falls back to the
+ * tag scan, which takes minutes, and the user deserves to know it was the
+ * file and not the disk. */
+static int g_lib_idx_reject;
+
+/* Refuse the index: log why, discard whatever was parsed before the check
+ * failed (a CRC is only known at the end, by which time the records are in
+ * g_songs), and return the loader's "fall back to a scan" result. */
+static int idx_reject(int why)
+{
+    static const char *const names[] = {
+        "ok", "magic", "version", "recsize", "size", "crc", "read"
+    };
+    g_lib_idx_reject = why;
+    uart_puts("idx: rejected (");
+    uart_puts(names[why]);
+    uart_puts(")\n");
+    g_songs_n = g_genres_n = 0;
+    albums_reset();
+    g_lib_orphaned = 0;
+    return 0;
+}
+
+/* Drop a recognised audio extension from an index file[] field, IN PLACE —
+ * and only a recognised one. The field is the first 63 bytes of the name; for
+ * a name longer than that the ".flac" is not in it, and cutting at whatever
+ * '.' remains produced the "16" of the bug described at lib_song_t. This is
+ * the display placeholder until the resolve pass installs the on-disk stem. */
+static void trim_audio_ext(char *name)
+{
+    if (classify_ext(name) < 0) return;
+    int dot = -1;
+    for (int j = 0; name[j]; j++) if (name[j] == '.') dot = j;
+    if (dot > 0) name[dot] = '\0';
+}
+
 /* Load the whole library from the host-built CORELIB.IDX in ONE streamed pass
  * (no per-file tag reads) — instant Songs/Genres/durations/disc. Returns 1 on
  * success, 0 if the index is absent/bad (caller falls back to a scan).
  * Record (256B, LE): u32 dur, u16 track, u16 disc, folder[64], file[64],
- * title[48], artist[40], genre[24], pad[8]. */
+ * title[48], artist[40], genre[24], u32 folder_hash, u32 file_hash. */
 static void library_finish(void);        /* sort + genre counts (shared)        */
 
 /* The library root: the "Music" folder if present, else the volume root (kept
@@ -2198,18 +2406,31 @@ static int library_load_index(fat32_t *fs)
         return 0;
     }
     if (g_idx_clus == 0) return 0;
+    folder_map_index();                    /* the walk is final: chain it     */
+    g_lib_idx_reject = IDX_OK;
 
     fat32_stream_t st;
     fat32_stream_open(&st, fs, g_idx_clus, g_idx_size);
-    uint8_t hdr[12];
-    if (fat32_stream_read(&st, hdr, 12) != 12) return 0;
-    if (hdr[0] != 'C' || hdr[1] != 'I' || hdr[2] != 'D' || hdr[3] != 'X') return 0;
-    int rec = hdr[6] | (hdr[7] << 8);
-    if (rec != 256) return 0;
-    uint32_t count = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) |
-                     ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
+    uint8_t hdr[IDX_HDR_V2];
+    if (fat32_stream_read(&st, hdr, IDX_HDR_V1) != (int32_t)IDX_HDR_V1) {
+        return idx_reject(IDX_EREAD);
+    }
+    /* A v2 header is four bytes longer; on a v1 file those bytes are record 0
+     * and the stream cannot rewind, so read them only once the version says
+     * they are there. idx_header_parse validates the version. */
+    if ((hdr[4] | (hdr[5] << 8)) == 2 &&
+        fat32_stream_read(&st, hdr + IDX_HDR_V1, IDX_HDR_V2 - IDX_HDR_V1)
+            != (int32_t)(IDX_HDR_V2 - IDX_HDR_V1)) {
+        return idx_reject(IDX_EREAD);
+    }
+    idx_hdr_t h;
+    int hrc = idx_header_parse(hdr, g_idx_size, &h);
+    if (hrc != IDX_OK) return idx_reject(hrc);
+    uint32_t count = h.count;
+    uint32_t crc   = 0xFFFFFFFFu;
 
-    g_songs_n = g_genres_n = g_albums_n = 0;
+    g_songs_n = g_genres_n = 0;
+    albums_reset();
     g_lib_truncated = 0;
     /* Read the index in 16 KB batches (64 records) rather than 256 B at a time:
      * a 256 B stream read pulls a whole 2048 B FS-sector and hands back 256 B, so
@@ -2224,6 +2445,7 @@ static int library_load_index(fat32_t *fs)
         if (got <= 0) break;
         uint32_t recs = (uint32_t)got / 256u;
         if (recs == 0) break;
+        if (h.has_crc) crc = crc32_update(crc, idxbuf, recs * 256u);
         for (uint32_t k = 0; k < recs && g_songs_n < LIB_MAX_SONGS; k++) {
             const uint8_t *r = idxbuf + k * 256u;
             char folder[NAME_MAX + 1];
@@ -2252,11 +2474,15 @@ static int library_load_index(fat32_t *fs)
             field_copy(s->title,  LIB_TITLE_MAX,  r + 136, 48);
             field_copy(s->artist, LIB_ARTIST_MAX, r + 184, 40);
             field_copy(s->file,   LIB_FILE_MAX,   r + 72,  64);
-            /* trim the extension (LAST '.') so it matches g_browse display names,
-             * which drop the ".flac" — but keep dots inside the title. */
-            { int dot = -1;
-              for (int j = 0; s->file[j]; j++) if (s->file[j] == '.') dot = j;
-              if (dot > 0) s->file[dot] = '\0'; }
+            trim_audio_ext(s->file);           /* display placeholder, see there */
+            /* Provisional resume locator, replaced by the on-disk stem's hash
+             * when the record binds. Exact for a name that fit the field. For
+             * one that did not it is the hash of a truncated string no
+             * directory entry produces — so it can never resume the wrong
+             * file, and it still counts as a same-named twin in
+             * resume_find_song's ambiguity rule if the record never binds
+             * (an unreadable album), which is the conservative side. */
+            s->stem_hash = name_hash(s->file);
             char genre[LIB_GENRE_MAX];
             field_copy(genre, LIB_GENRE_MAX, r + 224, 24);
             s->genre = genre_intern(genre);
@@ -2268,9 +2494,14 @@ static int library_load_index(fat32_t *fs)
                  count ? (int)(n * 75u / count) : 0);
     }
     if (n < count) g_lib_truncated = 1;    /* ran out of song slots (or of index) */
+    /* The CRC is over ALL the records, so it can only be checked when all of
+     * them streamed past. A load cut short by LIB_MAX_SONGS has not read them
+     * all — it is already flagged truncated, and the host refuses to write an
+     * index over the cap, so this is the one case that rides on the size
+     * check alone rather than reading the rest of the file for nothing. */
+    if (h.has_crc && n == count && ~crc != h.crc) return idx_reject(IDX_ECRC);
     library_finish();
     library_resolve_art(fs);               /* index each album's cover clusters */
-    g_lib_indexed = 1;
     g_lib_scanned = 1;
     return 1;
 }
@@ -2280,7 +2511,8 @@ static int library_load_index(fat32_t *fs)
 static void library_scan(fat32_t *fs)
 {
     if (g_lib_scanned) return;
-    g_songs_n = g_genres_n = g_scan_dirs_n = g_albums_n = 0;
+    g_songs_n = g_genres_n = g_scan_dirs_n = 0;
+    albums_reset();
     g_lib_truncated = 0;
     /* album_intern de-dupes by cluster, so the retry's re-walk of the folder
      * list is idempotent for g_albums; only g_scan_dirs needs the rewind. */
@@ -2323,7 +2555,8 @@ static void library_scan(fat32_t *fs)
                 s->artist[0] = '\0';
             field_copy(s->file, LIB_FILE_MAX,
                        (const uint8_t *)g_scan_files[i].name, NAME_MAX);
-            s->file_hash  = 0;                 /* scan path resolves by name */
+            s->file_hash  = g_scan_files[i].hash;  /* binds like an index record */
+            s->stem_hash  = name_hash(s->file);    /* exact: this IS the disk stem */
             s->dir_clus   = g_scan_dirs[d];
             s->duration_s = (ok && m.have) ? m.duration_s : 0;
             s->track      = (ok && m.have) ? (uint16_t)m.track : 0;
@@ -2606,19 +2839,19 @@ static void shuffle_songs_play(fat32_t *fs)
  * out of the "Artist - Album" folder name. Writes "" when the folder isn't in
  * the album table (a track whose folder never became an album entry).
  *
- * A linear scan, deliberately: it runs for the handful of rows actually on
- * screen, so it is at worst a few thousand integer compares per repaint, and a
- * cluster->album index would be another table to keep in sync with the loader
- * for no measurable gain.
+ * Through album_by_clus: the cluster->album hash already exists (the loader
+ * builds it for the queue builders), so there is no second table to keep in
+ * sync. This used to be its own linear scan over every album, run per visible
+ * row per repaint — up to 1024 compares a row, six rows a frame, on the one
+ * list the wheel moves fastest.
  */
 static void song_album_title(const lib_song_t *sg, char *out)
 {
-    for (int i = 0; i < g_albums_n; i++) {
-        if (g_albums[i].clus == sg->dir_clus) {
-            char artist[NAME_MAX + 1];
-            split_artist_album(g_albums[i].folder, artist, out);
-            return;
-        }
+    int ai = album_by_clus(sg->dir_clus);
+    if (ai >= 0) {
+        char artist[NAME_MAX + 1];
+        split_artist_album(g_albums[ai].folder, artist, out);
+        return;
     }
     out[0] = '\0';
 }
@@ -3351,8 +3584,92 @@ static screen_t  scr_cur(void)        { return g_scr[g_scr_n - 1]; }
  * two look identical otherwise and one of them is a disk fault. */
 static int g_browse_err;
 
-/* Read an album's tracklist (the folder at `dir_clus`) into g_browse. Only ever
- * called at depth 1 now — the album LIST is the index-driven g_albums. */
+/*
+ * Which library song each g_browse row IS — a g_songs index, or -1 for a file
+ * the library has no record of — and the row's ordering key. Both filled by
+ * browse_bind() at the end of every browse_load, so the tracklist screen,
+ * the album queue and the resume path all read the same answer.
+ *
+ * Rows bind to songs by FILE CLUSTER: the resolve pass already bound each
+ * record to its directory entry (by file_hash), and the row was made from
+ * that same entry, so the cluster is the one fact both sides hold exactly.
+ * Matching by name was what this replaces — the row's ext-trimmed name
+ * against the record's file[] field, which for a long filename is a
+ * truncated string no row could equal, so those rows showed no duration,
+ * no title and a made-up gutter number while the same file played fine.
+ */
+static int16_t  g_browse_song[BROWSE_MAX];
+static uint32_t g_browse_key[BROWSE_MAX];
+
+static int browse_key_cmp_idx(uint16_t a, uint16_t b)
+{
+    uint32_t ka = g_browse_key[a], kb = g_browse_key[b];
+    return (ka > kb) - (ka < kb);
+}
+
+static void browse_bind(uint32_t dir_clus)
+{
+    int n = g_browse_n;
+    for (int i = 0; i < n; i++) {
+        g_browse_song[i] = -1;
+        g_browse_key[i]  = 0xFFFFFFFFu;       /* unbound rows sort last */
+    }
+    /* One pass over the library: the album's songs are the ones whose folder
+     * is this one, and each finds its row by cluster among at most BROWSE_MAX.
+     * ~6000 integer compares plus a few hundred per album open — an event
+     * that just read a directory off the disk. */
+    for (int s = 0; s < g_songs_n; s++) {
+        const lib_song_t *sg = &g_songs[s];
+        if (sg->dir_clus != dir_clus || sg->file_clus == 0) continue;
+        for (int i = 0; i < n; i++) {
+            if (g_browse[i].is_dir || g_browse[i].clus != sg->file_clus) continue;
+            g_browse_song[i] = (int16_t)s;
+            g_browse_key[i]  = ((uint32_t)sg->disc << 16) | sg->track;
+            break;
+        }
+    }
+
+    /*
+     * Order the rows by the index's (disc, track). They arrive in raw FAT
+     * directory order — whatever order the importer happened to copy the
+     * files in — while the gutter prints the record's track number, so an
+     * album whose numbers did not come from the filenames read 7, 2, 11 down
+     * the screen. One authority: the index. Ties, and rows the index does not
+     * know, keep directory order (the sort is stable; unbound keys are max).
+     * The queue is built from g_browse in this order too, so the album PLAYS
+     * in it as well as listing in it.
+     *
+     * Applied in place by following cycles, inverted first — the same steps
+     * as library_finish, for the same reason (the sort yields a gather order
+     * and the swap loop scatters).
+     */
+    static uint16_t order[BROWSE_MAX];
+    for (int i = 0; i < n; i++) order[i] = (uint16_t)i;
+    merge_sort_idx(order, n, g_sort_tmp, browse_key_cmp_idx);
+    uint16_t *inv = g_sort_tmp;             /* free again once the sort is done */
+    for (int k = 0; k < n; k++) inv[order[k]] = (uint16_t)k;
+    for (int i = 0; i < n; i++) {
+        while (inv[i] != (uint16_t)i) {
+            int j = inv[i];
+            browse_entry_t te = g_browse[i];
+            g_browse[i] = g_browse[j];
+            g_browse[j] = te;
+            int16_t ts = g_browse_song[i];
+            g_browse_song[i] = g_browse_song[j];
+            g_browse_song[j] = ts;
+            uint32_t tk = g_browse_key[i];
+            g_browse_key[i] = g_browse_key[j];
+            g_browse_key[j] = tk;
+            uint16_t ti = inv[i];
+            inv[i] = inv[j];
+            inv[j] = ti;
+        }
+    }
+}
+
+/* Read an album's tracklist (the folder at `dir_clus`) into g_browse, bound to
+ * the library and in the index's order (browse_bind). Only ever called at
+ * depth 1 now — the album LIST is the index-driven g_albums. */
 static void browse_load(fat32_t *fs, uint32_t dir_clus)
 {
     g_list_epoch++;
@@ -3371,9 +3688,11 @@ static void browse_load(fat32_t *fs, uint32_t dir_clus)
     }
     /* The folder just read cleanly. If the load-time pass could not read it,
      * this is the re-attempt the flag promised: resolve it now, so its songs
-     * become playable from Songs/Genres/shuffle and the About count drops. */
+     * become playable from Songs/Genres/shuffle and the About count drops.
+     * Before the bind, which needs the clusters the resolve installs. */
     int ai = album_by_clus(dir_clus);
     if (ai >= 0 && g_albums[ai].unreadable) (void)album_resolve(fs, ai);
+    browse_bind(dir_clus);
 }
 
 /* After entering an album folder: load its hero art, pull each track's
@@ -3391,22 +3710,16 @@ static void detail_load_meta(fat32_t *fs)
         g_track_title[i] = 0;
         if (g_browse[i].is_dir) continue;
         g_album_track_n++;
-        if (g_lib_indexed) {
-            /* Same match as before (folder cluster + ext-trimmed name), but over
-             * the songs in this filename's hash bucket instead of all 1200. */
-            uint32_t b = name_hash(g_browse[i].name) & (SONG_HASH_BUCKETS - 1);
-            for (int k = g_song_hh[b]; k; k = g_song_hn[k - 1]) {
-                int s = k - 1;
-                if (g_songs[s].dir_clus == g_cur_dir &&
-                    name_eq_ci(g_songs[s].file, g_browse[i].name)) {
-                    g_track_dur[i]  = (uint16_t)g_songs[s].duration_s;
-                    g_track_disc[i] = (uint8_t)g_songs[s].disc;
-                    g_track_num[i]  = g_songs[s].track;
-                    if (g_songs[s].title[0]) g_track_title[i] = g_songs[s].title;
-                    if (g_songs[s].disc > maxd) maxd = g_songs[s].disc;
-                    break;
-                }
-            }
+        /* The row's song, bound by cluster in browse_bind. No longer gated on
+         * "loaded from the index": a scanned library binds the same way and
+         * has durations and numbers of its own to show. */
+        int s = g_browse_song[i];
+        if (s >= 0) {
+            g_track_dur[i]  = (uint16_t)g_songs[s].duration_s;
+            g_track_disc[i] = (uint8_t)g_songs[s].disc;
+            g_track_num[i]  = g_songs[s].track;
+            if (g_songs[s].title[0]) g_track_title[i] = g_songs[s].title;
+            if (g_songs[s].disc > maxd) maxd = g_songs[s].disc;
         }
     }
     g_detail_multidisc = (maxd > 1);
@@ -3445,6 +3758,50 @@ static void detail_load_meta(fat32_t *fs)
  * the first present is throttled conservatively before it is measured. */
 static uint32_t g_present_cost_us = 30000u;
 
+/*
+ * Scroll diagnostics, reported on a "core: ui" UART line every 5 s in which
+ * something was painted (see ui_stats_emit). These exist because "the list
+ * lags" has four candidate mechanisms — the render, the present, the cover
+ * reads issued under the wheel, and the playing-time throttle — and the only
+ * number the log carried was the last present's cost. Every counter is a
+ * store or a compare on a path that already reads the timer; none is on the
+ * audio path.
+ */
+static uint32_t g_ui_render_us;        /* CPU time of the last list paint, no present */
+static uint32_t g_ui_render_max_us;    /* worst paint in the window                    */
+static uint32_t g_ui_present_max_us;   /* worst present in the window                  */
+static uint32_t g_ui_full, g_ui_partial;   /* presents in the window, by path        */
+static uint32_t g_ui_art_reads;        /* cover loads issued (each a disk read)        */
+static uint32_t g_ui_art_max_us;       /* longest single pump: a spin-up lands here    */
+static uint32_t g_ui_art_held;         /* passes that refused to wake a parked platter */
+
+static uint32_t present_gap_us(void);  /* defined just below, with the throttle */
+
+static void ui_stats_emit(void)
+{
+    if (g_ui_full + g_ui_partial == 0 && g_ui_art_reads == 0 && g_ui_art_held == 0) {
+        return;                            /* nothing painted: keep the log quiet */
+    }
+    const player_stats_t *ps = player_stats();
+    uart_puts("core: ui full ");        uart_dec((int)g_ui_full);
+    uart_puts(" partial ");             uart_dec((int)g_ui_partial);
+    uart_puts(" render_us ");           uart_dec((int)g_ui_render_us);
+    uart_puts(" max ");                 uart_dec((int)g_ui_render_max_us);
+    uart_puts(" present_us ");          uart_dec((int)g_present_cost_us);
+    uart_puts(" max ");                 uart_dec((int)g_ui_present_max_us);
+    uart_puts(" gap_us ");              uart_dec((int)present_gap_us());
+    uart_puts(" art reads ");           uart_dec((int)g_ui_art_reads);
+    uart_puts(" max_us ");              uart_dec((int)g_ui_art_max_us);
+    uart_puts(" held ");                uart_dec((int)g_ui_art_held);
+    uart_puts(" parked ");              uart_dec(ata_is_parked());
+    uart_puts(" decode_us_per_kframe "); uart_dec(ps ? (int)ps->decode_us_per_kframe : -1);
+    uart_puts(" ring_low_pct ");        uart_dec((int)player_buf_pct());
+    uart_putc('\n');
+    g_ui_full = g_ui_partial = 0;
+    g_ui_render_max_us = g_ui_present_max_us = 0;
+    g_ui_art_reads = g_ui_art_max_us = g_ui_art_held = 0;
+}
+
 /* Present whatever has been drawn since the last console_damage_reset(), then
  * clear the damage. A full-screen damage rect (any console_clear) goes out via
  * the full-frame fast path, exactly as before. */
@@ -3463,11 +3820,22 @@ static void ui_present_damage(void)
     console_damage_reset();
 }
 
-/* How long to wait between repaints WHILE PLAYING. Self-tuning: keep the
- * IRQ-masked pixel push under ~1/4 of the loop's time by spacing repaints at
- * ~4x what the last one actually cost. A cheap partial present paces fast (a
- * responsive wheel), a full-frame push still backs off to about the old fixed
- * 150 ms — but only when it really is a full frame. */
+/* How long to wait between repaints WHILE PLAYING. Self-tuning: space repaints
+ * at ~4x what the last present actually cost. A cheap partial present paces
+ * fast (a responsive wheel), a full-frame push still backs off to about the
+ * old fixed 150 ms — but only when it really is a full frame.
+ *
+ * The 4x was chosen when the pixel push ran with IRQs MASKED end to end, to
+ * keep that masked time under ~1/4 of the loop. lcd.c now releases the I-bit
+ * between panel rows, so the DMA re-kick deadline no longer bears on this; what
+ * the gap still buys is CPU for the decoder. player_pump decodes exactly one
+ * 1024-frame step per pass (~23 ms of audio), so a pass that also renders and
+ * presents yields less audio than it consumes, and the gap is what keeps such
+ * passes the minority. Whether 4x is the right share is a question for the
+ * "core: ui" line (render_us, present_us, decode_us_per_kframe, ring_low_pct):
+ * on the album list every detent scrolls the window (ui_scroll_window anchors
+ * the selection a third of the way down), so every scroll present is a FULL
+ * frame and this multiplier is the frame rate. Do not lower it on a guess. */
 static uint32_t present_gap_us(void)
 {
     uint32_t gap = g_present_cost_us * 4u;
@@ -3576,6 +3944,8 @@ static int list_view_current(list_view_t *v)
 static struct {
     int      valid, scr, depth, sel, top, count, right_w;
     uint32_t chrome, epoch;
+    uint32_t rows;      /* bit r: row r's content changed under a still view
+                         * (a cover chip arrived) — repaint it, nothing else */
 } g_lp;
 
 static uint32_t chrome_key(void)
@@ -3605,12 +3975,21 @@ static void list_paint_note(void)
     g_lp.right_w = v.right[0] ? text_width(v.right, FONT_SMALL) : 0;
     g_lp.chrome  = chrome_key();
     g_lp.epoch   = g_list_epoch;
+    g_lp.rows    = 0;                     /* a full paint drew every row       */
 }
 
-/* Repaint the current screen by redrawing ONLY what a selection move changed:
- * the two affected rows, the header's "n / m" value and the scrollbar. Returns
- * 0 when that isn't provably sufficient (different screen, scrolled window,
- * changed contents or chrome) — the caller then does the full render. */
+/* Repaint the current screen by redrawing ONLY what changed under a still
+ * view: the two rows a selection move touched (plus the header's "n / m" value
+ * and the scrollbar), and any row whose cover chip arrived since the last
+ * paint (g_lp.rows). Returns 0 when that isn't provably sufficient (different
+ * screen, scrolled window, changed contents or chrome) — the caller then does
+ * the full render.
+ *
+ * The chip case used to fall through to the full render: with the selection
+ * unchanged there was "nothing" for the partial path to do, so each cover that
+ * landed on the album list cleared and re-pushed the whole panel — six times
+ * over for a fresh window, each one re-arming the playing-time throttle at the
+ * full-frame cost, in the middle of the scroll the covers were loading for. */
 static int list_repaint_partial(void)
 {
     list_view_t v;
@@ -3618,37 +3997,46 @@ static int list_repaint_partial(void)
     if (g_lp.scr != (int)scr_cur() || g_lp.depth != g_dir_depth) return 0;
     if (g_lp.epoch != g_list_epoch)                              return 0;
     if (g_lp.count != v.count || g_lp.chrome != chrome_key())    return 0;
-    if (v.sel == g_lp.sel)                                       return 0;
+    int moved = (v.sel != g_lp.sel);
+    if (!moved && g_lp.rows == 0)                                return 0;
     int top = ui_scroll_window(v.sel, v.count, v.visible);
     if (top != g_lp.top) return 0;        /* window scrolled: every row moved   */
 
-    int r_old = g_lp.sel - top, r_new = v.sel - top;
-    if (r_old < 0 || r_old >= v.visible || r_new < 0 || r_new >= v.visible) {
-        return 0;                          /* off-window selection: play it safe */
-    }
-
-    /* Header value: clear only as wide as the old/new text. If the title reaches
-     * into that box, the clear would eat it — fall back to a full paint. */
-    int rw = v.right[0] ? text_width(v.right, FONT_SMALL) : 0;
-    int cw = ((rw > g_lp.right_w) ? rw : g_lp.right_w) + 4;
-    if (cw > 4) {
-        int cx = LCD_WIDTH - 12 - cw;
-        if (12 + 20 + text_width(v.title, FONT_HEADER) > cx) return 0;
-        console_fill_rect(cx, HDR_BASE - 12, cw, 16, LINEN_SURFACE);
-        if (rw) {
-            ui_text(LCD_WIDTH - 12 - rw, HDR_BASE - 1, v.right, FONT_SMALL,
-                    LINEN_MUTED2);
+    uint32_t rows = g_lp.rows;
+    if (moved) {
+        int r_old = g_lp.sel - top, r_new = v.sel - top;
+        if (r_old < 0 || r_old >= v.visible || r_new < 0 || r_new >= v.visible) {
+            return 0;                      /* off-window selection: play it safe */
         }
+
+        /* Header value: clear only as wide as the old/new text. If the title
+         * reaches into that box, the clear would eat it — fall back to a full
+         * paint. */
+        int rw = v.right[0] ? text_width(v.right, FONT_SMALL) : 0;
+        int cw = ((rw > g_lp.right_w) ? rw : g_lp.right_w) + 4;
+        if (cw > 4) {
+            int cx = LCD_WIDTH - 12 - cw;
+            if (12 + 20 + text_width(v.title, FONT_HEADER) > cx) return 0;
+            console_fill_rect(cx, HDR_BASE - 12, cw, 16, LINEN_SURFACE);
+            if (rw) {
+                ui_text(LCD_WIDTH - 12 - rw, HDR_BASE - 1, v.right, FONT_SMALL,
+                        LINEN_MUTED2);
+            }
+        }
+        rows |= (1u << r_old) | (1u << r_new);
     }
 
-    /* The two rows: clear the band (the new content may be narrower) + redraw. */
-    for (int k = 0; k < 2; k++) {
-        int r = k ? r_new : r_old;
+    /* The rows: clear each band (the new content may be narrower) + redraw. */
+    for (int r = 0; r < v.visible; r++) {
+        if (!(rows & (1u << r))) continue;
         console_fill_rect(0, v.y0 + r * v.rh, LCD_WIDTH, v.rh, LINEN_SURFACE);
         int idx = top + r;
         if (idx < v.count) v.row(r, idx);
     }
-    ui_scrollbar(v.y0, top, v.visible, v.count);
+    if (moved) {
+        ui_scrollbar(v.y0, top, v.visible, v.count);
+    }
+    g_lp.rows = 0;
     return 1;
 }
 
@@ -3672,6 +4060,14 @@ static int list_repaint_partial(void)
  * well past the last detent — it must not blink out while you are still
  * deciding which letter to stop on. */
 #define WHEEL_AZ_HOLD_LETTER 1200000u
+
+/* Cover loads under a moving wheel (the album-list pump in run_ui; see the
+ * block comment there). A detent within SETTLE means the list is scrolling:
+ * one disk read per pass, not six. A parked platter is only woken for covers
+ * after QUIET of wheel silence — long enough that a deliberate detent-by-
+ * detent scroll (~300 ms apart) never trips a spin-up mid-gesture. */
+#define CHIP_WHEEL_SETTLE_US   150000u
+#define CHIP_SPINUP_QUIET_US   500000u
 
 static uint32_t g_wheel_last_us;
 static int      g_wheel_vel = 1;
@@ -3988,8 +4384,9 @@ static int wheel_move(int sel, int count, int8_t delta, int *accum)
  *
  * settings_t carries three fields (resume_hash / resume_secs / resume_total)
  * that ride along in the CORECFG.DAT record. The locator is the folded
- * name_hash() of the track's ext-trimmed FILENAME — not a queue index, not a
- * song index, not a cluster. Every one of those is a statement about the
+ * name_hash() of the track's ext-trimmed FILENAME as the queue displays it
+ * (the on-disk stem, which is also lib_song_t.stem_hash once a record has
+ * bound to its file) — not a queue index, not a song index, not a cluster. Every one of those is a statement about the
  * library as it happened to be laid out when we saved: re-import the music,
  * rebuild CORELIB.IDX, add one album, and index 412 is a different song while
  * cluster 918233 may be somebody else's file. The filename is the only handle
@@ -4082,7 +4479,7 @@ static void resume_capture(void)
 }
 
 /*
- * Find the library song whose ext-trimmed filename folds to `hash`. Returns a
+ * Find the library song whose on-disk stem folds to `hash`. Returns a
  * g_songs index, or -1 when there is no safe answer.
  *
  * "Safe" is the whole point. A name match that the duration also confirms is
@@ -4090,15 +4487,25 @@ static void resume_capture(void)
  * name is UNIQUE across the library — otherwise we would be picking one of
  * several "01 Intro.flac" at random, and a coin-flip is not a resume.
  *
- * One linear pass over g_songs at boot: ~6000 short hashes, single-digit
- * milliseconds, against a library load that already took seconds.
+ * The name compared is stem_hash — the hash of the name the file HAS, taken
+ * from its directory entry when the record bound, which is the same string
+ * the queue shows and resume_capture hashed. It used to be name_hash(file)
+ * over the index's copy of the filename, and for a filename past 63 bytes
+ * that copy is a truncated string that hashes like nothing on the disk: the
+ * track played, the position was saved, and the restore never found it. A
+ * record that never bound keeps that provisional hash — exact for a short
+ * name, matching nothing for a long one — so it can still count as a
+ * same-named twin below, but can never be the song that is opened.
+ *
+ * One linear pass over g_songs at boot: ~6000 integer compares, well under a
+ * millisecond, against a library load that already took seconds.
  */
 static int resume_find_song(uint32_t hash, uint32_t total_s)
 {
     int best = -1, n_named = 0;
 
     for (int i = 0; i < g_songs_n; i++) {
-        if (name_hash(g_songs[i].file) != hash) {
+        if (hash == 0 || g_songs[i].stem_hash != hash) {
             continue;
         }
         n_named++;
@@ -4163,10 +4570,12 @@ static void resume_restore(fat32_t *fs)
     g_boot_res_dir_ms = boot_ms_now() - rt0;
     g_dir_depth = saved_depth;
 
+    /* The row is the file the song bound to: same cluster. Not the name — the
+     * row's name and the song's are only the same string BECAUSE the song
+     * bound, and the cluster is the binding itself. */
     int idx = -1;
     for (int i = 0; i < g_browse_n; i++) {
-        if (!g_browse[i].is_dir &&
-            name_hash(g_browse[i].name) == g_settings.resume_hash) {
+        if (!g_browse[i].is_dir && g_browse[i].clus == g_songs[si].file_clus) {
             idx = i;
             break;
         }
@@ -4481,6 +4890,7 @@ _Noreturn static void run_ui(fat32_t *fs)
     uint32_t last_present = 0;           /* rate-limit UI presents while playing */
     uint32_t last_bars = 0;              /* rate-limit the now-playing bar anim  */
     uint32_t last_chip = 0;              /* rate-limit album-cover chip loads    */
+    uint32_t last_uistat = 0;            /* 5 s cadence of the "core: ui" line   */
     uint32_t last_mq = 0;                /* rate-limit the marquee scroll        */
     int      hold_prev = clickwheel_hold() ? 1 : 0;  /* seed hold-edge detect    */
     int      ext_prev  = power_is_external() ? 1 : 0; /* seed plug-in edge detect */
@@ -5315,7 +5725,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                  * render, which console_clear marks as whole-screen damage. The
                  * A-Z plate covers arbitrary rows, so while it is up (or in the
                  * frame that clears it) the full render is the honest option. */
-                if (az_letter || az_prev || !list_repaint_partial()) {
+                int partial = !az_letter && !az_prev && list_repaint_partial();
+                if (!partial) {
                     switch (scr_cur()) {
                     case SCR_MENU:    main_menu_render();            break;
                     case SCR_MUSIC:   music_menu_render();           break;
@@ -5333,7 +5744,13 @@ _Noreturn static void run_ui(fat32_t *fs)
                     }
                 }
                 if (az_letter) az_overlay_render(az_letter);
+                /* Render and present timed apart: `now` was read before the
+                 * paint, so the delta here is the CPU the renderer took. */
+                g_ui_render_us = mmio_read32(USEC_TIMER_ADDR) - now;
+                if (g_ui_render_us > g_ui_render_max_us) g_ui_render_max_us = g_ui_render_us;
                 ui_present_damage();
+                if (g_present_cost_us > g_ui_present_max_us) g_ui_present_max_us = g_present_cost_us;
+                if (partial) g_ui_partial++; else g_ui_full++;
                 list_paint_note();
                 az_prev = az_letter;
                 dirty = 0;
@@ -5425,17 +5842,51 @@ _Noreturn static void run_ui(fat32_t *fs)
          * pass (covers fill near-instantly). While a song plays we still spread
          * the I/O so it can't starve decode, but a folder.thm is only ~1KB and
          * the anti-skip diskbuf is 8MB (~73s), so a small BATCH every ~60ms
-         * (~50 covers/s) is safe and stops the old one-line-at-a-time trickle. */
+         * (~50 covers/s) is safe and stops the old one-line-at-a-time trickle.
+         *
+         * Every load is a SYNCHRONOUS disk read on this loop, so two things are
+         * held back while the wheel is actually turning:
+         *
+         *   - A PARKED platter is not woken for a cover. player.c parks the
+         *     drive between refill bursts (most of a track) and the idle timer
+         *     parks it after 20 s, so the first cover read after either is a
+         *     spin-up: the loop is frozen for the 1-3 s it takes (ATA_SPINUP_US
+         *     allows 4), the wheel's motion piles into the latch, and the list
+         *     jumps when it comes back. Covers wait for CHIP_SPINUP_QUIET_US of
+         *     wheel silence, so that stall lands on a still screen — a wait, not
+         *     a jerk — and a slow deliberate scroll never triggers it at all.
+         *   - With the platter up, a scroll in progress gets ONE read per pass.
+         *     Six reads is ~60 ms of seek+PIO stacked onto the pass that also
+         *     has to paint the new window; one bounds the hitch and the rest of
+         *     the window fills the moment the wheel settles.
+         *
+         * The pump is told the window (artcache_pump_for), so whichever reads
+         * do happen go to the rows on screen, top first — never to rows that
+         * already scrolled past. */
         if (scr_cur() == SCR_BROWSER && g_dir_depth == 0) {
             uint32_t nowc = mmio_read32(USEC_TIMER_ADDR);
             int idle_now  = !player_active();
-            if (idle_now || (uint32_t)(nowc - last_chip) >= 60000u) {
+            uint32_t since_wheel = nowc - g_wheel_last_us;
+            int moving = since_wheel < CHIP_WHEEL_SETTLE_US;
+            int budget;
+            if (ata_is_parked() && since_wheel < CHIP_SPINUP_QUIET_US) {
+                budget = 0;
+                g_ui_art_held++;
+            } else if (moving) {
+                budget = 1;
+            } else {
+                budget = idle_now ? 6 : 3;
+            }
+            if (budget > 0 && (idle_now || (uint32_t)(nowc - last_chip) >= 60000u)) {
                 /* A pumped slot is only worth a repaint if it is actually ON
                  * SCREEN: pumping a whole library's covers used to set dirty for
                  * every one of them, forcing ~21 consecutive full-frame repaints
                  * for rows nobody was looking at. Snapshot the visible rows'
-                 * chips, pump, and repaint only if one of THOSE appeared. */
+                 * chips, pump, and repaint only the rows whose chip appeared —
+                 * through g_lp.rows, so a landed cover costs one row band, not a
+                 * cleared panel and a full-frame push (see list_repaint_partial). */
                 const uint16_t *before[LIST_ROWS2];
+                int want[LIST_ROWS2];
                 int vtop = ui_scroll_window(g_br_sel, albumlist_count(), LIST_ROWS2);
                 /* PEEK, not get: this loop is only observing. artcache_get
                  * claims a way and re-stamps the LRU, so using it here (12
@@ -5446,17 +5897,35 @@ _Noreturn static void run_ui(fat32_t *fs)
                  * and a row is not an album when an artist filter puts the
                  * synthetic "All Songs" row at 0. */
                 for (int r = 0; r < LIST_ROWS2; r++) {
-                    int a = albumlist_album_at(vtop + r);
-                    before[r] = (a >= 0) ? artcache_peek(a) : 0;
+                    want[r]   = albumlist_album_at(vtop + r);
+                    before[r] = (want[r] >= 0) ? artcache_peek(want[r]) : 0;
                 }
-                for (int k = 0; k < (idle_now ? 6 : 3) && artcache_pump(fs); k++) {
+                uint32_t t_art = mmio_read32(USEC_TIMER_ADDR);
+                int loaded = 0;
+                while (loaded < budget && artcache_pump_for(fs, want, LIST_ROWS2)) {
+                    loaded++;
                 }
+                t_art = mmio_read32(USEC_TIMER_ADDR) - t_art;
+                g_ui_art_reads += (uint32_t)loaded;
+                if (loaded && t_art > g_ui_art_max_us) g_ui_art_max_us = t_art;
                 for (int r = 0; r < LIST_ROWS2; r++) {
-                    int a = albumlist_album_at(vtop + r);
-                    const uint16_t *now_px = (a >= 0) ? artcache_peek(a) : 0;
-                    if (now_px != before[r]) dirty = 1;
+                    const uint16_t *now_px = (want[r] >= 0) ? artcache_peek(want[r]) : 0;
+                    if (now_px != before[r]) {
+                        g_lp.rows |= 1u << r;
+                        dirty = 1;
+                    }
                 }
                 last_chip = nowc;
+            }
+        }
+
+        /* The scroll diagnostics line, on the same 5 s cadence as the battery
+         * and audio lines but only when something was painted. */
+        {
+            uint32_t nows = mmio_read32(USEC_TIMER_ADDR);
+            if ((uint32_t)(nows - last_uistat) >= 5000000u) {
+                ui_stats_emit();
+                last_uistat = nows;
             }
         }
 
