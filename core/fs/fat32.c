@@ -603,6 +603,20 @@ int fat32_readdir(fat32_t *fs, uint32_t dir_clus, fat32_dir_cb cb, void *ud)
      */
     uint8_t sec[4096];
 
+    /*
+     * A directory that starts at a cluster this volume cannot address is a
+     * corrupt entry (or a caller handing us a stale cluster), not an empty
+     * directory. The loop below simply would not run for it, returning 0 with
+     * no entries — and every caller reads "0, no entries" as a directory that
+     * is genuinely empty. For the library that means an album whose folder
+     * entry got a bad cluster shows up with no tracks and nothing ever says
+     * why. Same reasoning, same fix, as the first-cluster check in
+     * fat32_read_file.
+     */
+    if (!cluster_valid(fs, dir_clus)) {
+        return FAT32_ECORRUPT;
+    }
+
     uint32_t clus  = dir_clus;
     uint32_t guard = dir_walk_limit(fs);   /* bounded walk — see the #define */
     uint32_t slow  = dir_clus;             /* Floyd tortoise; see the loop tail */
@@ -833,6 +847,46 @@ void fat32_stream_open(fat32_stream_t *st, fat32_t *fs,
     st->remaining = size;
 }
 
+/*
+ * Step the cursor onto the next cluster of the chain. Called only when the
+ * current cluster is fully consumed (clus_off == clus_bytes) and bytes remain.
+ *
+ * This used to live at the BOTTOM of the read loop, and on a FAT read failure
+ * it zeroed st->clus before returning -1. That left the cursor in a state
+ * where every later call fell straight out of the loop and returned 0 —
+ * end-of-file — for a file that had not ended: one unreadable FAT sector
+ * became a short track, and the player, having been told EOF, moved on. Now
+ * the step happens at the TOP of the loop and a failed step leaves the
+ * cursor exactly where it was (on the consumed cluster), so the next call
+ * simply tries the walk again. A transient error is retryable; a persistent
+ * one is reported every time, never once and then swallowed.
+ *
+ * Returns 0 and advances the cursor, or a negative FAT32_* code with the
+ * cursor untouched. `*guard` bounds the number of steps per call so a cyclic
+ * chain terminates even if the file size is absurd.
+ */
+static int stream_step(fat32_stream_t *st, uint32_t *guard)
+{
+    fat32_t *fs = st->fs;
+    if ((*guard)-- == 0) {
+        return FAT32_ECORRUPT;       /* cyclic chain */
+    }
+    uint32_t nx = next_cluster(fs, st->clus);
+    if (nx == 0) {
+        return FAT32_EIO;            /* the FAT sector itself could not be read */
+    }
+    if (!cluster_valid(fs, nx)) {
+        /* The chain reached EOC (or a garbage entry) while the directory
+         * entry's size says bytes remain. That is a file whose metadata and
+         * allocation disagree — corruption — and it must not read as a clean
+         * EOF, or the tail of the track silently vanishes. */
+        return FAT32_ECORRUPT;
+    }
+    st->clus     = nx;
+    st->clus_off = 0;
+    return 0;
+}
+
 int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len)
 {
     fat32_t *fs    = st->fs;
@@ -841,9 +895,42 @@ int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len)
 
     uint32_t guard = fs->max_clus;   /* a chain can't outlast the volume */
 
-    while (total < len && st->remaining > 0 && cluster_valid(fs, st->clus)) {
-        if (guard-- == 0) {
-            return FAT32_ECORRUPT;   /* cyclic chain */
+    /*
+     * Bytes remain but there is no addressable cluster to read them from: a
+     * directory entry with a garbage first cluster and a real size. This is
+     * corruption, not an empty file. fat32_read_file was deliberately changed
+     * to say so (its first-cluster check, above), and player.c was written to
+     * tell an error apart from end-of-file — but this path kept returning 0,
+     * which is the one answer that looks exactly like a legitimately empty
+     * file. So a corrupt entry played as a zero-length track and the player
+     * advanced: precisely the "short song" that read_file's fix was meant to
+     * end, surviving on the streaming path that the player actually uses.
+     *
+     * A genuinely empty file has remaining == 0 and never reaches this test,
+     * so a clean EOF stays a clean EOF.
+     */
+    if (st->remaining > 0 && !cluster_valid(fs, st->clus)) {
+        return FAT32_ECORRUPT;
+    }
+
+    /*
+     * A failed call must leave the cursor where it found it. The old code
+     * advanced clus_off/remaining for the bytes it had copied and THEN hit the
+     * failure, returning -1 with the cursor several hundred bytes past what
+     * the caller ever received. player.c keeps its own byte position and
+     * assumes it matches ours, so after one such error the stream was
+     * silently ahead of the decoder and stayed that way. Four words copied
+     * per call; nothing next to a disk read.
+     */
+    const fat32_stream_t saved = *st;
+
+    while (total < len && st->remaining > 0) {
+        if (st->clus_off == fs->clus_bytes) {
+            int rc = stream_step(st, &guard);
+            if (rc != 0) {
+                *st = saved;
+                return rc;
+            }
         }
         uint32_t sec_in_clus = st->clus_off / fs->bytes_per_sec;
         uint32_t off_in_sec  = st->clus_off % fs->bytes_per_sec;
@@ -866,7 +953,8 @@ int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len)
             take = want < sec_avail ? want : sec_avail;
             const uint8_t *src;
             if (read_data_sector(fs, base_sec, &src) != 0) {
-                return -1;
+                *st = saved;
+                return FAT32_EIO;
             }
             memcpy(out, src + off_in_sec, take);
         } else {
@@ -887,7 +975,8 @@ int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len)
                 take = whole * fs->bytes_per_sec;
                 if (fs->read(fs->ud, fs->part_lba + base_sec * fs->sec_ratio,
                              whole * fs->sec_ratio, out) != 0) {
-                    return -1;
+                    *st = saved;
+                    return FAT32_EIO;
                 }
             } else {
                 /* Less than one FS-sector left to satisfy (a partial tail, or
@@ -895,7 +984,8 @@ int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len)
                 take = want;
                 const uint8_t *src;
                 if (read_data_sector(fs, base_sec, &src) != 0) {
-                    return -1;
+                    *st = saved;
+                    return FAT32_EIO;
                 }
                 memcpy(out, src, take);
             }
@@ -906,16 +996,9 @@ int32_t fat32_stream_read(fat32_stream_t *st, void *buf, uint32_t len)
         st->clus_off  += take;
         st->remaining -= take;
 
-        /* Advance to the next cluster only when the current one is fully
-         * consumed AND more file remains — so we never walk the FAT (and
-         * risk a spurious read error) once we've returned the last byte. */
-        if (st->clus_off == fs->clus_bytes && st->remaining > 0) {
-            st->clus     = next_cluster(fs, st->clus);
-            st->clus_off = 0;
-            if (st->clus == 0) {
-                return -1;   /* read error walking the FAT */
-            }
-        }
+        /* No step here: the next cluster is walked lazily at the top of the
+         * loop, and only when more file remains — so the FAT is never touched
+         * (and a spurious read error never raised) once the last byte is out. */
     }
     return (int32_t)total;
 }
@@ -926,9 +1009,22 @@ uint32_t fat32_stream_skip(fat32_stream_t *st, uint32_t n)
     uint32_t done  = 0;
     uint32_t guard = fs->max_clus;   /* a chain can't outlast the volume */
 
-    while (n > 0 && st->remaining > 0 && cluster_valid(fs, st->clus)) {
-        if (guard-- == 0) {
-            break;      /* cyclic chain — stop, report what we skipped */
+    /* Same corrupt-first-cluster case as fat32_stream_read. This call returns
+     * a byte count and has no error channel, so it skips nothing; the read
+     * that follows is what reports FAT32_ECORRUPT. It must not "skip" through
+     * a chain that does not exist and leave the cursor claiming a position
+     * that was never reached. */
+    if (st->remaining > 0 && !cluster_valid(fs, st->clus)) {
+        return 0;
+    }
+
+    while (n > 0 && st->remaining > 0) {
+        if (st->clus_off == fs->clus_bytes) {
+            if (stream_step(st, &guard) != 0) {
+                break;      /* FAT error or a broken chain: report what was
+                             * skipped; the cursor sits on the consumed cluster
+                             * and the next read retries the step, or reports */
+            }
         }
         /* Skip within the current cluster by just moving the cursor — no data
          * read. Only the FAT is touched, when we step to the next cluster. */
@@ -942,14 +1038,6 @@ uint32_t fat32_stream_skip(fat32_stream_t *st, uint32_t n)
         st->remaining -= take;
         done          += take;
         n             -= take;
-
-        if (st->clus_off == fs->clus_bytes && st->remaining > 0) {
-            st->clus     = next_cluster(fs, st->clus);
-            st->clus_off = 0;
-            if (st->clus == 0) {
-                break;      /* FAT read error — stop, report what we skipped */
-            }
-        }
     }
     return done;
 }

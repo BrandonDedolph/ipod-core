@@ -367,6 +367,12 @@ typedef struct {
     uint32_t clus;                       /* album folder cluster                  */
     uint32_t art_clus, art_size;         /* folder.art (120x120) — now-playing    */
     uint32_t thm_clus, thm_size;         /* folder.thm (28x28)  — list chip       */
+    uint8_t  unreadable;                 /* the folder's directory could not be
+                                          * read at load, even after retries. Its
+                                          * songs have file_clus == 0 — NOT because
+                                          * they left the disk, but because we never
+                                          * got to look. Cleared (and the songs
+                                          * bound) when a later open reads it. */
 } lib_album_t;
 static lib_album_t g_albums[LIB_MAX_ALBUMS];
 static int         g_albums_n;
@@ -377,6 +383,36 @@ static int         g_albumview_n;
  * LIB_MAX_ALBUMS / ARTISTS_MAX / LIB_MAX_GENRES / FOLDER_MAP_MAX), so the
  * truncation isn't silent — the About screen says the library didn't fit. */
 static int         g_lib_truncated;
+
+/*
+ * The other ways a load can come up short, kept SEPARATE from g_lib_truncated
+ * because "Library too large" is the wrong thing to tell the user for any of
+ * them — and until these existed, every one of them was silent: the tracks
+ * were simply absent, or present and dead, with nothing to say why.
+ *
+ *   g_lib_unreadable  albums whose folder could not be read (disk error, or a
+ *                     corrupt directory cluster) after the retries in
+ *                     lib_readdir. Each such album has .unreadable set and all
+ *                     its songs unresolved (file_clus == 0), so they list in
+ *                     Songs/Genres but cannot play. Opening the album retries
+ *                     the read and, on success, resolves it and decrements
+ *                     this. UI: About should say "N albums could not be read";
+ *                     the album's tracklist should say so instead of showing
+ *                     an empty list (see g_browse_err).
+ *   g_lib_orphaned    CORELIB.IDX records whose album folder is not on the
+ *                     disk at all — a stale index, not a disk fault. Nothing
+ *                     to retry; the fix is re-running the host importer. UI:
+ *                     "index out of date, N tracks skipped".
+ *   g_lib_load_err    nonzero (a FAT32_* code) when the library ROOT itself
+ *                     could not be enumerated, so there is no library at all
+ *                     this session. The counts above are then meaningless
+ *                     (0 songs). UI: a "could not read the disk" screen in
+ *                     place of an empty Music menu; to retry, clear
+ *                     g_lib_scanned and call library_ensure again.
+ */
+static int         g_lib_unreadable;
+static int         g_lib_orphaned;
+static int         g_lib_load_err;
 static uint32_t     g_lib_load_ms;   /* boot library load time, shown on About */
 
 /*
@@ -1672,6 +1708,7 @@ static void album_intern(const char *folder, uint32_t clus)
     for (; folder[k] && k < NAME_MAX; k++) g_albums[g_albums_n].folder[k] = folder[k];
     g_albums[g_albums_n].folder[k] = '\0';
     g_albums[g_albums_n].clus = clus;
+    g_albums[g_albums_n].unreadable = 0;     /* until the resolve pass says so */
     g_albums_n++;
 }
 
@@ -1898,6 +1935,70 @@ static int album_by_clus(uint32_t dc)
     return -1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Directory reads the library depends on.
+ *
+ * Every fat32_readdir in the loader used to ignore its return code. The walk
+ * can fail — FAT32_EIO when a sector read fails even after player_disk_read's
+ * six attempts, FAT32_ECORRUPT for a cyclic or unaddressable chain — and not
+ * one caller looked. The consequence was never a crash, which is why it went
+ * unnoticed: a failed album walk in the resolve pass just left every song in
+ * that album with file_clus == 0, and every later path reads that as "indexed
+ * but no longer on disk". The tracks stayed listed in Songs and Genres and
+ * did nothing when picked, until reboot; opening the album showed an empty
+ * tracklist. The trigger is mundane — the drive still settling from spin-up
+ * during "Loading Library" — so this is a bug users hit, not a hypothetical.
+ *
+ * lib_readdir is fat32_readdir with the two things the loader needs:
+ *
+ *   1. A RETRY. player_disk_read already retries each sector six times with
+ *      short backoffs, so a walk that failed has already burned ~200 ms on
+ *      the failing sector; a further LIB_READDIR_RETRY_MS pause and a fresh
+ *      walk gives a drive that was mid-settle its second chance. Only an EIO
+ *      is retried: ECORRUPT is structural (the bytes are wrong, not late) and
+ *      re-walking a cyclic chain costs the full bounded scan again for
+ *      nothing. The retry re-runs the callback from the top of the directory,
+ *      so the caller's accumulator is REWOUND first (`acc_n`) — otherwise the
+ *      entries seen before the failure would be listed twice.
+ *
+ *   2. A BUDGET. A dead drive fails every read; with a thousand albums to
+ *      resolve, retrying each one would turn a failed boot into minutes of
+ *      sleeping before the user even sees an error. g_lib_retry_budget is the
+ *      number of retries a whole load may spend: a spin-up is one event and a
+ *      couple of retries ride it out, so if the budget is gone and reads are
+ *      still failing, this is not spin-up and the remaining albums are marked
+ *      unreadable at the cost of one plain (already-retried) walk each.
+ *
+ * The common case — the walk succeeds first time — pays one compare. The
+ * loader is not slower for it.
+ *
+ * On a final failure the accumulator is rewound too: a half-listed directory
+ * is not "the files in this album", and presenting it as such is a subtler
+ * version of the bug this replaces. The return is the last FAT32_* code.
+ * ------------------------------------------------------------------------- */
+#define LIB_READDIR_RETRIES   2      /* re-walks per directory, after the first  */
+#define LIB_READDIR_RETRY_MS  250    /* settle time before each re-walk           */
+#define LIB_LOAD_RETRY_BUDGET 6      /* re-walks a whole library load may spend   */
+
+static int g_lib_retry_budget;
+
+static int lib_readdir(fat32_t *fs, uint32_t clus, fat32_dir_cb cb, void *ud,
+                       int *acc_n)
+{
+    int base = acc_n ? *acc_n : 0;
+    int rc   = fat32_readdir(fs, clus, cb, ud);
+    for (int attempt = 0;
+         rc == FAT32_EIO && attempt < LIB_READDIR_RETRIES && g_lib_retry_budget > 0;
+         attempt++) {
+        g_lib_retry_budget--;
+        sleep_ms(LIB_READDIR_RETRY_MS);
+        if (acc_n) *acc_n = base;
+        rc = fat32_readdir(fs, clus, cb, ud);
+    }
+    if (rc != 0 && acc_n) *acc_n = base;
+    return rc;
+}
+
 /* Resolve pass: ONE readdir per album at load time captures both the folder's
  * cover clusters (folder.art/.thm) AND every track file's own cluster into
  * g_songs — so later cover loads, playing a song, and shuffling the WHOLE
@@ -1944,9 +2045,48 @@ static int resolve_art_cb(void *ud, const fat32_dirent_t *e)
     }
     return 0;
 }
+/*
+ * Resolve ONE album: read its folder, bind its songs' clusters and capture its
+ * art. Returns the readdir result. This is the one place an album is marked
+ * unreadable or cleared again, so the count in g_lib_unreadable can never
+ * drift from the flags — the load-time pass and a later browse_load both come
+ * through here.
+ *
+ * On failure the art fields are left cleared (there is nothing to show) and
+ * songs that happened to be bound before the walk failed KEEP their binding:
+ * those entries were read correctly, and unbinding a playable track because a
+ * sibling's sector was bad would be manufacturing a second failure.
+ */
+static int album_resolve(fat32_t *fs, int i)
+{
+    g_res_art_clus = g_res_art_size = g_res_thm_clus = g_res_thm_size = 0;
+    g_res_album_clus = g_albums[i].clus;
+    int rc = lib_readdir(fs, g_albums[i].clus, resolve_art_cb, 0, 0);
+    if (rc != 0) {
+        if (!g_albums[i].unreadable) {
+            g_albums[i].unreadable = 1;
+            g_lib_unreadable++;
+        }
+        g_albums[i].art_clus = g_albums[i].art_size = 0;
+        g_albums[i].thm_clus = g_albums[i].thm_size = 0;
+        return rc;
+    }
+    if (g_albums[i].unreadable) {
+        g_albums[i].unreadable = 0;
+        g_lib_unreadable--;
+    }
+    g_albums[i].art_clus = g_res_art_clus;
+    g_albums[i].art_size = g_res_art_size;
+    g_albums[i].thm_clus = g_res_thm_clus;
+    g_albums[i].thm_size = g_res_thm_size;
+    return 0;
+}
+
 static void library_resolve_art(fat32_t *fs)
 {
     for (int s = 0; s < g_songs_n; s++) g_songs[s].file_clus = 0;
+    for (int a = 0; a < g_albums_n; a++) g_albums[a].unreadable = 0;
+    g_lib_unreadable = 0;
 
     /*
      * Walk the albums in ASCENDING CLUSTER order, not menu order.
@@ -1981,13 +2121,7 @@ static void library_resolve_art(fat32_t *fs)
         /* load_bar is time-throttled, so calling it per album is free and the
          * bar advances smoothly instead of in 4-album jumps. */
         load_bar("Loading Library", 75 + (n ? p * 25 / n : 25));
-        g_res_art_clus = g_res_art_size = g_res_thm_clus = g_res_thm_size = 0;
-        g_res_album_clus = g_albums[i].clus;
-        fat32_readdir(fs, g_albums[i].clus, resolve_art_cb, 0);
-        g_albums[i].art_clus = g_res_art_clus;
-        g_albums[i].art_size = g_res_art_size;
-        g_albums[i].thm_clus = g_res_thm_clus;
-        g_albums[i].thm_size = g_res_thm_size;
+        (void)album_resolve(fs, i);    /* failure is recorded on the album */
     }
 }
 
@@ -2013,7 +2147,12 @@ static int lib_root_cb(void *ud, const fat32_dirent_t *e)
 static uint32_t lib_root(fat32_t *fs)
 {
     g_lib_root_clus = 0;
-    fat32_readdir(fs, fs->root_clus, lib_root_cb, 0);
+    /* If the volume root cannot be read there is no finding Music/, and the
+     * fallback to the root cluster below will fail the same way one call later.
+     * Record it so the load reports "could not read the disk" rather than
+     * quietly producing a library of zero songs. */
+    int rc = lib_readdir(fs, fs->root_clus, lib_root_cb, 0, 0);
+    if (rc != 0) g_lib_load_err = rc;
     return g_lib_root_clus ? g_lib_root_clus : fs->root_clus;
 }
 
@@ -2021,7 +2160,16 @@ static int library_load_index(fat32_t *fs)
 {
     g_idx_clus = 0;
     g_folder_n = 0;
-    fat32_readdir(fs, lib_root(fs), index_root_cb, 0);
+    /* This one walk is the whole folder map: if it fails, every index record
+     * resolves to "album not on disk" and the library silently loads EMPTY —
+     * the whole-library version of the per-album bug. Rewinding g_folder_n
+     * on failure (lib_readdir does) matters here for the same reason: a
+     * half-built map would resolve half the library and orphan the rest. */
+    int rc = lib_readdir(fs, lib_root(fs), index_root_cb, 0, &g_folder_n);
+    if (rc != 0) {
+        g_lib_load_err = rc;
+        return 0;
+    }
     if (g_idx_clus == 0) return 0;
 
     fat32_stream_t st;
@@ -2058,7 +2206,15 @@ static int library_load_index(fat32_t *fs)
             uint32_t file_hash   = (uint32_t)r[252] | ((uint32_t)r[253] << 8) |
                                    ((uint32_t)r[254] << 16) | ((uint32_t)r[255] << 24);
             uint32_t dc = folder_clus_h(folder_hash, folder);
-            if (dc == 0) continue;             /* album not present on disk */
+            if (dc == 0) {
+                /* The index names an album folder the disk does not have: a
+                 * stale CORELIB.IDX (album deleted, importer not re-run), not
+                 * a read fault — the folder map above was read in full. The
+                 * record is dropped, but counted, so the user can be told the
+                 * index is out of date rather than wondering where it went. */
+                g_lib_orphaned++;
+                continue;
+            }
             lib_song_t *s = &g_songs[g_songs_n];
             s->dir_clus   = dc;
             s->file_hash  = file_hash;
@@ -2099,12 +2255,21 @@ static void library_scan(fat32_t *fs)
     if (g_lib_scanned) return;
     g_songs_n = g_genres_n = g_scan_dirs_n = g_albums_n = 0;
     g_lib_truncated = 0;
-    fat32_readdir(fs, lib_root(fs), scan_dirs_cb, 0);
+    /* album_intern de-dupes by cluster, so the retry's re-walk of the folder
+     * list is idempotent for g_albums; only g_scan_dirs needs the rewind. */
+    int rc = lib_readdir(fs, lib_root(fs), scan_dirs_cb, 0, &g_scan_dirs_n);
+    if (rc != 0) g_lib_load_err = rc;
     if (g_scan_dirs_n >= BROWSE_MAX) g_lib_truncated = 1;   /* folder list full */
     for (int d = 0; d < g_scan_dirs_n && g_songs_n < LIB_MAX_SONGS; d++) {
         g_scan_files_n = 0;
         g_scan_art_clus = g_scan_art_size = 0;
-        fat32_readdir(fs, g_scan_dirs[d], scan_files_cb, 0);
+        /* A failed file walk leaves this album with no songs in the scan; the
+         * resolve pass below reads the folder again and is where it gets
+         * marked unreadable (or not, if the disk has settled by then — in
+         * which case the album browses fine but its tracks are missing from
+         * Songs until the next boot; the index path, which ships, has no such
+         * gap because its song list does not come from this walk). */
+        (void)lib_readdir(fs, g_scan_dirs[d], scan_files_cb, 0, &g_scan_files_n);
         for (int i = 0; i < g_scan_files_n && g_songs_n < LIB_MAX_SONGS; i++) {
             player_pump();                 /* keep audio fed during the scan     */
             if ((g_songs_n & 31) == 0) {   /* live progress every 32 tracks       */
@@ -2256,8 +2421,19 @@ static void library_ensure(fat32_t *fs)
      * whether a change actually helped instead of judging it by feel. */
     uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
     load_bar("Loading Library", 0);       /* the load phases fill this in */
-    if (!library_load_index(fs))          /* host-built CORELIB.IDX */
+    g_lib_load_err     = 0;
+    g_lib_orphaned     = 0;
+    g_lib_unreadable   = 0;
+    g_lib_retry_budget = LIB_LOAD_RETRY_BUDGET;
+    if (!library_load_index(fs) &&        /* host-built CORELIB.IDX */
+        !g_lib_load_err)                  /* ...absent, not unreadable: */
         library_scan(fs);                  /* fallback: per-file tag scan     */
+    /* A root that could not be read leaves neither path having run to the
+     * end. Mark the load done anyway: library_ensure is called from every
+     * Music menu entry, and re-running the retries and sleeps on each
+     * keypress against a failing disk would make the whole UI crawl. The
+     * error is in g_lib_load_err; a deliberate retry clears g_lib_scanned. */
+    g_lib_scanned = 1;
     build_artists();                       /* so About/Artists count is live */
     g_lib_load_ms = (mmio_read32(USEC_TIMER_ADDR) - t0) / 1000u;
 }
@@ -3131,6 +3307,13 @@ static void      scr_pop(void)        { g_list_epoch++;
                                         if (g_scr_n > 1) g_scr_n--; }
 static screen_t  scr_cur(void)        { return g_scr[g_scr_n - 1]; }
 
+/* Why the last browse_load produced what it did: 0, or the FAT32_* code of a
+ * directory read that failed even after retries. An empty g_browse with a
+ * nonzero code is an album that COULD NOT BE READ, not an album with no
+ * tracks; the tracklist screen should say so (and offer Back), because the
+ * two look identical otherwise and one of them is a disk fault. */
+static int g_browse_err;
+
 /* Read an album's tracklist (the folder at `dir_clus`) into g_browse. Only ever
  * called at depth 1 now — the album LIST is the index-driven g_albums. */
 static void browse_load(fat32_t *fs, uint32_t dir_clus)
@@ -3140,7 +3323,20 @@ static void browse_load(fat32_t *fs, uint32_t dir_clus)
     g_browse_n = 0;
     g_art_clus = 0;                      /* re-captured by browse_collect below */
     g_art_size = 0;
-    fat32_readdir(fs, dir_clus, browse_collect, 0);
+    /* One directory, opened by hand: give it the full set of retries rather
+     * than whatever the boot load left in the budget — the budget exists to
+     * bound a thousand-album boot, not a single user-initiated open. */
+    g_lib_retry_budget = LIB_READDIR_RETRIES;
+    g_browse_err = lib_readdir(fs, dir_clus, browse_collect, 0, &g_browse_n);
+    if (g_browse_err != 0) {
+        g_art_clus = g_art_size = 0;     /* nothing from a walk we don't trust */
+        return;
+    }
+    /* The folder just read cleanly. If the load-time pass could not read it,
+     * this is the re-attempt the flag promised: resolve it now, so its songs
+     * become playable from Songs/Genres/shuffle and the About count drops. */
+    int ai = album_by_clus(dir_clus);
+    if (ai >= 0 && g_albums[ai].unreadable) (void)album_resolve(fs, ai);
 }
 
 /* After entering an album folder: load its hero art, pull each track's
