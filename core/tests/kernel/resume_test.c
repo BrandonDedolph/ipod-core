@@ -43,26 +43,26 @@ static void check(const char *label, int cond)
 /* ---- the environment the copied function reads -------------------------- */
 
 /*
- * A stand-in for main.c's g_songs[]/g_songs_n, carrying only the three fields
+ * A stand-in for main.c's g_songs[]/g_songs_n, carrying only the fields
  * resume_find_song() touches — under the same names, so the copy needs no
  * edits. main.c's lib_song_t has more, and none of it is consulted here.
+ *
+ * stem_hash is what the matcher compares: main.c fills it from the file's
+ * DIRECTORY ENTRY when the record binds (resolve_art_cb), not from file[],
+ * which is the index's 63-byte copy of the name and is display only. The
+ * fixture below sets both the way the device would.
  */
 #define STUB_FILE_MAX 64
 #define STUB_SONGS    16
 
 static struct {
-    char     file[STUB_FILE_MAX];    /* filename, extension trimmed */
+    char     file[STUB_FILE_MAX];    /* filename, extension trimmed (display)  */
+    uint32_t stem_hash;              /* name_hash of the ON-DISK stem; 0 = the  */
+                                     /* record never bound to a file            */
     uint32_t file_clus;              /* 0 = indexed but not on disk */
     uint32_t duration_s;
 } g_songs[STUB_SONGS];
 static int g_songs_n;
-
-/* main.c's name_hash() is static too; name_hash_ref.c holds the parity-checked
- * copy, so route the one call in the body at it. */
-static uint32_t name_hash(const char *s)
-{
-    return name_hash_ref(s);
-}
 
 /* Slop between the library's indexed duration and the decoder's, in seconds.
  * Restated here rather than shared: this file is the independent statement of
@@ -76,7 +76,7 @@ static int resume_find_song(uint32_t hash, uint32_t total_s)
     int best = -1, n_named = 0;
 
     for (int i = 0; i < g_songs_n; i++) {
-        if (name_hash(g_songs[i].file) != hash) {
+        if (hash == 0 || g_songs[i].stem_hash != hash) {
             continue;
         }
         n_named++;
@@ -105,13 +105,31 @@ static void lib_reset(void)
     g_songs_n = 0;
 }
 
-static void lib_add(const char *file, uint32_t clus, uint32_t dur)
+/*
+ * A song as the device holds it after the load. file[] is the index's copy of
+ * the name (63 bytes at most). stem_hash is what the device sets it to: the
+ * hash of file[] at load (provisional), replaced by the hash of the stem the
+ * DIRECTORY ENTRY has when the record binds. `disk_stem` is that on-disk
+ * stem; NULL means "the same as file[]" — a name short enough to have been
+ * stored whole, or a record that never bound and so keeps the provisional
+ * value, exactly as on the device.
+ */
+static void lib_add_disk(const char *file, const char *disk_stem,
+                         uint32_t clus, uint32_t dur)
 {
     int i = g_songs_n++;
     size_t n = strlen(file);
     memcpy(g_songs[i].file, file, n < STUB_FILE_MAX ? n : STUB_FILE_MAX - 1);
+    g_songs[i].stem_hash  = name_hash_ref(disk_stem ? disk_stem : file);
     g_songs[i].file_clus  = clus;
     g_songs[i].duration_s = dur;
+}
+
+/* The common case: a short name, stored in the index exactly as it is on the
+ * disk. */
+static void lib_add(const char *file, uint32_t clus, uint32_t dur)
+{
+    lib_add_disk(file, 0, clus, dur);
 }
 
 #define H(s) name_hash_ref(s)
@@ -247,11 +265,54 @@ static void test_ambiguous(void)
           resume_find_song(H("01 Intro"), 95) < 0);
 }
 
+/* ---- 4. long filenames: the index's copy of the name is not the name ------ */
+
+/*
+ * The index stores the first 63 bytes of a filename. For "16. TRAGIC (feat.
+ * Somebody) [A Name Past Sixty-Three Bytes Long].flac" that copy has lost its
+ * ".flac", and the device's old extension trim — cut at the LAST '.' of the
+ * stored field — cut at "feat." and left file[] reading "16". The track still
+ * played (the record binds to its file by a hash of the full name), so the
+ * queue showed the real stem, resume_capture hashed the real stem, and the
+ * restore then hashed file[] ("16") for every song and never found it.
+ *
+ * The matcher now compares stem_hash, which the device takes from the
+ * directory entry when the record binds. This test fails against the old
+ * body, which hashed file[].
+ */
+static void test_long_name(void)
+{
+    static const char LONG_STEM[] =
+        "16. TRAGIC (feat. Somebody) [A Name Past Sixty-Three Bytes Long]";
+    check("fixture: the stem really is longer than the index field",
+          strlen(LONG_STEM) + strlen(".flac") > 63);
+
+    lib_reset();
+    lib_add("Ceremony", 101, 264);
+    lib_add_disk("16", LONG_STEM, 300, 251);   /* bound: file[] is stale, hash real */
+    check("a track whose stored name was truncated resolves by its on-disk stem",
+          resume_find_song(H(LONG_STEM), 251) == 1);
+    check("...and by the stem alone when the name is unique",
+          resume_find_song(H(LONG_STEM), 0) == 1);
+    check("the truncated copy of the name is not a locator",
+          resume_find_song(H("16"), 251) < 0);
+
+    /* Never bound (the album was unreadable at load, or the file is gone):
+     * the record keeps the provisional hash of its truncated copy, which no
+     * on-disk stem produces, so it can neither be resumed nor mistaken. */
+    lib_reset();
+    lib_add_disk("16", 0, 0, 251);
+    check("an unbound truncated record resolves nothing",
+          resume_find_song(H(LONG_STEM), 251) < 0 &&
+          resume_find_song(H("16"), 251) < 0);
+}
+
 int main(void)
 {
     test_resolves();
     test_stale();
     test_ambiguous();
+    test_long_name();
 
     printf("resume_test: %s (%d failure%s)\n",
            g_fails == 0 ? "PASS" : "FAIL", g_fails, g_fails == 1 ? "" : "s");
