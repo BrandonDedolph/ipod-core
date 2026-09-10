@@ -126,6 +126,24 @@ if target == 'sim'
   )
   test('text', text_test, suite: 'unit')
 
+  # chrome: the shared list/panel chrome (core/ui/chrome.c) — the SAME source
+  # the ARM build links into core.elf. This target is the reason chrome.c
+  # exists: every function in it was a `static` inside kernel/main.c, which
+  # meson builds only for target == 'hw', so none of the list geometry,
+  # selection bars, scroll clamps or header layout could be checked without
+  # flashing the device. Draws into console.c's back buffer and measures glyphs
+  # through text.c; the marquee's clock is injected and left unset here, so
+  # overflowing titles clip. Assertions read pixels back out of the
+  # framebuffer rather than trusting return values.
+  chrome_test = executable(
+    'chrome_test',
+    sources: ['ui/chrome_test.c', '../ui/chrome.c', '../ui/text.c',
+              '../ui/palette.c', '../kernel/console.c'],
+    include_directories: include_directories('../ui', '../kernel', '../hal'),
+    override_options: test_opts,
+  )
+  test('chrome', chrome_test, suite: 'unit')
+
   # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
   # — the SAME source the ARM build links into core.elf. Shrinks a loaded
   # folder.art to a list chip / album-detail cover when no folder.thm is present.

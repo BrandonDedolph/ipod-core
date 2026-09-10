@@ -206,6 +206,20 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Shared list/panel chrome (ours): the header, list rows, selection bar,
+  # scrollbar, scroll window, rounded rect and text wrappers that every screen
+  # is built from. EXTRACTED OUT OF kernel/main.c, where it was file-local
+  # static and therefore uncompilable on the host (main.c is hw-only), and
+  # where ui/screen_settings.c kept a hand-maintained second copy that had
+  # already drifted. Pure: console.h + text.h + palette.h, no hardware — the
+  # marquee's time source is injected via ui_set_scroll_text(). Same chrome.c
+  # the host chrome_test compiles.
+  chrome_hw_lib = static_library(
+    'core_chrome_hw',
+    sources: ['ui/chrome.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Full-screen "charging" battery view (ours): renders design_reference's
   # ChargingScreen into the RGB565 console framebuffer with fill_rect shapes +
   # the Nunito text renderer. Pure integer rendering — no libc/libm/malloc, no
@@ -258,7 +272,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),
