@@ -1,0 +1,40 @@
+# Golden SER0 transcript for the clicky boot smoke (tests/scripts/clicky_smoke.py).
+#
+# One line per `core: ` status line the firmware emits between reset and
+# the idle task, in order, and NOTHING else may appear between them. The
+# run is stopped the moment the last line arrives, so this is the whole
+# transcript, not a prefix — a doubled line (the COP-park regression, where
+# both cores raced through kernel_main) or a missing one fails the diff.
+#
+# Only BOOT MILESTONES belong here. A field that legitimately differs
+# between the emulator and the device, or between runs, is written as
+# <hex32> and matched as any eight hex digits:
+#   - PROCESSOR_ID reads 0x55 on silicon and 0x55555555 in clicky (its
+#     4G quirk; see 01-soc-pp5022.md "Dual core"). crt0.S compares only
+#     the low byte, so both are the CPU.
+#   - cpu freq reads the post-PLL clock. clicky never sets the PLL lock
+#     bit, so the bounded lock poll gives up and the clock stays at the
+#     24 MHz boot crystal there; the device reports 30 MHz.
+# Nothing in this file is a timing number. Do not add one.
+#
+# The last two lines are the ones that make this more than a "did C run"
+# check: `sched init` proves kernel_main survived timer_init + the IRQ
+# unmask, and `idle task entered` is printed FROM the idle task, which is
+# only reached through switch_context + task_trampoline in kernel/switch.S
+# — the first restore of a hand-built initial frame, on a hand-carved
+# stack. That asm had no automated coverage of any kind before this file.
+#
+# To regenerate after a DELIBERATE change to the boot log: run the smoke
+# locally (see the script's docstring), copy the `core: ` lines from its
+# transcript, and re-apply the <hex32> masks above. Then explain the change
+# in the commit that carries it.
+core: kernel alive (iPod 5G/5.5G, PP5022)
+core: uart self-test 1234ABCD
+core: PROCESSOR_ID <hex32>
+core: clock init -> 30 MHz
+core: cpu freq <hex32>
+core: cache init
+core: timer init @ 100 Hz, enabling IRQs
+core: lcd bcm NOT powered, skipping disk + UI
+core: sched init (idle fallback)
+core: idle task entered
