@@ -557,6 +557,11 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
  * (playback keeps running); a brief plate flashes on the engage/disengage edge,
  * and a small padlock stays in the status strip while held. */
 static int         g_locked;
+
+/* Last believed headphone state (1 seated, 0 out, -1 unknown) — the unplug
+ * edge detector in run_ui(). Starts unknown so a boot with nothing in the
+ * jack cannot look like a pull-out. */
+static int         g_hp_last = -1;
 static ui_window_t g_lock_flash;
 
 /*
@@ -4352,6 +4357,31 @@ _Noreturn static void run_ui(fat32_t *fs)
         was_active = now_active;
         if (battery_refresh(0) && scr_cur() == SCR_CHARGING) {
             dirty = 1;                    /* refresh the % on the charging screen  */
+        }
+
+        /*
+         * Pause when the headphones are pulled out.
+         *
+         * Deliberately one-directional: re-inserting does NOT resume. The
+         * insertion switch closes before the audio contacts seat, so resuming
+         * on that edge would start playing into a half-made connection, at
+         * whatever the volume happened to be, while the user still has hold of
+         * the plug. Every reference player waits for Play, and keeping it
+         * one-way means there is no "was this pause the jack's or the user's?"
+         * flag to get wrong later.
+         *
+         * hal_headphones_present() returns -1 until the detect line's polarity
+         * is confirmed on the device (hal/hw/headphone.h), and the >= 0 guard
+         * is what makes that inert rather than a pause storm. Sitting outside
+         * the input-swallowing branch is also deliberate: a yank in the pocket
+         * is the canonical case, and Hold must not swallow it.
+         */
+        int hp = hal_headphones_present();
+        if (hp == 0 && g_hp_last == 1 && player_active() && !player_paused()) {
+            player_pause();
+        }
+        if (hp >= 0) {
+            g_hp_last = hp;
         }
 
         /* Charging screen: pop up on a plug-IN edge (not if already powered at
