@@ -77,6 +77,118 @@ int battery_sample(battery_sample_t *out);
  */
 int battery_percent_from_mv(int mv);
 
+/* ---------------------------------------------------------------------------
+ * Low-battery policy: filtered millivolts, two thresholds, one state machine.
+ *
+ * Nothing in this firmware reacted to a low cell at all: every consumer of the
+ * gauge only DREW it, and the device ran until the cell's protection IC or the
+ * PMU cut power — which it can do in the middle of config_save() putting a
+ * sector on the user's disk. 06-power.md documents the intended two-stage
+ * policy (park the drive at 3500 mV, power off at 3300 mV); this is it.
+ *
+ * Driven by MILLIVOLTS, never percent: the percent curve is a 2005 Apple-cell
+ * table that has never been measured against the fitted cell (see the header
+ * comment), and its low end is exactly the region a shutdown decision lives
+ * in. Millivolts are what the ADC actually measured.
+ *
+ * Driven by a FILTERED value, never a single sample: the reading is raw and
+ * unfiltered, and a 1.8" HDD spin-up sags the cell by tens to low hundreds of
+ * millivolts for a couple of seconds. In the 3720..3840 mV plateau the curve
+ * is 30 mV per 10 %, so one sagged sample looks like a large sudden drop —
+ * and, near either line, like a crossing that never happened. The policy sees
+ * only the median of the last BATTERY_FILTER_N samples (see battery.c for why
+ * a median and not an EMA), and the shutoff line must additionally hold for
+ * BATTERY_SHUTOFF_CONFIRM consecutive evaluations.
+ *
+ * The caller (kernel/main.c battery_refresh) samples every 5 s and feeds each
+ * result here; this module decides, the caller acts on the returned EVENT.
+ * Events are EDGES, so an action fires exactly once per crossing.
+ * ------------------------------------------------------------------------- */
+
+/* Thresholds on the FILTERED, clamped millivolts (06-power.md, "Brown-out /
+ * low-battery shutdown"). Compared with <=, not <: battery_sample() clamps mv
+ * to a 3300 mV floor, which coincides with the shutoff line, so a strict
+ * comparison could never fire on the clamped value. */
+#define BATTERY_MV_DISKSAFE   3500   /* park the drive, refuse disk writes     */
+#define BATTERY_MV_SHUTOFF    3300   /* power off (PMU standby)                */
+
+/* Hysteresis: DISKSAFE clears only once the filtered value has climbed back to
+ * this. 100 mV is above any plausible load-release rebound at these voltages
+ * but far below the plateau, so a genuinely low cell cannot bounce out of
+ * DISKSAFE by merely having its drive parked, while a charger plugged in
+ * (which drives the terminal straight up) clears it within one filter window. */
+#define BATTERY_MV_RECOVER    3600
+
+/* Median window. 5 samples at the 5 s cadence = 25 s of history; a median of 5
+ * ignores up to TWO outliers outright, i.e. two consecutive spin-up-sagged
+ * samples move the filtered value by exactly zero. */
+#define BATTERY_FILTER_N      5
+
+/* Consecutive full-ring evaluations with the median at/below the shutoff line
+ * before SHUTOFF fires. Powering off is the one action that cannot be undone
+ * by the next sample, so it gets a second, independent debounce on top of the
+ * median: 3 evaluations = 15 s, during which the median has to stay down —
+ * which in turn needs at least 3 of every 5 raw samples down. Worst-case
+ * response from the true crossing is therefore ~25-30 s; see battery.c for
+ * why that is well inside the margin the cell gives us. */
+#define BATTERY_SHUTOFF_CONFIRM 3
+
+typedef enum {
+    BATTERY_LEVEL_OK = 0,       /* normal operation                           */
+    BATTERY_LEVEL_DISKSAFE,     /* <= 3500 mV filtered: drive parked, no writes */
+    BATTERY_LEVEL_SHUTOFF,      /* <= 3300 mV confirmed: powering off (terminal) */
+} battery_level_t;
+
+typedef enum {
+    BATTERY_EVENT_NONE = 0,
+    BATTERY_EVENT_DISKSAFE,     /* OK -> DISKSAFE: flush, park, stop writing  */
+    BATTERY_EVENT_SHUTOFF,      /* DISKSAFE -> SHUTOFF: power off now         */
+    BATTERY_EVENT_RECOVERED,    /* DISKSAFE -> OK: writes may resume          */
+} battery_event_t;
+
+/* Forget all history: empty ring, level OK. Also the state at boot. */
+void battery_policy_reset(void);
+
+/*
+ * Feed one sample. `mv` is battery_sample()'s clamped mv, or -1 if that call
+ * failed. A failed sample is NOT a low sample: it is not entered into the
+ * ring and cannot move the filter or the level in either direction — a bus
+ * glitch must never look like a flat battery (and cannot look like a
+ * recovery either). Returns the edge this sample caused, or NONE.
+ *
+ * The policy is ARMED only once the ring is full (BATTERY_FILTER_N good
+ * samples, ~20 s after boot at the 5 s cadence). Before that the median is
+ * computed over what is present, for the gauge, but no event can fire — the
+ * boot path is one long disk spin-up, exactly the sag the filter exists to
+ * ride through.
+ */
+battery_event_t battery_policy_feed(int mv);
+
+/* Current level (for a UI to read: warn at DISKSAFE, "goodbye" at SHUTOFF). */
+battery_level_t battery_policy_level(void);
+
+/* Median of the ring, or -1 if no good sample has been fed yet. This — not the
+ * instantaneous sample — is what the gauge should convert with
+ * battery_percent_from_mv(), so the status-strip glyph stops twitching on
+ * every spin-up. */
+int battery_filtered_mv(void);
+
+/* 1 once the ring holds BATTERY_FILTER_N good samples (policy armed). */
+int battery_filter_ready(void);
+
+/*
+ * 0 while the cell is at or below the disk-safe line: nothing should start a
+ * disk WRITE, because there may not be enough energy left to finish it and a
+ * torn sector is the one outcome this whole policy exists to prevent. Reads
+ * are unaffected — playback can keep going down to the shutoff line.
+ *
+ * config_save() (kernel/config.c) is the only ata_write_sectors() caller in
+ * the firmware, and settings_commit() in kernel/main.c is its only caller;
+ * that is where this belongs. Pending changes should stay pending, not be
+ * dropped, so they land on the next commit after RECOVERED.
+ */
+int battery_disk_writes_allowed(void);
+
 /*
  * External power present: main charger (dock/FireWire/USB power) OR a
  * USB charger is attached. Pure GPIO read, no I2C. Returns 1/0.

@@ -792,9 +792,17 @@ static int      g_bat_ext = 0;               /* external power present          
 static uint32_t g_bat_last_us;
 static int      g_bat_raw = -1;              /* 10-bit ADC code, for calibration  */
 static int      g_bat_mv_raw = -1;           /* mV before the plausibility clamp  */
+static int      g_bat_mv_filt = -1;          /* median of recent samples (policy) */
 
 /* Defined further down with the other formatters; needed by the battery log. */
 static int u32_to_dec(char *dst, unsigned v);
+
+/* Defined further down; the low-battery policy in battery_refresh() acts
+ * through them. Forward-declared here rather than moving battery_refresh(),
+ * which sits with the status-strip state it feeds. */
+static void settings_commit(int force);
+static void resume_capture(void);
+_Noreturn static void enter_standby(void);
 
 /* Measured cost of the last full-frame present; defined with the present
  * throttle further down. Reported on the stats line below so the number the
@@ -838,15 +846,29 @@ static int battery_refresh(int force)
     if (battery_sample(&bs) != 0) {
         /* Bus failure is NOT a flat battery. Hold the last good reading rather
          * than reporting -1, which draw_battery() clamps to 0% — i.e. an empty
-         * red battery for an I2C hiccup. */
+         * red battery for an I2C hiccup. The policy is told the same thing:
+         * battery_policy_feed(-1) touches neither the filter nor the level, so
+         * a flaky bus can neither power the device off nor clear a genuine
+         * DISKSAFE. */
+        (void)battery_policy_feed(-1);
         uart_puts("core: batt read failed\n");
         return 1;
     }
     g_bat_raw    = bs.raw;
     g_bat_mv_raw = bs.mv_raw;
     g_bat_mv     = bs.mv;
-    g_bat_pct    = battery_percent_from_mv(bs.mv);
     g_bat_ext    = power_is_external();
+
+    /*
+     * Low-battery policy (battery.h). The sample goes into the median filter
+     * and the policy decides; we act on the EDGE it returns, so each action
+     * happens once per crossing. The displayed percentage is converted from
+     * the FILTERED millivolts too — same curve, same mapping, just not
+     * re-evaluated on a single spin-up-sagged sample every 5 s.
+     */
+    battery_event_t ev = battery_policy_feed(bs.mv);
+    g_bat_mv_filt = battery_filtered_mv();
+    g_bat_pct     = battery_percent_from_mv(g_bat_mv_filt);
 
     /*
      * One line per sample, so a full discharge can be logged over UART and
@@ -864,6 +886,8 @@ static int battery_refresh(int force)
     uart_puts("core: batt raw ");   uart_dec(g_bat_raw);
     uart_puts(" mv ");              uart_dec(g_bat_mv_raw);
     uart_puts(" clamped ");         uart_dec(g_bat_mv);
+    uart_puts(" filt ");            uart_dec(g_bat_mv_filt);
+    uart_puts(" lvl ");             uart_dec((int)battery_policy_level());
     uart_puts(" pct ");             uart_dec(g_bat_pct);
     uart_puts(" ext ");             uart_dec(g_bat_ext);
     uart_puts(" chg ");             uart_dec(power_is_charging());
@@ -893,6 +917,53 @@ static int battery_refresh(int force)
     uart_puts(" underruns ");        uart_dec((int)audio_underruns());
     uart_puts(" present_us ");       uart_dec((int)g_present_cost_us);
     uart_putc('\n');
+
+    /*
+     * Act on the policy's edge. Logged BEFORE acting, because the shutoff
+     * branch never returns and the UART line is the only record of why the
+     * device went dark.
+     */
+    switch (ev) {
+    case BATTERY_EVENT_DISKSAFE:
+        uart_puts("core: batt DISKSAFE: flushing settings, parking drive\n");
+        /*
+         * The LAST write. Persist the resume position + any pending change
+         * NOW, while the filtered cell is still at ~3500 mV and has the
+         * energy to finish one sector plus the FLUSH; from here down nothing
+         * should write (battery_disk_writes_allowed() == 0, which
+         * settings_commit() still needs to consult, see battery.h). This
+         * mirrors suspend_to_ram()'s "last chance to persist": after this the
+         * drive is parked and the next event is power-off. Forced, so the 3 s
+         * debounce does not eat it.
+         */
+        resume_capture();
+        settings_commit(1);
+        /* Park, unless the player is mid-stream: it parks between its own
+         * refill bursts (player.c) and its next read would only spin the
+         * platters straight back up. Same guard as the main loop's idle
+         * spin-down. Reads are harmless to data; writes are what matters. */
+        if (!ata_is_parked() && (!player_active() || player_paused())) {
+            ata_standby();
+        }
+        break;
+
+    case BATTERY_EVENT_SHUTOFF:
+        uart_puts("core: batt SHUTOFF: entering standby\n");
+        /* The documented power-off path: stop the player, blank the panel,
+         * PMU deep-sleep with wake sources set. Its own settings_commit(1)
+         * is the reason the DISKSAFE flush above exists: by now the write
+         * gate should refuse it (see battery_disk_writes_allowed). */
+        enter_standby();                  /* does not return */
+
+    case BATTERY_EVENT_RECOVERED:
+        uart_puts("core: batt RECOVERED: writes allowed again\n");
+        /* Nothing else to do: a change left pending by the gate rides out on
+         * the main loop's next settings_commit(0). */
+        break;
+
+    case BATTERY_EVENT_NONE:
+        break;
+    }
     return 1;
 }
 
