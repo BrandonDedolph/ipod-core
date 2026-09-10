@@ -23,6 +23,11 @@
  * here (2 x 8192) is the device's — hal/hw/audio.c's AUDIO_FRAMES_PER_BUF,
  * doubled for the ping-pong pair — and is what player.c compensates by. If
  * that buffer changes, this test and DAC_INFLIGHT_FRAMES move together.
+ *
+ * The last section is the other side of the same ring: how much the pump
+ * pushes per pass. One step while the ring is healthy, a refill to two pulls'
+ * worth when it is thin — the ration a blocking caller (the library scan)
+ * would otherwise starve the DMA through.
  */
 
 #include <stdio.h>
@@ -73,6 +78,19 @@ static int drain_exact(uint32_t frames)
         frames -= (uint32_t)want;
     }
     return ok;
+}
+
+/* Pull until the ring is dry; returns how much it held. */
+static uint32_t drain_all(void)
+{
+    uint32_t total = 0;
+    for (;;) {
+        int got = stub_drain(PULL);
+        if (got <= 0) {
+            return total;
+        }
+        total += (uint32_t)got;
+    }
 }
 
 /*
@@ -186,6 +204,31 @@ int main(void)
     }
     xpect(&c, "short: playback then runs out at the end of the queue",
           player_active() == 0);
+
+    /* ---- 4. the pump's decode ration versus a thin ring ------------------ *
+     * One 1024-frame step per pass while the ring is healthy (the UI's
+     * latency budget). Below two DMA pulls' worth, a caller that blocks
+     * between pumps — the library scan — would drain the ring at one step per
+     * pass, so the pump must instead refill to that line in one pass. The
+     * fill after a pump is read back by draining the ring dry. */
+    stub_reset();
+    stub_set_track_frames(262144u);                /* never reaches EOS here */
+    make_entries(ents, 1);
+    player_play_queue(ents, 1, 0, 0, 0);           /* primes 65536 frames */
+    xpect(&c, "ration: leave 20480 in the ring (above the 16384 line)",
+          drain_exact(65536u - 20480u));
+    player_pump();
+    xpect(&c, "ration: a healthy ring gets exactly one 1024-frame step",
+          drain_all() == 20480u + 1024u);
+    player_pump();                                 /* ring was empty */
+    xpect(&c, "ration: an empty ring is refilled to the 16384-frame line",
+          drain_all() == HAL_INFLIGHT_FRAMES);
+    player_pump();                                 /* empty again: back to the line */
+    xpect(&c, "ration: pull one buffer, leaving the ring one pull below the line",
+          drain_exact(HAL_BUF_FRAMES));
+    player_pump();
+    xpect(&c, "ration: one pass restores the line, not one step",
+          drain_all() == HAL_INFLIGHT_FRAMES);
 
     return xfail_done(&c);
 }

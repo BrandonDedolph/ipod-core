@@ -409,23 +409,74 @@ static void decode_pump(void)
  */
 #define SEEK_PRIME_FRAMES (3u * DAC_BUF_FRAMES)   /* ~557 ms at 44.1 kHz */
 
-/* Decode at most ONE chunk into the ring, then return. Used inside the play
- * loop so decoding never monopolizes the loop: however slow the codec is (a
- * soft-float MP3 frame can take many ms), the loop still gets back to polling
- * the wheel and repainting each pass, so the UI never appears frozen. Returns
- * the frames decoded this step (0 at EOS or when the ring is already full). */
+/*
+ * Below this many frames in the ring, decode_step stops rationing itself.
+ *
+ * The DMA feeder pulls DAC_BUF_FRAMES at a time and needs that many present
+ * at each pull, ~186 ms apart. Two pulls' worth covers the pull that may land
+ * at any instant plus the whole interval before the next one, so a ring at
+ * or above this line is safe for the duration of one pass however long that
+ * pass turns out to be — and one below it is not, unless the pass itself
+ * puts the frames back. 372 ms at 44.1 kHz.
+ */
+#define CATCH_UP_FRAMES (2u * DAC_BUF_FRAMES)
+
+/*
+ * Decode ONE step into the ring, then return — unless the ring is thin.
+ *
+ * The one-step ration exists for the UI: however slow the codec is (a
+ * soft-float MP3 frame can take many ms), the loop gets back to the wheel and
+ * the panel after ~23 ms of audio's worth of work, never after a 74 ms block.
+ *
+ * IS THE RATION A THROUGHPUT LIMIT? In the main loop, no. The loop only halts
+ * when the pump had nothing to do, so while there is decoding to do the pass
+ * rate is 1024 frames per (decode time + the pass's own cost), and the pass
+ * cost — wheel, timer and event reads, tens of microseconds — is under 1 % of
+ * the 23.2 ms one step represents. The codec sets the throughput, not the
+ * cap: the only measured figure in this tree is ~74 ms for a 4096-frame step,
+ * i.e. ~18 ms per 1024 frames, 78 % of real time, and the ring keeps up at
+ * any cost below 100 % whether the step is 1024 or 4096. The tightest DMA
+ * deadline is just after a seek, where the HAL's two pulls leave one buffer
+ * in the ring: the second completion, 372 ms out, needs 8 more steps —
+ * ~145 ms of decode plus one ~70 ms read-ahead fill — a 1.7x margin.
+ *
+ * Where the ration DOES starve the ring is a caller that blocks between
+ * pumps. The library scan (the no-index fallback, reachable from every Music
+ * entry while a track plays, and documented as "anti-skip covers audio")
+ * pumps once per file it probes, and each probe is a ~16 KB PIO read plus a
+ * tag parse — ~35 ms at this drive's ~0.28 s per 128 KB. One step per ~53 ms
+ * pass is ~19k frames/s against 44.1k consumed: the ring loses ~25k frames a
+ * second, so a full 5.94 s ring is gone ~10 s into a scan and a 1.49 s prime
+ * in ~2.6 s. Scans take longer than that. Not a worst case: the arithmetic.
+ *
+ * So: one step while the ring is healthy, and below CATCH_UP_FRAMES keep
+ * decoding until it is back above the line (at most the watermark's worth of
+ * steps, ~290 ms at the measured cost). The UI stalls for that long only when
+ * the alternative is silence, and a blocking caller then self-stabilises —
+ * each pass puts back what the DMA pulled during it, which is sustainable at
+ * any decode cost below real time. The healthy-ring path is unchanged.
+ *
+ * Returns the frames decoded this pass (0 at EOS or when the ring is full).
+ */
 static int decode_step(void)
 {
-    if (g_eos || pcm_ring_free(&g_ring) < PLAY_STEP_FRAMES) {
-        return 0;
+    int total = 0;
+    for (unsigned steps = 0; steps < CATCH_UP_FRAMES / PLAY_STEP_FRAMES; steps++) {
+        if (g_eos || pcm_ring_free(&g_ring) < PLAY_STEP_FRAMES) {
+            break;
+        }
+        int got = decode_chunk(PLAY_STEP_FRAMES);
+        if (got <= 0) {
+            g_eos = 1;
+            break;
+        }
+        g_written += pcm_ring_write(&g_ring, decode_buf, (uint32_t)got);
+        total += got;
+        if (pcm_ring_fill(&g_ring) >= CATCH_UP_FRAMES) {
+            break;                       /* healthy: one step is the ration */
+        }
     }
-    int got = decode_chunk(PLAY_STEP_FRAMES);
-    if (got <= 0) {
-        g_eos = 1;
-        return 0;
-    }
-    g_written += pcm_ring_write(&g_ring, decode_buf, (uint32_t)got);
-    return got;
+    return total;
 }
 
 /* FAT32 block callback: read absolute 512-byte LBAs off the disk.
@@ -1358,10 +1409,16 @@ void player_pump(void)
      * the feeder PULLING the boundary, 186..372 ms early. */
     if (g_pending && handover_audible(fill)) {
         pending_commit();
-        if (!g_pl_active) {
-            return;                      /* commit failed (unclockable rate) */
-        }
-        fill = pcm_ring_fill(&g_ring);
+        /* That was this pass's work. A commit already reads the new track's
+         * art off the disk and, on a format change, drains and re-clocks the
+         * codec — the longest pass the pump has — so it does not also decode.
+         * The next pass is one loop iteration away, and it is the one that
+         * prefetches the track after this one if this one turns out to be
+         * fully decoded already: one event per pass keeps a commit and the
+         * prefetch it enables from landing in the same call. (A commit that
+         * failed on an unclockable rate has left the player inactive, and
+         * returning covers that too.) */
+        return;
     }
 
     /* Decode, unless a format-changing handover is waiting: those frames must
