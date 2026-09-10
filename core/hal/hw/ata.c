@@ -3,12 +3,18 @@
  * core/hal/hw/ata.c — minimal PIO-polled ATA sector reader (PP5022).
  *
  * Implements core/docs/hw/04-ata.md's PIO LBA28 read path, trimmed to the
- * minimum: the chainloading bootloader already powered/spun/PIO-timed the
- * drive, so we skip power, reset, IDENTIFY and SET FEATURES, and we do NOT
- * touch IDE0_PRI_TIMING (its values depend on the CPU clock the bootloader
- * ran at). PP502x task registers are plain accesses — no PP5002 IDE_CFG
- * write handshake. Control registers 8-bit; data port 16-bit, 256
- * halfwords per 512-byte sector, little-endian, no byte swap.
+ * minimum. We boot DIRECTLY as the OSOS image (docs/hw/README.md, "How we
+ * actually boot"): there is no chainloader, so the drive state we inherit is
+ * whatever the Apple boot ROM left behind after it read our image off the
+ * firmware partition — powered, spun up, and with IDE0_PRI_TIMING programmed
+ * to values of the ROM's choosing at the ROM's clock. That is enough for us
+ * to skip power, IDENTIFY and SET FEATURES, and we deliberately do NOT
+ * rewrite IDE0_PRI_TIMING: the ROM's strobes read the disk fine today, and a
+ * wrong value there is a silent boot hang with no UART to explain it (see
+ * ata_clock_hold for how we keep the bus clock where the ROM left it
+ * instead). PP502x task registers are plain accesses — no PP5002 IDE_CFG
+ * write handshake. Control registers 8-bit; data port 16-bit, 256 halfwords
+ * per 512-byte sector, little-endian, no byte swap.
  */
 
 #include "pp5022.h"
@@ -17,8 +23,8 @@
 
 /*
  * Bounded polls so a wedged/absent drive can't hang the kernel. The disk
- * is already spun up (bootloader used it) so waits are short in practice;
- * 1<<20 trips is generously past a healthy PIO sector.
+ * is already spun up (the boot ROM just read our image off it) so waits are
+ * short in practice; 1<<20 trips is generously past a healthy PIO sector.
  */
 #define ATA_BSY_SPIN_LIMIT (1u << 20)
 /* Data-phase (DRQ) wait ceiling is TIME-based (microseconds), not an iteration
@@ -75,12 +81,15 @@ static int ata_wait_ready(void)
 /*
  * CPU-frequency bracket for a transfer (04-ata.md, "PIO timing values" — the
  * table is qualified "At 80 MHz operation"). We never rewrite
- * IDE0_PRI_TIMING0, so the PIO strobe widths are frozen at whatever the
- * chainloader calibrated them to, while kernel/clock.c moves the core (and
- * therefore the IDE bus clock) between 30 and 80 MHz. Issuing a transfer at a
- * DIFFERENT clock than the strobes were calibrated for is at best slow and at
- * worst marginal, so every command is bracketed in the boost: one fixed
- * operating point for all ATA traffic.
+ * IDE0_PRI_TIMING0, so the PIO strobe widths are frozen at whatever the Apple
+ * boot ROM programmed before it handed us control (there is no chainloader
+ * to have re-timed them — see the file banner), while kernel/clock.c moves
+ * the core (and therefore the IDE bus clock) between 30 and 80 MHz. Issuing a
+ * transfer at a DIFFERENT clock than the strobes were programmed for is at
+ * best slow and at worst marginal, so every command is bracketed in the
+ * boost: one fixed operating point for all ATA traffic, the boosted one the
+ * ROM's values are known to work at (every sector this firmware has ever read
+ * on the device went through it).
  *
  * cpu_boost/cpu_unboost are refcounted, so when the UI or the player already
  * holds a boost (the common case — main.c boosts whenever the backlight is on
@@ -256,9 +265,30 @@ static int g_ata_parked;
 
 int ata_is_parked(void) { return g_ata_parked; }
 
+/*
+ * LBA28 address-space guard. The register programming below carries only 28
+ * address bits — SECTOR/LCYL/HCYL plus the low nibble of SELECT — so an LBA
+ * at or past 1<<28 does not fail: its top bits are masked off, the drive
+ * quietly serves (or, on a write, OVERWRITES) the sector 2^28 lower, and the
+ * command reports success. Nothing on the fitted 80 GB drive lives above
+ * 2^28 sectors (128 GiB), and the FAT layer above us never asks; this exists
+ * so a future larger disk or a corrupt partition table fails loudly at the
+ * driver instead of silently aliasing the wrong sector. Written to avoid the
+ * uint32 wrap that `lba + count` would suffer near the top of the range.
+ */
+#define ATA_LBA28_SECTORS (1u << 28)
+
+static int ata_lba28_in_range(uint32_t lba, uint32_t count)
+{
+    return lba < ATA_LBA28_SECTORS && count <= ATA_LBA28_SECTORS - lba;
+}
+
 static int ata_read_raw_locked(uint32_t lba, uint32_t count, void *buf)
 {
     if (count == 0 || count > 256) {
+        return -1;
+    }
+    if (!ata_lba28_in_range(lba, count)) {
         return -1;
     }
     if (ata_wait_ready() != 0) {
@@ -425,14 +455,13 @@ int ata_wakeup(void)
  * PIO WRITE path (LBA28). 04-ata.md, "Read / write paths" -> "Write
  * differences" + "Power-management commands" -> "Flush cache".
  *
- * *** UNVERIFIED ON HARDWARE. *** Every line below is written from the doc
- * and mirrored off the read path; nothing here has yet touched a real drive,
- * and it is deliberately NOT wired to any caller — no settings file, no
- * playlist writer, no caller of any kind. It is a reviewed primitive only,
- * and the first thing anyone wiring it up must do is confirm it on device
- * against a scratch LBA (read back and compare) BEFORE letting it near a
- * region of the disk that matters. A wrong LBA here does not fail loudly the
- * way a bad read does: it destroys data.
+ * PROVEN ON HARDWARE 2026-07-27, and wired to exactly ONE caller: the
+ * settings save in kernel/config.c, which resolves its target LBA three
+ * independent ways before letting a byte leave the CPU and whose banner
+ * documents the re-qualification procedure (write a scratch LBA, read back,
+ * compare, fsck). Anyone adding a SECOND caller owes that same procedure,
+ * because a wrong LBA here does not fail loudly the way a bad read does: it
+ * destroys data.
  *
  * ALIGNMENT IS NOT OPTIONAL. This drive reports 2 logical sectors per
  * physical sector and REJECTS sub-physical-sector access with IDNF (see the
@@ -476,13 +505,28 @@ static int ata_wait_not_busy_timed(void)
  * Raw PIO WRITE SECTORS: `count` logical sectors at `lba` from `buf`. Both
  * must already be physical-sector-aligned (the wrapper guarantees it). The
  * shape mirrors ata_read_raw exactly — same register programming, same
- * command-to-status settle, same per-sector DRQ handshake — with the data
- * direction reversed and a completion wait after the final sector, because on
- * a write the drive asserts BSY after the last word while it commits.
+ * command-to-status settle, same per-sector DRQ handshake, SAME MID-TRANSFER
+ * RECOVERY — with the data direction reversed and a completion wait after the
+ * final sector, because on a write the drive asserts BSY after the last word
+ * while it commits.
+ *
+ * The recovery is not optional on the write side either. The first version of
+ * this function returned straight out of the loop on a DRQ timeout or an
+ * ERR/DF status, leaving the drive mid-WRITE with sectors still queued and a
+ * possibly half-filled buffer — exactly the residue the read path's
+ * ata_recover() banner warns about, except that the very next command after a
+ * settings save is typically the PLAYER'S REFILL READ, which would then be
+ * issued on top of that residue and could return shifted data reported as
+ * success. Every failure exit after the command byte is written therefore
+ * goes through ata_recover(), which also lets a bad LBA surface as
+ * ATA_ERR_IDNF instead of a retryable -3.
  */
 static int ata_write_raw(uint32_t lba, uint32_t count, const void *buf)
 {
     if (count == 0 || count > 256) {
+        return -1;
+    }
+    if (!ata_lba28_in_range(lba, count)) {
         return -1;
     }
     if (ata_wait_ready() != 0) {
@@ -508,7 +552,8 @@ static int ata_write_raw(uint32_t lba, uint32_t count, const void *buf)
     for (uint32_t s = 0; s < count; s++) {
         int rc = ata_wait_drq();
         if (rc != 0) {
-            return rc == -2 ? -3 : -2;   /* -3 drive error, -2 timeout */
+            /* -3 drive error, -2 timeout; ata_recover may upgrade to IDNF. */
+            return ata_recover(rc == -2 ? -3 : -2);
         }
         /* Read the primary status once to acknowledge, then stream the
          * sector out: 256 little-endian halfwords, no byte swap. */
@@ -518,24 +563,29 @@ static int ata_write_raw(uint32_t lba, uint32_t count, const void *buf)
         }
         uint8_t st = mmio_read8(ATA_ALT_STATUS_ADDR);
         if (st & (ATA_STATUS_ERR | ATA_STATUS_DF)) {
-            return -3;
+            return ata_recover(-3);
         }
     }
 
     /* The drive holds BSY after the final data word while it commits the
      * transfer; only then is the status meaningful. (The read path has no
-     * equivalent step — its last DRQ IS the last data.) */
+     * equivalent step — its last DRQ IS the last data.) A drive that never
+     * drops BSY, or reports an error once it does, is still mid-command from
+     * our point of view: reset it before anyone issues the next one. */
     if (ata_wait_not_busy_timed() != 0) {
-        return -2;
+        return ata_recover(-2);
     }
     if (mmio_read8(ATA_ALT_STATUS_ADDR) & (ATA_STATUS_ERR | ATA_STATUS_DF)) {
-        return -3;
+        return ata_recover(-3);
     }
     return 0;
 }
 
 /* Push the drive's write cache to the platters. See the banner above: this is
- * what makes a returned write durable across a power cut. */
+ * what makes a returned write durable across a power cut. A flush that times
+ * out or errors leaves the drive in a state we cannot characterise — and the
+ * next command is the player's refill — so it takes the same recovery as a
+ * failed transfer rather than handing a wedged channel to the reader. */
 static int ata_flush_cache(void)
 {
     if (ata_wait_ready() != 0) {
@@ -547,10 +597,10 @@ static int ata_flush_cache(void)
         /* command-to-status settle */
     }
     if (ata_wait_not_busy_timed() != 0) {
-        return -2;
+        return ata_recover(-2);
     }
     if (mmio_read8(ATA_ALT_STATUS_ADDR) & (ATA_STATUS_ERR | ATA_STATUS_DF)) {
-        return -3;
+        return ata_recover(-3);
     }
     return 0;
 }
@@ -575,8 +625,8 @@ int ata_write_sectors(uint32_t lba, uint32_t count, const void *buf)
      * Hold the CPU/IDE clock for the WHOLE request — data phase and flush
      * alike — exactly as ata_read_raw does per command (see ata_clock_hold).
      * We never rewrite IDE0_PRI_TIMING0, so the PIO strobe widths are frozen
-     * at whatever the chainloader calibrated at 80 MHz while kernel/clock.c
-     * moves the core between 30 and 80. A read issued at the wrong clock is
+     * at whatever the boot ROM programmed, while kernel/clock.c moves the
+     * core between 30 and 80 MHz. A read issued at the wrong clock is
      * slow or marginal and fails loudly; a WRITE issued at the wrong clock
      * can land corrupt bytes on the platter, which does not fail at all. The
      * debounced settings save runs from the idle main loop, which is

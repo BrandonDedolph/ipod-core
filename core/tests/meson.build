@@ -554,6 +554,30 @@ if target == 'sim'
   )
   test('hw-power-standby', power_trace_test, suite: 'unit')
 
+  # hw-ata: the PIO ATA driver (hal/hw/ata.c) — the code every music byte,
+  # FAT sector and settings save goes through — host-side under -DMMIO_MOCK.
+  # Its only host coverage used to be two happy-path cases misfiled in
+  # hw-audio (init with RDY pre-set, one read with RDY|DRQ pre-set so no poll
+  # ever spun). Those moved here, joined by what was missing: both bounded
+  # polls proven to spin and to give up after exactly their budget; the timed
+  # DRQ deadline; the ERR path with the recovery grammar (ERROR latched before
+  # the reset, residual DRQ drained, soft reset) that stops a retry returning
+  # shifted data as success; the >256-sector command split; standby/wakeup
+  # and the parked flag; the write+flush grammar with every data word
+  # checked and its failure paths routed through the same recovery; and the
+  # LBA28 guard. clicky models no drive, so the device is the only other
+  # place any of this runs.
+  ata_trace_test = executable(
+    'ata_trace_test',
+    sources: ['hw_ata/ata_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/ata.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+    override_options: test_opts,
+  )
+  test('hw-ata', ata_trace_test, suite: 'unit')
+
   # hw-audio-pingpong: the ping-pong PCM buffer state machine in
   # hal/hw/audio.c. audio_trace_test asserts the register grammar of the
   # driver chain but never calls hal_audio_start / audio_dma_isr /
