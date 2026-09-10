@@ -113,30 +113,62 @@ OPTICAL_TARGET_PX = int(os.environ.get("CORE_OPTICAL_TARGET", "2"))
 # makes word spacing consistent between faces rather than an accident of each
 # one's design width.
 OPTICAL_WORD_PX = int(os.environ.get("CORE_OPTICAL_WORD", "5"))
-# EXPERIMENTAL, opt-in: CORE_OPTICAL_MODE=area equalises the DAYLIGHT the eye
-# integrates over the x-height band instead of the single tightest row.
+# Spacing criterion. "min" (the e190093 rule) puts every letter pair at the
+# same clearance on its single tightest row; "area" puts every pair at the same
+# mean DAYLIGHT over the x-height band, with a floor on the tightest row so
+# cores never touch.
 #
-# Why it exists: the min-clearance rule above puts every pair at the same
-# minimum gap, and then 'ff', 'ld', 'ht', 'ft' in Nunito render with a visible
-# hole ("Shuf fle", "Chil dren") while 'oo' sits tight. A tail or hook is ONE
-# row; under the min rule it sets the whole pair's gap. Measured over 13 real
-# UI strings (tools/text_metrics.py --strings), the coefficient of variation
-# of per-pair daylight is 0.28-0.35 with the min rule and 0.09-0.17 with this
-# one at CORE_OPTICAL_AREA=3 (0.17-0.27 at 2.5); Tahoma through the same
-# pipeline goes 0.25-0.32 -> 0.10-0.16, so it is the criterion, not the face.
-# CORE_OPTICAL_FLOOR is the min-row clearance that may never be violated, so
-# cores cannot touch. Not verified on the device yet; left off by default.
-OPTICAL_MODE = os.environ.get("CORE_OPTICAL_MODE", "min")     # "min" | "area"
-OPTICAL_AREA_PX = float(os.environ.get("CORE_OPTICAL_AREA", "3"))
+# Why area: a tail or hook (Nunito l, f, t) is one row. Under the min rule that
+# row sets the whole pair's gap, so 'ff', 'ld', 'ht', 'ft' rendered with a
+# visible hole ("Shuf fle", "Chil dren") while 'oo' sat tight — measured over
+# 13 real UI strings (tools/ui_strings.txt, tools/text_metrics.py --strings)
+# the per-pair daylight had a coefficient of variation of 0.28-0.35, and the
+# same solver on Tahoma gave 0.25-0.32, so it was the criterion, not the face.
+OPTICAL_MODE = os.environ.get("CORE_OPTICAL_MODE", "area")    # "min" | "area"
+# Floor: the tightest-row clearance that may never be violated, in px, and
+# the alpha at which a pixel counts as ink for that test (1 = any ink,
+# 128 = core). ~37% of the pixels in these atlases are sub-25%-alpha fringe;
+# floors measured on any-ink keep the fringe apart, which is where the
+# unavoidable 'ld' looseness comes from.
 OPTICAL_FLOOR_PX = int(os.environ.get("CORE_OPTICAL_FLOOR", "1"))
+OPTICAL_FLOOR_ALPHA = int(os.environ.get("CORE_OPTICAL_FLOOR_ALPHA", "64"))
+# SOLVED per atlas by tools/optical_solve.py, not chosen by eye: (area px,
+# word px). Area is the daylight target that minimises the rhythm CV over the
+# real strings subject to the mean daylight matching the face's own 'n'
+# counter at that size (the classic even-texture rule); word is the midpoint
+# of the range where every word gap clears every intra-word gap by a whole
+# pixel and the space advance stays under a third of an em. See the solver's
+# docstring for the argument and the table it printed.
+# Output of: tools/optical_solve.py  (floor: alpha >= 64 clears 1px; strings:
+# tools/ui_strings.txt; 2026-09-10). Re-run it after changing the face, the
+# sizes, the tracking table, the floor, or the strings — never edit by hand.
+OPTICAL_SOLVED = {
+    (False,  9): (2.10, 5.25),   # NUNITO_REGULAR_9: n counter 2.00, sd 0.23 CV 0.107, word range 4.25-6.0
+    (False, 11): (2.20, 7.00),   # NUNITO_REGULAR_11: n counter 2.40, sd 0.31 CV 0.140, word range 6.0-7.75
+    (False, 12): (2.20, 7.00),   # NUNITO_REGULAR_12: n counter 2.40, sd 0.31 CV 0.143, word range 5.75-8.0
+    (True , 12): (1.85, 6.75),   # NUNITO_BOLD_12: n counter 1.75, sd 0.26 CV 0.138, word range 5.5-7.75
+    (True , 13): (2.10, 8.00),   # NUNITO_BOLD_13: n counter 2.00, sd 0.27 CV 0.130, word range 6.5-9.25
+    (True , 18): (2.65, 9.00),   # NUNITO_BOLD_18: n counter 2.57, sd 0.39 CV 0.145, word range 6.25-11.5
+}
+OPTICAL_AREA_DEFAULT = 2.5
+OPTICAL_WORD_DEFAULT = 7.0
 
 
-def fit_space_advance(glyphs, glyph_data, kerns, tracking, target_px):
+def fit_space_advance(glyphs, glyph_data, kerns, tracking, target_px,
+                      band=None):
     """Space advance (26.6) that puts the median word gap at target_px.
 
     Measured the way the device draws it: A's step into the space (tracking
     applies), then the space's step out (it does not), then the ink-to-ink
     clearance between A and B over the rows they share.
+
+    With `band` (x-height rows, ascender-relative) the gap is the mean
+    daylight over the band rows both glyphs ink — the same measure the area
+    criterion pins letter pairs to, so the word/letter ratio means what it
+    says — sampled over Upper->lower, lower->Upper and lower->lower pairs.
+    The first version sampled only Upper->lower on the tightest row, which
+    left 'd M' ("Fleetwood Mac") and 'e S' unconstrained. Without `band` it
+    is the tightest-row clearance over Upper->lower, as before.
     """
     kmap = {(l, r): v for l, r, v in kerns}
     idx = {chr(0x20 + i): i for i in range(95)}
@@ -150,29 +182,35 @@ def fit_space_advance(glyphs, glyph_data, kerns, tracking, target_px):
             ext[ch] = (row_extents_bitmap(glyph_data[off:off + w * h], w, h, oy),
                        ox, adv)
     sp_adv = glyphs[idx[" "]][4]
+    combos = [(ups, los)] if band is None else [(ups, los), (los, ups), (los, los)]
     gaps = []
-    for a in ups:
-        if a not in ext:
-            continue
-        ra, oxa, adva = ext[a]
-        for b in los:
-            if b not in ext:
+    for A, B in combos:
+        for a in A:
+            if a not in ext:
                 continue
-            rb, oxb, _ = ext[b]
-            sh = set(ra) & set(rb)
-            if not sh:
-                continue
-            s1 = (adva + tracking + kmap.get((idx[a], idx[" "]), 0) * 2
-                  + ADV_ONE // 2) >> ADV_SHIFT
-            s2 = (sp_adv + kmap.get((idx[" "], idx[b]), 0) * 2
-                  + ADV_ONE // 2) >> ADV_SHIFT
-            gaps.append(min((s1 + s2 + oxb + rb[y][0]) - (oxa + ra[y][1]) - 1
-                            for y in sh))
+            ra, oxa, adva = ext[a]
+            for b in B:
+                if b not in ext:
+                    continue
+                rb, oxb, _ = ext[b]
+                sh = set(ra) & set(rb)
+                if band is not None:
+                    sh = {y for y in sh if band[0] <= y < band[1]}
+                if not sh:
+                    continue
+                s1 = (adva + tracking + kmap.get((idx[a], idx[" "]), 0) * 2
+                      + ADV_ONE // 2) >> ADV_SHIFT
+                s2 = (sp_adv + kmap.get((idx[" "], idx[b]), 0) * 2
+                      + ADV_ONE // 2) >> ADV_SHIFT
+                per_row = [(s1 + s2 + oxb + rb[y][0]) - (oxa + ra[y][1]) - 1
+                           for y in sh]
+                gaps.append(min(per_row) if band is None
+                            else sum(per_row) / len(per_row))
     if not gaps:
         return sp_adv
     gaps.sort()
     median = gaps[len(gaps) // 2]
-    return max(ADV_ONE, sp_adv + (target_px - median) * ADV_ONE)
+    return max(ADV_ONE, sp_adv + int(round((target_px - median) * ADV_ONE)))
 
 PRINTABLE = range(0x20, 0x7F)  # 0x20..0x7E inclusive — 95 glyphs
 
@@ -257,7 +295,8 @@ def row_extents_bitmap(bmp, w, h, oy, thresh=1):
     return out
 
 
-def optical_kern(glyphs, glyph_data, tracking, target_px, band=None):
+def optical_kern(glyphs, glyph_data, tracking, target_px, band=None,
+                 mode=None, area_px=None, floor_px=None, floor_alpha=None):
     """Per-pair corrections that put every letter pair at the SAME ink gap.
 
     The font's own kerning is a design for print at large sizes; at 9-12px on
@@ -269,33 +308,43 @@ def optical_kern(glyphs, glyph_data, tracking, target_px, band=None):
 
     So we measure the actual baked ink and solve for the gap instead. The
     device pen steps in whole pixels (core/ui/text.c pen_step), so for glyphs A
-    then B the gap is:
+    then B the tightest-row gap is:
 
         gap = step + min_over_shared_rows(left_B(y) - right_A(y)) + oxB - oxA - 1
 
     which inverts to an exact integer step for a target gap, and from there to
     the kern value that produces it. Pairs already on target get no entry.
 
+    mode "min" pins that tightest-row gap to target_px. mode "area" pins the
+    MEAN daylight over the x-height `band` rows both glyphs ink to area_px,
+    then raises the step until the tightest row (at floor_alpha ink) clears
+    floor_px. Row extents are compared row against row throughout — the
+    extreme column of a glyph over all its rows is not its edge at any one
+    height. Parameters default to the module settings so atlas_gen.sh and the
+    solver call the same function.
+
     ASCII letters only: digits and punctuation have deliberate design widths
     (a comma should not be spaced like an 'o'), and forcing them to a uniform
     optical gap looks mechanical.
-
-    `band` is (top, bottom) of the x-height in ascender-relative rows; only
-    the OPTICAL_MODE=area experiment reads it.
     """
+    mode = mode or OPTICAL_MODE
+    area_px = OPTICAL_AREA_DEFAULT if area_px is None else area_px
+    floor_px = OPTICAL_FLOOR_PX if floor_px is None else floor_px
+    floor_alpha = OPTICAL_FLOOR_ALPHA if floor_alpha is None else floor_alpha
     idx = {}
     for i in range(95):
         idx[chr(0x20 + i)] = i
     letters = [c for c in
                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"]
-    ext = {}
+    ext, extf = {}, {}
     for ch in letters:
         gi = idx[ch]
         ox, oy, w, h, adv, off = glyphs[gi]
         if w == 0 or h == 0:
             continue
-        ext[ch] = (row_extents_bitmap(glyph_data[off:off + w * h], w, h, oy),
-                   ox, adv)
+        bmp = glyph_data[off:off + w * h]
+        ext[ch] = (row_extents_bitmap(bmp, w, h, oy), ox, adv)
+        extf[ch] = row_extents_bitmap(bmp, w, h, oy, floor_alpha)
     out = []
     for a in letters:
         if a not in ext:
@@ -309,14 +358,18 @@ def optical_kern(glyphs, glyph_data, tracking, target_px, band=None):
             if not shared:
                 continue
             m = min(rb[y][0] - ra[y][1] for y in shared) + oxb - oxa
-            if OPTICAL_MODE == "area":
+            if mode == "area":
                 rows = [y for y in shared if band and band[0] <= y < band[1]]
                 if not rows:
                     rows = list(shared)
                 ma = (sum(rb[y][0] - ra[y][1] for y in rows) / len(rows)
                       + oxb - oxa)
-                step = int(round(OPTICAL_AREA_PX + 1 - ma))
-                step = max(step, OPTICAL_FLOOR_PX + 1 - m)
+                step = int(round(area_px + 1 - ma))
+                fa, fb = extf.get(a, {}), extf.get(b, {})
+                fshared = set(fa) & set(fb)
+                if fshared:
+                    mf = min(fb[y][0] - fa[y][1] for y in fshared) + oxb - oxa
+                    step = max(step, floor_px + 1 - mf)
             else:
                 step = target_px + 1 - m
             adj64 = step * ADV_ONE - adva - tracking
@@ -366,7 +419,10 @@ def kern_pairs(font, chars):
     return out
 
 
-def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
+def raster(ttf_path: str, px_size: int):
+    """Rasterise every glyph we ship at px_size, exactly as the header will
+    carry it. Returns a dict the emitter and tools/optical_solve.py share, so
+    the solver evaluates the same bitmaps the device draws."""
     # Raqm applies the font's kerning in getlength(); the basic layout engine
     # does not, and would silently emit an empty kern table.
     font = ImageFont.truetype(ttf_path, px_size,
@@ -416,6 +472,47 @@ def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
     for _cp, ch in EXTRAS:
         add_glyph(ch)
 
+    chars = [chr(cp) for cp in PRINTABLE] + [ch for _cp, ch in EXTRAS]
+    xb = font.getbbox("x")
+    band = (ascent - (xb[3] - xb[1]), ascent) if xb else None
+    return dict(font=font, ascent=ascent, descent=descent, glyphs=glyphs,
+                glyph_data=glyph_data, chars=chars, band=band,
+                kerns=kern_pairs(font, chars))
+
+
+def tracking_for(symbol: str, px_size: int) -> int:
+    """Tracking in 26.6 for this atlas: the env override, else the table."""
+    _ovr = os.environ.get("CORE_TRACKING_PX")
+    _bold = "BOLD" in symbol.upper()
+    _tpx = (float(_ovr) if _ovr
+            else TRACKING_PX.get((_bold, px_size), TRACKING_DEFAULT))
+    return int(round(_tpx * ADV_ONE))
+
+
+def solved_for(symbol: str, px_size: int):
+    """(area px, word px) for this atlas: env overrides, else the solved
+    table, else the defaults (and a warning, because a default here is a
+    guess the solver has not blessed)."""
+    _bold = "BOLD" in symbol.upper()
+    area, word = OPTICAL_SOLVED.get((_bold, px_size), (None, None))
+    if area is None and OPTICAL_MODE == "area":
+        sys.stderr.write(f"warning: {symbol}: no solved optical constants "
+                         f"for ({_bold}, {px_size}); using defaults "
+                         f"{OPTICAL_AREA_DEFAULT}/{OPTICAL_WORD_DEFAULT} — "
+                         f"run tools/optical_solve.py\n")
+        area, word = OPTICAL_AREA_DEFAULT, OPTICAL_WORD_DEFAULT
+    if os.environ.get("CORE_OPTICAL_AREA"):
+        area = float(os.environ["CORE_OPTICAL_AREA"])
+    if os.environ.get("CORE_OPTICAL_WORD"):
+        word = float(os.environ["CORE_OPTICAL_WORD"])
+    return area, word
+
+
+def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
+    r = raster(ttf_path, px_size)
+    glyphs, glyph_data, chars = r["glyphs"], r["glyph_data"], r["chars"]
+    ascent, descent, band = r["ascent"], r["descent"], r["band"]
+
     # Every data_offset must fit the uint16_t field it is generated into.
     if len(glyph_data) > DATA_OFFSET_MAX:
         raise SystemExit(
@@ -443,22 +540,19 @@ def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
     out.append("")
     total = 95 + len(EXTRAS)
     # Tracking first: the optical solver needs it to compute a pair's step.
-    _ovr = os.environ.get("CORE_TRACKING_PX")
-    _bold = "BOLD" in symbol.upper()
-    _tpx = (float(_ovr) if _ovr
-            else TRACKING_PX.get((_bold, px_size), TRACKING_DEFAULT))
-    track = int(round(_tpx * ADV_ONE))
+    track = tracking_for(symbol, px_size)
 
-    chars = [chr(cp) for cp in PRINTABLE] + [ch for _cp, ch in EXTRAS]
-    kerns = kern_pairs(font, chars)
+    kerns = r["kerns"]
     # Optical pass: every LETTER pair is re-solved from the baked ink so they
     # all land on the same gap. Font kerning still governs everything else
     # (digits, punctuation, the Latin-1 extras), where design widths matter
     # more than a uniform optical rhythm.
     if OPTICAL_KERN:
-        xb = font.getbbox("x")
-        band = (ascent - (xb[3] - xb[1]), ascent) if xb else None
-        opt = optical_kern(glyphs, glyph_data, track, OPTICAL_TARGET_PX, band)
+        area_px, word_px = solved_for(symbol, px_size)
+        if OPTICAL_MODE != "area":
+            word_px = OPTICAL_WORD_PX
+        opt = optical_kern(glyphs, glyph_data, track, OPTICAL_TARGET_PX, band,
+                           area_px=area_px)
         merged = {(l, r): v for l, r, v in kerns}
         merged.update({(l, r): v for l, r, v in opt})   # optical wins
         kerns = [(l, r, v) for (l, r), v in merged.items() if v != 0]
@@ -467,7 +561,8 @@ def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
         sp = glyphs[0]
         glyphs[0] = (sp[0], sp[1], sp[2], sp[3],
                      fit_space_advance(glyphs, glyph_data, kerns, track,
-                                       OPTICAL_WORD_PX),
+                                       word_px,
+                                       band if OPTICAL_MODE == "area" else None),
                      sp[5])
 
     out.append(f"static const atlas_glyph_t {symbol}_GLYPHS[{total}] = {{")

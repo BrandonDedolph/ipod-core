@@ -13,11 +13,18 @@ GEN="$REPO/tools/atlas_gen.py"
 SRC="$REPO/tools/fonts-src"
 OUT="$REPO/core/ui/atlas"
 
+# The venv is untracked, so a fresh clone or a git worktree has none. Fall
+# back to the system interpreter if it can import Pillow with Raqm, which is
+# all the generator needs; otherwise say how to make the venv.
 if [[ ! -x "$PY" ]]; then
-    echo "ERROR: $PY missing. Set up the venv:" >&2
-    echo "  /usr/bin/python3 -m venv $REPO/tools/.venv" >&2
-    echo "  $REPO/tools/.venv/bin/pip install Pillow" >&2
-    exit 1
+    if python3 -c 'from PIL import features; import sys; sys.exit(0 if features.check("raqm") else 1)' 2>/dev/null; then
+        PY=python3
+    else
+        echo "ERROR: $PY missing and system python3 lacks Pillow+Raqm. Set up the venv:" >&2
+        echo "  /usr/bin/python3 -m venv $REPO/tools/.venv" >&2
+        echo "  $REPO/tools/.venv/bin/pip install Pillow" >&2
+        exit 1
+    fi
 fi
 
 mkdir -p "$OUT"

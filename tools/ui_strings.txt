@@ -1,0 +1,18 @@
+# Real UI strings the spacing is solved and judged against: screen titles,
+# album and artist names from the library, a descender-heavy track title, a
+# count. tools/optical_solve.py minimises rhythm variance over these;
+# tools/text_metrics.py --strings tools/ui_strings.txt reports it. One per
+# line, '#' comments skipped. Add strings, do not tune to them.
+Now Playing
+Taylor Swift
+The Velvet Underground
+Illenium — Awake
+Fleetwood Mac
+Rumours
+Boards of Canada
+Music Has the Right to Children
+Everybody Wants to Rule the World
+Bohemian Rhapsody
+3 / 12
+Shuffle Songs
+Playing 7 of 244
