@@ -501,10 +501,35 @@ static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start  
 static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (freezes clock) */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
-static int            g_shuffle;          /* pick the next track at random         */
+static int            g_shuffle;          /* walk g_order instead of the queue     */
 static int            g_repeat;           /* 0 off, 1 all (loop queue), 2 one       */
 static flac_meta_t    g_cur_meta;         /* tags/duration of the current track     */
 static uint32_t       g_rng = 0x2545F491u;/* LCG state for shuffle (varies w/ USEC) */
+
+/*
+ * The shuffle ORDER: every playable queue index, dealt into a random
+ * permutation. Shuffle is then simply "walk this array instead of the queue".
+ *
+ * It used to be a mechanism instead: every advance drew a fresh random index,
+ * avoiding only an immediate repeat. That is sampling WITH replacement, and
+ * the listener heard it — on a 12-track album the expected number of tracks
+ * before the first repeat is about five, while others never came up at all.
+ * Worse, a random draw always succeeds, so a shuffled queue could never reach
+ * the "nothing left" branch: Repeat Off and Repeat All were indistinguishable,
+ * player_end_seq() never bumped, the saved resume position was never dropped
+ * when an album finished, and Prev went to an unrelated track instead of the
+ * one just heard. A permutation fixes all of that at once, because Repeat,
+ * Prev and end-of-queue only ever asked "what is before/after this entry" —
+ * they just need that question answered against a different order.
+ *
+ * uint16_t rather than int: QUEUE_MAX is 6000, and at 6000 entries this is
+ * 12 KB of .bss instead of 24 KB. The image is inside its budget either way
+ * (see tests/scripts/check_size.sh), but the array is dead weight whenever
+ * shuffle is off, so it should cost as little as it can.
+ */
+_Static_assert(QUEUE_MAX <= 65535, "g_order indexes the queue with uint16_t");
+static uint16_t       g_order[QUEUE_MAX];
+static int            g_order_n;          /* playable entries in g_order (0 = none) */
 static int            g_last_err;         /* why the last open/skip failed          */
 
 /* Format the DAC is currently clocked at. hal_audio_init is only re-issued
@@ -561,39 +586,169 @@ static int            g_queue_art_shared;
  * and a single-track shuffle all reopen the SAME index. */
 static uint32_t       g_open_seq;
 
-void player_set_shuffle(int on)   { g_shuffle = on ? 1 : 0; }
 void player_set_repeat(int mode)  { g_repeat  = mode; }
 
-/* Count playable (non-dir) entries in the queue. */
-static int queue_playable_count(void)
+/* ---------------------------------------------------------------------------
+ * Playback order
+ *
+ * Two orders exist over the same queue: the queue itself (the folder's file
+ * order, or whatever Shuffle Songs enqueued) and g_order, a permutation of
+ * its playable indices. Every caller that needs "the entry after/before this
+ * one" goes through successor()/predecessor(), which consult whichever order
+ * g_shuffle selects. Nothing else in the player knows shuffle exists.
+ *
+ * Invariant: whenever g_shuffle is set and the queue is non-empty, g_order is
+ * a permutation of exactly the playable queue indices. It is dealt at every
+ * queue (re)start (player_play_queue / player_queue_commit) and on every
+ * off->on toggle, so it can never be stale against the queue it indexes.
+ * ------------------------------------------------------------------------- */
+
+/* The one LCG, stirred with the free-running microsecond timer so two boots
+ * (and two toggles) don't deal the same order. The low bits of an LCG are
+ * the least random, hence the >> 8. */
+static uint32_t rng_next(void)
 {
-    int c = 0;
-    for (int i = 0; i < g_queue_n; i++) {
-        if (!g_queue[i].is_dir) c++;
-    }
-    return c;
+    g_rng = g_rng * 1103515245u + 12345u + mmio_read32(USEC_TIMER_ADDR);
+    return g_rng >> 8;
 }
 
-/* Pick a random playable index, preferring one != `avoid` when possible. */
-static int queue_random_playable(int avoid)
+/* The next playable index AFTER `from` in QUEUE order: forward, wrapping
+ * only under Repeat All. -1 when there is none. Ignores Repeat-One (a
+ * deliberate skip always moves). */
+static int next_playable(int from)
 {
-    int n = queue_playable_count();
-    if (n <= 0) return -1;
-    g_rng = g_rng * 1103515245u + 12345u + mmio_read32(USEC_TIMER_ADDR);
-    int target = (int)((g_rng >> 8) % (uint32_t)n);      /* 0..n-1 among playable  */
-    int pick = -1, seen = 0;
-    for (int i = 0; i < g_queue_n; i++) {
-        if (g_queue[i].is_dir) continue;
-        if (seen == target) { pick = i; break; }
-        seen++;
+    for (int j = from + 1; j < g_queue_n; j++) {
+        if (!g_queue[j].is_dir) return j;
     }
-    if (n > 1 && pick == avoid) {                         /* avoid an immediate repeat */
-        for (int i = 1; i < g_queue_n; i++) {
-            int j = (pick + i) % g_queue_n;
-            if (!g_queue[j].is_dir) { pick = j; break; }
+    if (g_repeat == 1) {                  /* Repeat All: wrap to the first */
+        for (int j = 0; j < g_queue_n; j++) {
+            if (!g_queue[j].is_dir) return j;
         }
     }
-    return pick;
+    return -1;
+}
+
+/* The previous playable index before `from` in QUEUE order, wrapping to the
+ * last entry. -1 only when the queue holds no playable entry at all. */
+static int prev_playable(int from)
+{
+    for (int j = from - 1; j >= 0; j--) {
+        if (!g_queue[j].is_dir) return j;
+    }
+    for (int j = g_queue_n - 1; j >= 0; j--) {   /* wrap to last */
+        if (!g_queue[j].is_dir) return j;
+    }
+    return -1;
+}
+
+/* Where queue index `idx` sits in g_order, or -1 if it isn't there (a folder,
+ * or a current index the order was never dealt over). A linear search, but
+ * it runs once per track change over at most QUEUE_MAX halfwords, and it
+ * saves keeping a cursor in step with every path that assigns g_queue_idx —
+ * the prefetch hand-over in particular sets it seconds after the choice. */
+static int order_pos_of(int idx)
+{
+    for (int p = 0; p < g_order_n; p++) {
+        if (g_order[p] == idx) return p;
+    }
+    return -1;
+}
+
+static void order_swap(int a, int b)
+{
+    uint16_t t = g_order[a];
+    g_order[a] = g_order[b];
+    g_order[b] = t;
+}
+
+/*
+ * Deal a fresh order: every playable index, Fisher-Yates shuffled. When
+ * `keep` is a playable index it is moved to the FRONT afterwards, so the
+ * track that is playing right now stays current and the shuffle only decides
+ * what comes after it — turning Shuffle on mid-album must not restart or
+ * change the song. Moving one element to the front of a uniform permutation
+ * leaves the remainder uniformly random, so nothing is biased by it.
+ */
+static void shuffle_build(int keep)
+{
+    int n = 0;
+    for (int i = 0; i < g_queue_n; i++) {
+        if (!g_queue[i].is_dir) g_order[n++] = (uint16_t)i;
+    }
+    g_order_n = n;
+    for (int i = n - 1; i > 0; i--) {
+        int j = (int)(rng_next() % (uint32_t)(i + 1));
+        order_swap(i, j);
+    }
+    if (keep >= 0) {
+        int p = order_pos_of(keep);
+        if (p > 0) order_swap(0, p);
+    }
+}
+
+/* The entry after `from` in SHUFFLE order. -1 once the order is used up and
+ * Repeat is off — that is the end of the queue, exactly as in plain order.
+ * Under Repeat All a used-up order is re-dealt, so the loop is a new
+ * sequence each time round instead of the same one forever; the only
+ * constraint carried across is that the new first track isn't the one that
+ * just finished, which would sound like Repeat One for a moment.
+ *
+ * Known edge: the re-deal happens when the successor is ASKED for, and the
+ * prefetch asks up to ~6 s before the last track of a pass is audibly over
+ * (see the hand-over note above the globals). A Prev pressed inside that
+ * window walks the new order, not the old one. Deferring the re-deal to the
+ * commit would need a second order array to hold both; not worth 12 KB for
+ * a few seconds once per pass. */
+static int shuffle_next(int from)
+{
+    if (g_order_n == 0) return -1;
+    int pos = order_pos_of(from);         /* -1 (not in the order) starts at the top */
+    if (pos + 1 < g_order_n) return g_order[pos + 1];
+    if (g_repeat != 1) return -1;
+    shuffle_build(-1);
+    if (g_order_n > 1 && g_order[0] == from) {
+        order_swap(0, 1 + (int)(rng_next() % (uint32_t)(g_order_n - 1)));
+    }
+    return g_order[0];
+}
+
+/* The entry before `from` in SHUFFLE order, wrapping to the tail the way
+ * prev_playable wraps — so Prev is always "the track I just heard". */
+static int shuffle_prev(int from)
+{
+    if (g_order_n == 0) return -1;
+    int pos = order_pos_of(from);
+    if (pos > 0) return g_order[pos - 1];
+    return g_order[g_order_n - 1];
+}
+
+/* The entry a manual or automatic skip lands on after/before `from`, in
+ * whichever order is in force. Both ignore Repeat-One; see auto_next_index
+ * for the replay case. */
+static int successor(int from)
+{
+    return g_shuffle ? shuffle_next(from) : next_playable(from);
+}
+
+static int predecessor(int from)
+{
+    return g_shuffle ? shuffle_prev(from) : prev_playable(from);
+}
+
+/*
+ * Toggle shuffle. Only an off->on transition deals a new order, and it keeps
+ * the current track current: settings_apply() in the UI re-pushes this on
+ * EVERY settings change (volume included), so "on while already on" must be
+ * a no-op or adjusting the volume would silently re-deal the album. Turning
+ * it off needs nothing beyond the flag — the queue order is always there.
+ */
+void player_set_shuffle(int on)
+{
+    on = on ? 1 : 0;
+    if (on && !g_shuffle) {
+        shuffle_build(g_queue_n > 0 ? g_queue_idx : -1);
+    }
+    g_shuffle = on;
 }
 
 void player_init(fat32_t *fs)
@@ -825,22 +980,6 @@ void player_stop(void)
     g_pl_active = 0;
 }
 
-/* The next playable index AFTER `from` for a manual skip: forward, wrapping
- * only under Repeat All. -1 when there is none. Ignores Repeat-One (a
- * deliberate skip always moves). */
-static int next_playable(int from)
-{
-    for (int j = from + 1; j < g_queue_n; j++) {
-        if (!g_queue[j].is_dir) return j;
-    }
-    if (g_repeat == 1) {                  /* Repeat All: wrap to the first */
-        for (int j = 0; j < g_queue_n; j++) {
-            if (!g_queue[j].is_dir) return j;
-        }
-    }
-    return -1;
-}
-
 /* The index AUTO-advance should play after `from` (Repeat-One / Shuffle /
  * Repeat-All aware). -1 when the queue is finished. */
 static int auto_next_index(int from)
@@ -848,10 +987,7 @@ static int auto_next_index(int from)
     if (g_repeat == 2) {                  /* Repeat One: the same track again */
         return from;
     }
-    if (g_shuffle) {
-        return queue_random_playable(from);
-    }
-    return next_playable(from);
+    return successor(from);
 }
 
 /*
@@ -878,7 +1014,7 @@ static void prefetch_next(void)
             /* Step FORWARD past the broken entry rather than re-asking
              * auto_next_index, which under Repeat-One would hand back the same
              * unopenable file forever. */
-            nxt = next_playable(nxt);
+            nxt = successor(nxt);
             continue;
         }
         g_pending          = 1;
@@ -967,8 +1103,7 @@ static void player_advance(void)
         return;
     }
     for (int tries = 0; tries <= g_queue_n; tries++) {
-        int nxt = g_shuffle ? queue_random_playable(g_queue_idx)
-                            : next_playable(g_queue_idx);
+        int nxt = successor(g_queue_idx);
         if (nxt < 0) {
             /* Queue done → idle. Bump the end counter so the UI can tell
              * "the album finished on its own" apart from "still playing" —
@@ -997,6 +1132,9 @@ void player_play_queue(const browse_entry_t *src, int n, int start,
     }
     g_queue_n   = (n < QUEUE_MAX) ? n : QUEUE_MAX;
     g_queue_idx = start;
+    if (g_shuffle) {
+        shuffle_build(start);            /* the picked track first, then the rest */
+    }
     /* One album, one cover: every entry shares it, so per-track art loading is
      * suppressed for the life of this queue. */
     g_queue_art_shared = (art_clus != 0);
@@ -1011,6 +1149,7 @@ void player_queue_begin(void)
 {
     player_stop();
     g_queue_n = 0;
+    g_order_n = 0;                       /* indexes the queue just emptied */
 }
 
 void player_queue_add(const browse_entry_t *e)
@@ -1026,6 +1165,9 @@ void player_queue_commit(int start)
         return;
     }
     g_queue_idx = (start >= 0 && start < g_queue_n) ? start : 0;
+    if (g_shuffle) {
+        shuffle_build(g_queue_idx);
+    }
     /* Mixed queue: each entry carries its own art_clus, and a zero one means
      * "this album has no cover" — NOT "keep whatever is loaded". Without this
      * distinction every coverless album in a Shuffle Songs queue displayed the
@@ -1236,8 +1378,7 @@ void player_next(void)
     if (g_queue_n == 0) {
         return;
     }
-    int nxt = g_shuffle ? queue_random_playable(g_queue_idx)
-                        : next_playable(g_queue_idx);
+    int nxt = successor(g_queue_idx);
     if (nxt < 0) {
         /*
          * Past the last track with Repeat off. This used to return and leave
@@ -1274,38 +1415,28 @@ void player_next(void)
         if (open_current_keep_pause(was_paused) == 0) {
             return;
         }
-        nxt = g_shuffle ? queue_random_playable(g_queue_idx)
-                        : next_playable(g_queue_idx);
+        nxt = successor(g_queue_idx);
     }
-}
-
-/* The previous playable index before `from`, wrapping to the last entry.
- * -1 only when the queue holds no playable entry at all. */
-static int prev_playable(int from)
-{
-    for (int j = from - 1; j >= 0; j--) {
-        if (!g_queue[j].is_dir) return j;
-    }
-    for (int j = g_queue_n - 1; j >= 0; j--) {   /* wrap to last */
-        if (!g_queue[j].is_dir) return j;
-    }
-    return -1;
 }
 
 /* Manual skip to the previous track — or restart the current one if we're more
  * than ~3s in (the familiar iPod behaviour). Wraps at the start. Keeps a
- * paused transport paused. */
+ * paused transport paused.
+ *
+ * The restart applies under Shuffle too. It used to be gated on !g_shuffle
+ * only because a shuffled Prev was a fresh random draw, so "go back" had no
+ * meaning worth protecting; now that it returns to the track just heard, the
+ * two orders behave the same way here. */
 void player_prev(void)
 {
     if (g_queue_n == 0) {
         return;
     }
-    if (!g_shuffle && player_elapsed_s() > 3u) {         /* restart current */
+    if (player_elapsed_s() > 3u) {                       /* restart current */
         player_jump(g_queue_idx);
         return;
     }
-    int prv = g_shuffle ? queue_random_playable(g_queue_idx)
-                        : prev_playable(g_queue_idx);
+    int prv = predecessor(g_queue_idx);
     if (prv < 0) {
         return;
     }
@@ -1317,8 +1448,7 @@ void player_prev(void)
         if (open_current_keep_pause(was_paused) == 0) {
             return;
         }
-        prv = g_shuffle ? queue_random_playable(g_queue_idx)
-                        : prev_playable(g_queue_idx);
+        prv = predecessor(g_queue_idx);
     }
 }
 

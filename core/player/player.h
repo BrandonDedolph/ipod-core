@@ -76,9 +76,13 @@ void player_resume(void);
 void player_toggle_pause(void);
 int  player_paused(void);              /* 1 while paused */
 
-/* Playback order/looping (driven by Settings). shuffle: pick the next track at
- * random. repeat: 0 = off (stop at queue end), 1 = all (loop the queue), 2 = one
- * (replay the current track). */
+/* Playback order/looping (driven by Settings). shuffle: play the queue in a
+ * random PERMUTATION — every playable entry once, then the queue ends (or,
+ * under Repeat All, a new permutation is dealt). Turning it on mid-track keeps
+ * that track current and shuffles the rest; turning it off resumes plain
+ * queue order from the current entry; re-setting it while already on is a
+ * no-op (no re-deal). repeat: 0 = off (stop at queue end), 1 = all (loop the
+ * queue), 2 = one (replay the current track). */
 void player_set_shuffle(int on);
 void player_set_repeat(int mode);
 

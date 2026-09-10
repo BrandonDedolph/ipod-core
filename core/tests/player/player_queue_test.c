@@ -7,8 +7,9 @@
  * and real hardware, but the part that decides WHICH TRACK PLAYS NEXT is pure
  * bookkeeping over an array, and it is the part users notice when it is wrong:
  * a queue that stops one track early, a Repeat All that doesn't wrap, a
- * Shuffle that replays the song you just heard, a Prev that restarts instead
- * of going back, a broken file that stalls playback instead of being skipped.
+ * Shuffle that replays the song you just heard (or never ends), a Prev that
+ * restarts instead of going back, a broken file that stalls playback instead
+ * of being skipped.
  *
  * The real player.c is compiled unmodified; its disk, codec and DAC are
  * replaced by the controllable fakes in player_test_stubs.c. Which entry the
@@ -16,11 +17,13 @@
  * not from an index accessor — so the assertions are about the file that would
  * actually play.
  *
- * Note on what is NOT covered here: player_advance(), queue_playable_count()
- * and queue_random_playable() are `static` in player.c and therefore not
+ * Note on what is NOT covered here: player_advance(), shuffle_build() and
+ * successor()/predecessor() are `static` in player.c and therefore not
  * directly reachable. They are exercised INDIRECTLY, through player_pump()
  * running a track to end-of-stream (which is how auto-advance happens in the
- * firmware) and through player_next/player_prev. The decode/ring path,
+ * firmware) and through player_next/player_prev. The shuffle order itself is
+ * never read out: the tests observe which files play and in what sequence,
+ * which is the contract the listener experiences. The decode/ring path,
  * load_folder_art() and player_probe_meta() need real file bytes and are out
  * of scope for this test.
  */
@@ -291,69 +294,379 @@ int main(void)
     player_set_repeat(0);
 
     /* ---- 10. shuffle --------------------------------------------------- */
+    /*
+     * Shuffle is a PERMUTATION of the playable entries, walked in order — not
+     * a fresh random draw per advance. The assertions that used to live here
+     * passed against the old draw-per-advance code, which means they encoded
+     * its bug: they pressed Next 60 times on a 6-track queue with Repeat OFF
+     * and required every press to land somewhere new. A queue that survives
+     * 60 Nexts with Repeat off is precisely a queue that can never end, and
+     * "shuffle with a single playable entry REPLAYS it" on Next with Repeat
+     * off is the same fault at n=1. Everything below is only true of a real
+     * order: each track once, then the end; Prev is the track just heard.
+     */
+
+    /* 10a. Auto-advance (player_pump running each track out — how an album
+     * plays on the device) visits every playable entry exactly once, and
+     * THEN the queue ends with the same signal a plain queue gives. */
     stub_reset();
+    stub_set_track_frames(4096);
+    player_set_repeat(0);
     player_set_shuffle(1);
+    make_entries(ents, 8, 0);
+    player_play_queue(ents, 8, 3, 0, 0);
+    xpect(&c, "shuffle: playback starts on the entry that was picked",
+          player_queue_current() == 3 && stub_last_open_clus() == CLUS(3));
+    {
+        int plays[8] = { 0 };
+        int walked   = 1;
+        plays[3]++;
+        for (int k = 1; k < 8; k++) {
+            pump_to_track_end(2000);
+            int cur = player_queue_current();
+            if (!player_active() || cur < 0 || cur >= 8 ||
+                stub_last_open_clus() != CLUS(cur)) {
+                walked = 0;
+                break;
+            }
+            plays[cur]++;
+        }
+        xpect(&c, "shuffle: seven auto-advances stay inside the queue and active",
+              walked);
+        int once = 1;
+        for (int i = 0; i < 8; i++) {
+            if (plays[i] != 1) once = 0;
+        }
+        xpect(&c, "shuffle: every track played exactly once before any repeat",
+              once);
+        uint32_t ends0 = player_end_seq();
+        pump_to_track_end(2000);
+        xpect(&c, "shuffle + repeat off: the queue ENDS after the last unplayed track",
+              player_active() == 0 && stub_audio_running == 0);
+        xpect(&c, "shuffle + repeat off: the end counts as the queue finishing",
+              player_end_seq() == ends0 + 1);
+        xpect(&c, "shuffle + repeat off: nothing was opened past the end",
+              stub_opens == 8);
+    }
+
+    /* 10b. Repeat All: the second time round is a NEW permutation (not the
+     * same sequence forever), still each track once, and the seam never
+     * plays the same track twice in a row. The RNG is an LCG over a mocked
+     * timer, so this is deterministic, not a coin flip. */
+    stub_reset();
+    player_set_repeat(1);
+    make_entries(ents, 8, 0);
+    player_play_queue(ents, 8, 0, 0, 0);
+    {
+        int cyc1[8], cyc2[8];
+        cyc1[0] = 0;
+        for (int k = 1; k < 8; k++) {
+            pump_to_track_end(2000);
+            cyc1[k] = player_queue_current();
+        }
+        for (int k = 0; k < 8; k++) {
+            pump_to_track_end(2000);
+            cyc2[k] = player_queue_current();
+        }
+        xpect(&c, "shuffle + repeat all: still playing after two full passes",
+              player_active() == 1);
+        int plays[8] = { 0 };
+        int perm = 1;
+        for (int k = 0; k < 8; k++) {
+            if (cyc2[k] < 0 || cyc2[k] >= 8) { perm = 0; break; }
+            plays[cyc2[k]]++;
+        }
+        for (int i = 0; i < 8 && perm; i++) {
+            if (plays[i] != 1) perm = 0;
+        }
+        xpect(&c, "shuffle + repeat all: the second pass is again each track once",
+              perm);
+        xpect(&c, "shuffle + repeat all: the wrap does not replay the track just heard",
+              cyc2[0] != cyc1[7]);
+        xpect(&c, "shuffle + repeat all: the second pass is a different order",
+              memcmp(cyc1, cyc2, sizeof cyc1) != 0);
+    }
+
+    /* 10c. The same contract driven by the Next button: n-1 presses land on
+     * n-1 distinct unplayed tracks, the n-th ENDS the queue (Repeat off) —
+     * exactly what test 9 requires of Next in plain order. */
+    stub_reset();
+    player_set_repeat(0);
     make_entries(ents, 6, 0);
     player_play_queue(ents, 6, 0, 0, 0);
     {
-        /* Every shuffle pick must be a real, playable entry, and over many
-         * picks it must actually move around rather than sticking. The RNG is
-         * stirred with USEC_TIMER, so advance the clock between picks. */
         int seen[6] = { 0 };
-        int immediate_repeats = 0;
-        int prev = player_queue_current();
         int in_range = 1;
-        for (int i = 0; i < 60; i++) {
+        seen[0] = 1;
+        for (int i = 0; i < 5; i++) {
             set_usec((uint32_t)(i * 7919));
             player_next();
             int cur = player_queue_current();
-            if (cur < 0 || cur >= 6) {
+            if (cur < 0 || cur >= 6 || !player_active()) {
                 in_range = 0;
                 break;
             }
-            seen[cur] = 1;
-            if (cur == prev) {
-                immediate_repeats++;
-            }
-            prev = cur;
+            seen[cur]++;
         }
-        xpect(&c, "shuffle only ever selects entries inside the queue", in_range);
+        xpect(&c, "shuffle: Next only ever selects entries inside the queue",
+              in_range);
         int distinct = 0;
         for (int i = 0; i < 6; i++) {
-            distinct += seen[i];
+            distinct += (seen[i] == 1);
         }
-        xpect(&c, "shuffle reaches most of the queue over 60 picks",
-              distinct >= 4);
-        xpect(&c, "shuffle avoids replaying the track it just played",
-              immediate_repeats == 0);
+        xpect(&c, "shuffle: five Nexts on six tracks reach the other five, once each",
+              distinct == 6);
+        uint32_t ends1 = player_end_seq();
+        player_next();
+        xpect(&c, "shuffle: Next after the last unplayed track ends the queue",
+              player_active() == 0 && player_end_seq() == ends1 + 1);
     }
 
-    /* Shuffle must not pick a folder. */
+    /* 10d. Prev is the track just heard, and the order is stable under it:
+     * Next after Prev returns to the same track, not a new draw. */
     stub_reset();
-    player_set_shuffle(1);
-    make_entries(ents, 5, 0x0Au);             /* entries 1 and 3 are folders */
-    player_play_queue(ents, 5, 0, 0, 0);
+    set_usec(0);
+    make_entries(ents, 6, 0);
+    player_play_queue(ents, 6, 0, 0, 0);
     {
-        int picked_folder = 0;
-        for (int i = 0; i < 40; i++) {
+        set_usec(1000000u);
+        player_next();
+        int a = player_queue_current();
+        xpect(&c, "shuffle: the first Next leaves the starting track", a != 0);
+        player_prev();                          /* 0 s into `a` */
+        xpect(&c, "shuffle: Prev returns to the track just played, not a random one",
+              player_queue_current() == 0 && stub_last_open_clus() == CLUS(0));
+        player_next();
+        xpect(&c, "shuffle: Next after Prev goes forward to the same track again",
+              player_queue_current() == a && stub_last_open_clus() == CLUS(a));
+
+        pump_to_track_end(2000);                /* auto-advance to a third track */
+        int b = player_queue_current();
+        xpect(&c, "shuffle: auto-advance moves to a third distinct track",
+              b != a && b != 0);
+        player_prev();
+        xpect(&c, "shuffle: Prev after an auto-advance is the track that just ended",
+              player_queue_current() == a);
+
+        set_usec(9000000u + 1000000u);          /* well past 3 s into `a` */
+        int opens_a = stub_opens;
+        player_prev();
+        xpect(&c, "shuffle: Prev late in a track restarts it, as in plain order",
+              player_queue_current() == a && stub_opens == opens_a + 1);
+    }
+
+    /* Prev at the HEAD of the order wraps to its tail (as prev_playable wraps
+     * to the last entry); Next from the tail with Repeat off then ends. */
+    stub_reset();
+    set_usec(0);
+    player_play_queue(ents, 6, 2, 0, 0);
+    {
+        player_prev();
+        int tail = player_queue_current();
+        xpect(&c, "shuffle: Prev at the head of the order wraps to its tail",
+              tail != 2 && player_active() == 1);
+        uint32_t ends2 = player_end_seq();
+        player_next();
+        xpect(&c, "shuffle: the wrapped-to tail really is the last of the order",
+              player_active() == 0 && player_end_seq() == ends2 + 1);
+    }
+
+    /* 10e. Shuffle OFF returns to plain queue order from wherever we are. */
+    stub_reset();
+    player_set_repeat(1);
+    set_usec(0);
+    make_entries(ents, 6, 0);
+    player_play_queue(ents, 6, 0, 0, 0);
+    {
+        player_next();
+        int x = player_queue_current();
+        player_set_shuffle(0);
+        player_next();
+        xpect(&c, "shuffle off: the next track is the queue's next entry",
+              player_queue_current() == (x + 1) % 6 &&
+              stub_last_open_clus() == CLUS((x + 1) % 6));
+        player_next();
+        xpect(&c, "shuffle off: and so is the one after",
+              player_queue_current() == (x + 2) % 6);
+        player_prev();                          /* 0 s in: goes back */
+        xpect(&c, "shuffle off: Prev is the queue's previous entry",
+              player_queue_current() == (x + 1) % 6);
+    }
+
+    /* 10f. Shuffle ON mid-playback keeps the current track playing
+     * untouched and shuffles only what comes after it; re-applying the
+     * setting while already on does not re-deal (the UI pushes every
+     * setting on every change, volume included). */
+    stub_reset();
+    player_set_repeat(0);
+    player_set_shuffle(0);
+    set_usec(0);
+    make_entries(ents, 6, 0);
+    player_play_queue(ents, 6, 2, 0, 0);
+    {
+        set_usec(2000000u);
+        int      opens0 = stub_opens;
+        uint32_t seq0   = player_open_seq();
+        player_set_shuffle(1);
+        xpect(&c, "shuffle on mid-track: the current track keeps playing",
+              player_queue_current() == 2 && player_active() == 1 &&
+              stub_opens == opens0 && player_open_seq() == seq0 &&
+              stub_audio_running == 1);
+        xpect(&c, "shuffle on mid-track: the elapsed clock is not reset",
+              player_elapsed_s() == 2u);
+        player_next();
+        int a = player_queue_current();
+        player_prev();
+        player_set_shuffle(1);                  /* already on: must not re-deal */
+        player_next();
+        xpect(&c, "shuffle on while already on: the order is not re-dealt",
+              player_queue_current() == a);
+
+        int plays[6] = { 0 };
+        plays[2]++;
+        plays[a]++;
+        for (int k = 0; k < 4; k++) {
+            pump_to_track_end(2000);
+            int cur = player_queue_current();
+            if (cur >= 0 && cur < 6) plays[cur]++;
+        }
+        int once = 1;
+        for (int i = 0; i < 6; i++) {
+            if (plays[i] != 1) once = 0;
+        }
+        xpect(&c, "shuffle on mid-track: the rest plays once each, current excluded",
+              once && player_active() == 1);
+        pump_to_track_end(2000);
+        xpect(&c, "shuffle on mid-track: then the queue ends",
+              player_active() == 0);
+    }
+
+    /* 10g. Folders are never in the order: three passes under Repeat All
+     * over a queue with folders interleaved, driven by Next. Each pass is a
+     * permutation of the playable entries, no pass ever lands on a folder,
+     * and no two consecutive picks are the same track. */
+    stub_reset();
+    player_set_repeat(1);
+    make_entries(ents, 7, 0x2Au);             /* entries 1, 3, 5 are folders */
+    player_play_queue(ents, 7, 0, 0, 0);
+    {
+        int picks[12];
+        int picked_folder = 0, immediate_repeat = 0;
+        picks[0] = 0;
+        for (int i = 1; i < 12; i++) {
             set_usec((uint32_t)(i * 104729));
             player_next();
-            if (player_queue_is_dir(player_queue_current())) {
-                picked_folder = 1;
-            }
+            picks[i] = player_queue_current();
+            if (player_queue_is_dir(picks[i])) picked_folder = 1;
+            if (picks[i] == picks[i - 1])      immediate_repeat = 1;
         }
         xpect(&c, "shuffle never selects a subdirectory", !picked_folder);
+        xpect(&c, "shuffle never plays the same track twice running, even at a wrap",
+              !immediate_repeat);
+        int each_pass = 1;
+        for (int p = 0; p < 3; p++) {
+            int plays[7] = { 0 };
+            for (int k = 0; k < 4; k++) {
+                plays[picks[p * 4 + k]]++;
+            }
+            if (plays[0] != 1 || plays[2] != 1 || plays[4] != 1 || plays[6] != 1) {
+                each_pass = 0;
+            }
+        }
+        xpect(&c, "shuffle: every pass over a queue with folders is each track once",
+              each_pass);
     }
 
-    /* A shuffled queue with exactly one playable entry must terminate. */
+    /* 10h. One playable entry: Repeat off ends on Next (the one track WAS the
+     * whole order — replaying it here was the never-ending-queue bug at n=1);
+     * Repeat all replays it, bounded, on both Next and auto-advance. */
     stub_reset();
-    player_set_shuffle(1);
+    player_set_repeat(0);
     make_entries(ents, 3, 0x6u);              /* only entry 0 is playable */
     player_play_queue(ents, 3, 0, 0, 0);
+    {
+        uint32_t ends3 = player_end_seq();
+        player_next();
+        xpect(&c, "shuffle, one playable, repeat off: Next ends the queue",
+              player_active() == 0 && player_end_seq() == ends3 + 1 &&
+              player_queue_current() == 0);
+    }
+    stub_reset();
+    player_set_repeat(1);
+    set_usec(0);
+    player_play_queue(ents, 3, 0, 0, 0);
+    {
+        int opens0 = stub_opens;
+        player_next();
+        xpect(&c, "shuffle, one playable, repeat all: Next replays it, bounded",
+              player_queue_current() == 0 && player_active() == 1 &&
+              stub_opens == opens0 + 1);
+        uint32_t seq0 = player_open_seq();
+        pump_to_track_end(2000);
+        xpect(&c, "shuffle, one playable, repeat all: auto-advance replays it",
+              player_queue_current() == 0 && player_active() == 1 &&
+              player_open_seq() == seq0 + 1);
+        player_prev();
+        xpect(&c, "shuffle, one playable: Prev wraps onto the same track",
+              player_queue_current() == 0 && player_active() == 1);
+    }
+
+    /* 10i. No playable entry at all, and an empty queue: nothing to order,
+     * so the transport calls must not crash, loop, or pick a folder. (The UI
+     * never launches on a folder; the first open here is the stub obliging
+     * a request the firmware would not make.) */
+    stub_reset();
+    player_set_repeat(0);
+    make_entries(ents, 3, 0x7u);              /* every entry is a folder */
+    player_play_queue(ents, 3, 0, 0, 0);
     player_next();
-    xpect(&c, "shuffle with a single playable entry replays it, bounded",
-          player_queue_current() == 0 && player_active() == 1);
+    xpect(&c, "shuffle, nothing playable: Next ends rather than picking a folder",
+          player_active() == 0);
+    player_prev();
+    xpect(&c, "shuffle, nothing playable: Prev is a no-op",
+          player_active() == 0 && stub_open_attempts == 1);
+    player_pump();
+    xpect(&c, "shuffle, nothing playable: pump is harmless",
+          player_active() == 0 && player_queue_len() == 3);
+
+    stub_reset();
+    player_queue_begin();
     player_set_shuffle(0);
+    player_set_shuffle(1);                    /* dealt over an EMPTY queue */
+    player_next();
+    player_prev();
+    xpect(&c, "shuffle turned on over an empty queue is harmless",
+          player_active() == 0 && stub_open_attempts == 0);
+
+    /* 10j. The incremental builder (Shuffle Songs / Songs) deals the order at
+     * commit, starting on the requested entry, and the run ends too. */
+    make_entries(ents, 6, 0);
+    for (int i = 0; i < 6; i++) {
+        player_queue_add(&ents[i]);
+    }
+    player_queue_commit(4);
+    xpect(&c, "shuffle via the builder: commit starts on the requested entry",
+          player_queue_current() == 4 && stub_last_open_clus() == CLUS(4));
+    {
+        int plays[6] = { 0 };
+        plays[4]++;
+        for (int k = 1; k < 6; k++) {
+            pump_to_track_end(2000);
+            int cur = player_queue_current();
+            if (cur >= 0 && cur < 6) plays[cur]++;
+        }
+        int once = 1;
+        for (int i = 0; i < 6; i++) {
+            if (plays[i] != 1) once = 0;
+        }
+        xpect(&c, "shuffle via the builder: each track once, still active",
+              once && player_active() == 1);
+        pump_to_track_end(2000);
+        xpect(&c, "shuffle via the builder: then the queue ends",
+              player_active() == 0);
+    }
+    player_set_shuffle(0);
+    player_set_repeat(0);
 
     /* ---- 11. pause / resume -------------------------------------------- */
     stub_reset();
