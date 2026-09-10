@@ -701,6 +701,28 @@ if target == 'sim'
   )
   test('player-queue', player_queue_test, suite: 'unit')
 
+  # player-clock: the reported position against what can be heard. The DMA
+  # feeder pulls whole ping-pong buffers out of the PCM ring, two of which are
+  # in flight inside the HAL at any time, so "consumed from the ring" runs
+  # 186..372 ms ahead of the DAC. The gapless hand-over used to present the
+  # next track (and re-anchor its clock) on the consumed count. Same fakes as
+  # player-queue; stub_drain() IS the feeder, so pulls are counted exactly.
+  player_clock_test = executable(
+    'player_clock_test',
+    sources: ['player/player_clock_test.c',
+              'player/player_test_stubs.c',
+              'hw_mmio/mmio_mock.c',
+              '../player/player.c',
+              '../kernel/pcm_ring.c'],
+    include_directories: include_directories(
+      '../player', '../hal', '../hal/hw', '../fs', '../kernel',
+      '../codecs', '../codecs/dr_flac', '../codecs/dr_mp3',
+      'hw_mmio', 'player', '.'),
+    c_args: ['-DMMIO_MOCK', '-DCORE_FREESTANDING'],
+    override_options: test_opts,
+  )
+  test('player-clock', player_clock_test, suite: 'unit')
+
   if py.found()
     # fat32-corrupt: the FAT32 reader against deliberately broken volumes.
     # fat32_test is entirely happy-path, yet this parser consumes whatever is
