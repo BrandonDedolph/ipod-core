@@ -113,6 +113,22 @@ OPTICAL_TARGET_PX = int(os.environ.get("CORE_OPTICAL_TARGET", "2"))
 # makes word spacing consistent between faces rather than an accident of each
 # one's design width.
 OPTICAL_WORD_PX = int(os.environ.get("CORE_OPTICAL_WORD", "5"))
+# EXPERIMENTAL, opt-in: CORE_OPTICAL_MODE=area equalises the DAYLIGHT the eye
+# integrates over the x-height band instead of the single tightest row.
+#
+# Why it exists: the min-clearance rule above puts every pair at the same
+# minimum gap, and then 'ff', 'ld', 'ht', 'ft' in Nunito render with a visible
+# hole ("Shuf fle", "Chil dren") while 'oo' sits tight. A tail or hook is ONE
+# row; under the min rule it sets the whole pair's gap. Measured over 13 real
+# UI strings (tools/text_metrics.py --strings), the coefficient of variation
+# of per-pair daylight is 0.28-0.35 with the min rule and 0.09-0.17 with this
+# one at CORE_OPTICAL_AREA=3 (0.17-0.27 at 2.5); Tahoma through the same
+# pipeline goes 0.25-0.32 -> 0.10-0.16, so it is the criterion, not the face.
+# CORE_OPTICAL_FLOOR is the min-row clearance that may never be violated, so
+# cores cannot touch. Not verified on the device yet; left off by default.
+OPTICAL_MODE = os.environ.get("CORE_OPTICAL_MODE", "min")     # "min" | "area"
+OPTICAL_AREA_PX = float(os.environ.get("CORE_OPTICAL_AREA", "3"))
+OPTICAL_FLOOR_PX = int(os.environ.get("CORE_OPTICAL_FLOOR", "1"))
 
 
 def fit_space_advance(glyphs, glyph_data, kerns, tracking, target_px):
@@ -241,7 +257,7 @@ def row_extents_bitmap(bmp, w, h, oy, thresh=1):
     return out
 
 
-def optical_kern(glyphs, glyph_data, tracking, target_px):
+def optical_kern(glyphs, glyph_data, tracking, target_px, band=None):
     """Per-pair corrections that put every letter pair at the SAME ink gap.
 
     The font's own kerning is a design for print at large sizes; at 9-12px on
@@ -263,6 +279,9 @@ def optical_kern(glyphs, glyph_data, tracking, target_px):
     ASCII letters only: digits and punctuation have deliberate design widths
     (a comma should not be spaced like an 'o'), and forcing them to a uniform
     optical gap looks mechanical.
+
+    `band` is (top, bottom) of the x-height in ascender-relative rows; only
+    the OPTICAL_MODE=area experiment reads it.
     """
     idx = {}
     for i in range(95):
@@ -290,7 +309,16 @@ def optical_kern(glyphs, glyph_data, tracking, target_px):
             if not shared:
                 continue
             m = min(rb[y][0] - ra[y][1] for y in shared) + oxb - oxa
-            step = target_px + 1 - m
+            if OPTICAL_MODE == "area":
+                rows = [y for y in shared if band and band[0] <= y < band[1]]
+                if not rows:
+                    rows = list(shared)
+                ma = (sum(rb[y][0] - ra[y][1] for y in rows) / len(rows)
+                      + oxb - oxa)
+                step = int(round(OPTICAL_AREA_PX + 1 - ma))
+                step = max(step, OPTICAL_FLOOR_PX + 1 - m)
+            else:
+                step = target_px + 1 - m
             adj64 = step * ADV_ONE - adva - tracking
             adj = int(round(adj64 / 2.0))          # 1/64 -> 1/32
             if adj == 0:
@@ -428,7 +456,9 @@ def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
     # (digits, punctuation, the Latin-1 extras), where design widths matter
     # more than a uniform optical rhythm.
     if OPTICAL_KERN:
-        opt = optical_kern(glyphs, glyph_data, track, OPTICAL_TARGET_PX)
+        xb = font.getbbox("x")
+        band = (ascent - (xb[3] - xb[1]), ascent) if xb else None
+        opt = optical_kern(glyphs, glyph_data, track, OPTICAL_TARGET_PX, band)
         merged = {(l, r): v for l, r, v in kerns}
         merged.update({(l, r): v for l, r, v in opt})   # optical wins
         kerns = [(l, r, v) for (l, r), v in merged.items() if v != 0]

@@ -2839,11 +2839,11 @@ static void shuffle_songs_play(fat32_t *fs)
  * out of the "Artist - Album" folder name. Writes "" when the folder isn't in
  * the album table (a track whose folder never became an album entry).
  *
- * This was a linear scan of g_albums, justified as "a few thousand compares
- * per repaint" — but it runs per visible row per repaint, while every wheel
- * tick repaints, and album_by_clus already answers the same question from a
- * hash bucket that the loader keeps in sync. There is no second table to
- * drift; there is only the one that was already there.
+ * Through album_by_clus: the cluster->album hash already exists (the loader
+ * builds it for the queue builders), so there is no second table to keep in
+ * sync. This used to be its own linear scan over every album, run per visible
+ * row per repaint — up to 1024 compares a row, six rows a frame, on the one
+ * list the wheel moves fastest.
  */
 static void song_album_title(const lib_song_t *sg, char *out)
 {
@@ -3758,6 +3758,50 @@ static void detail_load_meta(fat32_t *fs)
  * the first present is throttled conservatively before it is measured. */
 static uint32_t g_present_cost_us = 30000u;
 
+/*
+ * Scroll diagnostics, reported on a "core: ui" UART line every 5 s in which
+ * something was painted (see ui_stats_emit). These exist because "the list
+ * lags" has four candidate mechanisms — the render, the present, the cover
+ * reads issued under the wheel, and the playing-time throttle — and the only
+ * number the log carried was the last present's cost. Every counter is a
+ * store or a compare on a path that already reads the timer; none is on the
+ * audio path.
+ */
+static uint32_t g_ui_render_us;        /* CPU time of the last list paint, no present */
+static uint32_t g_ui_render_max_us;    /* worst paint in the window                    */
+static uint32_t g_ui_present_max_us;   /* worst present in the window                  */
+static uint32_t g_ui_full, g_ui_partial;   /* presents in the window, by path        */
+static uint32_t g_ui_art_reads;        /* cover loads issued (each a disk read)        */
+static uint32_t g_ui_art_max_us;       /* longest single pump: a spin-up lands here    */
+static uint32_t g_ui_art_held;         /* passes that refused to wake a parked platter */
+
+static uint32_t present_gap_us(void);  /* defined just below, with the throttle */
+
+static void ui_stats_emit(void)
+{
+    if (g_ui_full + g_ui_partial == 0 && g_ui_art_reads == 0 && g_ui_art_held == 0) {
+        return;                            /* nothing painted: keep the log quiet */
+    }
+    const player_stats_t *ps = player_stats();
+    uart_puts("core: ui full ");        uart_dec((int)g_ui_full);
+    uart_puts(" partial ");             uart_dec((int)g_ui_partial);
+    uart_puts(" render_us ");           uart_dec((int)g_ui_render_us);
+    uart_puts(" max ");                 uart_dec((int)g_ui_render_max_us);
+    uart_puts(" present_us ");          uart_dec((int)g_present_cost_us);
+    uart_puts(" max ");                 uart_dec((int)g_ui_present_max_us);
+    uart_puts(" gap_us ");              uart_dec((int)present_gap_us());
+    uart_puts(" art reads ");           uart_dec((int)g_ui_art_reads);
+    uart_puts(" max_us ");              uart_dec((int)g_ui_art_max_us);
+    uart_puts(" held ");                uart_dec((int)g_ui_art_held);
+    uart_puts(" parked ");              uart_dec(ata_is_parked());
+    uart_puts(" decode_us_per_kframe "); uart_dec(ps ? (int)ps->decode_us_per_kframe : -1);
+    uart_puts(" ring_low_pct ");        uart_dec((int)player_buf_pct());
+    uart_putc('\n');
+    g_ui_full = g_ui_partial = 0;
+    g_ui_render_max_us = g_ui_present_max_us = 0;
+    g_ui_art_reads = g_ui_art_max_us = g_ui_art_held = 0;
+}
+
 /* Present whatever has been drawn since the last console_damage_reset(), then
  * clear the damage. A full-screen damage rect (any console_clear) goes out via
  * the full-frame fast path, exactly as before. */
@@ -3776,11 +3820,22 @@ static void ui_present_damage(void)
     console_damage_reset();
 }
 
-/* How long to wait between repaints WHILE PLAYING. Self-tuning: keep the
- * IRQ-masked pixel push under ~1/4 of the loop's time by spacing repaints at
- * ~4x what the last one actually cost. A cheap partial present paces fast (a
- * responsive wheel), a full-frame push still backs off to about the old fixed
- * 150 ms — but only when it really is a full frame. */
+/* How long to wait between repaints WHILE PLAYING. Self-tuning: space repaints
+ * at ~4x what the last present actually cost. A cheap partial present paces
+ * fast (a responsive wheel), a full-frame push still backs off to about the
+ * old fixed 150 ms — but only when it really is a full frame.
+ *
+ * The 4x was chosen when the pixel push ran with IRQs MASKED end to end, to
+ * keep that masked time under ~1/4 of the loop. lcd.c now releases the I-bit
+ * between panel rows, so the DMA re-kick deadline no longer bears on this; what
+ * the gap still buys is CPU for the decoder. player_pump decodes exactly one
+ * 1024-frame step per pass (~23 ms of audio), so a pass that also renders and
+ * presents yields less audio than it consumes, and the gap is what keeps such
+ * passes the minority. Whether 4x is the right share is a question for the
+ * "core: ui" line (render_us, present_us, decode_us_per_kframe, ring_low_pct):
+ * on the album list every detent scrolls the window (ui_scroll_window anchors
+ * the selection a third of the way down), so every scroll present is a FULL
+ * frame and this multiplier is the frame rate. Do not lower it on a guess. */
 static uint32_t present_gap_us(void)
 {
     uint32_t gap = g_present_cost_us * 4u;
@@ -3889,6 +3944,8 @@ static int list_view_current(list_view_t *v)
 static struct {
     int      valid, scr, depth, sel, top, count, right_w;
     uint32_t chrome, epoch;
+    uint32_t rows;      /* bit r: row r's content changed under a still view
+                         * (a cover chip arrived) — repaint it, nothing else */
 } g_lp;
 
 static uint32_t chrome_key(void)
@@ -3918,12 +3975,21 @@ static void list_paint_note(void)
     g_lp.right_w = v.right[0] ? text_width(v.right, FONT_SMALL) : 0;
     g_lp.chrome  = chrome_key();
     g_lp.epoch   = g_list_epoch;
+    g_lp.rows    = 0;                     /* a full paint drew every row       */
 }
 
-/* Repaint the current screen by redrawing ONLY what a selection move changed:
- * the two affected rows, the header's "n / m" value and the scrollbar. Returns
- * 0 when that isn't provably sufficient (different screen, scrolled window,
- * changed contents or chrome) — the caller then does the full render. */
+/* Repaint the current screen by redrawing ONLY what changed under a still
+ * view: the two rows a selection move touched (plus the header's "n / m" value
+ * and the scrollbar), and any row whose cover chip arrived since the last
+ * paint (g_lp.rows). Returns 0 when that isn't provably sufficient (different
+ * screen, scrolled window, changed contents or chrome) — the caller then does
+ * the full render.
+ *
+ * The chip case used to fall through to the full render: with the selection
+ * unchanged there was "nothing" for the partial path to do, so each cover that
+ * landed on the album list cleared and re-pushed the whole panel — six times
+ * over for a fresh window, each one re-arming the playing-time throttle at the
+ * full-frame cost, in the middle of the scroll the covers were loading for. */
 static int list_repaint_partial(void)
 {
     list_view_t v;
@@ -3931,37 +3997,46 @@ static int list_repaint_partial(void)
     if (g_lp.scr != (int)scr_cur() || g_lp.depth != g_dir_depth) return 0;
     if (g_lp.epoch != g_list_epoch)                              return 0;
     if (g_lp.count != v.count || g_lp.chrome != chrome_key())    return 0;
-    if (v.sel == g_lp.sel)                                       return 0;
+    int moved = (v.sel != g_lp.sel);
+    if (!moved && g_lp.rows == 0)                                return 0;
     int top = ui_scroll_window(v.sel, v.count, v.visible);
     if (top != g_lp.top) return 0;        /* window scrolled: every row moved   */
 
-    int r_old = g_lp.sel - top, r_new = v.sel - top;
-    if (r_old < 0 || r_old >= v.visible || r_new < 0 || r_new >= v.visible) {
-        return 0;                          /* off-window selection: play it safe */
-    }
-
-    /* Header value: clear only as wide as the old/new text. If the title reaches
-     * into that box, the clear would eat it — fall back to a full paint. */
-    int rw = v.right[0] ? text_width(v.right, FONT_SMALL) : 0;
-    int cw = ((rw > g_lp.right_w) ? rw : g_lp.right_w) + 4;
-    if (cw > 4) {
-        int cx = LCD_WIDTH - 12 - cw;
-        if (12 + 20 + text_width(v.title, FONT_HEADER) > cx) return 0;
-        console_fill_rect(cx, HDR_BASE - 12, cw, 16, LINEN_SURFACE);
-        if (rw) {
-            ui_text(LCD_WIDTH - 12 - rw, HDR_BASE - 1, v.right, FONT_SMALL,
-                    LINEN_MUTED2);
+    uint32_t rows = g_lp.rows;
+    if (moved) {
+        int r_old = g_lp.sel - top, r_new = v.sel - top;
+        if (r_old < 0 || r_old >= v.visible || r_new < 0 || r_new >= v.visible) {
+            return 0;                      /* off-window selection: play it safe */
         }
+
+        /* Header value: clear only as wide as the old/new text. If the title
+         * reaches into that box, the clear would eat it — fall back to a full
+         * paint. */
+        int rw = v.right[0] ? text_width(v.right, FONT_SMALL) : 0;
+        int cw = ((rw > g_lp.right_w) ? rw : g_lp.right_w) + 4;
+        if (cw > 4) {
+            int cx = LCD_WIDTH - 12 - cw;
+            if (12 + 20 + text_width(v.title, FONT_HEADER) > cx) return 0;
+            console_fill_rect(cx, HDR_BASE - 12, cw, 16, LINEN_SURFACE);
+            if (rw) {
+                ui_text(LCD_WIDTH - 12 - rw, HDR_BASE - 1, v.right, FONT_SMALL,
+                        LINEN_MUTED2);
+            }
+        }
+        rows |= (1u << r_old) | (1u << r_new);
     }
 
-    /* The two rows: clear the band (the new content may be narrower) + redraw. */
-    for (int k = 0; k < 2; k++) {
-        int r = k ? r_new : r_old;
+    /* The rows: clear each band (the new content may be narrower) + redraw. */
+    for (int r = 0; r < v.visible; r++) {
+        if (!(rows & (1u << r))) continue;
         console_fill_rect(0, v.y0 + r * v.rh, LCD_WIDTH, v.rh, LINEN_SURFACE);
         int idx = top + r;
         if (idx < v.count) v.row(r, idx);
     }
-    ui_scrollbar(v.y0, top, v.visible, v.count);
+    if (moved) {
+        ui_scrollbar(v.y0, top, v.visible, v.count);
+    }
+    g_lp.rows = 0;
     return 1;
 }
 
@@ -3985,6 +4060,14 @@ static int list_repaint_partial(void)
  * well past the last detent — it must not blink out while you are still
  * deciding which letter to stop on. */
 #define WHEEL_AZ_HOLD_LETTER 1200000u
+
+/* Cover loads under a moving wheel (the album-list pump in run_ui; see the
+ * block comment there). A detent within SETTLE means the list is scrolling:
+ * one disk read per pass, not six. A parked platter is only woken for covers
+ * after QUIET of wheel silence — long enough that a deliberate detent-by-
+ * detent scroll (~300 ms apart) never trips a spin-up mid-gesture. */
+#define CHIP_WHEEL_SETTLE_US   150000u
+#define CHIP_SPINUP_QUIET_US   500000u
 
 static uint32_t g_wheel_last_us;
 static int      g_wheel_vel = 1;
@@ -4807,6 +4890,7 @@ _Noreturn static void run_ui(fat32_t *fs)
     uint32_t last_present = 0;           /* rate-limit UI presents while playing */
     uint32_t last_bars = 0;              /* rate-limit the now-playing bar anim  */
     uint32_t last_chip = 0;              /* rate-limit album-cover chip loads    */
+    uint32_t last_uistat = 0;            /* 5 s cadence of the "core: ui" line   */
     uint32_t last_mq = 0;                /* rate-limit the marquee scroll        */
     int      hold_prev = clickwheel_hold() ? 1 : 0;  /* seed hold-edge detect    */
     int      ext_prev  = power_is_external() ? 1 : 0; /* seed plug-in edge detect */
@@ -5641,7 +5725,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                  * render, which console_clear marks as whole-screen damage. The
                  * A-Z plate covers arbitrary rows, so while it is up (or in the
                  * frame that clears it) the full render is the honest option. */
-                if (az_letter || az_prev || !list_repaint_partial()) {
+                int partial = !az_letter && !az_prev && list_repaint_partial();
+                if (!partial) {
                     switch (scr_cur()) {
                     case SCR_MENU:    main_menu_render();            break;
                     case SCR_MUSIC:   music_menu_render();           break;
@@ -5659,7 +5744,13 @@ _Noreturn static void run_ui(fat32_t *fs)
                     }
                 }
                 if (az_letter) az_overlay_render(az_letter);
+                /* Render and present timed apart: `now` was read before the
+                 * paint, so the delta here is the CPU the renderer took. */
+                g_ui_render_us = mmio_read32(USEC_TIMER_ADDR) - now;
+                if (g_ui_render_us > g_ui_render_max_us) g_ui_render_max_us = g_ui_render_us;
                 ui_present_damage();
+                if (g_present_cost_us > g_ui_present_max_us) g_ui_present_max_us = g_present_cost_us;
+                if (partial) g_ui_partial++; else g_ui_full++;
                 list_paint_note();
                 az_prev = az_letter;
                 dirty = 0;
@@ -5751,17 +5842,51 @@ _Noreturn static void run_ui(fat32_t *fs)
          * pass (covers fill near-instantly). While a song plays we still spread
          * the I/O so it can't starve decode, but a folder.thm is only ~1KB and
          * the anti-skip diskbuf is 8MB (~73s), so a small BATCH every ~60ms
-         * (~50 covers/s) is safe and stops the old one-line-at-a-time trickle. */
+         * (~50 covers/s) is safe and stops the old one-line-at-a-time trickle.
+         *
+         * Every load is a SYNCHRONOUS disk read on this loop, so two things are
+         * held back while the wheel is actually turning:
+         *
+         *   - A PARKED platter is not woken for a cover. player.c parks the
+         *     drive between refill bursts (most of a track) and the idle timer
+         *     parks it after 20 s, so the first cover read after either is a
+         *     spin-up: the loop is frozen for the 1-3 s it takes (ATA_SPINUP_US
+         *     allows 4), the wheel's motion piles into the latch, and the list
+         *     jumps when it comes back. Covers wait for CHIP_SPINUP_QUIET_US of
+         *     wheel silence, so that stall lands on a still screen — a wait, not
+         *     a jerk — and a slow deliberate scroll never triggers it at all.
+         *   - With the platter up, a scroll in progress gets ONE read per pass.
+         *     Six reads is ~60 ms of seek+PIO stacked onto the pass that also
+         *     has to paint the new window; one bounds the hitch and the rest of
+         *     the window fills the moment the wheel settles.
+         *
+         * The pump is told the window (artcache_pump_for), so whichever reads
+         * do happen go to the rows on screen, top first — never to rows that
+         * already scrolled past. */
         if (scr_cur() == SCR_BROWSER && g_dir_depth == 0) {
             uint32_t nowc = mmio_read32(USEC_TIMER_ADDR);
             int idle_now  = !player_active();
-            if (idle_now || (uint32_t)(nowc - last_chip) >= 60000u) {
+            uint32_t since_wheel = nowc - g_wheel_last_us;
+            int moving = since_wheel < CHIP_WHEEL_SETTLE_US;
+            int budget;
+            if (ata_is_parked() && since_wheel < CHIP_SPINUP_QUIET_US) {
+                budget = 0;
+                g_ui_art_held++;
+            } else if (moving) {
+                budget = 1;
+            } else {
+                budget = idle_now ? 6 : 3;
+            }
+            if (budget > 0 && (idle_now || (uint32_t)(nowc - last_chip) >= 60000u)) {
                 /* A pumped slot is only worth a repaint if it is actually ON
                  * SCREEN: pumping a whole library's covers used to set dirty for
                  * every one of them, forcing ~21 consecutive full-frame repaints
                  * for rows nobody was looking at. Snapshot the visible rows'
-                 * chips, pump, and repaint only if one of THOSE appeared. */
+                 * chips, pump, and repaint only the rows whose chip appeared —
+                 * through g_lp.rows, so a landed cover costs one row band, not a
+                 * cleared panel and a full-frame push (see list_repaint_partial). */
                 const uint16_t *before[LIST_ROWS2];
+                int want[LIST_ROWS2];
                 int vtop = ui_scroll_window(g_br_sel, albumlist_count(), LIST_ROWS2);
                 /* PEEK, not get: this loop is only observing. artcache_get
                  * claims a way and re-stamps the LRU, so using it here (12
@@ -5772,17 +5897,35 @@ _Noreturn static void run_ui(fat32_t *fs)
                  * and a row is not an album when an artist filter puts the
                  * synthetic "All Songs" row at 0. */
                 for (int r = 0; r < LIST_ROWS2; r++) {
-                    int a = albumlist_album_at(vtop + r);
-                    before[r] = (a >= 0) ? artcache_peek(a) : 0;
+                    want[r]   = albumlist_album_at(vtop + r);
+                    before[r] = (want[r] >= 0) ? artcache_peek(want[r]) : 0;
                 }
-                for (int k = 0; k < (idle_now ? 6 : 3) && artcache_pump(fs); k++) {
+                uint32_t t_art = mmio_read32(USEC_TIMER_ADDR);
+                int loaded = 0;
+                while (loaded < budget && artcache_pump_for(fs, want, LIST_ROWS2)) {
+                    loaded++;
                 }
+                t_art = mmio_read32(USEC_TIMER_ADDR) - t_art;
+                g_ui_art_reads += (uint32_t)loaded;
+                if (loaded && t_art > g_ui_art_max_us) g_ui_art_max_us = t_art;
                 for (int r = 0; r < LIST_ROWS2; r++) {
-                    int a = albumlist_album_at(vtop + r);
-                    const uint16_t *now_px = (a >= 0) ? artcache_peek(a) : 0;
-                    if (now_px != before[r]) dirty = 1;
+                    const uint16_t *now_px = (want[r] >= 0) ? artcache_peek(want[r]) : 0;
+                    if (now_px != before[r]) {
+                        g_lp.rows |= 1u << r;
+                        dirty = 1;
+                    }
                 }
                 last_chip = nowc;
+            }
+        }
+
+        /* The scroll diagnostics line, on the same 5 s cadence as the battery
+         * and audio lines but only when something was painted. */
+        {
+            uint32_t nows = mmio_read32(USEC_TIMER_ADDR);
+            if ((uint32_t)(nows - last_uistat) >= 5000000u) {
+                ui_stats_emit();
+                last_uistat = nows;
             }
         }
 

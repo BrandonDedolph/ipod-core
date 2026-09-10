@@ -50,8 +50,14 @@
                                     * whole library (LIB_MAX_ALBUMS). This is a
                                     * KEY RANGE + a 12-byte directory entry —
                                     * NOT a decoded thumbnail each. */
-#define ARTCACHE_WAYS  16          /* resident decoded covers: ~2.5 screens of
-                                    * chips at 6 rows, ~25 KB */
+#define ARTCACHE_WAYS  32          /* resident decoded covers, ~50 KB. Sized
+                                    * for a REVERSAL: scrolling down and back
+                                    * up stays free for (WAYS - 6 visible)
+                                    * rows, and every row past that is a disk
+                                    * read under the wheel. At 16 ways a
+                                    * 20-row round trip re-read 10 covers
+                                    * (tests/ui/artcache_test.c); at 32 it
+                                    * re-reads none. */
 
 /* CoreArt sidecar layout (see tools/coreart.py): "CART"(4) + u16 version +
  * u16 width + u16 height + u16 reserved, then width*height RGB565 pixels.
@@ -92,6 +98,23 @@ void artcache_queue(int idx, uint32_t thm_clus, uint32_t thm_size,
  * main-loop pass.
  */
 int artcache_pump(fat32_t *fs);
+
+/*
+ * artcache_pump, told what is on screen. `want` is the album index of each
+ * visible row, top to bottom (-1 for a row that is not an album, e.g. "All
+ * Songs"). The first of those that still needs pixels is loaded — claiming a
+ * way for it if the list has not drawn it yet — and only when every wanted
+ * album is resident (or hopeless) does the backlog of rows that scrolled past
+ * get a turn, oldest first.
+ *
+ * WHY. A miss is a synchronous disk read from the main loop, so the pump is
+ * budgeted to a few reads per pass — and a fast scroll queues far more rows
+ * than that. Plain artcache_pump serves them oldest-first, which after such a
+ * scroll means the rows that have ALREADY GONE PAST: measured on the host,
+ * fifteen detents followed by six reads fetched nothing the user could see.
+ * Returns 1 if it loaded something, else 0.
+ */
+int artcache_pump_for(fat32_t *fs, const int *want, int n);
 
 /*
  * Return album `idx`'s ARTCACHE_DIM x ARTCACHE_DIM RGB565 pixels if they are
