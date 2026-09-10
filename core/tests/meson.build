@@ -297,9 +297,11 @@ if target == 'sim'
   # policy, compiled host-side with -DSCHED_TEST against inert stubs for
   # the two asm symbols (switch_context / task_trampoline). Proves task
   # add/bounds, round-robin selection, done-task skipping, and the
-  # single-runnable no-switch case. The context-switch asm itself has NO
-  # automated coverage: it has only ever been run by hand in the clicky
-  # emulator, which is not wired up as a target in this repo.
+  # single-runnable no-switch case. The context-switch asm itself is not
+  # reachable from here — it is covered by the boot-smoke CI job, which boots
+  # the linked image in clicky and requires `core: idle task entered`, a line
+  # printed from inside a task reached only through switch_context and
+  # task_trampoline (tests/clicky/boot_uart.golden).
   sched_test = executable(
     'sched_test',
     sources: ['hw_sched/sched_test.c',
@@ -317,9 +319,11 @@ if target == 'sim'
   # timer_tick_isr acks by reading TIMER1_VAL and advances the counter,
   # that irq_dispatch only ticks when CPU_INT_STAT shows TIMER1 pending,
   # and the sleep_ms tick math (a sched_yield stub advances the mocked
-  # tick so the cooperative wait terminates). The IRQ entry asm + real
-  # interrupt delivery have NO automated coverage — manual clicky runs only,
-  # and there is no clicky target in this repo.
+  # tick so the cooperative wait terminates). The IRQ entry asm and real
+  # interrupt delivery are not reachable host-side; they are covered by the
+  # boot-smoke CI job, whose settle window requires the run to survive live
+  # timer IRQs through our own vector table — a broken entry lands in the
+  # fault vectors, which panic over the same UART and fail the check.
   timer_test = executable(
     'timer_test',
     sources: ['hw_timer/timer_test.c',
