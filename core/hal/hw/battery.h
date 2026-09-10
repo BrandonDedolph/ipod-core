@@ -59,8 +59,11 @@ int battery_percent(void);
  * scaling against a meter at all.
  *
  * Fills `out` and returns 0, or returns -1 on I2C failure (in which case every
- * field is set to -1 rather than a plausible-looking zero). `mv_raw` is the
- * unclamped conversion; `mv` is what the gauge should use.
+ * field is set to -1 rather than a plausible-looking zero). An ADC code of 0
+ * is treated as a failure too: the I2C driver cannot see a missing ack, and
+ * 0 V is not a voltage this cell can be at while the firmware is running to
+ * ask. `mv_raw` is the unclamped conversion; `mv` is what the gauge should
+ * use.
  */
 typedef struct {
     int raw;      /* 10-bit ADC code as read (0..1023)                       */

@@ -196,6 +196,21 @@ int battery_sample(battery_sample_t *out)
 
     /* Assemble the 10-bit sample and scale to millivolts. */
     int raw = ((int)data[0] << 2) | (data[1] & PMU_ADC_LOW_MASK);
+
+    /*
+     * An all-zero result is a FAILED read, not a measurement. i2c_read()
+     * checks only that the controller went idle, never that the PMU acked,
+     * so a transfer the PMU did not answer returns whatever the data
+     * registers hold and reports success. A code of 0 is 0 V on a cell that
+     * is, demonstrably, running this CPU — impossible as a reading, and
+     * dangerous as one: the plausibility clamp below pins it to the 3300 mV
+     * floor, which is the shutoff line, and three of those in a row would
+     * carry the low-battery policy straight through DISKSAFE to a power-off
+     * on a healthy battery. Returned as -1, it enters nothing anywhere.
+     */
+    if (raw == 0) {
+        return -1;
+    }
     int mv  = (raw * PMU_ADC_FULLSCALE_MV) >> PMU_ADC_BITS;
 
     out->raw    = raw;

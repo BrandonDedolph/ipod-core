@@ -192,6 +192,37 @@ static int test_battery_sample_clamp(void)
     return trace_done(&tc);
 }
 
+/*
+ * An all-zero ADC result is a failed read. i2c_read() only waits for the
+ * controller to go idle — it never checks that the PMU acked — so a transfer
+ * the PMU did not answer can return zeros and report success. Raw 0 would
+ * clamp to the 3300 mV floor, i.e. the shutoff line, so three of them in a
+ * row would walk the policy from OK to power-off on a healthy cell. The
+ * driver must reject it, and the policy must then see -1 and hold still.
+ */
+static int test_battery_sample_zero_is_failure(void)
+{
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_DATA0_ADDR, 0x00);
+    mmio_mock_set_read(I2C_DATA1_ADDR, 0x00);
+
+    battery_sample_t bs;
+    int rc = battery_sample(&bs);
+    trace_cursor tc = trace_begin("battery_sample_zero_is_failure");
+    if (rc == 0 || bs.raw != -1 || bs.mv_raw != -1 || bs.mv != -1) {
+        fprintf(stderr, "[%s] rc %d raw %d mv_raw %d mv %d; expected -1 everywhere\n",
+                tc.name, rc, bs.raw, bs.mv_raw, bs.mv);
+        tc.fails++;
+    }
+    /* The two wrappers must agree: no caller gets a 3300 out of this. */
+    if (battery_millivolts() != -1 || battery_percent() != -1) {
+        fprintf(stderr, "[%s] wrappers returned a value for a zero read\n",
+                tc.name);
+        tc.fails++;
+    }
+    return trace_done(&tc);
+}
+
 /* The curve as a pure function: same answer as battery_percent(), with no bus
  * traffic at all — which is what lets a caller filter several samples and
  * convert once. */
@@ -517,10 +548,32 @@ static int test_policy_i2c_failure_inert(void)
     feed_expect(&tc, 3300, 1, BATTERY_EVENT_NONE);   /* run 2 */
     expect_level(&tc, BATTERY_LEVEL_DISKSAFE, 0, "failures at floor");
 
-    /* End to end through the driver on a healthy ring. */
+    /* End to end through the driver on a healthy ring: a run of all-zero
+     * reads (a PMU that stopped answering) is as inert as a wedged bus. Three
+     * of them, because three genuine floor samples is what SHUTOFF needs. */
     if (prime(&tc, 3700)) {
         return trace_done(&tc);
     }
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_DATA0_ADDR, 0x00);
+    mmio_mock_set_read(I2C_DATA1_ADDR, 0x00);
+    for (int i = 0; i < 3; i++) {
+        battery_sample_t zb;
+        int zrc = battery_sample(&zb);
+        battery_event_t zev = battery_policy_feed(zrc == 0 ? zb.mv : -1);
+        if (zrc == 0 || zev != BATTERY_EVENT_NONE) {
+            fprintf(stderr, "[%s] zero read %d: rc %d event %d\n",
+                    tc.name, i, zrc, (int)zev);
+            tc.fails++;
+        }
+    }
+    if (battery_filtered_mv() != 3700) {
+        fprintf(stderr, "[%s] zero reads moved the filter: %d\n",
+                tc.name, battery_filtered_mv());
+        tc.fails++;
+    }
+    expect_level(&tc, BATTERY_LEVEL_OK, 1, "after zero reads");
+
     mmio_mock_reset();
     mmio_mock_set_read(I2C_STATUS_ADDR, I2C_BUSY);   /* bus wedged */
     battery_sample_t bs;
@@ -579,6 +632,7 @@ int main(void)
     fails += test_battery_percent();
     fails += test_battery_sample();
     fails += test_battery_sample_clamp();
+    fails += test_battery_sample_zero_is_failure();
     fails += test_battery_percent_from_mv();
 
     /* Low-battery policy: filter, thresholds, debounce, bus failure, recovery. */
