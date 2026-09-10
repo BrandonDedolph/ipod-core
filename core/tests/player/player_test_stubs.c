@@ -62,6 +62,10 @@ int  stub_audio_stops;
 int  stub_audio_running;
 int  stub_audio_primed;   /* HAL still holds unplayed PCM (survives a stop)  */
 int  stub_audio_flushes;
+int  stub_audio_cold;     /* codec powered down (suspend/close), not by stop */
+int  stub_audio_suspends;
+int  stub_audio_wakes;
+int  stub_audio_suspends_while_running;
 int  stub_audio_drains;
 int  stub_audio_drained_while_running;  /* drains issued BEFORE the stop      */
 int  stub_ata_standbys;
@@ -84,6 +88,8 @@ void stub_reset(void)
     stub_audio_starts = stub_audio_stops = stub_audio_running = 0;
     stub_audio_primed = stub_audio_flushes = stub_audio_drains = 0;
     stub_audio_drained_while_running = 0;
+    stub_audio_cold = stub_audio_suspends = stub_audio_wakes = 0;
+    stub_audio_suspends_while_running = 0;
     stub_ata_standbys = stub_meta_reads = 0;
     stub_seeks = 0;
     g_seek_ok  = 1;
@@ -345,7 +351,14 @@ decoder_alloc_t decoder_arena_allocator(decoder_arena_t *a)
 
 int hal_audio_init(uint32_t rate, uint16_t channels)
 {
-    return (rate == 44100u && channels == 2u) ? 0 : -1;
+    if (rate != 44100u || channels != 2u) {
+        return -1;
+    }
+    /* A full bring-up: the codec is up and, as on the device, the buffers are
+     * severed from whatever stream came before. */
+    stub_audio_cold   = 0;
+    stub_audio_primed = 0;
+    return 0;
 }
 
 /* Codec gain/balance. player_open_current() re-applies these on every open so a
@@ -387,7 +400,36 @@ int stub_drain(int frames)
 void hal_audio_start(void)
 {
     stub_audio_starts++;
-    stub_audio_running = 1;
+    /* A start on a cold codec is the bug the wake exists to prevent: on the
+     * device the DMA would stream into an unclocked FIFO and simply never
+     * complete. Modelled as "not running" so a missing wake shows up as a DAC
+     * that did not restart, rather than being invisible. */
+    stub_audio_running = stub_audio_cold ? 0 : 1;
+}
+
+void hal_audio_suspend(void)
+{
+    if (stub_audio_running) {
+        stub_audio_suspends_while_running++;   /* the real one refuses this */
+        return;
+    }
+    if (stub_audio_cold) {
+        return;                                /* idempotent, as on the device */
+    }
+    stub_audio_suspends++;
+    stub_audio_cold = 1;
+    /* Deliberately NOT clearing stub_audio_primed: keeping the buffered PCM is
+     * the whole difference between a suspend and a close. */
+}
+
+int hal_audio_wake(void)
+{
+    if (!stub_audio_cold) {
+        return 0;
+    }
+    stub_audio_wakes++;
+    stub_audio_cold = 0;
+    return 0;
 }
 
 void hal_audio_stop(void)
@@ -420,6 +462,8 @@ int hal_audio_drain(uint32_t timeout_ms)
 void hal_audio_close(void)
 {
     hal_audio_stop();
+    stub_audio_cold   = 1;
+    stub_audio_primed = 0;    /* close severs the buffers; suspend does not */
 }
 
 /* ---- fake drive ------------------------------------------------------- */

@@ -155,6 +155,18 @@ static volatile uint32_t g_late_worst_us;/* worst overshoot seen, microseconds *
 static volatile uint32_t g_stop_done;
 
 /*
+ * The codec is powered down and the I2S/MCLK clocks are gated — set by
+ * hal_audio_suspend() and hal_audio_close(), cleared by hal_audio_wake() and
+ * hal_audio_init(). It exists so the power-down sequence runs exactly once:
+ * the UI closes the HAL on the active->inactive edge, and a stop that follows
+ * a suspended pause would otherwise run wm8758_powerdown() against a codec
+ * whose rails are already off and gate clocks that are already gated —
+ * harmless register-wise, but a second I2C sequence for nothing, and a
+ * hal_audio_wake() has to know whether there is anything to wake.
+ */
+static volatile int      g_cold;
+
+/*
  * DMA-visible physical address of a buffer. SDRAM is dual-mapped: our .bss
  * lives at the post-MMAP0-remap logical base (0x00000000-based), and the
  * same bytes are reachable at the native SDRAM base (0x10000000 + offset).
@@ -281,6 +293,7 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels)
     g_active      = 0;
     g_running     = 0;
     g_primed      = 0;
+    g_cold        = 0;       /* wm8758_init + i2s_init just brought it all up */
     g_completions = 0;
     g_underruns   = 0;
     g_late_kicks  = 0;
@@ -510,11 +523,76 @@ void hal_audio_flush(void)
     g_stop_done = 0;
 }
 
+/*
+ * Codec off, clocks gated, everything else untouched. Shared by suspend and
+ * close; see g_cold for why it runs at most once between bring-ups.
+ */
+static void codec_power_off(void)
+{
+    if (g_cold) {
+        return;
+    }
+    wm8758_powerdown();      /* codec cold (mute+VMID discharge) — MCLK still live */
+    i2s_disable();           /* then gate the I2S + codec-MCLK clocks              */
+    g_cold = 1;
+}
+
+void hal_audio_suspend(void)
+{
+    /*
+     * Only over a stop. Powering the codec down under a running DMA would
+     * leave the engine streaming into a FIFO nothing clocks out — the
+     * completion IRQ would simply stop arriving and the player would sit in
+     * hal_audio_drain's timeout. Refusing is right: the caller pauses first,
+     * and a suspend that lands while playing is a caller bug, not a request.
+     *
+     * Deliberately NOT touching g_primed, g_stop_done, g_active, g_kick_bytes
+     * or the source: they are what hal_audio_start() resumes into, and keeping
+     * them is the entire difference between this and hal_audio_close(). See
+     * audio.h.
+     */
+    if (g_running) {
+        return;
+    }
+    codec_power_off();
+}
+
+int hal_audio_wake(void)
+{
+    if (!g_cold) {
+        return 0;
+    }
+    /*
+     * The same bring-up hal_audio_init performs, minus the state reset. The
+     * rate preset is still latched inside wm8758.c from the last set_rate, so
+     * wm8758_init programs the PLL for the stream we paused; i2s_init
+     * re-pulses the block out of reset and re-ungates DEV_I2S + DEV_EXTCLOCKS;
+     * dma_playback_init re-arms the channel's static config (the engine itself
+     * kept nothing across the stop — every kick reprograms address and count).
+     *
+     * The I2S TX FIFO is cleared by i2s_init. That loses nothing: the FIFO's
+     * ~16 frames were already written off when hal_audio_stop() sampled the
+     * resume offset (it rounds to the frame the DMA had handed over, and the
+     * FIFO tail is the ~0.4 ms of slack that offset is documented to carry).
+     *
+     * The restore hook is re-registered rather than assumed, for the same
+     * reason hal_audio_init registers it every time: wm8758_init's first act
+     * is a WM_RESET, and the user's volume/balance/tone must come back with
+     * the codec, not a track change later.
+     */
+    i2c_init();
+    i2s_init();
+    wm8758_set_restore(hal_codec_restore);
+    int codec_bad = wm8758_init();
+    dma_playback_init();
+    g_cold = 0;
+    return codec_bad != 0 ? -2 : 0;
+}
+
 void hal_audio_close(void)
 {
     hal_audio_stop();
-    wm8758_powerdown();      /* codec cold (mute+VMID discharge) — MCLK still live */
-    i2s_disable();           /* then gate the I2S + codec-MCLK clocks              */
+    codec_power_off();       /* no-op if a suspended pause already did it        */
     g_primed = 0;            /* buffers are no longer related to any live stream   */
 }
 

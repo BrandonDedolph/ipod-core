@@ -4867,11 +4867,21 @@ _Noreturn static void run_ui(fat32_t *fs)
          * 80. Restore the instant there's life again: any wake back to BL_FULL, or
          * playback starting. Rides the same refcounted boost the boot path took, so
          * it stays balanced (idle unboost 1->0, wake boost 0->1) and re-boosts
-         * before the render/decode work later in this same iteration. */
-        if (cpu_idled && (bl_state != BL_OFF || player_active())) {
+         * before the render/decode work later in this same iteration.
+         *
+         * "Playing" means the DAC is running — player_playing(), NOT
+         * player_active(). Active stays set across a pause (the UI needs it to,
+         * every transport control is gated on it), so keying this on active
+         * meant a PAUSED device with the screen off held 80 MHz indefinitely:
+         * the single largest idle-power miss in the firmware, since pause-and-
+         * pocket is the common way to stop listening. A paused pump does no
+         * decode and feeds no DMA, so 30 MHz is plenty; the resume itself
+         * always arrives through a wake press that has already re-lit the
+         * screen (and so re-boosted here) one pass earlier. */
+        if (cpu_idled && (bl_state != BL_OFF || player_playing())) {
             cpu_boost();
             cpu_idled = 0;
-        } else if (!cpu_idled && bl_state == BL_OFF && !player_active()) {
+        } else if (!cpu_idled && bl_state == BL_OFF && !player_playing()) {
             cpu_unboost();
             cpu_idled = 1;
         }
@@ -4895,8 +4905,7 @@ _Noreturn static void run_ui(fat32_t *fs)
         settings_commit(0);
 
         const uint32_t disk_idle_us = 20000000u;   /* 20 s: saves ~100 mA, no thrash */
-        if ((!player_active() || player_paused())
-            && !ata_is_parked() && idle > disk_idle_us) {
+        if (!player_playing() && !ata_is_parked() && idle > disk_idle_us) {
             ata_standby();
         }
 
@@ -4976,8 +4985,9 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
             lock_flashing = 1;
             /* Only throttle when idle; keep audio paced while playing. Halt the
-             * core (self-waking ~10 ms, one tick) instead of a busy-spin. */
-            if (!player_active()) {
+             * core (self-waking ~10 ms, one tick) instead of a busy-spin. Same
+             * gate as the main halt below: a PAUSED player has no DMA to pace. */
+            if (!player_playing()) {
                 cpu_wait_ms(10);
             }
             continue;                     /* skip the normal render this pass      */
@@ -5208,16 +5218,26 @@ _Noreturn static void run_ui(fat32_t *fs)
          * an interrupt, and the audio DMA ISR has only the ~363 us I2S FIFO of
          * slack — 200 us stays inside that budget while still parking the core
          * for the overwhelming majority of an idle pass. Input is latched by the
-         * tick ISR and every animation here ticks at >= 33 ms, so nothing is lost. */
-        if (player_active() && !dirty && pump_us < 200u) {
+         * tick ISR and every animation here ticks at >= 33 ms, so nothing is lost.
+         *
+         * Gated on player_playing(), not player_active(). The 200 us figure is a
+         * DMA-feeding budget, and a PAUSED player has no DMA to feed — but
+         * active() stays 1 across a pause, so a paused device used to take this
+         * branch and spin the loop ~5,000 times a second (each pass a
+         * player_pump call, several USEC_TIMER reads, GPIO reads and an event
+         * drain) for as long as it sat paused. Paused is idle: it belongs in
+         * the 10 ms halt below, fifty times fewer wakeups. */
+        if (player_playing() && !dirty && pump_us < 200u) {
             cpu_wait_us(200);
         }
 
         /* Only throttle when idle; while playing, player_pump's decode_step
          * paces the loop and the wheel stays responsive. Halt the core until the
          * next tick (self-waking ~10 ms) instead of a busy-spin: input is latched
-         * by the 100 Hz timer ISR, so this costs no responsiveness. */
-        if (!player_active()) {
+         * by the 100 Hz timer ISR, so this costs no responsiveness. "Idle"
+         * includes paused (see above); the paused pump's only job — the codec
+         * power-down timeout — is seconds long, so 100 Hz is ample for it. */
+        if (!player_playing()) {
             cpu_wait_ms(10);
         }
 

@@ -497,6 +497,15 @@ static int            g_queue_n;
 static int            g_queue_idx;
 static int            g_pl_active;        /* a track is loaded (playing OR paused) */
 static int            g_pl_paused;         /* DMA suspended, position held          */
+/*
+ * The codec has been powered down UNDER the current pause (hal_audio_suspend)
+ * and must be woken before the DAC can run again. Cleared by every bring-up
+ * (audio_bringup, i.e. every open and every rate change) and by the wake in
+ * player_resume. It mirrors the HAL's own state; the player keeps a copy so
+ * the pump powers down once per pause rather than re-issuing the sequence on
+ * every pass, and so resume knows whether a wake is owed.
+ */
+static int            g_pl_codec_cold;
 static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start    */
 static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (freezes clock) */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
@@ -862,8 +871,40 @@ static int audio_bringup(uint32_t rate)
     hal_balance_set(hal_balance_get());
     hal_audio_set_source(ring_source, 0);
     hal_audio_start();
-    g_out_rate = rate;
+    g_out_rate      = rate;
+    g_pl_codec_cold = 0;                 /* init is a full bring-up */
     return 0;
+}
+
+/*
+ * Bring a codec that a persistent pause powered down back to life, without
+ * touching the stream. The counterpart of the suspend in player_pump.
+ *
+ * Only the codec is re-initialised — NOT hal_audio_init, which would clear the
+ * HAL's ping-pong buffers and lose up to ~370 ms of PCM that was pulled from
+ * the ring before the pause and never heard (the listener would resume a
+ * third of a second ahead of where they stopped). hal_audio_wake keeps those
+ * buffers and the mid-buffer offset; the hal_audio_start that follows resumes
+ * into them exactly as a plain unpause does.
+ *
+ * Volume and balance are re-applied here for the same reason audio_bringup
+ * does it: the wake is a WM_RESET and the codec comes back at 0 dB. The HAL's
+ * own restore hook covers it too, so this is belt-and-braces — but the hook
+ * is a HAL courtesy and the gain is the player's responsibility, so it is
+ * applied explicitly, BEFORE the DMA is kicked, on every path into playback.
+ *
+ * A wake failure (-2: the codec did not answer on I2C) is not fatal to the
+ * transport: the DMA still runs and the position stays honest, the listener
+ * simply hears nothing — the same outcome a wedged bus gives a track change,
+ * and the next open reports it through player_last_error() where the UI can
+ * see it. Leaving the player paused forever would be no more informative.
+ */
+static void codec_wake(void)
+{
+    (void)hal_audio_wake();
+    hal_volume_set(hal_volume_get());
+    hal_balance_set(hal_balance_get());
+    g_pl_codec_cold = 0;
 }
 
 /* Open g_queue[g_queue_idx] and start the DAC. Returns 0, or -1 on failure;
@@ -928,7 +969,12 @@ static int open_current_keep_pause(int was_paused)
 }
 
 /* Pause: suspend the DMA but keep the decoder, ring, and position — resume
- * re-primes the DAC from the still-full ring. Freezes the elapsed clock. */
+ * re-primes the DAC from the still-full ring. Freezes the elapsed clock.
+ *
+ * The codec stays UP here on purpose: an unpause within a moment must be
+ * instant and silent, and the power-down is a codec reset on the way back.
+ * player_pump powers it down once the pause has persisted
+ * (PLAYER_PAUSE_CODEC_OFF_US), timed from g_pl_pause_us. */
 void player_pause(void)
 {
     if (!g_pl_active || g_pl_paused) {
@@ -940,7 +986,13 @@ void player_pause(void)
 }
 
 /* Resume from pause: shift the track start forward by the paused duration so the
- * elapsed clock is continuous, then restart the DAC (re-primes from the ring). */
+ * elapsed clock is continuous, then restart the DAC (re-primes from the ring).
+ *
+ * If the pause lasted long enough for the pump to power the codec down, wake
+ * it first — the HAL's buffers and offset are intact underneath, so the
+ * hal_audio_start that follows is the same seamless resume either way. The
+ * clock shift is unaffected: it is computed from the pause timestamp, which
+ * the power-down never touches. */
 void player_resume(void)
 {
     if (!g_pl_active || !g_pl_paused) {
@@ -948,6 +1000,9 @@ void player_resume(void)
     }
     g_pl_start_us += mmio_read32(USEC_TIMER_ADDR) - g_pl_pause_us;
     g_pl_paused    = 0;
+    if (g_pl_codec_cold) {
+        codec_wake();
+    }
     hal_audio_start();
 }
 
@@ -1183,8 +1238,30 @@ void player_queue_commit(int start)
  * main-loop pass, so audio runs in the background while the UI is elsewhere. */
 void player_pump(void)
 {
-    if (!g_pl_active || g_pl_paused) {
-        return;                          /* paused: hold the ring + position     */
+    if (!g_pl_active) {
+        return;
+    }
+    if (g_pl_paused) {
+        /*
+         * Paused: hold the ring + position. The only work is the codec
+         * power-down once the pause has persisted (see player.h for why not
+         * at once and why this long). Timed from the pause timestamp, as a
+         * wrap-safe difference — USEC_TIMER rolls over every ~71 minutes and a
+         * pause can easily outlive that. Once per pause: the HAL's suspend is
+         * idempotent, but the flag keeps this from re-walking the I2C
+         * power-down sequence 100 times a second for the rest of the pause.
+         *
+         * hal_audio_suspend, not hal_audio_close: close discards the HAL's
+         * two buffers of already-pulled PCM and resume would jump ahead by
+         * that much. Suspend keeps them. codec_wake() undoes this on resume.
+         */
+        if (!g_pl_codec_cold &&
+            (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - g_pl_pause_us)
+                >= PLAYER_PAUSE_CODEC_OFF_US) {
+            hal_audio_suspend();
+            g_pl_codec_cold = 1;
+        }
+        return;
     }
 
     uint32_t fill = pcm_ring_fill(&g_ring);
@@ -1288,7 +1365,8 @@ void player_pump(void)
     }
 }
 
-int player_active(void) { return g_pl_active; }
+int player_active(void)  { return g_pl_active; }
+int player_playing(void) { return g_pl_active && !g_pl_paused; }
 
 const char *player_track_name(void) { return g_queue[g_queue_idx].name; }
 
@@ -1473,6 +1551,28 @@ void player_prev(void)
  */
 
 /*
+ * Re-anchor the elapsed clock so it reads `sec` NOW.
+ *
+ * While paused the clock is (g_pl_pause_us - g_pl_start_us), and resume adds
+ * (now - g_pl_pause_us) onto the start. A paused seek used to move only the
+ * start, leaving the pause stamp where the pause began — so the frozen clock
+ * read `sec` minus however long the listener had already been paused, and
+ * resuming then added that same paused stretch back on top, landing the
+ * clock short of the target by the length of the pause. Invisible when the
+ * seek lands in the same instant as the pause (which is all the earlier test
+ * exercised); a scrub a minute into a pause was wrong by a minute. Moving the
+ * pause stamp with the start keeps both identities true.
+ */
+static void clock_anchor(uint32_t sec)
+{
+    uint32_t now = mmio_read32(USEC_TIMER_ADDR);
+    g_pl_start_us = now - sec * 1000000u;
+    if (g_pl_paused) {
+        g_pl_pause_us = now;
+    }
+}
+
+/*
  * Re-open the CURRENT queue entry from scratch, for a seek that cannot trust
  * the live decoder.
  *
@@ -1561,7 +1661,7 @@ int player_seek_to(uint32_t sec)
             g_boundary = 0;
             g_eos      = 0;
             decode_pump_upto(SEEK_PRIME_FRAMES);
-            g_pl_start_us = mmio_read32(USEC_TIMER_ADDR);
+            clock_anchor(0);
         }
         if (!was_paused) {
             hal_audio_start();
@@ -1585,7 +1685,7 @@ int player_seek_to(uint32_t sec)
     /* Only enough to restart cleanly — the play loop fills the rest while the
      * audio runs, so first sound is not gated on the full anti-skip depth. */
     decode_pump_upto(SEEK_PRIME_FRAMES);
-    g_pl_start_us = mmio_read32(USEC_TIMER_ADDR) - sec * 1000000u;
+    clock_anchor(sec);
     g_pl_low_fill = RING_FRAMES;
     if (!was_paused) {
         hal_audio_start();

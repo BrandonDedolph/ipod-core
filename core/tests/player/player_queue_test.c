@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "player.h"
+#include "hal.h"                 /* hal_audio_close: the UI's edge action */
 #include "pp5022.h"
 #include "mmio_mock.h"
 #include "player_test_stubs.h"
@@ -716,6 +717,210 @@ int main(void)
     player_stop();
     xpect(&c, "stop is idempotent", player_active() == 0);
 
+    /* ---- 12b. paused is not playing: what the power gates consume ------ *
+     *
+     * An audit found that a PAUSED device was treated as a PLAYING one by
+     * every power gate in the main loop, because they all keyed off
+     * player_active() — which must stay 1 across a pause for the UI's sake.
+     * So a paused, screen-off iPod held 80 MHz, spun the main loop ~5,000
+     * times a second on the DMA-feeding halt, and kept the codec's PLL,
+     * VMID, DACs and headphone amps live indefinitely. player_playing() is
+     * the gate those decisions want; the codec power-down is the third fix.
+     *
+     * The stubs model the codec's power state (stub_audio_cold) separately
+     * from the DAC's running state, and keep stub_audio_primed across a
+     * suspend — which is what lets a test tell "powered down and resumed
+     * from the same place" from "powered down and lost a third of a second".
+     */
+    stub_reset();
+    /* Set explicitly: the shuffle cases above leave the fake track at 4096
+     * frames, and the ring arithmetic below depends on knowing the length. */
+    stub_set_track_frames(8192u);
+    make_entries(ents, 3, 0);
+    set_usec(0);
+    xpect(&c, "nothing loaded: not playing", player_playing() == 0);
+    player_play_queue(ents, 3, 0, 0, 0);
+    xpect(&c, "a fresh track is playing", player_playing() == 1);
+    xpect(&c, "a fresh track's codec is up", stub_audio_cold == 0);
+    /* Pull some of the ring so "the ring survives" below is a real claim: an
+     * 8192-frame track is primed in full at open. */
+    {
+        int pulled = 0;
+        while (pulled < 3000) {
+            int got = stub_drain(1000);
+            if (got <= 0) break;
+            pulled += got;
+        }
+        xpect(&c, "the DAC drew from the ring before the pause", pulled == 3000);
+    }
+
+    set_usec(5000000u);                       /* 5 s in */
+    player_pause();
+    xpect(&c, "paused: NOT playing, for the power gates", player_playing() == 0);
+    xpect(&c, "paused: still loaded, for the UI", player_active() == 1);
+
+    /* A SHORT pause leaves the codec exactly as the pause left it: unpausing
+     * has to be instant and silent, and the wake is a codec reset. */
+    set_usec(5000000u + 2000000u);            /* 2 s into the pause */
+    player_pump();
+    xpect(&c, "a short pause does not power the codec down",
+          stub_audio_suspends == 0 && stub_audio_cold == 0);
+    player_resume();
+    xpect(&c, "resume after a short pause needs no wake",
+          stub_audio_wakes == 0 && stub_audio_running == 1 &&
+          player_playing() == 1);
+    xpect(&c, "resume after a short pause keeps the clock",
+          player_elapsed_s() == 5u);
+
+    /* A pause that PERSISTS powers the codec down — once, and not before the
+     * documented timeout. */
+    set_usec(10000000u);                      /* 8 s in on the running clock */
+    player_pause();
+    set_usec(10000000u + PLAYER_PAUSE_CODEC_OFF_US - 1u);
+    player_pump();
+    xpect(&c, "just under the timeout: the codec is still up",
+          stub_audio_suspends == 0 && stub_audio_cold == 0);
+    set_usec(10000000u + PLAYER_PAUSE_CODEC_OFF_US);
+    player_pump();
+    xpect(&c, "a pause held past the timeout powers the codec down",
+          stub_audio_suspends == 1 && stub_audio_cold == 1);
+    xpect(&c, "the power-down is a suspend, never issued under a running DMA",
+          stub_audio_suspends_while_running == 0);
+    player_pump();
+    player_pump();
+    xpect(&c, "powered down once per pause, not once per pass",
+          stub_audio_suspends == 1);
+    xpect(&c, "the power-down keeps the HAL's buffered PCM (suspend, not close)",
+          stub_audio_primed == 1 && stub_audio_flushes == 0);
+    xpect(&c, "powered down: still paused, still loaded, still not playing",
+          player_paused() == 1 && player_active() == 1 && player_playing() == 0);
+    xpect(&c, "powered down: the elapsed clock stays frozen",
+          player_elapsed_s() == 8u);
+    int opens_at_powerdown = stub_opens;
+
+    /* Resume from the powered-down state: wake, restart, same place. */
+    set_usec(10000000u + 60000000u);          /* a minute later */
+    player_resume();
+    xpect(&c, "resume after a power-down wakes the codec",
+          stub_audio_wakes == 1 && stub_audio_cold == 0);
+    xpect(&c, "resume after a power-down restarts the DAC",
+          stub_audio_running == 1 && player_playing() == 1);
+    xpect(&c, "resume after a power-down does not re-open the track",
+          stub_opens == opens_at_powerdown);
+    xpect(&c, "resume after a power-down does not reset the elapsed clock",
+          player_elapsed_s() == 8u);
+    xpect(&c, "resume after a power-down does not discard the HAL's PCM",
+          stub_audio_primed == 1 && stub_audio_flushes == 0);
+    {
+        /* The ring itself: 8192 frames were primed, 3000 pulled before the
+         * pause. Exactly the other 5192 must still be there — no reset, no
+         * re-prime, no loss. */
+        int pulled = 0, got;
+        while ((got = stub_drain(1000)) > 0) {
+            pulled += got;
+        }
+        xpect(&c, "resume after a power-down keeps the ring's contents",
+              pulled == 8192 - 3000);
+    }
+
+    /* Pause -> resume -> pause -> resume, past the timeout each time, stays
+     * consistent: one suspend and one wake per cycle, the clock only ever
+     * counts running time, the DAC comes back every time. */
+    {
+        int      consistent = 1;
+        uint32_t t          = 80000000u;     /* running clock: 8 s + (80-70) */
+        uint32_t elapsed    = 8u + 10u;
+        set_usec(t);
+        for (int k = 0; k < 4; k++) {
+            player_pause();
+            t += PLAYER_PAUSE_CODEC_OFF_US + 3000000u;
+            set_usec(t);
+            player_pump();
+            if (stub_audio_suspends != 2 + k || stub_audio_cold != 1 ||
+                player_playing() != 0 || player_elapsed_s() != elapsed) {
+                consistent = 0;
+            }
+            t += 1000000u;
+            set_usec(t);
+            player_resume();
+            if (stub_audio_wakes != 2 + k || stub_audio_cold != 0 ||
+                stub_audio_running != 1 || player_playing() != 1 ||
+                player_elapsed_s() != elapsed) {
+                consistent = 0;
+            }
+            t += 2000000u;                    /* 2 s of listening */
+            elapsed += 2u;
+            set_usec(t);
+        }
+        xpect(&c, "repeated pause/resume past the timeout stays consistent",
+              consistent);
+        xpect(&c, "repeated cycles never suspended under a running DMA",
+              stub_audio_suspends_while_running == 0);
+    }
+
+    /* A skip while powered down: the new track's bring-up is a full init, so
+     * the codec is up again — and still paused, as a paused skip must be. The
+     * new pause then times out on its own. */
+    {
+        uint32_t t = 200000000u;
+        set_usec(t);
+        player_pause();
+        set_usec(t + PLAYER_PAUSE_CODEC_OFF_US);
+        player_pump();
+        int suspends_before = stub_audio_suspends;
+        player_next();
+        xpect(&c, "a skip while powered down brings the codec up with the new "
+                  "track", stub_audio_cold == 0 && player_queue_current() == 1);
+        xpect(&c, "a skip while powered down stays paused",
+              player_paused() == 1 && player_playing() == 0 &&
+              stub_audio_running == 0);
+        set_usec(t + PLAYER_PAUSE_CODEC_OFF_US + PLAYER_PAUSE_CODEC_OFF_US);
+        player_pump();
+        xpect(&c, "the pause on the new track times out and powers down again",
+              stub_audio_suspends == suspends_before + 1 && stub_audio_cold == 1);
+        /* Seek while powered down: paused, stopped, flushed — and the resume
+         * that follows wakes the codec and starts from the seek target. */
+        stub_set_track_frames(44100u * 10u);
+        player_jump(2);                       /* a 10 s track, still paused */
+        set_usec(t + 3u * PLAYER_PAUSE_CODEC_OFF_US);
+        player_pump();
+        xpect(&c, "seek while powered down succeeds", player_seek_to(4u) == 0);
+        xpect(&c, "seek while powered down stays paused and cold",
+              player_paused() == 1 && stub_audio_cold == 1 &&
+              stub_audio_running == 0);
+        int wakes_before = stub_audio_wakes;
+        set_usec(t + 3u * PLAYER_PAUSE_CODEC_OFF_US + 1000000u);
+        player_resume();
+        xpect(&c, "resume after a seek while powered down wakes and starts",
+              stub_audio_wakes == wakes_before + 1 && stub_audio_running == 1);
+        /* This one also guards a bug the earlier paused-seek test could not
+         * see: a paused seek re-anchored the start against NOW but left the
+         * pause stamp at the original pause, so resume added the whole
+         * pre-seek paused stretch back on — here that would read 4 s minus
+         * five-plus seconds, i.e. a wrapped, absurd elapsed. The earlier test
+         * pauses and seeks in the same instant, where the two agree. */
+        xpect(&c, "resume after a seek while powered down is at the target",
+              player_elapsed_s() == 4u);
+        stub_set_track_frames(8192u);
+    }
+
+    /* Stop while powered down: inactive, not playing, and the UI's close on
+     * the active->inactive edge is harmless over an already-cold codec. */
+    set_usec(300000000u);
+    player_pause();
+    set_usec(300000000u + PLAYER_PAUSE_CODEC_OFF_US);
+    player_pump();
+    player_stop();
+    xpect(&c, "stop while powered down leaves the player inactive and not "
+              "playing", player_active() == 0 && player_playing() == 0);
+    hal_audio_close();
+    xpect(&c, "the UI's close after a stop while powered down is harmless",
+          stub_audio_cold == 1 && stub_audio_running == 0);
+    player_play_queue(ents, 3, 0, 0, 0);
+    xpect(&c, "a new queue after a cold stop comes up playing",
+          player_playing() == 1 && stub_audio_cold == 0 &&
+          stub_audio_running == 1);
+
     /* ---- 13. the incremental queue builder ----------------------------- */
     stub_reset();
     player_queue_begin();
@@ -896,6 +1101,9 @@ int main(void)
     xpect(&c, "next/prev/pump/pause on an empty queue do nothing",
           player_active() == 0 && stub_open_attempts == 0 &&
           player_queue_len() == 0);
+    xpect(&c, "nothing loaded is not playing, and pumping it never touches "
+              "the codec", player_playing() == 0 && stub_audio_suspends == 0 &&
+          stub_audio_wakes == 0);
     xpect(&c, "elapsed/total read as zero when nothing is loaded",
           player_elapsed_s() == 0u && player_total_s() == 0u);
 
