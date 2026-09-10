@@ -521,6 +521,60 @@ if target == 'sim'
   )
   test('hw-battery', battery_trace_test, suite: 'unit')
 
+  # hw-headphone-*: the headphone-jack insertion-detect driver
+  # (hal/hw/headphone.c) — the SAME source the ARM build links — host-side
+  # under -DMMIO_MOCK. The driver has three compile-time shapes and each
+  # carries a promise the device cannot cheaply check, so one source builds
+  # three binaries (headphone_trace_test.c picks its main() by the macros):
+  #
+  #   trace      (-DHEADPHONE_DETECT_TRUSTED=1): one poll is exactly one
+  #              USEC_TIMER read + one GPIOA_INPUT_VAL read; bit 7 decodes with
+  #              the documented polarity; and the DEBOUNCE debounces — a
+  #              bouncing switch yields exactly one transition, timed from the
+  #              last bounce; sub-window glitches yield none; the first sample
+  #              primes without waiting; a USEC_TIMER wrap mid-window is fine.
+  #   untrusted  (defaults, what ships until the device transcript confirms
+  #              the line): answers -1 and never touches the bus.
+  #   probe      (-DHEADPHONE_PROBE=1): the pin-finding UART probe prints its
+  #              config block once, nothing while inputs are static, two lines
+  #              per change, honours its 20 ms sample interval, and goes silent
+  #              after its event budget — it cannot flood the debug channel.
+  #              Links uart.c so the bytes are counted at SER0_THR.
+  headphone_trace_test = executable(
+    'headphone_trace_test',
+    sources: ['hw_mmio/headphone_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/headphone.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK', '-DHEADPHONE_DETECT_TRUSTED=1'],
+    override_options: test_opts,
+  )
+  test('hw-headphone-trace', headphone_trace_test, suite: 'unit')
+
+  headphone_untrusted_test = executable(
+    'headphone_untrusted_test',
+    sources: ['hw_mmio/headphone_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/headphone.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+    override_options: test_opts,
+  )
+  test('hw-headphone-untrusted', headphone_untrusted_test, suite: 'unit')
+
+  headphone_probe_test = executable(
+    'headphone_probe_test',
+    sources: ['hw_mmio/headphone_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/headphone.c',
+              '../hal/hw/uart.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK', '-DHEADPHONE_DETECT_TRUSTED=1',
+             '-DHEADPHONE_PROBE=1'],
+    override_options: test_opts,
+  )
+  test('hw-headphone-probe', headphone_probe_test, suite: 'unit')
+
   # hw-volume: the WM8758 output-volume HAL (hal/hw/volume.c) over the
   # reused i2c.c write path, host-side under -DMMIO_MOCK. Volume is not
   # modelled by clicky and the device needs a logic analyzer, so this is
