@@ -4095,6 +4095,22 @@ static void suspend_to_ram(uint32_t play_down_us)
          * unaffected — it only lets the deferred bring-up actually run.
          */
         while (clickwheel_get_event(&drain)) { }
+        /*
+         * Pump while suspended, so the codec actually powers down.
+         *
+         * The pause above stops the DMA but leaves the WM8758 fully powered —
+         * PLL, VMID, DACs, headphone amps — and the thing that shuts it off is
+         * the persistent-pause timeout inside player_pump(). This loop never
+         * called pump, so a device "asleep" via Play-hold held the codec live
+         * for the entire suspend, which is the most expensive way to do
+         * nothing that this firmware is capable of.
+         *
+         * Safe to call here: pump's paused branch does the codec-off check and
+         * returns immediately. No decode, no disk, no ring work — which
+         * matters, because the drive is parked by this point and waking it
+         * would defeat the whole exercise.
+         */
+        player_pump();
         cpu_wait_ms(30);
     }
     /* Swallow the wake press so it isn't also acted on as navigation. */

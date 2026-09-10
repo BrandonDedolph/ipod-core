@@ -234,8 +234,12 @@ void hal_audio_start(void);
  *
  * Stop does NOT power the codec down — PLL, VMID and the DAC stay live, which
  * is the full analog budget. A device left paused indefinitely should be shut
- * down with hal_audio_close() after a timeout and re-opened with
- * hal_audio_init() on resume; init is idempotent and per-track anyway.
+ * down after a timeout, but NOT with hal_audio_close(): close discards the
+ * HAL's buffered PCM, so resuming from it lands ahead of where the listener
+ * paused, by up to a full internal buffer. The hw backend offers
+ * hal_audio_suspend()/hal_audio_wake() for exactly this — the same
+ * pop-suppressed power-down, without dropping the buffers. The player uses
+ * them after a pause persists.
  */
 void hal_audio_stop(void);
 
