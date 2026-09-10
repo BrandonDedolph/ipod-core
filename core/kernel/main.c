@@ -840,6 +840,32 @@ static void settings_commit(int force);
 static void resume_capture(void);
 _Noreturn static void enter_standby(void);
 
+/*
+ * settings_commit() modes.
+ *
+ *   CFG_COMMIT_IDLE   the main loop: debounced, deferred while the drive is
+ *                     parked under a live player, refused below the
+ *                     disk-safe battery line.
+ *   CFG_COMMIT_FORCE  now (suspend, power-off): no debounce, no parked
+ *                     check — still refused below the disk-safe line.
+ *   CFG_COMMIT_LAST   the ONE write the low-battery policy makes at the
+ *                     DISKSAFE edge, exempt from the battery gate.
+ *
+ * The exemption is not optional. battery_policy_feed() latches DISKSAFE
+ * BEFORE it returns the edge, so by the time battery_refresh() acts on that
+ * edge battery_disk_writes_allowed() is already 0 — and a gated commit there
+ * refuses the very flush the policy exists to make while the cell still has
+ * the energy for it. That is exactly what happened when the flush and the
+ * gate landed as two separate changes, each written without the other: the
+ * DISKSAFE handler called settings_commit(1), the gate turned it away, and a
+ * low-battery shutdown persisted nothing at all — no resume position, no
+ * pending setting — while both commit messages described a flush that
+ * never ran.
+ */
+#define CFG_COMMIT_IDLE   0
+#define CFG_COMMIT_FORCE  1
+#define CFG_COMMIT_LAST   2
+
 /* Measured cost of the last full-frame present; defined with the present
  * throttle further down. Reported on the stats line below so the number the
  * repaint throttle has always been guessing at becomes observable. */
@@ -965,15 +991,16 @@ static int battery_refresh(int force)
         /*
          * The LAST write. Persist the resume position + any pending change
          * NOW, while the filtered cell is still at ~3500 mV and has the
-         * energy to finish one sector plus the FLUSH; from here down nothing
-         * should write (battery_disk_writes_allowed() == 0, which
-         * settings_commit() still needs to consult, see battery.h). This
-         * mirrors suspend_to_ram()'s "last chance to persist": after this the
-         * drive is parked and the next event is power-off. Forced, so the 3 s
-         * debounce does not eat it.
+         * energy to finish one sector plus the FLUSH. From here down nothing
+         * else writes: the policy latched DISKSAFE before handing us this
+         * edge, so battery_disk_writes_allowed() is ALREADY 0 — which is why
+         * this one commit is CFG_COMMIT_LAST (exempt from the gate) and every
+         * other one, enter_standby()'s included, is refused until RECOVERED.
+         * This mirrors suspend_to_ram()'s "last chance to persist": after
+         * this the drive is parked and the next event is power-off.
          */
         resume_capture();
-        settings_commit(1);
+        settings_commit(CFG_COMMIT_LAST);
         /* Park, unless the player is mid-stream: it parks between its own
          * refill bursts (player.c) and its next read would only spin the
          * platters straight back up. Same guard as the main loop's idle
@@ -2756,6 +2783,7 @@ static void settings_apply(void)
 #define CFG_SAVE_DEBOUNCE_US  3000000u    /* 3 s after the last change */
 
 static int      g_cfg_dirty;              /* a change is pending a write   */
+static int      g_cfg_save_deferred;      /* gate refusal already logged   */
 static uint32_t g_cfg_dirty_us;           /* when the last change happened */
 
 static void settings_touch(void)
@@ -2811,10 +2839,19 @@ static void settings_commit(int force)
      * shutoff threshold that path would otherwise attempt a write at 3300 mV,
      * which is exactly the moment there is least energy to complete one.
      */
-    if (!battery_disk_writes_allowed()) {
-        uart_puts("core: cfg save deferred — battery below disk-safe\n");
+    if (force != CFG_COMMIT_LAST && !battery_disk_writes_allowed()) {
+        /* Logged ONCE per refusal, not once per pass. This runs from the main
+         * loop — 100 Hz idle, thousands of passes a second while playing —
+         * and a UART line is milliseconds of blocking TX at 115200 baud;
+         * printed on every pass it would have dragged the whole UI for as
+         * long as the cell stayed below the line with a change pending. */
+        if (!g_cfg_save_deferred) {
+            uart_puts("core: cfg save deferred — battery below disk-safe\n");
+            g_cfg_save_deferred = 1;
+        }
         return;
     }
+    g_cfg_save_deferred = 0;
     g_cfg_dirty = 0;
     if (!config_writable()) {
         return;                            /* no CORECFG.DAT — nothing to do */
