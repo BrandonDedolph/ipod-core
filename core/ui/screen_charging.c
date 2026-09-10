@@ -20,20 +20,11 @@
 #include "../kernel/console.h"
 #include "../hal/hal.h"          /* LCD_WIDTH / LCD_HEIGHT */
 
-/* ---------------------------------------------------------------------------
- * Palette (system-screens.jsx ChargingScreen tokens -> RGB565)
- * ------------------------------------------------------------------------- */
-#define CHG_BG      0x0861u      /* #0e0d0c near-black background            */
-#define CHG_OUTLINE 0x5A89u      /* #5a5048 battery outline + nub            */
-#define CHG_FILL    0xEF3Bu      /* #e8e4dd light fill (normal, not low)     */
-#define CHG_GREEN   0x3E4Du      /* charging fill (oklch(0.78 0.16 145))     */
-#define CHG_RED     0xDA46u      /* low-battery fill (oklch(0.65 0.18 30))   */
-#define CHG_TEXT    0xEF3Bu      /* #e8e4dd big percent digits               */
-#define CHG_UNIT    0xACF2u      /* #a89e92 muted "%" unit                   */
+/* Palette: the CHG_* tokens live in screen_charging.h, shared with the
+ * low-battery screens (screen_battery.c) that are drawn on the same field. */
+
 /* At or above this, a stopped charger means "full", not "failed". */
 #define CHG_FULL_PCT 90
-
-#define CHG_MUTED   0x7B8Du      /* #7a736a muted status / "not charging"    */
 
 /* Battery geometry. Centred horizontally: body 150 wide -> the panel centre
  * (160) is the battery centre, so the lightning bolt lands dead-centre. */
@@ -160,6 +151,21 @@ static void draw_bolt(int cx, int y0, int bh, uint16_t c)
     }
 }
 
+void screen_charging_draw_battery(int x, int y, int w, int h, int pct,
+                                  uint16_t fill)
+{
+    draw_battery_outline(x, y, w, h, BATT_T, CHG_OUTLINE);
+
+    /* Terminal nub on the right, vertically centred. */
+    console_fill_rect(x + w, y + (h - NUB_H) / 2, NUB_W, NUB_H, CHG_OUTLINE);
+
+    /* Proportional inner fill. */
+    int iw = w - 2 * BATT_INSET;
+    int ih = h - 2 * BATT_INSET;
+    console_fill_rect(x + BATT_INSET, y + BATT_INSET, fill_width(pct, iw), ih,
+                      fill);
+}
+
 void screen_charging_render(int pct, int charging, int external)
 {
     pct = clamp_pct(pct);
@@ -170,22 +176,12 @@ void screen_charging_render(int pct, int charging, int external)
      * else the light "full" tone (system-screens.jsx). */
     uint16_t fill = charging ? CHG_GREEN : (pct < 20 ? CHG_RED : CHG_FILL);
 
-    draw_battery_outline(BATT_X, BATT_Y, BATT_W, BATT_H, BATT_T, CHG_OUTLINE);
-
-    /* Terminal nub on the right, vertically centred. */
-    console_fill_rect(BATT_X + BATT_W, BATT_Y + (BATT_H - NUB_H) / 2,
-                      NUB_W, NUB_H, CHG_OUTLINE);
-
-    /* Proportional inner fill. */
-    int ix = BATT_X + BATT_INSET;
-    int iy = BATT_Y + BATT_INSET;
-    int iw = BATT_W - 2 * BATT_INSET;
-    int ih = BATT_H - 2 * BATT_INSET;
-    int fw = fill_width(pct, iw);
-    console_fill_rect(ix, iy, fw, ih, fill);
+    screen_charging_draw_battery(BATT_X, BATT_Y, BATT_W, BATT_H, pct, fill);
 
     /* Lightning bolt cut into the fill while charging. */
     if (charging) {
+        int iy = BATT_Y + BATT_INSET;
+        int ih = BATT_H - 2 * BATT_INSET;
         draw_bolt(LCD_WIDTH / 2, iy + 4, ih - 8, CHG_BG);
     }
 

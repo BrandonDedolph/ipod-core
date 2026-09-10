@@ -144,6 +144,24 @@ if target == 'sim'
   )
   test('chrome', chrome_test, suite: 'unit')
 
+  # screen_battery: the low-battery warning UI (core/ui/screen_battery.c) — the
+  # SAME source the ARM build links into core.elf. The renders are checked
+  # against the framebuffer (full-panel coverage, red kept inside the glyph, the
+  # toast touching nothing outside its plate and reporting exactly that plate as
+  # damage), and the pure battwarn_* state machine is driven through the whole
+  # flap-prevention sequence with the clock straddling the 32-bit timer wrap.
+  # Pulls in screen_charging.c for the shared battery glyph + palette, and
+  # hw/battery.h (header only, no MMIO) to static-assert the level contract.
+  screen_battery_test = executable(
+    'screen_battery_test',
+    sources: ['ui/screen_battery_test.c', '../ui/screen_battery.c',
+              '../ui/screen_charging.c', '../ui/chrome.c', '../ui/text.c',
+              '../ui/palette.c', '../kernel/console.c'],
+    include_directories: include_directories('../ui', '../kernel', '../hal'),
+    override_options: test_opts,
+  )
+  test('screen_battery', screen_battery_test, suite: 'unit')
+
   # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
   # — the SAME source the ARM build links into core.elf. Shrinks a loaded
   # folder.art to a list chip / album-detail cover when no folder.thm is present.

@@ -18,6 +18,25 @@
 #ifndef CORE_UI_SCREEN_CHARGING_H
 #define CORE_UI_SCREEN_CHARGING_H
 
+#include <stdint.h>
+
+/* ---------------------------------------------------------------------------
+ * Palette (system-screens.jsx ChargingScreen tokens -> RGB565)
+ *
+ * Shared with screen_battery.c: the low-battery modal and the goodbye screen
+ * are the charging screen's siblings — same dark field, same battery glyph,
+ * same type colours — so they take the tokens from here rather than carrying
+ * their own copies of the same six numbers.
+ * ------------------------------------------------------------------------- */
+#define CHG_BG      0x0861u      /* #0e0d0c near-black background            */
+#define CHG_OUTLINE 0x5A89u      /* #5a5048 battery outline + nub            */
+#define CHG_FILL    0xEF3Bu      /* #e8e4dd light fill (normal, not low)     */
+#define CHG_GREEN   0x3E4Du      /* charging fill (oklch(0.78 0.16 145))     */
+#define CHG_RED     0xDA46u      /* low-battery fill (oklch(0.65 0.18 30))   */
+#define CHG_TEXT    0xEF3Bu      /* #e8e4dd big percent digits / headlines   */
+#define CHG_UNIT    0xACF2u      /* #a89e92 muted "%" unit / body copy       */
+#define CHG_MUTED   0x7B8Du      /* #7a736a muted status / "not charging"    */
+
 /*
  * Render the charging screen into the console framebuffer.
  *
@@ -28,5 +47,19 @@
  *             zero the status line prompts "CONNECT CABLE".
  */
 void screen_charging_render(int pct, int charging, int external);
+
+/*
+ * The big battery glyph on its own: outline + terminal nub + a pct-
+ * proportional inner fill in `fill`, at the charging screen's stroke/inset/
+ * nub proportions (so it is the SAME glyph the charging screen draws — the
+ * low-battery screens in screen_battery.c share it rather than carrying a
+ * copy that would drift the next time the outline is retuned). (x, y, w, h)
+ * is the outline box; the nub is drawn to its right, outside it. The four
+ * outer corner pixels are knocked back to the charging background, so this
+ * is only correct over that dark field. The minimum-8px stub rule applies:
+ * pct 0 still draws a short fill, never a bare outline.
+ */
+void screen_charging_draw_battery(int x, int y, int w, int h, int pct,
+                                  uint16_t fill);
 
 #endif /* CORE_UI_SCREEN_CHARGING_H */

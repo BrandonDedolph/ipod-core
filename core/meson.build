@@ -231,6 +231,18 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Low-battery warning UI (ours): the DISKSAFE modal, the SHUTOFF goodbye
+  # screen, the LOW toast, and the pure battwarn_* state machine that keeps a
+  # sagging-and-recovering cell from flickering them. Same primitives and
+  # palette as the charging screen (it links against screen_charging_hw_lib's
+  # shared battery glyph); no hardware, no present — the SAME source the host
+  # screen_battery_test compiles. Relative includes only; stays under -Werror.
+  screen_battery_hw_lib = static_library(
+    'core_screen_battery_hw',
+    sources: ['ui/screen_battery.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Freestanding incremental album-art thumbnail cache (ours): loads AT MOST one
   # album cover per pump() call and pre-shrinks it to a 22x22 list chip, spreading
   # the disk I/O across many main-loop passes so scrolling the album list never
@@ -272,7 +284,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),
