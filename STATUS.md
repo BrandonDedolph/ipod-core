@@ -265,8 +265,8 @@ linked ARM image:
   past the documented ceiling.
 - `tests/scripts/check_hw_consistency.py` — `hal/hw/pp5022.h` addresses vs
   `docs/hw/`.
-- `tests/scripts/check_name_hash_parity.py` — the name hash across its three
-  implementations.
+- `tests/scripts/check_name_hash_parity.py` — the host tool's name hash
+  against the golden vectors the C side (`library/names.c`) is tested on.
 - `tests/scripts/check_resume_parity.py` — the resume matcher across C and host.
 
 Current image: **~298 KB text, 260 B data, ~11.45 MB bss** (budgets 1 MB /

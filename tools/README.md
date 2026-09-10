@@ -78,7 +78,7 @@ Re-run `atlas_gen.sh` after changing either.
 
 ### The library locator hash
 
-`build_index.py`'s `name_hash()` is duplicated in `core/kernel/main.c`, and the
+`build_index.py`'s `name_hash()` is duplicated in `core/library/names.c`, and the
 two **must** agree byte for byte: that hash is the only thing binding an index
 record to the file on disk, so a disagreement doesn't error — the affected track
 just silently stops appearing. Both sides are asserted against one golden vector

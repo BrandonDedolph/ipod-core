@@ -220,6 +220,42 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Wheel acceleration + the A-Z locator (ours): the velocity curve, the
+  # idle reset, the letter-mode latch and hold window, the tick accumulator
+  # and the letter stepping every list is navigated with. EXTRACTED OUT OF
+  # kernel/main.c, where it was file-local static and could only be checked by
+  # spinning the wheel. Pure integer logic; its clock, its row-initial source
+  # and its click are injected from kernel_main (wheel_set_*), the seam
+  # chrome.c uses for the marquee. pp5022.h for CW_WHEEL_SENSITIVITY only.
+  # Same wheel.c the host wheel_test compiles.
+  wheel_hw_lib = static_library(
+    'core_wheel_hw',
+    sources: ['ui/wheel.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
+  # Music-library model (ours; library/, not to be confused with lib/, the
+  # freestanding libc). names.c is the name handling the library is built on:
+  # the folded locator hash that binds a CORELIB.IDX record to its file, the
+  # display-name copy every row and queue entry is made by, the folder-name
+  # split, extension classification, and the decimal/time formatters. EXTRACTED
+  # OUT OF kernel/main.c, where it was file-local static and therefore
+  # uncompilable on the host — which is why tests/kernel kept a verbatim copy
+  # of name_hash() with a Python script diffing it against main.c. Pure string
+  # code, no hardware; player.h for NAME_MAX only. Same names.c the host
+  # name-hash, resume and names tests compile. idx.c is the CORELIB.IDX header
+  # validator and record CRC-32 — the part of the index loader that decides
+  # whether to trust a file off the user's disk — likewise extracted from
+  # main.c, where the host test had to carry verbatim copies of it. Same
+  # idx.c the host idx test compiles. sort.c is the stable index-array merge
+  # sort every alphabetised list is built with; same sort.c the host sort test
+  # compiles against a stable reference.
+  library_hw_lib = static_library(
+    'core_library_hw',
+    sources: ['library/names.c', 'library/idx.c', 'library/sort.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Full-screen "charging" battery view (ours): renders design_reference's
   # ChargingScreen into the RGB565 console framebuffer with fill_rect shapes +
   # the Nunito text renderer. Pure integer rendering — no libc/libm/malloc, no
@@ -272,7 +308,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

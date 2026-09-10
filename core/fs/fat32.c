@@ -278,20 +278,28 @@ static void fmt_83(const uint8_t raw[11], char *out)
  * entry carries 13 UTF-16LE code units at byte offsets 1..10, 14..25, 28..31,
  * a 1-based sequence number in byte 0 (bit 0x40 marks the last/first-logical
  * piece), and the 8.3 checksum in byte 13. We accumulate the pieces by their
- * sequence index into one flat ASCII buffer, then match the caller's ASCII
- * name against it. Non-ASCII code points (> 0x7F) become a sentinel that can
- * never match an ASCII request; names longer than the cap are marked unusable
- * and simply fall back to the 8.3 match.
+ * sequence index into one flat buffer of code units, UTF-8-encoded when the
+ * dirent is built. A run longer than the bound is not reassembled — the entry
+ * falls back to its 8.3 name — but the dirent says so (name_lossy), because a
+ * silent fallback is a file nobody can find by name.
  */
-#define FAT_LFN_MAX 128  /* longest long-name we reassemble (chars). Must clear
-                          * the longest real "NN. Title.flac" — a feature-heavy
-                          * title like "16. TRAGIC (feat. Youngboy Never Broke
-                          * Again & Internet Money).flac" is 67 chars; at 64 the
-                          * reassembly gave up and fell back to the ugly 8.3
-                          * short name ("16TRAG~1"), which then failed to match
-                          * the library index and lost the track's metadata.
-                          * 128 covers any realistic track name; the buffer
-                          * (a stack local) stays small for a freestanding build. */
+/*
+ * Longest long name we reassemble, in UTF-16 code units. 255 is the VFAT
+ * bound itself: a name occupies at most 20 LFN entries of 13 units, and the
+ * specification caps it at 255 characters (the 260th slot is padding).
+ *
+ * This was 128, on the argument that it "covers any realistic track name",
+ * and anything over it fell back SILENTLY to the 8.3 short name. The same
+ * argument had already been made once at 64, when "16. TRAGIC (feat. Youngboy
+ * Never Broke Again & Internet Money).flac" (67 units) came back as
+ * "16TRAG~1.FLA". The failure is not cosmetic: the library binds a file to its
+ * index entry by a hash of the FULL name, so a mangled name is a track that
+ * cannot be matched and does not play — and nothing said why. There is no
+ * realistic-name argument to make at the specification's own limit. The
+ * accumulator is a stack local in the walk (the supervisor stack is ~89 KB),
+ * so the extra 254 bytes cost .bss nothing.
+ */
+#define FAT_LFN_MAX FAT32_LFN_MAX_UNITS
 
 /* Byte offset of each of the 13 chars inside a 32-byte LFN entry. */
 static const uint8_t lfn_pos[13] = {1,3,5,7,9,14,16,18,20,22,24,28,30};
@@ -302,6 +310,10 @@ typedef struct {
     int  max_idx;           /* highest slot written, -1 if none               */
     int  term;              /* terminator (0x0000) position, -1 if none       */
     int  bad;               /* saw an out-of-range piece -> unusable          */
+    int  overflow;          /* ...and specifically: a unit past FAT_LFN_MAX,
+                             * so the name existed and was too long for us.
+                             * Reported to the caller as name_lossy when the
+                             * run's checksum binds it to the entry.          */
     int  have_sum;          /* at least one fragment contributed a checksum   */
     uint8_t sum;            /* 8.3 checksum every fragment in the run carries */
 } lfn_acc_t;
@@ -328,6 +340,7 @@ static void lfn_reset(lfn_acc_t *a)
     a->max_idx  = -1;
     a->term     = -1;
     a->bad      = 0;
+    a->overflow = 0;
     a->have_sum = 0;
     a->sum      = 0;
     /* Zero the code units too. `lfn_acc_t acc` is a plain stack local in the
@@ -367,7 +380,8 @@ static void lfn_add(lfn_acc_t *a, const uint8_t *e)
         } else if (u == 0xFFFF) {
             /* padding past the terminator: nothing to store */
         } else if (idx >= FAT_LFN_MAX) {
-            a->bad = 1;                         /* longer than we handle */
+            a->bad      = 1;                    /* longer than we handle... */
+            a->overflow = 1;                    /* ...and the caller hears it */
         } else {
             a->lfn[idx] = u;                    /* keep the full code unit; the
                                                 * dirent build UTF-8-encodes it */
@@ -397,8 +411,10 @@ static int lfn_length(const lfn_acc_t *a, uint8_t sum)
 }
 
 /* UTF-8-encode the assembled long name into `dst` (capacity `cap`, always
- * NUL-terminated). Truncates on a char boundary if it would overflow — real
- * names are far shorter than the buffer.
+ * NUL-terminated). Returns 1 if it had to stop short, on a character
+ * boundary, 0 if the whole name fit. With the dirent sized for the longest
+ * legal name (fat32.h) it always fits; the return keeps a caller honest if
+ * that sizing ever changes, rather than truncating quietly.
  *
  * Surrogate pairs are COMBINED into the 4-byte form. Encoding each UTF-16
  * code unit independently (what this did before) emits two 3-byte sequences
@@ -409,10 +425,10 @@ static int lfn_length(const lfn_acc_t *a, uint8_t sum)
  * U+FFFD rather than propagating garbage. The 4-byte form fits: the loop
  * already reserves 4 bytes of headroom before the NUL.
  */
-static void lfn_to_utf8(const uint16_t *lfn, int len, char *dst, int cap)
+static int lfn_to_utf8(const uint16_t *lfn, int len, char *dst, int cap)
 {
     int bi = 0;
-    for (int i = 0; i < len && bi + 4 < cap; i++) {
+    for (int i = 0; i < len; i++) {
         uint32_t cp = lfn[i];
 
         if (cp >= 0xD800u && cp <= 0xDBFFu) {           /* high surrogate */
@@ -425,6 +441,15 @@ static void lfn_to_utf8(const uint16_t *lfn, int len, char *dst, int cap)
             }
         } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {    /* stray low surrogate */
             cp = 0xFFFDu;
+        }
+
+        /* Exactly the bytes this code point needs, plus the NUL, must fit.
+         * The old guard reserved four regardless, which refused the last
+         * character of a name that filled the buffer to the byte. */
+        int need = cp < 0x80u ? 1 : cp < 0x800u ? 2 : cp < 0x10000u ? 3 : 4;
+        if (bi + need >= cap) {
+            dst[bi] = '\0';
+            return 1;
         }
 
         if (cp < 0x80u) {
@@ -444,6 +469,7 @@ static void lfn_to_utf8(const uint16_t *lfn, int len, char *dst, int cap)
         }
     }
     dst[bi] = '\0';
+    return 0;
 }
 
 /* ---- public API ------------------------------------------------------ */
@@ -660,15 +686,29 @@ int fat32_readdir(fat32_t *fs, uint32_t dir_clus, fat32_dir_cb cb, void *ud)
                 /* Real 8.3 entry: build the dirent. Prefer the reassembled
                  * long name, but only when its checksum binds it to THIS
                  * entry; otherwise fall back to the formatted 8.3 short name.
-                 * The name buffer lives in the caller's fat32_dirent_t (their
-                 * stack), and the long name is capped at FAT_LFN_MAX (< 256),
-                 * so it always fits with room for the terminator. */
+                 * The name buffer lives in this function's fat32_dirent_t (on
+                 * the stack) and is sized for the longest legal long name in
+                 * UTF-8 (fat32.h), so a name within the bound always fits.
+                 *
+                 * The fallback is NOT silent when the run was this file's.
+                 * A checksum-bound run that overflowed FAT_LFN_MAX means the
+                 * file has a long name and we are not showing it: name_lossy
+                 * says so, so a caller matching files by name can refuse to
+                 * hash the mangled 8.3 form. An orphaned run (checksum for a
+                 * different entry) is not this file's name at all, and the
+                 * 8.3 name is then the real one. */
                 fat32_dirent_t ent;
-                int llen = lfn_length(&acc, lfn_checksum(e));
+                uint8_t sum  = lfn_checksum(e);
+                int     llen = lfn_length(&acc, sum);
+                ent.name_lossy = 0;
                 if (llen >= 0) {
-                    lfn_to_utf8(acc.lfn, llen, ent.name, (int)sizeof ent.name);
+                    ent.name_lossy = (uint8_t)lfn_to_utf8(acc.lfn, llen, ent.name,
+                                                          (int)sizeof ent.name);
                 } else {
                     fmt_83(e, ent.name);
+                    if (acc.overflow && acc.have_sum && acc.sum == sum) {
+                        ent.name_lossy = 1;
+                    }
                 }
                 fmt_83(e, ent.short_name);  /* always the raw 8.3, for lookup */
                 ent.is_dir     = (e[11] & 0x10) ? 1 : 0;

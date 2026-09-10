@@ -144,6 +144,23 @@ if target == 'sim'
   )
   test('chrome', chrome_test, suite: 'unit')
 
+  # wheel: the wheel acceleration state machine and A-Z locator
+  # (core/ui/wheel.c) — the SAME source the ARM build links into core.elf.
+  # Its clock, row-initial source and click are injected, so every event here
+  # is an exact (delta, gap) pair and the assertions are the exact selection
+  # indices a spin lands on: the detent arithmetic (never 1,1,2), the flick
+  # cap, the clamps, the velocity curve event by event (1,2,5,7,8), the
+  # letter-mode latch surviving a slowdown and clearing on the idle gap, the
+  # letterless-screen fall-through, letter stepping at both ends, the plate's
+  # hold window to the microsecond, and a gap across the 32-bit clock wrap.
+  wheel_test = executable(
+    'wheel_test',
+    sources: ['ui/wheel_test.c', '../ui/wheel.c'],
+    include_directories: include_directories('../ui', '.'),
+    override_options: test_opts,
+  )
+  test('wheel', wheel_test, suite: 'unit')
+
   # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
   # — the SAME source the ARM build links into core.elf. Shrinks a loaded
   # folder.art to a list chip / album-detail cover when no folder.thm is present.
@@ -675,18 +692,33 @@ if target == 'sim'
   )
   test('hw-audio-pingpong', audio_pingpong_test, suite: 'unit')
 
-  # name-hash: the library locator hash. It exists three times — in
-  # kernel/main.c (device), in tools/build_index.py (host), and in the
-  # verbatim copy here that makes it testable — and it is the ONLY thing
-  # binding a CORELIB.IDX record to its file on disk. If two copies disagree
-  # the track does not error, it silently stops resolving. Asserts a golden
-  # vector table covering ASCII/case, Latin-1, smart quotes, dashes,
-  # punctuation, CJK, and (as documented expected failures) astral
-  # codepoints, where main.c's re-encoder has no 4-byte branch. The Python
-  # half and the copy-vs-original diff run in hw-name-hash-parity below.
+  # names: the library's name handling (core/library/names.c) — the SAME
+  # source the ARM build links into core.elf. Every function in it was a
+  # `static` in kernel/main.c, which meson builds only for target == 'hw', so
+  # the display-name copy every row and queue entry is made by, the
+  # "Artist - Album" split, the extension classifier and the Now Playing
+  # formatters had never been compiled by the host. Sentinel-guarded buffers
+  # prove the NAME_MAX bounds; the UTF-8 decoder under the locator hash is
+  # driven through overlongs, surrogates and truncation; one XFAIL records
+  # that classify_ext matches any extension that merely STARTS with "flac".
+  names_test = executable(
+    'names_test',
+    sources: ['library/names_test.c', '../library/names.c'],
+    include_directories: include_directories('.'),
+    override_options: test_opts,
+  )
+  test('names', names_test, suite: 'unit')
+
+  # name-hash: the library locator hash. It exists twice — in
+  # library/names.c (device) and in tools/build_index.py (host) — and it is
+  # the ONLY thing binding a CORELIB.IDX record to its file on disk. If the
+  # two disagree the track does not error, it silently stops resolving.
+  # Compiles the real names.c and asserts a golden vector table covering
+  # ASCII/case, Latin-1, smart quotes, dashes, punctuation, CJK and astral
+  # codepoints. The Python half runs in hw-name-hash-parity below.
   name_hash_test = executable(
     'name_hash_test',
-    sources: ['kernel/name_hash_test.c', 'kernel/name_hash_ref.c'],
+    sources: ['kernel/name_hash_test.c', '../library/names.c'],
     include_directories: include_directories('kernel', '.'),
     override_options: test_opts,
   )
@@ -700,34 +732,51 @@ if target == 'sim'
   # happy path, every stale case (deleted / unindexed / unresolved / empty
   # library / empty locator), and the ambiguity rules: duplicate filenames are
   # disambiguated by the saved track LENGTH, and decline outright when the
-  # length cannot choose. Compiles a verbatim copy of the static function
-  # (like name_hash_ref.c); hw-resume-parity below diffs it against main.c.
+  # length cannot choose. Compiles a verbatim copy of the static function;
+  # hw-resume-parity below diffs it against main.c. The locator hash it
+  # calls is the real library/names.c.
   resume_test = executable(
     'resume_test',
-    sources: ['kernel/resume_test.c', 'kernel/name_hash_ref.c'],
+    sources: ['kernel/resume_test.c', '../library/names.c'],
     include_directories: include_directories('kernel', '.'),
     override_options: test_opts,
   )
   test('resume', resume_test, suite: 'unit')
 
-  # index: the CORELIB.IDX header validation and record CRC in kernel/main.c
-  # (idx_header_parse / crc32_update). The loader used to read the magic and
-  # the record size and trust the rest — the version bytes were never looked
-  # at and nothing checked that the file held the records it claimed, so a
-  # half-copied index or a future layout loaded as plausible garbage. Covers
-  # the CRC against its published check value and batch-splitting, every
-  # accepted header shape (v1 without CRC, v2 with), and each refusal: magic,
-  # unknown version, record size, a truncated or padded file, a count that
-  # wraps the size arithmetic. Verbatim copies, like resume_test.c;
-  # hw-index-parity below diffs them against main.c and checks the loader
-  # actually calls them.
-  index_test = executable(
-    'index_test',
-    sources: ['kernel/index_test.c'],
-    include_directories: include_directories('kernel', '.'),
+  # idx: the CORELIB.IDX header validation and record CRC (core/library/idx.c)
+  # — the SAME source the ARM build links into core.elf. The loader used to
+  # read the magic and the record size and trust the rest — the version bytes
+  # were never looked at and nothing checked that the file held the records it
+  # claimed, so a half-copied index or a future layout loaded as plausible
+  # garbage. Covers the CRC against its published check value and
+  # batch-splitting, every accepted header shape (v1 without CRC, v2 with),
+  # and each refusal: magic, unknown version, record size, a truncated or
+  # padded file, a count that wraps the size arithmetic. hw-index-loader below
+  # checks that main.c's loader actually calls these.
+  idx_test = executable(
+    'idx_test',
+    sources: ['library/idx_test.c', '../library/idx.c'],
+    include_directories: include_directories('.'),
     override_options: test_opts,
   )
-  test('index', index_test, suite: 'unit')
+  test('idx', idx_test, suite: 'unit')
+
+  # sort: the stable index-array merge sort (core/library/sort.c) every
+  # alphabetised list is built with — the SAME source the ARM build links.
+  # main.c's only evidence for it was a comment saying it had been checked
+  # against a reference once. Compares against a stable insertion sort over
+  # the same keys — results must be IDENTICAL, so tie order is asserted, not
+  # just ordering — over many sizes (non-powers of two leave a short final
+  # run at every width), tie densities from all-equal to all-distinct, and
+  # the full LIB_MAX_SONGS; sentinels bracket both arrays; the compare
+  # counts out-of-range indices and the O(n log n) bound.
+  sort_test = executable(
+    'sort_test',
+    sources: ['library/sort_test.c', '../library/sort.c'],
+    include_directories: include_directories('.'),
+    override_options: test_opts,
+  )
+  test('sort', sort_test, suite: 'unit')
 
   # player-queue: the queue / auto-advance / repeat / shuffle logic of
   # core/player/player.c — 753 lines with no test at all, and the part users
@@ -755,6 +804,28 @@ if target == 'sim'
   )
   test('player-queue', player_queue_test, suite: 'unit')
 
+  # player-clock: the reported position against what can be heard. The DMA
+  # feeder pulls whole ping-pong buffers out of the PCM ring, two of which are
+  # in flight inside the HAL at any time, so "consumed from the ring" runs
+  # 186..372 ms ahead of the DAC. The gapless hand-over used to present the
+  # next track (and re-anchor its clock) on the consumed count. Same fakes as
+  # player-queue; stub_drain() IS the feeder, so pulls are counted exactly.
+  player_clock_test = executable(
+    'player_clock_test',
+    sources: ['player/player_clock_test.c',
+              'player/player_test_stubs.c',
+              'hw_mmio/mmio_mock.c',
+              '../player/player.c',
+              '../kernel/pcm_ring.c'],
+    include_directories: include_directories(
+      '../player', '../hal', '../hal/hw', '../fs', '../kernel',
+      '../codecs', '../codecs/dr_flac', '../codecs/dr_mp3',
+      'hw_mmio', 'player', '.'),
+    c_args: ['-DMMIO_MOCK', '-DCORE_FREESTANDING'],
+    override_options: test_opts,
+  )
+  test('player-clock', player_clock_test, suite: 'unit')
+
   if py.found()
     # fat32-corrupt: the FAT32 reader against deliberately broken volumes.
     # fat32_test is entirely happy-path, yet this parser consumes whatever is
@@ -767,7 +838,7 @@ if target == 'sim'
     # timeout, so a non-terminating walk is a deterministic finding.
     fat32_corrupt_imgs = []
     foreach v : ['good', 'cyclic-fat', 'oob-cluster', 'fat16-bpb',
-                 'orphan-lfn', 'truncated']
+                 'orphan-lfn', 'truncated', 'long-lfn']
       fat32_corrupt_imgs += custom_target('fat32-img-' + v,
         output: v + '.img',
         command: [py, files('scripts' / 'make_fat32_image.py'),
@@ -783,10 +854,9 @@ if target == 'sim'
          depends: fat32_corrupt_imgs,
          suite: 'unit')
 
-    # hw-name-hash-parity: the Python half of the locator-hash test, plus the
-    # check that the verbatim copy in tests/kernel/name_hash_ref.c has not
-    # drifted from kernel/main.c. Without the diff the C test could pass
-    # against a fossil while the device runs something else.
+    # hw-name-hash-parity: the Python half of the locator-hash test —
+    # tools/build_index.py against the same golden vectors the C test
+    # (name-hash, above, on the real library/names.c) asserts.
     test('hw-name-hash-parity', py,
          args: [meson.current_source_dir() / 'scripts' /
                 'check_name_hash_parity.py'],
@@ -801,13 +871,13 @@ if target == 'sim'
                 'check_resume_parity.py'],
          suite: 'unit')
 
-    # hw-index-parity: the same guard for the index validator — the copies in
-    # tests/kernel/index_test.c must not drift from kernel/main.c — plus a
-    # check that library_load_index() actually calls them, since a validator
-    # the loader does not consult tests nothing.
-    test('hw-index-parity', py,
+    # hw-index-loader: library_load_index() in kernel/main.c must actually
+    # call the validator idx_test covers (idx_header_parse with the directory
+    # entry's size, crc32_update, a refusal on IDX_ECRC) — a validator the
+    # loader does not consult tests nothing.
+    test('hw-index-loader', py,
          args: [meson.current_source_dir() / 'scripts' /
-                'check_index_parity.py'],
+                'check_index_loader.py'],
          suite: 'unit')
 
     # build-index: the host tool that writes CORELIB.IDX, run over a synthetic
