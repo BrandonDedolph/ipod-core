@@ -12,7 +12,12 @@
  * Build (host, no meson needed):
  *   cc -I core/ui -o /tmp/text_preview tools/text_preview.c core/ui/text.c
  * Usage:
- *   /tmp/text_preview out.ppm [zoom]
+ *   /tmp/text_preview out.ppm [zoom] [strings.txt]
+ *
+ * With a third argument the built-in samples are replaced by that file's
+ * lines (UTF-8, one string per line, '#' comments skipped), so a face swap
+ * can be judged on the exact metadata that lives in the user's library
+ * rather than on whatever this file happened to hard-code.
  *
  * The right-hand column repeats each line at `zoom` (default 3) with nearest-
  * neighbour scaling, because the defect being tuned here is sub-pixel and is
@@ -26,7 +31,7 @@
 #include "text.h"
 
 #define W 320
-#define H 720                     /* tall: every face, twice */
+#define H 1600                    /* tall: six faces x a strings file  */
 #define BG   0xF7BE               /* Linen surface-ish */
 #define INK  0x18E3               /* near-black */
 
@@ -46,6 +51,32 @@ static const char *const SAMPLES[] = {
     "HELLO WORLD hello world",
 };
 #define NSAMP ((int)(sizeof SAMPLES / sizeof SAMPLES[0]))
+#define MAX_LINES 64
+#define MAX_LINE  128
+
+/* Lines read from argv[3], if given; otherwise SAMPLES. */
+static char  file_lines[MAX_LINES][MAX_LINE];
+static const char *samples[MAX_LINES];
+static int   nsamp;
+
+static void load_samples(const char *path)
+{
+    nsamp = 0;
+    if (!path) {
+        for (int i = 0; i < NSAMP; i++) samples[nsamp++] = SAMPLES[i];
+        return;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) { perror(path); exit(1); }
+    while (nsamp < MAX_LINES && fgets(file_lines[nsamp], MAX_LINE, fp)) {
+        char *l = file_lines[nsamp];
+        l[strcspn(l, "\r\n")] = 0;
+        if (l[0] == 0 || l[0] == '#') continue;
+        samples[nsamp] = l;
+        nsamp++;
+    }
+    fclose(fp);
+}
 
 struct face { const char *name; const text_font_t *(*get)(void); };
 
@@ -54,14 +85,15 @@ int main(int argc, char **argv)
     const char *out = (argc > 1) ? argv[1] : "text_preview.ppm";
     int zoom = (argc > 2) ? atoi(argv[2]) : 3;
     if (zoom < 1) zoom = 1;
+    load_samples(argc > 3 ? argv[3] : NULL);
 
     const struct face faces[] = {
         { "regular 9",  text_font_regular_9  },
         { "regular 11", text_font_regular_11 },
-        { "regular 13", text_font_regular_12 },
-        { "bold 11",    text_font_bold_12    },
+        { "regular 12", text_font_regular_12 },
+        { "bold 12",    text_font_bold_12    },
         { "bold 13",    text_font_bold_13    },
-        { "bold 17",    text_font_bold_18    },
+        { "bold 18",    text_font_bold_18    },
     };
     const int nfaces = (int)(sizeof faces / sizeof faces[0]);
 
@@ -74,9 +106,9 @@ int main(int argc, char **argv)
         /* Face label in the smallest face so it never dominates. */
         text_draw(fb, W, H, 4, y, faces[f].name, text_font_regular_9(), INK);
         y += text_line_height(text_font_regular_9()) + 2;
-        for (int s = 0; s < NSAMP; s++) {
+        for (int s = 0; s < nsamp; s++) {
             if (y + lh >= H) break;
-            text_draw(fb, W, H, 6, y + text_ascent(fo), SAMPLES[s], fo, INK);
+            text_draw(fb, W, H, 6, y + text_ascent(fo), samples[s], fo, INK);
             y += lh;
         }
         y += 6;

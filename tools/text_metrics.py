@@ -110,17 +110,31 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worst", type=int, default=10)
     ap.add_argument("--atlas", default=None)
+    ap.add_argument("--atlas-dir", default=ATLAS_DIR,
+                    help="measure the atlases in this directory instead of "
+                         "the shipped ones — for judging a candidate face "
+                         "baked into a scratch tree before it is committed")
     ap.add_argument("--triplets", action="store_true",
                     help="check all 52x52x52 letter triplets, including the "
                          "OUTER pair's clearance across a narrow middle glyph "
                          "— which no pairwise check can see")
+    ap.add_argument("--strings", default=None,
+                    help="measure RHYTHM over the strings in this file (one "
+                         "per line): for every adjacent letter pair, the mean "
+                         "daylight over the rows both glyphs ink, then the "
+                         "coefficient of variation across all pairs. The "
+                         "min-clearance number above can be perfectly "
+                         "uniform while this is not — 'ff' and 'oo' can share "
+                         "a 2px minimum and differ 3x in the daylight the eye "
+                         "integrates. Also prints word gap / letter gap.")
     ap.add_argument("--target", type=float, default=None,
                     help="solve for the tracking (px) that puts each atlas's "
                          "soft mean gap at this many pixels, and print a "
                          "TRACKING_PX table")
     args = ap.parse_args()
 
-    files = sorted(glob.glob(os.path.join(ATLAS_DIR, "nunito_*.h")))
+    files = sorted(f for f in glob.glob(os.path.join(args.atlas_dir, "*.h"))
+                   if not f.endswith("glyphmap.h"))
     if args.atlas:
         files = [f for f in files if args.atlas in os.path.basename(f)]
     letters = ([chr(c) for c in range(0x41, 0x5B)] +
@@ -157,6 +171,73 @@ def main():
         print(f"{name:<22}{tracking/64:>6.2f}{cm:>11.2f}{touch:>8.1f}%"
               f"{sm:>11.2f}{p10:>6d}{p90:>6d}")
         report[name] = (core, soft)
+
+    if args.strings:
+        lines = [l.rstrip("\n") for l in open(args.strings, encoding="utf-8")
+                 if l.strip() and not l.startswith("#")]
+        print(f"\n--- rhythm over {len(lines)} strings from {args.strings} ---")
+        print(f"{'atlas':<14}{'pairs':>6}{'area mean':>11}{'area CV':>9}"
+              f"{'min mean':>10}{'word/letter':>12}  loosest pairs (area)")
+        for path in files:
+            glyphs, data, kern, track = load_atlas(path)
+            name = os.path.basename(path).replace("nunito_", "").replace(".h", "")
+            areas, mins, words = [], [], []
+            for line in lines:
+                # pen exactly as text.c: whole-pixel steps from 26.6 advances
+                pen = 0
+                xs = []
+                for i, ch in enumerate(line):
+                    gi = ord(ch) - 0x20
+                    if gi not in glyphs:
+                        xs.append(None); continue
+                    xs.append(((pen + 32) >> 6) + glyphs[gi]["ox"])
+                    nxt = ord(line[i + 1]) - 0x20 if i + 1 < len(line) else None
+                    step = glyphs[gi]["adv"]
+                    if nxt is not None:
+                        if gi != 0 and nxt != 0:
+                            step += track
+                        step += kern.get((gi, nxt), 0) * 2
+                    pen += step
+                ext = {}
+                for i, ch in enumerate(line):
+                    gi = ord(ch) - 0x20
+                    if gi in glyphs and xs[i] is not None:
+                        ext[i] = row_extents(glyphs[gi], data, 1)
+                for i in range(len(line) - 1):
+                    a, b = line[i], line[i + 1]
+                    if i not in ext or i + 1 not in ext:
+                        continue
+                    ra, rb = ext[i], ext[i + 1]
+                    sh = set(ra) & set(rb)
+                    if not sh:
+                        continue
+                    g = [(xs[i + 1] + rb[y][0]) - (xs[i] + ra[y][1]) - 1
+                         for y in sh]
+                    if a.isalpha() and b.isalpha():
+                        areas.append((sum(g) / len(g), a + b))
+                        mins.append(min(g))
+                # word gaps: letter, space, letter
+                for i in range(1, len(line) - 1):
+                    if line[i] == " " and (i - 1) in ext and (i + 1) in ext \
+                            and line[i - 1].isalpha() and line[i + 1].isalpha():
+                        ra, rb = ext[i - 1], ext[i + 1]
+                        sh = set(ra) & set(rb)
+                        if sh:
+                            words.append(min((xs[i + 1] + rb[y][0]) -
+                                             (xs[i - 1] + ra[y][1]) - 1
+                                             for y in sh))
+            if not areas:
+                continue
+            vals = [a for a, _ in areas]
+            mean = sum(vals) / len(vals)
+            sd = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
+            wm = sum(words) / len(words) if words else 0
+            mm = sum(mins) / len(mins)
+            loose = " ".join(f"{p}({a:.1f})" for a, p in
+                             sorted(areas, reverse=True)[:5])
+            print(f"{name:<14}{len(vals):>6}{mean:>11.2f}{sd / mean:>9.2f}"
+                  f"{mm:>10.2f}{wm / mm if mm else 0:>12.2f}  {loose}")
+        return 0
 
     if args.triplets:
         letters = ([chr(c) for c in range(0x41, 0x5B)] +
