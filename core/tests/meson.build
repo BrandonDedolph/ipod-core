@@ -621,18 +621,33 @@ if target == 'sim'
   )
   test('hw-audio-pingpong', audio_pingpong_test, suite: 'unit')
 
-  # name-hash: the library locator hash. It exists three times — in
-  # kernel/main.c (device), in tools/build_index.py (host), and in the
-  # verbatim copy here that makes it testable — and it is the ONLY thing
-  # binding a CORELIB.IDX record to its file on disk. If two copies disagree
-  # the track does not error, it silently stops resolving. Asserts a golden
-  # vector table covering ASCII/case, Latin-1, smart quotes, dashes,
-  # punctuation, CJK, and (as documented expected failures) astral
-  # codepoints, where main.c's re-encoder has no 4-byte branch. The Python
-  # half and the copy-vs-original diff run in hw-name-hash-parity below.
+  # names: the library's name handling (core/library/names.c) — the SAME
+  # source the ARM build links into core.elf. Every function in it was a
+  # `static` in kernel/main.c, which meson builds only for target == 'hw', so
+  # the display-name copy every row and queue entry is made by, the
+  # "Artist - Album" split, the extension classifier and the Now Playing
+  # formatters had never been compiled by the host. Sentinel-guarded buffers
+  # prove the NAME_MAX bounds; the UTF-8 decoder under the locator hash is
+  # driven through overlongs, surrogates and truncation; one XFAIL records
+  # that classify_ext matches any extension that merely STARTS with "flac".
+  names_test = executable(
+    'names_test',
+    sources: ['library/names_test.c', '../library/names.c'],
+    include_directories: include_directories('.'),
+    override_options: test_opts,
+  )
+  test('names', names_test, suite: 'unit')
+
+  # name-hash: the library locator hash. It exists twice — in
+  # library/names.c (device) and in tools/build_index.py (host) — and it is
+  # the ONLY thing binding a CORELIB.IDX record to its file on disk. If the
+  # two disagree the track does not error, it silently stops resolving.
+  # Compiles the real names.c and asserts a golden vector table covering
+  # ASCII/case, Latin-1, smart quotes, dashes, punctuation, CJK and astral
+  # codepoints. The Python half runs in hw-name-hash-parity below.
   name_hash_test = executable(
     'name_hash_test',
-    sources: ['kernel/name_hash_test.c', 'kernel/name_hash_ref.c'],
+    sources: ['kernel/name_hash_test.c', '../library/names.c'],
     include_directories: include_directories('kernel', '.'),
     override_options: test_opts,
   )
@@ -646,11 +661,12 @@ if target == 'sim'
   # happy path, every stale case (deleted / unindexed / unresolved / empty
   # library / empty locator), and the ambiguity rules: duplicate filenames are
   # disambiguated by the saved track LENGTH, and decline outright when the
-  # length cannot choose. Compiles a verbatim copy of the static function
-  # (like name_hash_ref.c); hw-resume-parity below diffs it against main.c.
+  # length cannot choose. Compiles a verbatim copy of the static function;
+  # hw-resume-parity below diffs it against main.c. The locator hash it
+  # calls is the real library/names.c.
   resume_test = executable(
     'resume_test',
-    sources: ['kernel/resume_test.c', 'kernel/name_hash_ref.c'],
+    sources: ['kernel/resume_test.c', '../library/names.c'],
     include_directories: include_directories('kernel', '.'),
     override_options: test_opts,
   )
@@ -729,10 +745,9 @@ if target == 'sim'
          depends: fat32_corrupt_imgs,
          suite: 'unit')
 
-    # hw-name-hash-parity: the Python half of the locator-hash test, plus the
-    # check that the verbatim copy in tests/kernel/name_hash_ref.c has not
-    # drifted from kernel/main.c. Without the diff the C test could pass
-    # against a fossil while the device runs something else.
+    # hw-name-hash-parity: the Python half of the locator-hash test —
+    # tools/build_index.py against the same golden vectors the C test
+    # (name-hash, above, on the real library/names.c) asserts.
     test('hw-name-hash-parity', py,
          args: [meson.current_source_dir() / 'scripts' /
                 'check_name_hash_parity.py'],

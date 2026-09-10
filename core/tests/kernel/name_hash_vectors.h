@@ -3,8 +3,8 @@
  * tests/kernel/name_hash_vectors.h — THE golden vector table for the library
  * locator hash. One table, read by both sides:
  *
- *   C      — tests/kernel/name_hash_test.c, against the verbatim copy of
- *            kernel/main.c's name_hash().
+ *   C      — tests/kernel/name_hash_test.c — the C side, against
+ *            core/library/names.c's name_hash() (the real source, compiled in).
  *   Python — tests/scripts/check_name_hash_parity.py, against
  *            tools/build_index.py's name_hash().
  *
@@ -82,7 +82,7 @@ NAME_HASH_VEC("cjk-bmp", "\346\235\261\344\272\254", 0x68DEA76Fu)
  * CORELIB.IDX under a hash the device could never match, and resolved to
  * nothing.
  *
- * kernel/main.c now carries the 4-byte branch (and says why), so these are
+ * library/names.c now carries the 4-byte branch (and says why), so these are
  * ordinary vectors. Keep them that way: the expected values are what
  * build_index.py produces, and they are the only thing pinning the two
  * encoders together across the astral boundary.
