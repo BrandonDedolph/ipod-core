@@ -42,6 +42,7 @@
 #include "../ui/chrome.h"
 #include "../library/names.h"
 #include "../library/idx.h"
+#include "../library/sort.h"
 #include "hw/volume.h"
 
 /*
@@ -2193,39 +2194,6 @@ static void library_scan(fat32_t *fs)
     library_finish();
     library_resolve_art(fs);               /* index each album's cover clusters */
     g_lib_scanned = 1;
-}
-
-
-/*
- * Bottom-up merge sort over an index array.
- *
- * Both library sorts were insertion sorts, which is fine at a few hundred
- * entries and quadratic beyond that: at the old 1200-song cap the song sort
- * already cost ~720k case-insensitive string compares, and raising the cap
- * would have made "Loading Library" grow with the SQUARE of the library. This
- * is O(n log n), stable (so equal titles keep their load order), and needs one
- * scratch array of the same length.
- */
-typedef int (*idx_cmp_fn)(uint16_t a, uint16_t b);
-
-static void merge_sort_idx(uint16_t *a, int n, uint16_t *tmp, idx_cmp_fn cmp)
-{
-    for (int width = 1; width < n; width *= 2) {
-        for (int lo = 0; lo < n; lo += 2 * width) {
-            int mid = lo + width;
-            int hi  = lo + 2 * width;
-            if (mid > n) mid = n;
-            if (hi  > n) hi  = n;
-            int i = lo, j = mid, k = lo;
-            while (i < mid && j < hi) {
-                /* <= keeps the sort STABLE: a tie takes the left run first. */
-                tmp[k++] = (cmp(a[i], a[j]) <= 0) ? a[i++] : a[j++];
-            }
-            while (i < mid) tmp[k++] = a[i++];
-            while (j < hi)  tmp[k++] = a[j++];
-        }
-        for (int i = 0; i < n; i++) a[i] = tmp[i];
-    }
 }
 
 /* Scratch for merge_sort_idx. Sized to the larger of the two things sorted. */

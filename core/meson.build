@@ -233,10 +233,12 @@ if target == 'hw'
   # validator and record CRC-32 — the part of the index loader that decides
   # whether to trust a file off the user's disk — likewise extracted from
   # main.c, where the host test had to carry verbatim copies of it. Same
-  # idx.c the host idx test compiles.
+  # idx.c the host idx test compiles. sort.c is the stable index-array merge
+  # sort every alphabetised list is built with; same sort.c the host sort test
+  # compiles against a stable reference.
   library_hw_lib = static_library(
     'core_library_hw',
-    sources: ['library/names.c', 'library/idx.c'],
+    sources: ['library/names.c', 'library/idx.c', 'library/sort.c'],
     c_args: ['-DCORE_FREESTANDING'],
   )
 

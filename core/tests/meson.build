@@ -690,6 +690,23 @@ if target == 'sim'
   )
   test('idx', idx_test, suite: 'unit')
 
+  # sort: the stable index-array merge sort (core/library/sort.c) every
+  # alphabetised list is built with — the SAME source the ARM build links.
+  # main.c's only evidence for it was a comment saying it had been checked
+  # against a reference once. Compares against a stable insertion sort over
+  # the same keys — results must be IDENTICAL, so tie order is asserted, not
+  # just ordering — over many sizes (non-powers of two leave a short final
+  # run at every width), tie densities from all-equal to all-distinct, and
+  # the full LIB_MAX_SONGS; sentinels bracket both arrays; the compare
+  # counts out-of-range indices and the O(n log n) bound.
+  sort_test = executable(
+    'sort_test',
+    sources: ['library/sort_test.c', '../library/sort.c'],
+    include_directories: include_directories('.'),
+    override_options: test_opts,
+  )
+  test('sort', sort_test, suite: 'unit')
+
   # player-queue: the queue / auto-advance / repeat / shuffle logic of
   # core/player/player.c — 753 lines with no test at all, and the part users
   # notice when it is wrong (a queue that stops a track early, a Repeat All
