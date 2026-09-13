@@ -445,6 +445,55 @@ static int config_slot_lba(uint32_t slot, uint32_t *out)
 
 /* ---- load -------------------------------------------------------------- */
 
+/*
+ * The boot reads — the root walk that finds the file and the two slot reads —
+ * happen while the drive may still be settling from spin-up, which is exactly
+ * when the library loader's directory walks were seen to fail (main.c,
+ * lib_readdir). A read error there is NOT the same thing as a slot that
+ * decoded invalid, and until this was told apart it was treated the same
+ * way: `have` stayed 0, the module stayed writable with seq 0, and the first
+ * save wrote seq 1 into a slot while the other still held (say) seq 57 — so
+ * the following boot preferred the old slot and everything from the session,
+ * resume position included, was silently thrown away.
+ *
+ * So a failed read is retried after a short settle, the same shape as
+ * lib_readdir (which already rides the driver's own per-sector retries), and
+ * if a slot is still unreadable after that:
+ *
+ *   - with NO valid record from the other slot the module goes NOT WRITABLE
+ *     for the session (fail closed): an unreadable slot may hold the newest
+ *     record, and a write with seq 1 would lose to it forever;
+ *   - with a valid record from the other slot saving stays enabled. The next
+ *     write goes to the unreadable slot (it is the one we did not read from)
+ *     with seq best+1, which beats whatever it held — so nothing inverts —
+ *     and rewriting it is precisely how a slot whose ECC a power cut spoiled
+ *     comes back.
+ *
+ * sleep_ms is the kernel's cooperative delay; weak so the host test, which
+ * links config.c with no timer, resolves it to null and retries without
+ * waiting (ata.c takes the same approach with cpu_boost).
+ */
+__attribute__((weak)) void sleep_ms(uint32_t ms);
+
+static void cfg_settle(void)
+{
+    if (sleep_ms) {
+        sleep_ms(CONFIG_READ_RETRY_MS);
+    }
+}
+
+/* One slot, straight off the platter, with the settle-and-retry above.
+ * Returns the block callback's final result (0 = the buffer holds the slot). */
+static int cfg_read_slot_raw(fat32_t *fs, uint32_t lba)
+{
+    int rc = fs->read(fs->ud, lba, CONFIG_SLOT_SECTORS, g_slot_buf);
+    for (uint32_t attempt = 0; rc != 0 && attempt < CONFIG_READ_RETRIES; attempt++) {
+        cfg_settle();
+        rc = fs->read(fs->ud, lba, CONFIG_SLOT_SECTORS, g_slot_buf);
+    }
+    return rc;
+}
+
 /* Root-directory scan: capture CORECFG.DAT's cluster + size. Mirrors how
  * CORELIB.IDX is located in main.c — the file is found by ENUMERATION, never
  * by a hardcoded address. */
@@ -491,7 +540,21 @@ int config_load(fat32_t *fs, settings_t *s)
         return 0;
     }
 
-    if (fat32_readdir(fs, fs->root_clus, cfg_root_cb, 0) != 0) {
+    /* Only a read error is retried: ECORRUPT is structural (the bytes are
+     * wrong, not late). The walk restarts from the top, so what the callback
+     * captured on the failed pass is rewound first — a stale hit from a
+     * half-walked root is not the file. */
+    int rc = fat32_readdir(fs, fs->root_clus, cfg_root_cb, 0);
+    for (uint32_t attempt = 0;
+         rc == FAT32_EIO && attempt < CONFIG_READ_RETRIES; attempt++) {
+        cfg_settle();
+        g_cfg.first_clus = 0;
+        g_cfg.size       = 0;
+        rc = fat32_readdir(fs, fs->root_clus, cfg_root_cb, 0);
+    }
+    if (rc != 0) {
+        g_cfg.first_clus = 0;
+        g_cfg.size       = 0;
         return 0;                   /* disk/geometry error — stay disabled */
     }
     if (g_cfg.first_clus == 0 || g_cfg.size < CONFIG_MIN_BYTES) {
@@ -520,9 +583,10 @@ int config_load(fat32_t *fs, settings_t *s)
      * would serve a stale copy of a sector we just wrote, and we want the
      * platter's truth here.)
      */
-    int      have   = 0;
-    uint32_t best   = 0;
-    uint8_t  best_i = 0;
+    int      have       = 0;
+    int      unreadable = 0;    /* slots the drive would not give us at all */
+    uint32_t best       = 0;
+    uint8_t  best_i     = 0;
     settings_t cand = *s;   /* seeded from the caller's defaults: `have` gates
                              * every use, and this leaves nothing uninitialised
                              * for a compiler (or a future edit) to trip over  */
@@ -532,8 +596,10 @@ int config_load(fat32_t *fs, settings_t *s)
         if (config_slot_lba(slot, &lba) != 0) {
             continue;
         }
-        if (fs->read(fs->ud, lba, CONFIG_SLOT_SECTORS, g_slot_buf) != 0) {
-            continue;               /* unreadable slot — the other may be fine */
+        if (cfg_read_slot_raw(fs, lba) != 0) {
+            unreadable++;           /* still unreadable after the retries: NOT
+                                     * "invalid" — we do not know what it holds */
+            continue;
         }
         settings_t tmp;
         uint32_t   seq = 0;
@@ -549,8 +615,18 @@ int config_load(fat32_t *fs, settings_t *s)
     }
 
     if (!have) {
+        if (unreadable) {
+            /* No record we can trust AND a slot we could not read: it may hold
+             * the newest record, and a save from seq 0 would write seq 1 over
+             * the other slot — losing, on the next boot, to the one we never
+             * saw. Fail closed: not writable this session — the boot log's
+             * "writable 0" says so. */
+            g_cfg.fs    = 0;
+            g_cfg.found = 0;
+            return 0;
+        }
         /* File is usable but holds no valid record (fresh, or both slots
-         * damaged). Saving stays ENABLED — writing slot 0 is exactly how we
+         * damaged). Saving stays ENABLED — the first write is exactly how we
          * recover — but the caller keeps its defaults. seq restarts at 0 so
          * the first save writes 1. */
         return 0;
