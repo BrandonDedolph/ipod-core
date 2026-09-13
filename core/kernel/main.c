@@ -46,6 +46,7 @@
 #include "../library/idx.h"
 #include "../library/sort.h"
 #include "../ui/wheel.h"
+#include "../ui/keyhold.h"
 #include "hw/volume.h"
 
 /*
@@ -590,6 +591,8 @@ static int      g_scrub_dirty;       /* target moved since the last commit     *
 
 /* SELECT press-length arbitration on Now Playing: tap = scrubber, hold = queue. */
 #define SEL_HOLD_US 450000u
+/* PLAY held this long sleeps the device; released sooner, it is play/pause. */
+#define PLAY_HOLD_US 2000000u
 
 static uint32_t g_sel_down_us;
 static int      g_sel_pending;
@@ -639,7 +642,12 @@ static int      g_bat_mv_filt = -1;          /* median of recent samples (policy
  * which sits with the status-strip state it feeds. */
 static void settings_commit(int force);
 static void resume_capture(void);
-_Noreturn static void enter_standby(void);
+static int  enter_standby(void);
+
+/* Set by enter_standby() when the PMU refused the power-down and the device
+ * was brought back instead: run_ui reads and clears it to resync its
+ * backlight/idle state with the screen enter_standby already relit. */
+static int g_standby_refused;
 
 /*
  * settings_commit() modes.
@@ -833,11 +841,19 @@ static int battery_refresh(int force)
          * The hold is a USEC_TIMER spin, not cpu_wait_ms(): that takes a
          * uint8_t of milliseconds and may wake early on an IRQ, and this is
          * the one message the user gets.
+         *
+         * Order: panel awake, frame presented, THEN backlight. This can fire
+         * from inside a suspend, where the panel is asleep (LCD_SLEEP) and
+         * a present is a no-op until lcd_wake(); and light behind a panel
+         * that is still running its wake-init is the white flash. lcd_wake
+         * is a no-op when the panel is already up, and the present is then
+         * the ordinary one — so the order costs nothing on the main loop.
          */
         player_pause();
-        backlight_set(g_settings.backlight_bright);
+        lcd_wake();
         screen_battery_render(BATTWARN_SHUTOFF);
         lcd_present_fb(console_framebuffer());
+        backlight_set(g_settings.backlight_bright);
         {
             uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
             while ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - t0) < 1500000u) {
@@ -846,8 +862,12 @@ static int battery_refresh(int force)
         /* The documented power-off path: stop the player, blank the panel,
          * PMU deep-sleep with wake sources set. Its own settings_commit(1)
          * is the reason the DISKSAFE flush above exists: by now the write
-         * gate should refuse it (see battery_disk_writes_allowed). */
-        enter_standby();                  /* does not return */
+         * gate should refuse it (see battery_disk_writes_allowed). It comes
+         * back only if the PMU refused, already repainted; nothing more to do
+         * here — the policy stays latched at SHUTOFF, so this edge does not
+         * repeat, and the device runs on until the cell gives out. */
+        (void)enter_standby();
+        break;
 
     case BATTERY_EVENT_RECOVERED:
         uart_puts("core: batt RECOVERED: writes allowed again\n");
@@ -4216,42 +4236,146 @@ static void paint_current_screen(void)
     }
 }
 
-/* Quiesce and enter PMU deep-sleep standby (triggered by holding PLAY). Stops
- * audio + the decode/disk feed, blanks the panel + backlight, then hands off to
- * the PMU. Never returns — a button press wakes the device by re-running the
- * boot path (a cold boot of the firmware, not a resume). */
-_Noreturn static void enter_standby(void)
+/*
+ * Quiesce and enter PMU deep-sleep standby — the true "off" (holding PLAY
+ * past ~5 s, the suspend timeout, or the battery policy's SHUTOFF edge).
+ * A button press wakes the device by re-running the boot path (a cold boot
+ * of the firmware, not a resume).
+ *
+ * Everything that draws is put away BEFORE the rail cut, in the order the
+ * hardware wants: the transport and the codec (hal_audio_close powers the
+ * WM8758 down and gates the audio clocks), then the settings write while the
+ * drive is still spinning, then the drive itself (cache flushed, heads
+ * parked, spun down — 04-ata.md: "safe to cut power after this returns"),
+ * then the panel (black frame, backlight off, LCD_SLEEP). The PMU write is
+ * last. The settings write goes through the normal battery gate: below the
+ * disk-safe line it is refused, and the DISKSAFE-edge flush that already
+ * happened is what persists (see CFG_COMMIT_LAST).
+ *
+ * RETURNS -1 IF THE PMU REFUSED. power_standby() gives up after a bounded
+ * number of I2C retries rather than hang, and this used to fall into a
+ * for(;;) regardless — a dark, dead device, reached by the user asking to
+ * turn it off. Now the refusal is recovered here: panel woken, the current
+ * screen repainted (the present absorbs the panel init), backlight restored,
+ * and the caller carries on. The player has been STOPPED by then, not paused
+ * — that is the price of the refusal, and the caller must not resume it.
+ * On the device this path has never been seen to fire; it is the I2C-wedged
+ * case, and the recovery sequence is UNVERIFIED on hardware.
+ */
+static int enter_standby(void)
 {
     /* BEFORE player_stop(): once the transport is torn down there is no track
      * name and no elapsed clock left to record. */
     resume_capture();
     player_stop();
-    settings_commit(1);                   /* persist before the PMU cuts power */
+    hal_audio_close();                    /* codec rails off, audio clocks gated */
+    settings_commit(1);                   /* persist while the drive still spins */
+    if (!ata_is_parked()) {
+        ata_standby();                    /* flush + park + spin down. Not
+                                           * ata_sleep(): the rail cut follows
+                                           * and STANDBY is the device-proven
+                                           * path; a suspend has already slept
+                                           * it (parked) by the time it gets here */
+    }
     console_clear(0x0000);                /* blank BEFORE the power cut so no */
     lcd_present_fb(console_framebuffer()); /* stale colour lingers on the panel */
     cpu_wait_ms(80);                      /* let the BCM push the black frame  */
     backlight_set(0);
-    power_standby();                      /* PMU cuts power — does not return */
-    for (;;) {
-    }
+    lcd_sleep();                          /* panel off; the BCM stays alive   */
+    (void)power_standby();                /* PMU cuts power — normally no return */
+
+    /*
+     * Still here: the PMU never took the command. Bring the device back to a
+     * usable state rather than leave it dark. Wake the panel and push ONE
+     * frame BEFORE the backlight: that first present is the one the BCM
+     * answers with its ~500 ms panel init, and lighting the LED over it is
+     * the white flash (02-lcd.md).
+     */
+    uart_puts("core: standby REFUSED by the PMU; staying up\n");
+    lcd_wake();
+    paint_current_screen();
+    lcd_present_fb(console_framebuffer());
+    backlight_set(g_settings.backlight_bright);
+    g_standby_refused = 1;
+    return -1;
 }
 
 /*
  * Suspend: the seamless "off". Keeps the CPU + RAM alive so wake RESUMES the
- * running firmware instantly (no cold boot, so no ipl2 menu) — but actually
- * quiesces the power-hungry parts: audio paused, the hard drive spun DOWN (ATA
- * standby), backlight off, panel blanked to black. Any button wakes it: spin
- * the drive back up, restore the screen, resume playback. Holding the trigger
- * PLAY past ~5s escalates to a true PMU power-down (everything off, but wakes
- * via a cold boot). `play_down_us` is when the hold began, for that escalation.
+ * running firmware instantly (no cold boot) — and puts everything else away:
  *
- * Caveat vs a true power-down: the LCD controller + CPU stay powered (the panel
- * is dark, not electrically off), so it draws more than deep-sleep — fine for
- * short off/on, which is what this is for.
+ *   audio     paused; the codec powers itself down through player_pump()'s
+ *             persistent-pause timeout, which the idle loop keeps calling;
+ *   settings  written now (forced), with the resume position;
+ *   clock     boost released, so the core idles at 30 MHz between ticks;
+ *   drive     ata_sleep(): cache flushed, heads parked, platters down, then
+ *             SLEEP so the interface logic is off too — a reset wakes it;
+ *   panel     black frame, backlight off, then LCD_SLEEP (SUSPEND_PANEL_SLEEP;
+ *             the BCM stays powered so no firmware re-upload on wake).
+ *
+ * While suspended the loop samples the battery on the main loop's 5 s
+ * cadence and runs the same DISKSAFE / SHUTOFF policy, so a forgotten device
+ * flushes and powers off cleanly instead of deep-discharging to the PMU's
+ * hard cut; and on battery it escalates to a real PMU standby on its own
+ * after SUSPEND_TO_STANDBY_US. Holding the trigger PLAY past ~5 s escalates
+ * at once. `play_down_us` is when the hold began, for that escalation.
+ *
+ * Any button wakes it: reset + spin the drive up, wake the panel, repaint,
+ * present (that present retires the panel's wake-init before returning),
+ * THEN backlight, then resume — only if the headphone jack is not known to
+ * be empty. A refused PMU standby from any of the escalations falls through
+ * this same wake path with the player stopped and nothing to resume.
+ *
+ * What still draws: the CPU, RAM, PLL and the 100 Hz tick (the wake is what
+ * they buy), and the BCM. That is why the escalation exists. NOT MEASURED on
+ * the device: the suspend draw before or after this, whether the panel
+ * comes back from LCD_SLEEP (SUSPEND_PANEL_SLEEP has the rollback), and the
+ * drive's post-SLEEP reset wake — all first-flash items.
  */
+/*
+ * Put the LCD PANEL to sleep for the suspend, not just the backlight.
+ *
+ * lcd_sleep() issues the BCM's LCD_SLEEP (panel driver off; the BCM itself
+ * stays powered and bootstrapped, so no firmware re-upload is needed). The
+ * hazard is on the way back: the first LCD_UPDATE after a wake carries a
+ * ~500 ms panel init, and light behind the panel before that update has
+ * retired is the solid-white screen (02-lcd.md). The wake path below does
+ * lcd_wake(); paint; present; backlight in that order, and the present does
+ * not return until the init has retired (hal/hw/lcd.c bcm_frame_commit) —
+ * which is what makes this safe to ship at 1.
+ *
+ * UNVERIFIED ON THE DEVICE as of 2026-09-13. If the screen comes back WHITE
+ * after a suspend, set this to 0: the panel then stays driven-black for the
+ * suspend exactly as before (backlight off only), and nothing else changes.
+ */
+#ifndef SUSPEND_PANEL_SLEEP
+#define SUSPEND_PANEL_SLEEP 1
+#endif
+
+/*
+ * How long a suspend may last on battery before it escalates to a real PMU
+ * standby (enter_standby). Suspend keeps the CPU, RAM, PLL and the 100 Hz
+ * tick alive so that wake is instant; that is the right trade for "off for
+ * a minute", and the wrong one for "off overnight", where the same draw
+ * just takes the cell to the PMU's hard cut with nothing saved. Not applied
+ * while on external power: a docked device can sit suspended for as long
+ * as it likes. The cost of escalating is a cold boot on the next wake.
+ */
+#ifndef SUSPEND_TO_STANDBY_US
+#define SUSPEND_TO_STANDBY_US  (30u * 60u * 1000000u)     /* 30 minutes */
+#endif
+
+/* Idle-loop period while suspended. Nothing in the loop needs to be
+ * prompt: the 100 Hz tick samples the wheel into the latch regardless, so a
+ * press is seen within one period, and the battery sample is on its own
+ * 5 s cadence. Longer periods mean fewer wakeups of a core that is
+ * otherwise halted (cpu_wait_ms). */
+#define SUSPEND_IDLE_MS        100u
+
 static void suspend_to_ram(uint32_t play_down_us)
 {
     wheel_event_t drain;
+    uint32_t suspend_t0 = mmio_read32(USEC_TIMER_ADDR);
     int was_playing = player_active() && !player_paused();
     if (was_playing) {
         player_pause();                   /* silence + stop feeding the disk */
@@ -4267,7 +4391,7 @@ static void suspend_to_ram(uint32_t play_down_us)
                                            * entered from BL_FULL), so without this
                                            * the "sleeping" device holds the 80 MHz
                                            * operating point for the whole suspend */
-    ata_standby();                        /* spin the platters down (quiet, low-power) */
+    ata_sleep();                          /* flush, park, spin down, interface off */
     /* Clear to black BEFORE cutting the backlight, so the transflective panel
      * doesn't faintly ghost the last UI in ambient light while asleep. Wake
      * repaints the real screen while the backlight is still off (below), so the
@@ -4275,12 +4399,24 @@ static void suspend_to_ram(uint32_t play_down_us)
     console_clear(0x0000);
     lcd_present_fb(console_framebuffer());
     backlight_set(0);
+#if SUSPEND_PANEL_SLEEP
+    lcd_sleep();                          /* panel driver off; drains the black
+                                           * frame first, then LCD_SLEEP     */
+#endif
 
     /* Wait for the trigger PLAY hold to release (so it can't instantly wake us).
-     * Held past ~5s total => a real power-down instead. */
+     * Held past ~5s total => a real power-down instead. If the PMU refuses
+     * that, enter_standby() has already stopped the player and repainted:
+     * skip the idle wait and fall through to the wake path, which finishes
+     * the job (release-wait, re-boost, drive spin-up) without resuming. */
+    int standby_refused = 0;
     while (clickwheel_buttons() & WHEEL_BTN_PLAY) {
         if ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - play_down_us) > 5000000u) {
-            enter_standby();              /* true off (PMU) — does not return */
+            if (enter_standby() != 0) {   /* true off (PMU) — normally no return */
+                standby_refused = 1;
+                was_playing     = 0;      /* stopped, not paused: nothing to resume */
+                break;
+            }
         }
         /* See the wake loop below for why this drain is load-bearing. */
         while (clickwheel_get_event(&drain)) { }
@@ -4290,7 +4426,7 @@ static void suspend_to_ram(uint32_t play_down_us)
 
     /* Low-power idle until any button is pressed. The 100 Hz tick keeps sampling
      * the wheel into the latch through each cpu_wait, so a press is seen fast. */
-    while (clickwheel_buttons() == 0) {
+    while (!standby_refused && clickwheel_buttons() == 0) {
         /*
          * DRAINING HERE IS WHAT MAKES THE DEVICE WAKE AT ALL.
          *
@@ -4327,7 +4463,50 @@ static void suspend_to_ram(uint32_t play_down_us)
          * would defeat the whole exercise.
          */
         player_pump();
-        cpu_wait_ms(30);
+
+        /*
+         * Watch the battery. battery_refresh() only ever ran from the main
+         * loop, so a suspended device took no samples at all: it discharged
+         * straight past the DISKSAFE and SHUTOFF lines to the PMU's hard cut,
+         * with nothing flushed and no goodbye. Same call, same 5 s cadence,
+         * same policy — the DISKSAFE edge makes its last write (which wakes
+         * the slept drive, so put it back to sleep afterwards if the handler
+         * left it up), and the SHUTOFF edge powers the device off through
+         * enter_standby(). If the PMU refuses THAT, enter_standby has already
+         * stopped the player and relit the screen: leave the loop the way a
+         * refused hold-escalation does, and do not resume.
+         */
+        if (battery_refresh(0)) {
+            if (g_standby_refused) {
+                standby_refused = 1;
+                was_playing     = 0;
+                break;
+            }
+            if (!ata_is_parked()) {
+                ata_sleep();
+            }
+        }
+
+        /* Keep the jack debouncer fed (a GPIO read), so the answer it gives
+         * at wake reflects what happened during the suspend, not before it. */
+        (void)hal_headphones_present();
+
+        /*
+         * Escalate. Past SUSPEND_TO_STANDBY_US on battery this is no longer
+         * a short "off": trade the instant wake for a real power-down before
+         * the cell is spent. Checked every pass, so a device unplugged after
+         * the deadline escalates on the next one.
+         */
+        if (!power_is_external() &&
+            (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - suspend_t0) >
+                SUSPEND_TO_STANDBY_US) {
+            if (enter_standby() != 0) {   /* normally no return */
+                standby_refused = 1;
+                was_playing     = 0;
+                break;
+            }
+        }
+        cpu_wait_ms(SUSPEND_IDLE_MS);
     }
     /* Swallow the wake press so it isn't also acted on as navigation. */
     while (clickwheel_buttons() != 0) {
@@ -4341,39 +4520,64 @@ static void suspend_to_ram(uint32_t play_down_us)
      * time the idle path unboosts). It also puts the ATA read and the render
      * back at 80 MHz, which is where their timing was calibrated. */
     cpu_boost();
-    ata_wakeup();                         /* spin the drive back up before any read */
+    ata_wakeup();                         /* reset + spin the drive back up before any read */
+    /*
+     * Panel back, in the only order that is safe: wake the panel driver,
+     * render the real screen while everything is still dark, present it —
+     * this present carries the BCM's ~500 ms panel init and does not return
+     * until that has retired — and ONLY THEN light the backlight. Light any
+     * earlier and the init shows as a white flash; on the old absorb
+     * ordering it could latch white for good. lcd_wake() is a no-op when
+     * the panel was not slept (SUSPEND_PANEL_SLEEP 0, or a refused standby
+     * that already woke it), and the present is then the ordinary one.
+     */
+    lcd_wake();
     paint_current_screen();               /* render the real screen while dark... */
-    lcd_present_fb(console_framebuffer());
+    lcd_present_fb(console_framebuffer()); /* ...retire the panel init...     */
     backlight_set(g_settings.backlight_bright);  /* ...then light up straight to it */
     if (was_playing) {
-        player_resume();
+        /*
+         * Resume only into a seated plug. The main loop pauses on an unplug
+         * edge but was not running to see one during the suspend; the
+         * debouncer was kept fed above, so this is the current answer. -1
+         * (detect not yet trusted on this device, hal/hw/headphone.h) keeps
+         * today's behaviour: resume. 0 leaves it paused, one PLAY away.
+         */
+        if (hal_headphones_present() != 0) {
+            player_resume();
+        }
     }
 }
 
 /*
- * Panel sleep at idle is DISABLED: it leaves the screen solid WHITE until a
- * reboot, which is the worst possible failure on a device whose only debug
- * channel is that screen.
+ * Panel sleep at IDLE (backlight timeout) is DISABLED: when it was tried it
+ * left the screen solid WHITE until a reboot, which is the worst possible
+ * failure on a device whose only debug channel is that screen.
  *
  * Mechanism, from docs/hw/02-lcd.md: on the first LCD_UPDATE after LCD_SLEEP the
  * BCM re-runs its internal LCD panel init and is allowed up to 500 ms for it
  * ("After waking from sleep, the first update can take up to 500 ms ... because
- * the BCM is doing internal LCD panel init"). Our commit handshake budgets
- * BCM_IDLE_SPIN_LIMIT (~2 ms) and RE-KICKS LCD_UPDATE 16 times inside that
- * window, while every later present streams a fresh 150 KB frame straight into
- * the in-progress init — so the init never completes and the BCM latches. The
- * doc names the symptom outright: "If we wake the backlight before the first
- * update completes, the user sees a 500 ms white flash." We light the backlight
- * at the input site, ~400 lines before lcd_wake() runs, so it is white, and
- * there is no bcm_init() anywhere in the tree to recover with — hence the
- * reboot.
+ * the BCM is doing internal LCD panel init"). At the time, our commit handshake
+ * budgeted BCM_IDLE_SPIN_LIMIT (~2 ms) and RE-KICKED LCD_UPDATE 16 times inside
+ * that window, every later present streamed a fresh 150 KB frame straight into
+ * the in-progress init, and the backlight was lit at the input site before any
+ * of it — so the init never completed and the BCM latched. The doc names the
+ * symptom outright: "If we wake the backlight before the first update
+ * completes, the user sees a 500 ms white flash."
  *
- * The backlight LED is by far the larger draw and is already off in this state;
- * suspend_to_ram() makes the same trade deliberately ("the panel is dark, not
- * electrically off"). Do NOT re-enable this without (a) a real bcm_init()
- * bootstrap to recover a failed wake, (b) a wall-clock absorb window on the
- * first post-wake commit with the re-kick SUPPRESSED, and (c) deferring
- * backlight-on until that first present has retired.
+ * The three preconditions for retrying it, and where they stand:
+ *   (a) a real bcm_init() bootstrap to recover a failed wake — exists
+ *       (lcd_recover), but is compiled out (LCD_RECOVER_ON_WAKE 0) because it
+ *       has never run on silicon;
+ *   (b) the first post-wake commit waits for ITS update to retire, wall-clock
+ *       bounded, with the re-kick suppressed — DONE (hal/hw/lcd.c
+ *       bcm_frame_commit, and it is what suspend_to_ram now relies on);
+ *   (c) backlight-on deferred until that first present has retired — DONE
+ *       here (bl_relight), and inherent in suspend's wake order.
+ * The backlight LED is by far the larger draw and is already off in this
+ * state, so the win from flipping this is small; suspend_to_ram is where the
+ * panel sleep actually earns its keep (SUSPEND_PANEL_SLEEP), and it should
+ * prove itself there on the device before this is turned on.
  */
 #define PANEL_SLEEP_AT_IDLE  0
 
@@ -4472,8 +4676,8 @@ _Noreturn static void run_ui(fat32_t *fs)
     char     az_prev = 0;                /* A-Z locator letter on screen         */
     int      toast_prev = 0;             /* low-battery toast on screen          */
     int      bat_glyph_prev = battery_glyph_key(g_bat_pct); /* strip gauge as drawn */
-    int      play_held = 0;              /* PLAY currently down (long-press off)  */
-    uint32_t play_down_us = 0;           /* when PLAY went down                   */
+    keyhold_t play_key;                  /* PLAY: tap = pause, hold = sleep       */
+    keyhold_reset(&play_key);
     g_locked = hold_prev;
 
     /* Backlight inactivity: full -> dim -> off. Any input wakes to full; a press
@@ -4656,25 +4860,52 @@ _Noreturn static void run_ui(fat32_t *fs)
             dirty = 1;
         }
 
-        /* Long-press PLAY (~2s) sleeps the device (suspend: drive spun down,
-         * screen dark, but CPU+RAM alive so wake is INSTANT and skips ipl2).
-         * Holding on to ~5s escalates to a true PMU power-down. LIVE button
-         * state tracks a continuous hold; a short PLAY tap is play/pause.
-         * Locked out while the hold switch is on. */
-        if (!g_locked && (clickwheel_buttons() & WHEEL_BTN_PLAY)) {
+        /*
+         * PLAY press-length arbitration: a tap toggles pause, a hold of
+         * PLAY_HOLD_US sleeps the device (suspend: drive spun down, screen
+         * dark, but CPU+RAM alive so wake is INSTANT). Holding on to ~5 s
+         * escalates to a true PMU power-down. Decided from LIVE button state
+         * once per pass, by the same rule SELECT uses on Now Playing: the
+         * down-edge decides nothing, the release before the threshold is the
+         * tap, the first pass at the threshold is the hold. The pause toggle
+         * used to fire on the down-edge EVENT regardless, so hold-to-sleep
+         * paused first (and wake did not resume) and hold-while-paused played
+         * for two seconds before sleeping. Locked out while the hold switch is
+         * on; a press that woke the backlight or dismissed a modal has its tap
+         * swallowed below (keyhold_swallow_tap) but can still hold.
+         */
+        {
             uint32_t nowp = mmio_read32(USEC_TIMER_ADDR);
-            if (!play_held) {
-                play_held = 1;
-                play_down_us = nowp;
-            } else if ((uint32_t)(nowp - play_down_us) > 2000000u) {
-                suspend_to_ram(play_down_us);   /* returns on wake */
-                play_held  = 0;
+            int      down = !g_locked &&
+                            (clickwheel_buttons() & WHEEL_BTN_PLAY) != 0;
+            switch (keyhold_feed(&play_key, down, nowp, PLAY_HOLD_US)) {
+            case KEYHOLD_TAP:
+                /* Transport: PLAY toggles pause from any screen, like a real
+                 * iPod (RIGHT/LEFT skip in the event block below). */
+                if (player_active()) {
+                    player_toggle_pause();
+                    dirty = 1;
+                }
+                break;
+            case KEYHOLD_HOLD:
+                suspend_to_ram(keyhold_down_us(&play_key));  /* returns on wake */
                 last_input = mmio_read32(USEC_TIMER_ADDR);
                 bl_state   = BL_FULL;           /* backlight restored on resume */
                 dirty      = 1;                 /* repaint the current screen */
+                break;
+            case KEYHOLD_NONE:
+                break;
             }
-        } else {
-            play_held = 0;
+        }
+
+        /* A refused PMU standby (see enter_standby) has already relit and
+         * repainted the screen from outside this loop; resync the backlight
+         * and idle bookkeeping so the next press is not treated as a wake. */
+        if (g_standby_refused) {
+            g_standby_refused = 0;
+            last_input = mmio_read32(USEC_TIMER_ADDR);
+            bl_state   = BL_FULL;
+            dirty      = 1;
         }
 
         /* Hold-switch edge (a cheap GPIO read, independent of the wheel block
@@ -4684,6 +4915,7 @@ _Noreturn static void run_ui(fat32_t *fs)
         if (held != hold_prev) {
             hold_prev = held;
             g_locked  = held;
+            keyhold_reset(&play_key);     /* a press under the switch is void */
             /* Force the plate to REPAINT for the new state. Without this, a second
              * edge (e.g. on->off within the 1 s window) leaves lock_flashing set
              * from the first edge, so the render guard (!lock_flashing) suppresses
@@ -4716,6 +4948,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                 if (was_off) {                /* swallow the wake press */
                     ev.buttons = 0;
                     ev.wheel_delta = 0;
+                    keyhold_swallow_tap(&play_key);   /* ...its release too */
                 }
             }
             /* Menu click on a button press (one per down-edge; not on the
@@ -4731,21 +4964,23 @@ _Noreturn static void run_ui(fat32_t *fs)
              * trying to get the modal off the screen for. Same swallow pattern as
              * the backlight wake above. */
             /* Any input dismisses a live toast (not consumed — the press was
-             * meant for whatever is underneath) and marks the modal seen. */
-            battwarn_input(mmio_read32(USEC_TIMER_ADDR));
+             * meant for whatever is underneath) and marks the modal seen.
+             * Not for a swallowed wake press: that one only lit the screen,
+             * and it must not also count as "the user has seen the warning". */
+            if (ev.buttons || ev.wheel_delta) {
+                battwarn_input(mmio_read32(USEC_TIMER_ADDR));
+            }
             if ((scr_cur() == SCR_CHARGING || scr_cur() == SCR_BATTERY) &&
                 ev.buttons) {
                 scr_pop();
                 dirty = 1;
                 ev.buttons     = 0;
                 ev.wheel_delta = 0;
+                keyhold_swallow_tap(&play_key);   /* PLAY's release too */
             }
             /* Transport buttons are global (work from any screen while playing),
-             * like a real iPod: PLAY toggles pause, RIGHT/LEFT skip track. */
-            if ((ev.buttons & WHEEL_BTN_PLAY) && player_active()) {
-                player_toggle_pause();
-                dirty = 1;
-            }
+             * like a real iPod: RIGHT/LEFT skip track. PLAY is decided by press
+             * length in the keyhold block above, not here at the down-edge. */
             if ((ev.buttons & WHEEL_BTN_RIGHT) && player_active()) {
                 player_next();
                 hal_volume_set(g_volume);         /* re-apply over codec re-init */

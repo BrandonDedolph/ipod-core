@@ -179,6 +179,22 @@ if target == 'sim'
   )
   test('wheel', wheel_test, suite: 'unit')
 
+  # keyhold: tap-vs-hold press-length arbitration (core/ui/keyhold.c) — the
+  # SAME source the ARM build links into core.elf, driving PLAY (tap = pause,
+  # hold = sleep). Pure integer logic over (is_down, clock) samples. Asserts
+  # that a press yields exactly ONE action decided by its length: silent at
+  # the down-edge, TAP on release under the threshold, HOLD on the first pass
+  # at it, a silent release after a HOLD (the wake case), the swallowed-tap
+  # rule (a press that woke the backlight taps nothing but can still hold),
+  # the mid-press reset, and a press across the 32-bit clock wrap.
+  keyhold_test = executable(
+    'keyhold_test',
+    sources: ['ui/keyhold_test.c', '../ui/keyhold.c'],
+    include_directories: include_directories('../ui', '.'),
+    override_options: test_opts,
+  )
+  test('keyhold', keyhold_test, suite: 'unit')
+
   # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
   # — the SAME source the ARM build links into core.elf. Shrinks a loaded
   # folder.art to a list chip / album-detail cover when no folder.thm is present.

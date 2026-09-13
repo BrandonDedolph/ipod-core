@@ -365,61 +365,27 @@ static int bcm_frame_commit(void)
     int rc = 0;
     const int post_wake = lcd_post_wake;
 
-    if (post_wake || lcd_first_frame) {
+    if (lcd_first_frame) {
         /*
-         * THE TWO "WE DON'T KNOW WHAT THE BCM IS DOING" COMMITS: the first
-         * one after a panel wake, and the very first one after boot.
-         *
-         * Post-wake, 02-lcd.md: the update can take up to 500 ms because the
-         * BCM is running internal LCD panel init. At boot we inherit whatever
-         * the previous stage left running — under a direct ROM boot (no
-         * ipodloader2) that may include the Apple ROM's own panel init, which
-         * the doc times at the same ~500 ms; see lcd_first_frame above.
+         * THE "WE DON'T KNOW WHAT THE BCM IS DOING" COMMIT: the very first
+         * one after boot. We inherit whatever the previous stage left running
+         * — under a direct ROM boot (no ipodloader2) that may include the
+         * Apple ROM's own panel init, which 02-lcd.md times at ~500 ms; see
+         * lcd_first_frame above.
          *
          * The ordinary path below budgets BCM_IDLE_SPIN_LIMIT (512 polls, on
          * the order of milliseconds) and RE-KICKS LCD_UPDATE up to
          * BCM_IDLE_SPIN_LIMIT/BCM_REKICK_TRIPS times inside that window — so
-         * it hammers new update commands into a BCM that is mid-panel-init,
-         * and later presents stream fresh pixels into the same in-progress
+         * it would hammer new update commands into a BCM that is mid-panel-
          * init. That is how the BCM ends up permanently latched: the screen
-         * wakes to solid white and only a reboot recovers.
+         * comes up solid white and only a reboot recovers.
          *
-         * So both of these commits ABSORB instead: a wall-clock window wider
-         * than the documented panel-init time, and NO re-kick. Re-kicking is
-         * the failure mechanism here, not the cure.
+         * So this commit ABSORBS instead: a wall-clock window wider than the
+         * documented panel-init time, and NO re-kick. Re-kicking is the
+         * failure mechanism here, not the cure.
          */
         rc = bcm_wait_idle_wall(BCM_LCDINIT_TIMEOUT_US);
-        lcd_post_wake = 0;
-#if LCD_RECOVER_ON_WAKE
-        /* Recovery is wired to the POST-WAKE absorb only — the boot-time
-         * absorb deliberately does not trigger a re-bootstrap. At frame one
-         * the panel has never been shown to work in the first place, so a
-         * timeout there is far more likely to mean "this BCM was never alive"
-         * (emulator, dead unit) than "a working BCM wedged", and power-cycling
-         * it would trade a diagnosable boot for an unexplained dark screen. */
-        if (post_wake && rc != 0 && !lcd_in_recover) {
-            /*
-             * LAST RESORT. The BCM was given a window wider than the documented
-             * 500 ms panel init and still never retired the update — this is
-             * precisely the state that latched the panel solid white until a
-             * reboot, and from here every later frame is streamed into a BCM
-             * that will never consume it. Re-bootstrap it from scratch.
-             *
-             * Return WITHOUT the command + strobe below: lcd_recover() has
-             * already streamed and strobed a full frame at the freshly started
-             * BCM, and issuing a second update on top of that would hammer a
-             * BCM in mid-panel-init — the exact mechanism this branch exists to
-             * avoid. The pixels this call streamed died with the power cycle
-             * (the BCM's SDRAM framebuffer does not survive it), so the caller
-             * must repaint; the -1 says so.
-             */
-            lcd_timeouts++;
-            lcd_warn("lcd: post-wake BCM never retired — re-bootstrapping\n");
-            (void)lcd_recover();
-            return -1;
-        }
-#endif
-    } else if (!lcd_first_frame) {
+    } else if (!post_wake) {
         uint32_t spin = BCM_IDLE_SPIN_LIMIT;
         uint32_t kick = BCM_REKICK_TRIPS;
         uint32_t stat = bcm_read32(BCMA_COMMAND);
@@ -439,10 +405,65 @@ static int bcm_frame_commit(void)
             rc = -1;
         }
     }
+    /*
+     * post_wake: NO wait before the command. Nothing is in flight — the last
+     * command was LCD_SLEEP, which lcd_sleep() drained before issuing, or
+     * this is lcd_recover()'s fill at a BCM that just started. The wait that
+     * matters comes AFTER, below.
+     */
     lcd_first_frame = 0;
 
     bcm_write32(BCMA_COMMAND, BCMCMD_LCD_UPDATE);
     mmio_write16(BCM_CONTROL_ADDR, BCM_CONTROL_STROBE);
+
+    if (post_wake) {
+        /*
+         * THE FIRST UPDATE AFTER A PANEL WAKE — the one just issued — is the
+         * slow one: 02-lcd.md, the BCM re-runs its internal LCD panel init
+         * behind it and may take up to 500 ms to retire it. This commit does
+         * not return until it has, wall-clock bounded and with NO re-kick.
+         *
+         * The wait used to sit BEFORE the command instead, where it found the
+         * BCM idle (nothing was in flight) and returned at once — so the
+         * present returned with the panel init still running, the caller lit
+         * the backlight over it (the white flash), and the NEXT present's
+         * re-kick path above hammered LCD_UPDATE into the init. Waiting here
+         * is what lets a caller do lcd_wake(); present; backlight_set() and
+         * have it mean what it says.
+         */
+        int wrc = bcm_wait_idle_wall(BCM_LCDINIT_TIMEOUT_US);
+        lcd_post_wake = 0;
+        if (wrc != 0) {
+            rc = -1;
+#if LCD_RECOVER_ON_WAKE
+            /* Recovery is wired to the POST-WAKE absorb only — the boot-time
+             * absorb above deliberately does not trigger a re-bootstrap. At
+             * frame one the panel has never been shown to work in the first
+             * place, so a timeout there is far more likely to mean "this BCM
+             * was never alive" (emulator, dead unit) than "a working BCM
+             * wedged", and power-cycling it would trade a diagnosable boot
+             * for an unexplained dark screen. */
+            if (!lcd_in_recover) {
+                /*
+                 * LAST RESORT. The BCM was given a window wider than the
+                 * documented 500 ms panel init and still never retired the
+                 * update — precisely the state that latched the panel solid
+                 * white until a reboot, and from here every later frame is
+                 * streamed into a BCM that will never consume it. Re-bootstrap
+                 * it from scratch. lcd_recover() streams and strobes its own
+                 * full frame at the freshly started BCM and waits that one
+                 * out too; the pixels THIS call streamed died with the power
+                 * cycle (the BCM's SDRAM framebuffer does not survive it), so
+                 * the caller must repaint — the -1 says so.
+                 */
+                lcd_timeouts++;
+                lcd_warn("lcd: post-wake BCM never retired — re-bootstrapping\n");
+                (void)lcd_recover();
+                return -1;
+            }
+#endif
+        }
+    }
 
     if (rc != 0) {
         lcd_timeouts++;
@@ -767,12 +788,13 @@ void lcd_wake(void)
     lcd_slept     = 0;
     /*
      * Arm the absorb window. The NEXT commit is the one the BCM answers
-     * slowly (up to 500 ms of internal panel init, 02-lcd.md) and it must not
-     * be re-kicked — see bcm_frame_commit. Note for callers: the backlight
-     * should not be brought up until that first present has returned, or the
-     * user sees the panel-init as a white flash (02-lcd.md: "If we wake the
-     * backlight before the first update completes, the user sees a 500 ms
-     * white flash").
+     * slowly (up to 500 ms of internal panel init, 02-lcd.md): it issues its
+     * LCD_UPDATE and then WAITS for it to retire before returning, with no
+     * re-kick — see bcm_frame_commit. So a caller's first present after this
+     * returns only once the panel init is done, and the backlight can be
+     * raised the moment it does; raising it any earlier shows the init as a
+     * white flash (02-lcd.md: "If we wake the backlight before the first
+     * update completes, the user sees a 500 ms white flash").
      */
     lcd_post_wake = 1;
 }
@@ -1127,18 +1149,18 @@ int lcd_recover(void)
          * garbage on screen. lcd.c holds no back buffer, so black is the only
          * frame we can produce here — the caller repaints.
          *
-         * lcd_first_frame is re-armed so that fill's commit takes the plain
-         * post-handoff path (nothing is in flight on a BCM that just started),
-         * and lcd_post_wake is cleared across it so the fill does not try to
-         * absorb a panel init that has not been kicked off yet. It is set
-         * again afterwards because that fill IS what kicks the panel init
-         * off — so the NEXT commit is the slow one, exactly as after a wake.
+         * That fill IS what kicks the panel init off, so it is committed as
+         * the post-wake frame: no wait before its command (nothing is in
+         * flight on a BCM that just started — lcd_first_frame is cleared so
+         * the boot absorb does not run either), and the commit then waits for
+         * the init to retire before returning. Nobody streams pixels at a
+         * BCM mid-init this way; the caller's repaint lands on a finished
+         * panel and takes the ordinary path.
          */
-        lcd_slept      = 0;
-        lcd_first_frame = 1;
-        lcd_post_wake   = 0;
-        lcd_fill(0x0000);
+        lcd_slept       = 0;
+        lcd_first_frame = 0;
         lcd_post_wake   = 1;
+        lcd_fill(0x0000);
     }
 
     lcd_in_recover = 0;

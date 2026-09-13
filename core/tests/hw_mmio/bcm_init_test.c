@@ -284,8 +284,11 @@ static void expect_black_frame(trace_cursor *tc)
     for (uint32_t i = 0; i < FRAME_WORDS; i++) {
         expect_w(tc, 32, BCM_DATA_ADDR, 0);
     }
-    expect_absorb_idle(tc);
+    /* Committed as the post-wake frame: command first (nothing is in flight
+     * on a BCM that just started), then the absorb that waits out the panel
+     * init THIS update kicks off. Idle on the healthy mock. */
     expect_command_strobe(tc);
+    expect_absorb_idle(tc);
 }
 
 /* ---- cases ------------------------------------------------------------ */
@@ -488,10 +491,17 @@ static int test_lcd_recover(void)
 }
 
 /*
- * THE WIRING. A post-wake commit whose wall-clock absorb never sees the BCM
- * go idle — exactly the state that latches the panel solid white until a
- * reboot — must fall through to lcd_recover(), and must NOT then issue its
- * own command + strobe on top of the frame lcd_recover already presented.
+ * THE WIRING. A post-wake commit issues its LCD_UPDATE and then absorbs —
+ * waits, wall-clock bounded and with no re-kick, for the panel init that
+ * update kicked off to retire. One whose absorb never sees the BCM go idle
+ * — exactly the state that latches the panel solid white until a reboot —
+ * must fall through to lcd_recover(), whose own black frame is the only
+ * further command issued (lcd_recover commits it as a post-wake frame too,
+ * so it waits its init out before returning).
+ *
+ * The absorb used to run BEFORE the command, where it found nothing in
+ * flight and returned at once — so it could never time out on the update
+ * that actually mattered, and this recovery was wired to the wrong wait.
  *
  * Only reachable because this binary is built with -DLCD_RECOVER_ON_WAKE=1;
  * the shipping image compiles this branch out.
@@ -528,11 +538,13 @@ static int test_recover_on_wake(void)
     lcd_present_rect(fb, 0, 0, 2, 1);
 
     trace_cursor tc = trace_begin("recover_on_wake");
-    /* the caller's stream */
+    /* the caller's stream, then its command + strobe: NO wait before it,
+     * nothing is in flight after a wake */
     expect_write_addr(&tc, BCMA_CMDPARAM);
     expect_w(&tc, 32, BCM_DATA_ADDR, 0);
-    /* the absorb, run to its guard: baseline read, then four read handshakes
-     * with a deadline check between each */
+    expect_command_strobe(&tc);
+    /* the absorb of THAT update, run to its guard: baseline read, then four
+     * read handshakes with a deadline check between each */
     expect_r(&tc, 32, USEC_TIMER_ADDR);
     for (int trip = 0; trip < 4; trip++) {
         if (trip > 0) {
@@ -540,8 +552,8 @@ static int test_recover_on_wake(void)
         }
         expect_read32(&tc, BCMA_COMMAND);
     }
-    /* ... which never saw idle, so: re-bootstrap, and NO command + strobe
-     * from this commit — lcd_recover's frame is the only one issued. */
+    /* ... which never saw idle, so: re-bootstrap. lcd_recover's frame is
+     * the only further command issued. */
     expect_port_init(&tc);
     expect_bcm_init(&tc);
     expect_black_frame(&tc);

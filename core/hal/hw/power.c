@@ -15,7 +15,6 @@
 #include "i2c.h"
 #include "pp5022.h"
 #include "mmio.h"
-#include "backlight.h"
 
 #define PMU_ADDR         0x08            /* PCF50605 control port (7-bit)        */
 #define PMU_OOCC1        0x08            /* on/off control & config 1            */
@@ -111,12 +110,14 @@ int power_standby(void)
     }
 
     /*
-     * Still here: standby did not happen. Make that VISIBLE — the caller has
-     * already blanked the panel, so relight the backlight; a lit screen that
-     * comes back is unambiguous, where a dark unresponsive device is not. The
-     * caller can then repaint and stay usable.
+     * Still here: standby did not happen. Report it and let the caller make
+     * that VISIBLE. This used to relight the backlight itself, at full, as a
+     * signal — but the caller has by now put the PANEL to sleep too, and light
+     * behind a panel that is mid-init is the solid-white failure (02-lcd.md);
+     * only the caller can wake the panel, present a frame, and THEN relight,
+     * in that order (kernel/main.c enter_standby). A -1 that is acted on is
+     * a better signal than a lamp.
      */
-    backlight_set(BACKLIGHT_MAX);
     return -1;
 }
 

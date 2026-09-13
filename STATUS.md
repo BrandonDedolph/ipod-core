@@ -123,16 +123,33 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   post-fix total has NOT been read off the device — Boot Details shows it
   live; take the number from there rather than quoting arithmetic.
 - **Power management** — CPU scaled to 30 MHz and halted at idle; the HDD
-  spun down after 20 s idle, including while paused; the codec powered down
-  and the audio clocks gated at stop; a two-tier power button with
-  suspend-to-RAM (which now drops the clock on the way in instead of
-  holding 80 MHz through the whole suspend); the lock/unlock plate
-  repainted on every Hold edge. **LCD panel sleep at idle is written but
-  DISABLED** (`PANEL_SLEEP_AT_IDLE 0`, `core/kernel/main.c:4222`) — it left
-  the screen solid white until a reboot. Two of the three stated
-  preconditions for re-enabling it are now met (`bcm_init()` exists, the
-  post-wake backlight relight is deferred), so this is a real candidate to
-  retry.
+  spun down after 20 s idle, including while paused (and the parked flag
+  now survives a settings write, so it re-parks afterwards); the codec
+  powered down and the audio clocks gated at stop; the lock/unlock plate
+  repainted on every Hold edge. **The power button** (`ui/keyhold.c`,
+  host-tested): PLAY decided by press length — a tap toggles pause on
+  release, a 2 s hold suspends, 5 s escalates to PMU standby; a
+  hold-to-sleep no longer pauses first, so wake resumes. **Suspend**
+  (`suspend_to_ram`) now actually powers things down: drive to ATA SLEEP
+  (flush, standby, `0xE6`; a reset wakes it), panel to `LCD_SLEEP`
+  (`SUSPEND_PANEL_SLEEP 1`, rollback documented beside it), clock
+  unboosted, codec off via the pump; it samples the battery on the 5 s
+  cadence and runs the DISKSAFE/SHUTOFF policy while asleep, escalates to
+  real standby after `SUSPEND_TO_STANDBY_US` (30 min) on battery, and on
+  wake does `lcd_wake` -> present -> backlight (the present retires the
+  panel's wake-init before returning — `bcm_frame_commit` used to absorb
+  BEFORE the update, i.e. never) and skips the resume if the jack is
+  known empty. **Standby** (`enter_standby`) quiesces first (codec,
+  settings, drive, panel) and is no longer `_Noreturn`: a PMU that refuses
+  the write gets a relit, repainted, running device instead of a dark
+  dead one. **UNVERIFIED ON THE DEVICE, all of it** — none of this has
+  been flashed: whether the panel comes back from `LCD_SLEEP` (if it wakes
+  white, `SUSPEND_PANEL_SLEEP 0`), the drive's post-SLEEP reset wake, the
+  suspend draw before/after, and the refused-standby recovery. **LCD panel
+  sleep at idle stays DISABLED** (`PANEL_SLEEP_AT_IDLE 0`) — two of its
+  three preconditions are now genuinely met (the post-wake absorb order,
+  the deferred relight); `bcm_init()` exists but is compiled out. Let the
+  suspend path prove panel sleep on the device first.
 - **Charging** — `charger_set_max_current(500)` asserts HPWR so the LTC4066
   uses the 500 mA input cap instead of the 100 mA one we had been
   inheriting from the boot ROM. **UNVERIFIED ON HARDWARE** — needs an
@@ -196,8 +213,12 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
    fixed and measured, and the type still reads wrong at 9–13 px. Nunito
    ships no hinting bytecode, so the next lever is swapping the face for
    one designed for small sizes — not more spacing tuning.
-5. **Re-enable panel sleep at idle** — see above; the two blockers it was
-   disabled for have since been fixed.
+5. **Flash and measure the power work** — the suspend/standby changes
+   above are entirely device-unverified; the first flash should check the
+   panel wakes from `LCD_SLEEP`, the drive wakes from SLEEP, and read the
+   suspend draw. Then **re-enable panel sleep at idle** — see above; the
+   blockers it was disabled for have since been fixed, and the suspend path
+   exercises the same wake sequence.
 6. **Podcasts / Audiobooks / Composers** — greyed placeholders in the
    menus; no backing implementation.
 7. **More codecs** — AAC / ALAC / Vorbis / Opus / WAV are stubbed in
