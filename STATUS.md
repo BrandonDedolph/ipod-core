@@ -3,6 +3,69 @@
 The README is the canonical public story; this doc is the running list of
 what works, what doesn't, and what to pick up next.
 
+## 2026-09-13 — issue sweep landed on `main`, NOT yet flashed
+
+Six read-only audits over the whole tree, then six fix branches merged
+(28 commits, 53 host suites green, ARM `-Werror` + `verify-hw` clean). The
+two user-reported problems turned out to be one chain: a PLAY-hold "off"
+was suspend-to-RAM, which never escalated to PMU standby and drained the
+cell; the resulting cold boot then rebuilt the queue as the album.
+
+What changed (see `git log 054c722..`):
+- **Power-down** — PLAY is arbitrated by press length (`ui/keyhold.c`: tap
+  = pause on release, hold = sleep; the down-edge no longer pauses).
+  Suspend now: FLUSH + STANDBY + **SLEEP** on the drive (reset-to-wake),
+  `lcd_sleep()` behind `SUSPEND_PANEL_SLEEP` (default 1), 100 ms loop
+  period, battery sampled on the 5 s cadence with the DISKSAFE/SHUTOFF
+  policy live, and **escalation to PMU standby after
+  `SUSPEND_TO_STANDBY_US` (30 min) off external power**. `enter_standby()`
+  quiesces codec/drive/panel first and RETURNS -1 on a refused PMU command
+  (repaint + carry on) instead of spinning bright. The `lcd_wake()` absorb
+  window now lands after the panel-init update, not before.
+- **Resume keeps the real queue** — the settings record carries queue kind
+  (album / songs / artist / genre / shuffle-songs), cursor and two shuffle
+  seeds (payload 24 → 44 B, version unchanged, old records still load).
+  Shuffle deals are seed-reproducible; the Shuffle Songs double-deal is gone.
+  Album remains the fallback.
+- **Player** — the pump parked the drive on EVERY pass (hundreds of STANDBY
+  commands a second, and the one-shot spin-up probe stayed latched so track
+  opens ran without retries); the elapsed clock and seek anchor wrapped at
+  71 min; a failed seek now restarts from 0; skips while paused no longer
+  kick the DAC (no click); a dropped DMA completion no longer replays a
+  buffer on resume.
+- **Config/FS** — a slot read error at boot no longer regresses the seq and
+  silently discards the session's settings; forced saves wake a parked
+  drive first and stay dirty until a reported success (`kernel/cfg_commit.c`);
+  a CORELIB.IDX read error is refused instead of reported as "Library too
+  large"; an orphaned LFN fragment no longer eats the next file's name;
+  `build_index.py` no longer turns "7 rings" into track 7.
+- **HAL** — a NACKed battery ADC read is a failed read, not a 3300 mV cell
+  (was a false SHUTOFF path); SHUTOFF cannot fire on external power; I2C
+  waits for the bus before its one-time reset; ATA ready waits are timed
+  (10 s / 31 s after SRST, spin-up 8 s); backlight ISR flags volatile.
+- **UI** — low-battery modal survives a plug-in/unplug and the toast is
+  timed from first paint; pending SELECT dropped on screen change / Hold;
+  modals replace rather than overflow the screen stack; rail-pinned sliders
+  don't write; lock plate no longer busy-spins; stale strip gauge repaints.
+
+**First-flash checklist (all of the above is unverified on the device):**
+1. Suspend → wake: panel comes back from `LCD_SLEEP` (white → set
+   `SUSPEND_PANEL_SLEEP 0`); drive comes back from SLEEP via SRST (watch the
+   UART for the spin-up wait); measure suspend draw before/after.
+2. Hold PLAY 5 s → PMU standby; also let a suspend run past 30 min off the
+   charger and confirm it powers down.
+3. Resume into a Songs / Artist / Shuffle Songs context, press Next, check
+   the order; confirm no click on a paused skip.
+4. Battery line still reads sane values (the 2800–4600 mV plausibility band
+   must not reject a real cell).
+5. PLAY tap vs hold feel; a tap must never sleep, a hold must never pause.
+
+Still open from the audit: `DEV_EN` peripheral gating and PLL-off in
+suspend (moot once escalation lands), the BCM power gate, `PANEL_SLEEP_AT_IDLE`
+(still 0), a tiebreak for same-hash files in one folder, `flac_meta.c`
+stripping non-ASCII on the scan fallback, `ata_identify()`'s ERR check, and
+the reserved playlist queue kind. Nothing has been pushed.
+
 ## Where we are right now (2026-07-28)
 
 **A full music player on real hardware, and it is now the device's own
