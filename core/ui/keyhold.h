@@ -35,6 +35,7 @@
 typedef struct {
     uint8_t  down;      /* a press is being timed                          */
     uint8_t  no_tap;    /* this press's tap was consumed by someone else    */
+    uint8_t  grace;     /* idle feeds a pre-press swallow may wait for its press */
     uint8_t  fired;     /* KEYHOLD_HOLD has already been reported for it    */
     uint32_t down_us;   /* when the press began                             */
 } keyhold_t;

@@ -124,6 +124,17 @@ int main(void)
     xpect(&c, "early swallow + hold: the hold still fires",
           keyhold_feed(&k, 1, now, HOLD_US) == KEYHOLD_HOLD);
 
+    /* --- a swallow whose press never comes lapses --------------------------- *
+     * The race is one pass wide; after a few idle samples the swallow is
+     * stale, and a PLAY tap a minute later must still pause. */
+    keyhold_reset(&k);
+    keyhold_swallow_tap(&k);
+    feed_n(&k, 0, &now, 10000u, 5, KEYHOLD_NONE, &c,
+           "stale swallow: idle feeds are silent");
+    xpect(&c, "stale swallow: the next press is a fresh one (its tap counts)",
+          keyhold_feed(&k, 1, now += 10000u, HOLD_US) == KEYHOLD_NONE &&
+          keyhold_feed(&k, 0, now += 10000u, HOLD_US) == KEYHOLD_TAP);
+
     /* --- reset mid-press: the Hold switch went on under the finger -------- */
     keyhold_reset(&k);
     keyhold_feed(&k, 1, now += 10000u, HOLD_US);

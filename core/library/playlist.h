@@ -87,7 +87,11 @@ typedef struct {
     uint32_t listed;      /* entries the parser produced                     */
     uint32_t missing;     /* paths that name nothing on the disk (ENOENT)    */
     uint32_t unplayable;  /* resolved to a folder, or a non-audio extension  */
-    uint32_t io_err;      /* resolves that hit a disk/corruption error       */
+    uint32_t io_err;      /* resolves that hit a disk/corruption error (once
+                           * one read fails, the rest of the list is counted
+                           * here unwalked: a failing disk is not paid per row) */
+    uint32_t rejected;    /* lines the parser refused (too long, escaped the
+                           * root, URL/control bytes) — listed but unusable    */
     uint8_t  truncated;   /* the file has more entries than the row cap      */
     m3u_result_t m3u;     /* the parser's own report, for the curious        */
 } playlist_stats_t;
@@ -98,6 +102,10 @@ typedef struct {
     m3u_scratch_t  m3u;
     m3u_entry_t    ent[PLAYLIST_TRACKS_MAX];
     fat32_dirent_t de;
+    char           dir[M3U_PATH_MAX + 1];  /* last entry's folder prefix ... */
+    uint32_t       dir_clus;               /* ... and the cluster it walked to */
+    int            dir_len;                /* prefix length, 0 = nothing cached */
+    int            dir_failed;             /* the cached prefix would not read */
 } playlist_scratch_t;
 
 /*

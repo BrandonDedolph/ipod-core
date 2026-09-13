@@ -2797,13 +2797,23 @@ static int playlist_bind_row(const playlist_track_t *t)
     if (fh == 0) {
         return -1;                        /* lossy name: no locator */
     }
+    int pick = -1;
     for (int i = g_song_hh[fh & (SONG_HASH_BUCKETS - 1)]; i; i = g_song_hn[i - 1]) {
         const lib_song_t *s = &g_songs[i - 1];
         if (s->file_hash != fh || s->dir_clus != t->dir_clus) continue;
         if (s->file_clus != 0 && s->file_clus != t->clus) continue;
-        return i - 1;
+        if (pick < 0) {
+            pick = i - 1;
+            if (s->file_clus != 0) break;     /* bound: the cluster settled it */
+            continue;
+        }
+        /* A second unbound candidate in the same folder — two files whose
+         * names fold to one hash ("It's" / "It’s"). The exact on-disk name
+         * decides, as resolve_art_cb does; otherwise the first in the chain. */
+        if (name_bind_exact(s->file, t->name, 0)) { pick = i - 1; break; }
+        if (name_bind_exact(g_songs[pick].file, t->name, 0)) break;
     }
-    return -1;
+    return pick;
 }
 
 /* Open playlist `pi`: parse it, resolve every entry, bind the rows. Rows
@@ -2932,6 +2942,7 @@ static void playlist_render(int sel)
          * tracks none of which are on the disk, or it lists none. */
         const char *why = g_pl_err            ? "Could not read playlist"
                         : g_pl_stats.listed   ? "No tracks found on disk"
+                        : g_pl_stats.rejected ? "Entries not usable"
                         :                       "Empty playlist";
         ui_text(14, LIST_Y0 + 20, why, FONT_ROW, LINEN_MUTED);
         return;
@@ -5283,9 +5294,12 @@ _Noreturn static void run_ui(fat32_t *fs)
                 wheel_accel_reset();      /* don't resume a pre-sleep gesture */
                 dirty = 1;                    /* repaint anything drawn while off */
                 if (was_off) {                /* swallow the wake press */
+                    if (ev.buttons & WHEEL_BTN_PLAY) {
+                        keyhold_swallow_tap(&play_key);   /* ...its release too */
+                    }                         /* (a MENU/wheel wake must not
+                                               * claim the NEXT PLAY tap)   */
                     ev.buttons = 0;
                     ev.wheel_delta = 0;
-                    keyhold_swallow_tap(&play_key);   /* ...its release too */
                 }
             }
             /* Menu click on a button press (one per down-edge; not on the
@@ -5311,9 +5325,11 @@ _Noreturn static void run_ui(fat32_t *fs)
                 ev.buttons) {
                 scr_pop();
                 dirty = 1;
+                if (ev.buttons & WHEEL_BTN_PLAY) {
+                    keyhold_swallow_tap(&play_key);   /* PLAY's release too */
+                }
                 ev.buttons     = 0;
                 ev.wheel_delta = 0;
-                keyhold_swallow_tap(&play_key);   /* PLAY's release too */
             }
             /* Transport buttons are global (work from any screen while playing),
              * like a real iPod: RIGHT/LEFT skip track. PLAY is decided by press

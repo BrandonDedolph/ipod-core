@@ -167,25 +167,73 @@ int playlist_resolve(fat32_t *fs, const playlist_t *pl, const char *base_dir,
         return rc;                    /* the playlist file itself failed */
     }
     st->listed    = st->m3u.count;
+    st->rejected  = st->m3u.skipped_long + st->m3u.skipped_escape +
+                    st->m3u.skipped_bad;
     st->truncated = st->m3u.truncated;
 
     /* The walk, once per entry. Every outcome but "playable file" is a
-     * counter, not a return: the rows that do resolve are the playlist. */
+     * counter, not a return: the rows that do resolve are the playlist.
+     *
+     * Directory sectors are not cached below us, so a walk from the root is
+     * a handful of uncached reads per entry — and playlists are
+     * overwhelmingly album-grouped. Remember the last entry's folder prefix
+     * and the cluster it walked to; an entry with the same prefix walks only
+     * its leaf inside that folder. Same answer either way (the leaf lookup
+     * IS the last step of the full walk), ~1 full walk per album instead of
+     * per track. */
+    scr->dir_len    = 0;
+    scr->dir_failed = 0;
     int n = 0;
     for (uint32_t i = 0; i < st->m3u.count; i++) {
         if (n >= max) {
             st->truncated = 1;
             break;
         }
+        const char *path = scr->ent[i].path;
+        int plen = 0, cut = -1;
+        for (; path[plen] != '\0' && plen <= (int)M3U_PATH_MAX; plen++) {
+            if (path[plen] == '/' || path[plen] == '\\') {
+                cut = plen;
+            }
+        }
+        int same_dir = cut > 0 && scr->dir_len == cut &&
+                       memcmp(scr->dir, path, (size_t)cut) == 0;
+        if (same_dir && scr->dir_failed) {
+            /* This folder already failed to read. Walking it again costs
+             * the same ATA timeout for the same answer (up to 128 x 10 s
+             * with the UI frozen — at boot, inside the resume). */
+            st->io_err++;
+            continue;
+        }
         uint32_t parent = 0;
-        rc = fat32_resolve_path(fs, fs->root_clus, scr->ent[i].path,
-                                &scr->de, &parent);
+        if (same_dir) {
+            rc = fat32_resolve_path(fs, scr->dir_clus, path + cut + 1,
+                                    &scr->de, &parent);
+        } else {
+            rc = fat32_resolve_path(fs, fs->root_clus, path, &scr->de, &parent);
+            if (cut > 0 && cut <= (int)M3U_PATH_MAX &&
+                (rc == 0 || (rc != FAT32_ENOENT && rc != FAT32_EINVAL))) {
+                memcpy(scr->dir, path, (size_t)cut);
+                scr->dir[cut]   = '\0';
+                scr->dir_len    = cut;
+                scr->dir_clus   = parent;
+                scr->dir_failed = (rc != 0);
+            }
+        }
         if (rc == FAT32_ENOENT || rc == FAT32_EINVAL) {
             st->missing++;            /* not on the disk (or not a path) */
             continue;
         }
         if (rc != 0) {
-            st->io_err++;             /* a read failed: unknown, not gone */
+            /* A read failed: unknown, not gone. One folder that will not
+             * read is remembered above and skipped cheaply; a SECOND
+             * distinct failure means the disk itself is failing, and a
+             * listing that cannot be trusted is not a listing: count the
+             * rest unwalked and stop. */
+            if (st->io_err++ > 0 && !same_dir) {
+                st->io_err += st->m3u.count - i - 1;
+                break;
+            }
             continue;
         }
         const fat32_dirent_t *de = &scr->de;
