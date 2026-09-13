@@ -365,7 +365,7 @@ static void test_context(void)
         settings_t s;
         memset(&s, 0, sizeof s);
         resume_ctx_t c = { H("07 Track"), 61, 245, RESUME_KIND_ARTIST, 4,
-                           0, 0xBADC0DE5u, 2 };
+                           0, 0xBADC0DE5u, 2, 0 };
         check("a first capture is a change", resume_ctx_store(&s, &c) == 1);
         check("...and stores every field",
               s.resume_hash == H("07 Track") && s.resume_secs == 61 &&
@@ -388,15 +388,36 @@ static void test_context(void)
 
         /* A Shuffle Songs capture carries its seed. */
         resume_ctx_t sh = { H("07 Track"), 0, 245, RESUME_KIND_SHUFFLE, 1500,
-                            0xC0FFEE01u, 0, -2 };
+                            0xC0FFEE01u, 0, -2, 0 };
         check("a Shuffle Songs capture stores the library seed",
               resume_ctx_store(&s, &sh) == 1 && s.resume_seed == 0xC0FFEE01u &&
               s.resume_kind == RESUME_KIND_SHUFFLE && s.resume_qidx == 1500);
+        check("...and 0 for the context hash, whatever was passed",
+              s.resume_ctx_hash == 0);
+
+        /* A playlist capture carries the playlist's name hash — the one
+         * word that says WHICH playlist; nothing in the song's record does.
+         * Folded like the locator, so a re-cased filename still matches. */
+        resume_ctx_t pl = { H("07 Track"), 30, 245, RESUME_KIND_PLAYLIST, 3,
+                            0, 0, -1, H("Road Trip") };
+        check("a playlist capture stores the playlist's name hash",
+              resume_ctx_store(&s, &pl) == 1 &&
+              s.resume_ctx_hash == H("Road Trip") &&
+              s.resume_ctx_hash == H("road trip") &&
+              s.resume_kind == RESUME_KIND_PLAYLIST && s.resume_qidx == 3);
+        check("the same playlist capture again is not a change",
+              resume_ctx_store(&s, &pl) == 0);
+        pl.ctx_hash = H("Gym");             /* the same track, another playlist */
+        check("switching playlists with the track still is a change",
+              resume_ctx_store(&s, &pl) == 1 && s.resume_ctx_hash == H("Gym"));
+        pl.kind = RESUME_KIND_ALBUM;        /* back to the album: hash dropped */
+        check("leaving the playlist drops the context hash",
+              resume_ctx_store(&s, &pl) == 1 && s.resume_ctx_hash == 0);
 
         /* Out-of-range values never reach the record as such: a kind this
          * build has no builder for is NONE (the album fallback), an index
          * outside u16 is pinned. */
-        resume_ctx_t bad = { 1, 0, 0, 200, 70000, 0, 0, 0 };
+        resume_ctx_t bad = { 1, 0, 0, 200, 70000, 0, 0, 0, 0 };
         check("an unknown kind is stored as NONE, an oversize index pinned",
               resume_ctx_store(&s, &bad) == 1 &&
               s.resume_kind == RESUME_KIND_NONE && s.resume_qidx == 0xFFFF);
@@ -407,7 +428,8 @@ static void test_context(void)
         check("...and leaves nothing behind",
               s.resume_hash == 0 && s.resume_secs == 0 && s.resume_total == 0 &&
               s.resume_kind == 0 && s.resume_qidx == 0 && s.resume_seed == 0 &&
-              s.resume_order_seed == 0 && s.resume_order_keep == 0);
+              s.resume_order_seed == 0 && s.resume_order_keep == 0 &&
+              s.resume_ctx_hash == 0);
         check("clearing an empty record is not a change",
               resume_ctx_clear(&s) == 0);
     }

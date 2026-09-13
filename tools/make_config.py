@@ -125,7 +125,7 @@ CTX_FIELDS = [
     ("resume_qidx",       "<H", 26),   # queue index of the track
     ("resume_seed",       "<I", 28),   # Shuffle Songs' library-order LCG seed
     ("resume_order_seed", "<I", 32),   # the player's shuffle-deal seed
-    ("resume_ctx_hash",   "<I", 36),   # reserved, 0
+    ("resume_ctx_hash",   "<I", 36),   # KIND_PLAYLIST: the playlist's name hash, else 0
     ("resume_order_keep", "<h", 40),   # the player's shuffle-deal pin
     ("resume_pad",        "<H", 42),   # reserved, 0
 ]

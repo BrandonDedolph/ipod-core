@@ -186,7 +186,10 @@ enum {
 #define P_RES_QIDX      (CFG_PAYLOAD_V2 + 2u)    /* 26: u16 queue index       */
 #define P_RES_SEED      (CFG_PAYLOAD_V2 + 4u)    /* 28: u32 Shuffle Songs seed*/
 #define P_RES_OSEED     (CFG_PAYLOAD_V2 + 8u)    /* 32: u32 player order seed */
-#define P_RES_CTX       (CFG_PAYLOAD_V2 + 12u)   /* 36: u32 reserved (0)      */
+#define P_RES_CTX       (CFG_PAYLOAD_V2 + 12u)   /* 36: u32 context hash: the
+                                                  *     playlist's name hash
+                                                  *     for KIND_PLAYLIST,
+                                                  *     else 0              */
 #define P_RES_OKEEP     (CFG_PAYLOAD_V2 + 16u)   /* 40: i16 player order keep */
 #define P_RES_PAD       (CFG_PAYLOAD_V2 + 18u)   /* 42: u16 reserved (0)      */
 #define CFG_PAYLOAD_V2Q (CFG_PAYLOAD_V2 + 20u)   /* = 44                      */
@@ -319,18 +322,21 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
 
     /* The queue context follows the same rule: no track, no context. A kind
      * this build doesn't know is written as NONE rather than as a number a
-     * future reader might act on. The reserved words are always 0. */
+     * future reader might act on. The context hash (a playlist's name hash
+     * under KIND_PLAYLIST, 0 otherwise — resume_ctx_store enforces that)
+     * rides along verbatim; the reserved words are always 0. */
     int      kind  = (rh && s->resume_kind <= RESUME_KIND_MAX) ? s->resume_kind : 0;
     uint32_t qidx  = rh ? s->resume_qidx : 0u;
     uint32_t seed  = rh ? s->resume_seed : 0u;
     uint32_t oseed = rh ? s->resume_order_seed : 0u;
+    uint32_t ctx   = rh ? s->resume_ctx_hash : 0u;
     int      okeep = rh ? clampi(s->resume_order_keep, -32768, 32767) : 0;
     p[P_RES_KIND]  = (uint8_t)kind;
     p[P_RES_FLAGS] = 0;
     wr16(&p[P_RES_QIDX],  (uint16_t)qidx);
     wr32(&p[P_RES_SEED],  seed);
     wr32(&p[P_RES_OSEED], oseed);
-    wr32(&p[P_RES_CTX],   0);
+    wr32(&p[P_RES_CTX],   ctx);
     wr16(&p[P_RES_OKEEP], (uint16_t)(int16_t)okeep);
     wr16(&p[P_RES_PAD],   0);
 
@@ -415,7 +421,7 @@ int config_decode(const uint8_t *rec, settings_t *s, uint32_t *seq)
         s->resume_seed       = rd32(&p[P_RES_SEED]);
         s->resume_order_seed = rd32(&p[P_RES_OSEED]);
         s->resume_order_keep = (int16_t)rd16(&p[P_RES_OKEEP]);
-        s->resume_ctx_hash   = 0;
+        s->resume_ctx_hash   = rd32(&p[P_RES_CTX]);
     } else {
         s->resume_kind       = 0;
         s->resume_flags      = 0;

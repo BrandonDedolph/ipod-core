@@ -62,6 +62,11 @@ typedef struct {
     uint32_t seed;          /* Shuffle Songs' library-order seed, else 0     */
     uint32_t order_seed;    /* player_order_seed()                           */
     int      order_keep;    /* player_order_keep()                           */
+    uint32_t ctx_hash;      /* RESUME_KIND_PLAYLIST: name_hash of the
+                             * playlist's ext-trimmed filename — the one
+                             * word that says WHICH playlist, since nothing
+                             * in the song's own record does. Stored as 0
+                             * for every other kind, whatever is passed.   */
 } resume_ctx_t;
 
 /*
@@ -74,12 +79,14 @@ static inline int resume_ctx_store(settings_t *s, const resume_ctx_t *c)
 {
     int      qidx = c->qidx < 0 ? 0 : (c->qidx > 0xFFFF ? 0xFFFF : c->qidx);
     uint8_t  kind = (uint8_t)(c->kind >= 0 && c->kind <= RESUME_KIND_MAX ? c->kind : 0);
+    uint32_t ctx  = (kind == RESUME_KIND_PLAYLIST) ? c->ctx_hash : 0u;
 
     if (s->resume_hash == c->hash && s->resume_secs == c->secs &&
         s->resume_total == c->total && s->resume_kind == kind &&
         s->resume_qidx == (uint16_t)qidx && s->resume_seed == c->seed &&
         s->resume_order_seed == c->order_seed &&
-        s->resume_order_keep == c->order_keep) {
+        s->resume_order_keep == c->order_keep &&
+        s->resume_ctx_hash == ctx) {
         return 0;
     }
     s->resume_hash       = c->hash;
@@ -91,14 +98,14 @@ static inline int resume_ctx_store(settings_t *s, const resume_ctx_t *c)
     s->resume_seed       = c->seed;
     s->resume_order_seed = c->order_seed;
     s->resume_order_keep = c->order_keep;
-    s->resume_ctx_hash   = 0;
+    s->resume_ctx_hash   = ctx;
     return 1;
 }
 
 /* Forget the locator and its context. 1 when there was something to forget. */
 static inline int resume_ctx_clear(settings_t *s)
 {
-    resume_ctx_t z = { 0, 0, 0, RESUME_KIND_NONE, 0, 0, 0, 0 };
+    resume_ctx_t z = { 0, 0, 0, RESUME_KIND_NONE, 0, 0, 0, 0, 0 };
     return resume_ctx_store(s, &z);
 }
 

@@ -4182,6 +4182,7 @@ static void resume_capture(void)
     c.seed       = g_queue_seed;
     c.order_seed = player_order_seed();
     c.order_keep = player_order_keep();
+    c.ctx_hash   = (g_queue_kind == RESUME_KIND_PLAYLIST) ? g_queue_ctx_hash : 0;
     if (resume_ctx_store(&g_settings, &c)) {
         settings_touch();              /* something moved — schedule a write */
     }
@@ -4337,13 +4338,62 @@ static int resume_open_shuffle(fat32_t *fs, int si)
 }
 
 /*
+ * A playlist: the .m3u8 whose ext-trimmed filename hashes to the saved
+ * context, re-read and re-resolved exactly as opening it from the
+ * Playlists screen does, then played from the row that holds the song.
+ * The row is the song's file — matched by cluster, the binding itself —
+ * with the saved queue index as the first guess, so a playlist that lists
+ * the track twice comes back on the copy that was playing. A renamed or
+ * deleted playlist, or one that no longer lists the track, declines and
+ * the caller falls back to the album. The read is counted under the
+ * "dir" boot phase (it is directory walks: one per entry).
+ */
+static int resume_open_playlist(fat32_t *fs, int si)
+{
+    uint32_t want = g_settings.resume_ctx_hash;
+    if (want == 0) {
+        return 0;
+    }
+    playlists_load(fs);
+    int pi = -1;
+    for (int i = 0; i < g_playlists_n; i++) {
+        if (g_playlists[i].hash == want) {
+            pi = i;
+            break;
+        }
+    }
+    if (pi < 0) {
+        return 0;                      /* renamed or deleted */
+    }
+    g_pl_sel = pi;                     /* Playlists opens on it later */
+    uint32_t rt0 = boot_ms_now();
+    playlist_open(fs, pi);
+    g_boot_res_dir_ms = boot_ms_now() - rt0;
+
+    uint32_t fc  = g_songs[si].file_clus;
+    int idx = -1, hint = g_settings.resume_qidx;
+    if (hint < g_pl_tracks_n && g_pl_tracks[hint].clus == fc) {
+        idx = hint;
+    }
+    for (int i = 0; idx < 0 && i < g_pl_tracks_n; i++) {
+        if (g_pl_tracks[i].clus == fc) idx = i;
+    }
+    if (idx < 0) {
+        return 0;                      /* the playlist no longer lists it */
+    }
+    g_plt_sel = idx;
+    return playlist_play(idx) == idx && resume_landed();
+}
+
+/*
  * Re-open the saved track at the saved position, PAUSED, at boot — in the
  * queue it was playing in, with the same shuffle order, so Next after a
  * power cut is the track that was going to come next.
  *
- * The queue is rebuilt from the saved kind: Songs, an artist, a genre or a
- * Shuffle Songs draw, each from the resumed song's own fields plus the seed
- * the record carries. When the kind is unknown (a record from before the
+ * The queue is rebuilt from the saved kind: Songs, an artist, a genre, a
+ * Shuffle Songs draw or a playlist, each from the resumed song's own fields
+ * plus the seed (or the playlist's name hash) the record carries. When the
+ * kind is unknown (a record from before the
  * context existed), the album, or a rebuild that does not land on the track
  * (the library changed under it), the track's ALBUM is built instead — the
  * one context that needs nothing but the song.
@@ -4388,7 +4438,8 @@ static void resume_restore(fat32_t *fs)
     case RESUME_KIND_ARTIST:
     case RESUME_KIND_GENRE:   ok = resume_open_view(fs, si, kind); break;
     case RESUME_KIND_SHUFFLE: ok = resume_open_shuffle(fs, si);    break;
-    default:                  break;   /* album, none, or not wired (playlist) */
+    case RESUME_KIND_PLAYLIST: ok = resume_open_playlist(fs, si);  break;
+    default:                  break;   /* album or none: the fallback below */
     }
     if (!ok) {
         ok = resume_open_album(fs, si, &fmt);
