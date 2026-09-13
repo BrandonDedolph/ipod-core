@@ -4075,7 +4075,11 @@ static int enter_standby(void)
     hal_audio_close();                    /* codec rails off, audio clocks gated */
     settings_commit(1);                   /* persist while the drive still spins */
     if (!ata_is_parked()) {
-        ata_standby();                    /* flush + park + spin down            */
+        ata_standby();                    /* flush + park + spin down. Not
+                                           * ata_sleep(): the rail cut follows
+                                           * and STANDBY is the device-proven
+                                           * path; a suspend has already slept
+                                           * it (parked) by the time it gets here */
     }
     console_clear(0x0000);                /* blank BEFORE the power cut so no */
     lcd_present_fb(console_framebuffer()); /* stale colour lingers on the panel */
@@ -4102,16 +4106,35 @@ static int enter_standby(void)
 
 /*
  * Suspend: the seamless "off". Keeps the CPU + RAM alive so wake RESUMES the
- * running firmware instantly (no cold boot, so no ipl2 menu) — but actually
- * quiesces the power-hungry parts: audio paused, the hard drive spun DOWN (ATA
- * standby), backlight off, panel blanked to black. Any button wakes it: spin
- * the drive back up, restore the screen, resume playback. Holding the trigger
- * PLAY past ~5s escalates to a true PMU power-down (everything off, but wakes
- * via a cold boot). `play_down_us` is when the hold began, for that escalation.
+ * running firmware instantly (no cold boot) — and puts everything else away:
  *
- * Caveat vs a true power-down: the LCD controller + CPU stay powered (the panel
- * is dark, not electrically off), so it draws more than deep-sleep — fine for
- * short off/on, which is what this is for.
+ *   audio     paused; the codec powers itself down through player_pump()'s
+ *             persistent-pause timeout, which the idle loop keeps calling;
+ *   settings  written now (forced), with the resume position;
+ *   clock     boost released, so the core idles at 30 MHz between ticks;
+ *   drive     ata_sleep(): cache flushed, heads parked, platters down, then
+ *             SLEEP so the interface logic is off too — a reset wakes it;
+ *   panel     black frame, backlight off, then LCD_SLEEP (SUSPEND_PANEL_SLEEP;
+ *             the BCM stays powered so no firmware re-upload on wake).
+ *
+ * While suspended the loop samples the battery on the main loop's 5 s
+ * cadence and runs the same DISKSAFE / SHUTOFF policy, so a forgotten device
+ * flushes and powers off cleanly instead of deep-discharging to the PMU's
+ * hard cut; and on battery it escalates to a real PMU standby on its own
+ * after SUSPEND_TO_STANDBY_US. Holding the trigger PLAY past ~5 s escalates
+ * at once. `play_down_us` is when the hold began, for that escalation.
+ *
+ * Any button wakes it: reset + spin the drive up, wake the panel, repaint,
+ * present (that present retires the panel's wake-init before returning),
+ * THEN backlight, then resume — only if the headphone jack is not known to
+ * be empty. A refused PMU standby from any of the escalations falls through
+ * this same wake path with the player stopped and nothing to resume.
+ *
+ * What still draws: the CPU, RAM, PLL and the 100 Hz tick (the wake is what
+ * they buy), and the BCM. That is why the escalation exists. NOT MEASURED on
+ * the device: the suspend draw before or after this, whether the panel
+ * comes back from LCD_SLEEP (SUSPEND_PANEL_SLEEP has the rollback), and the
+ * drive's post-SLEEP reset wake — all first-flash items.
  */
 /*
  * Put the LCD PANEL to sleep for the suspend, not just the backlight.
