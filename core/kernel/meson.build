@@ -15,5 +15,11 @@
 # so no filesystem metadata is ever mutated). It is also the only caller of
 # ata_write_sectors. Its record codec + the write path's register grammar are
 # covered host-side by tests/kernel/config_test.c.
+#
+# cfg_commit.c is the commit GATE in front of config_save: the debounce, the
+# parked-drive and battery refusals, the wake-before-write, and what becomes
+# of a change whose write failed. EXTRACTED OUT OF main.c's settings_commit()
+# so the host can test it (tests/kernel/cfg_commit_test.c); pure, no
+# hardware — main.c hands it the clock, the drive, the player and the battery.
 
-kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c')
+kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c')

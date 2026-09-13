@@ -60,6 +60,14 @@
 #define CONFIG_MIN_BYTES    (CONFIG_SLOT_BYTES * CONFIG_SLOTS)    /* 2048 B  */
 
 /*
+ * Settle-and-retry for the boot reads (the root walk and the two slots): a
+ * read error at boot is usually the drive still spinning up, not a bad slot.
+ * Exposed so the host test can assert the exact number of attempts.
+ */
+#define CONFIG_READ_RETRIES  2u     /* re-reads after the first failure   */
+#define CONFIG_READ_RETRY_MS 250u   /* settle time before each re-read    */
+
+/*
  * Record layout version this build writes. Readers accept <= this.
  *
  *   v1  the settings fields (12 payload bytes).
@@ -97,6 +105,12 @@
  * settings_defaults(). A 0 return does not necessarily disable saving: if the
  * file exists and resolves but holds no valid record (a fresh file, or both
  * slots corrupt) we can still write it. config_writable() says which.
+ *
+ * A slot the drive would not READ (as opposed to one that decoded invalid)
+ * is retried after a settle; if it stays unreadable and the other slot holds
+ * no valid record either, the module refuses to write for the session — the
+ * unread slot may hold the newest record, and a save from seq 0 would lose
+ * to it on the next boot.
  *
  * Safe to call with a null `fs` or `s` (returns 0, module disabled).
  */

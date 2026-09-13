@@ -75,6 +75,48 @@ def main():
     if fails == 0:
         print("OK: library_load_index() validates the header and the CRC")
 
+    # A failed record read is not the end of the index. The loop used to
+    # `break` on any got <= 0, so an EIO/ECORRUPT mid-file looked like EOF:
+    # n < count flagged the library "too large", the CRC (which only runs
+    # when every record streamed past) was skipped, and library_finish ran
+    # on the partial set with g_lib_load_err 0 — no retry, no scan fallback,
+    # half the library missing behind the wrong diagnosis. The loader must:
+    #   - never conflate a negative return with EOF;
+    #   - retry an EIO on the load's retry budget (the same one lib_readdir
+    #     spends), and on a final EIO record it in g_lib_load_err — the disk,
+    #     not the file — and refuse the load (IDX_EREAD);
+    #   - refuse (IDX_EREAD) on any other negative or short return, which is
+    #     the file, so library_ensure's scan fallback takes over.
+    read_fails = 0
+    # Code only: the loader's own comment quotes the old line as a warning.
+    code = re.sub(r"/\*.*?\*/", "", loader, flags=re.S)
+    if re.search(r"if\s*\(\s*got\s*<=\s*0\s*\)\s*break\s*;", code):
+        read_fails += 1
+        print("FAIL: library_load_index() still breaks out of the record loop "
+              "on got <= 0 — a read error is being treated as end-of-file.",
+              file=sys.stderr)
+    if not re.search(r"got\s*==\s*FAT32_EIO[^;]*g_lib_retry_budget\s*>\s*0", code,
+                     re.S):
+        read_fails += 1
+        print("FAIL: library_load_index() does not retry an EIO record read "
+              "against g_lib_retry_budget.", file=sys.stderr)
+    if not re.search(r"if\s*\(\s*got\s*==\s*FAT32_EIO\s*\)\s*\{\s*"
+                     r"g_lib_load_err\s*=\s*FAT32_EIO\s*;\s*"
+                     r"return\s+idx_reject\(\s*IDX_EREAD\s*\)\s*;", code, re.S):
+        read_fails += 1
+        print("FAIL: library_load_index() does not report a final EIO in "
+              "g_lib_load_err and refuse the load with IDX_EREAD.",
+              file=sys.stderr)
+    if not re.search(r"if\s*\(\s*got\s*<\s*0\s*\|\|.*?\)\s*\{\s*"
+                     r"return\s+idx_reject\(\s*IDX_EREAD\s*\)\s*;", code, re.S):
+        read_fails += 1
+        print("FAIL: library_load_index() does not refuse (IDX_EREAD) a "
+              "negative or short record read.", file=sys.stderr)
+    if read_fails == 0:
+        print("OK: library_load_index() retries an EIO and refuses, never "
+              "truncates, on a failed record read")
+    fails += read_fails
+
     if fails:
         print(f"\n{fails} index loader failure(s)", file=sys.stderr)
         return 1

@@ -23,13 +23,17 @@
  *      a torn/garbage slot is ignored in favour of the good one, sequence
  *      WRAPAROUND resolves the right way round, both-bad falls back to
  *      defaults, and a missing/too-small file disables writing entirely.
+ *      Plus READ ERRORS, which are not the same thing as a bad slot: a
+ *      failed read is retried, and a slot still unreadable with no good
+ *      record to anchor on makes the module refuse to write for the session.
  *
  *   4. WRITE GRAMMAR. config_save() compiled against the recording mock bus
  *      (-DMMIO_MOCK), asserting the exact register sequence ata.c emits:
  *      WRITE SECTORS 0x30 with the resolved LBA in the task registers, two
  *      DRQ-out data phases of 256 halfwords each, then FLUSH CACHE 0xE7.
- *      Also that a refused save emits ZERO bus events, and that consecutive
- *      saves ALTERNATE slots.
+ *      Also that a refused save emits ZERO bus events, that consecutive
+ *      saves ALTERNATE slots, and that a fresh (or both-bad) file takes its
+ *      first write in slot 0, as the host tool tells the operator to expect.
  *
  * WHAT THIS CANNOT PROVE: that the drive does what the trace says. The
  * register grammar, the alignment and the addresses are checked; the physical
@@ -152,6 +156,34 @@ static void build_image(uint32_t cfg_size)
     /* root[32..] stays 0x00 => end of directory */
 }
 
+/*
+ * Read-fault injection. Any read touching [g_fail_lba, g_fail_lba + g_fail_n)
+ * fails while g_fail_left is nonzero — each failure consumes one, negative
+ * means forever. This stages the boot failure config_load actually meets: the
+ * drive still settling from spin-up, so the first read (or every read) of a
+ * sector errors while the bytes underneath are perfectly good.
+ */
+#define NO_FAIL 0xFFFFFFFFu
+static uint32_t g_fail_lba  = NO_FAIL;
+static uint32_t g_fail_n    = 0;
+static int      g_fail_left = 0;
+static int      g_fail_hits;        /* how many reads the injector refused */
+
+static void fail_sectors(uint32_t lba, uint32_t n, int times)  /* times < 0: forever */
+{
+    g_fail_lba  = lba;
+    g_fail_n    = n;
+    g_fail_left = times;
+    g_fail_hits = 0;
+}
+
+static void fail_none(void)
+{
+    g_fail_lba  = NO_FAIL;
+    g_fail_n    = 0;
+    g_fail_left = 0;
+}
+
 /* 512-byte block callback over the RAM disk. Absolute LBAs, exactly like the
  * device's player_disk_read. */
 static int mem_read(void *ud, uint32_t lba, uint32_t count, void *buf)
@@ -159,6 +191,14 @@ static int mem_read(void *ud, uint32_t lba, uint32_t count, void *buf)
     (void)ud;
     if ((uint64_t)lba + count > IMG_TOT_LBA) {
         return -1;
+    }
+    if (g_fail_lba != NO_FAIL && g_fail_left != 0 &&
+        lba < g_fail_lba + g_fail_n && g_fail_lba < lba + count) {
+        if (g_fail_left > 0) {
+            g_fail_left--;
+        }
+        g_fail_hits++;
+        return -1;                  /* the injected fault */
     }
     memcpy(buf, &g_disk[(size_t)lba * 512u], (size_t)count * 512u);
     return 0;
@@ -928,6 +968,64 @@ static void test_write_trace(void)
     }
 }
 
+/*
+ * A FRESH file (both slots zero) — the state make_config.py --create leaves
+ * behind, and what --verify describes as "will write slot 0 on the first
+ * save". The comment in config_load said the same. The code disagreed: with
+ * no record loaded g_cfg.slot stayed 0, config_save alternated to the OTHER
+ * slot, and the first write went to slot 1. Pinned on the wire, both saves.
+ */
+static void test_fresh_file_slot(void)
+{
+    uint8_t expect[CONFIG_SLOT_BYTES];
+    settings_t s;
+    fat32_t fs;
+
+    check("fresh setup: load finds no record but the file is writable",
+          load_with(0, 0, &fs, &s) == 0 && config_writable() == 1 &&
+          config_seq() == 0u);
+
+    s.volume = 55;
+    config_encode(expect, &s, 1);
+    arm_drive_ready();
+    check("fresh file: first save returns 0", config_save(&s) == 0);
+    check("fresh file: first save is seq 1", config_seq() == 1u);
+    trace_cursor tc = trace_begin("cfg-fresh-first-write-slot0");
+    expect_write_trace(&tc, CFG_LBA0, expect);
+    trace_expect_end(&tc);
+    if (trace_done(&tc) != 0) {
+        g_fails++;
+    }
+
+    s.theme = 2;
+    config_encode(expect, &s, 2);
+    arm_drive_ready();
+    check("fresh file: second save returns 0", config_save(&s) == 0);
+    trace_cursor tc2 = trace_begin("cfg-fresh-second-write-slot1");
+    expect_write_trace(&tc2, CFG_LBA1, expect);
+    trace_expect_end(&tc2);
+    if (trace_done(&tc2) != 0) {
+        g_fails++;
+    }
+
+    /* Both slots damaged is the same "no record" state and takes the same
+     * path: recovery starts in slot 0. */
+    uint8_t a[CONFIG_SLOT_BYTES], b[CONFIG_SLOT_BYTES];
+    for (unsigned i = 0; i < sizeof a; i++) a[i] = 0xFF;
+    for (unsigned i = 0; i < sizeof b; i++) b[i] = 0x5A;
+    check("both-bad setup: load finds no record but stays writable",
+          load_with(a, b, &fs, &s) == 0 && config_writable() == 1);
+    config_encode(expect, &s, 1);
+    arm_drive_ready();
+    check("both slots bad: first save returns 0", config_save(&s) == 0);
+    trace_cursor tc3 = trace_begin("cfg-bothbad-first-write-slot0");
+    expect_write_trace(&tc3, CFG_LBA0, expect);
+    trace_expect_end(&tc3);
+    if (trace_done(&tc3) != 0) {
+        g_fails++;
+    }
+}
+
 static void test_save_refusals(void)
 {
     settings_t s;
@@ -971,6 +1069,113 @@ static void test_save_refusals(void)
 }
 
 /* ---- probe ------------------------------------------------------------- */
+
+/* ---- 4b. read errors at load ------------------------------------------- */
+
+/*
+ * A read that FAILS is not a slot that decoded invalid, and config_load used
+ * to conflate them: with both slot reads erroring (the drive still settling
+ * at boot) `have` stayed 0, the module stayed writable at seq 0, and the
+ * first save wrote seq 1 into a slot while the other still held seq 57 — so
+ * the next boot preferred the old slot and the whole session's changes,
+ * resume position included, were silently discarded. Now a failed read is
+ * retried after a settle, and a slot still unreadable with no good record
+ * to fall back on makes the module refuse to write for the session.
+ */
+#define ROOT_LBA  (IMG_PART_LBA + 2u * (IMG_BPS / 512u))              /* 72 */
+
+static void test_load_read_errors(void)
+{
+    uint8_t rec0[CONFIG_SLOT_BYTES], rec1[CONFIG_SLOT_BYTES];
+    uint8_t expect[CONFIG_SLOT_BYTES];
+    settings_t want0, want1, got;
+    fat32_t fs;
+
+    defaults(&want0); want0.volume = 40;  want0.theme = 2;    /* seq 57 */
+    defaults(&want1); want1.volume = 70;  want1.theme = 0;    /* seq 56 */
+    config_encode(rec0, &want0, 57);
+    config_encode(rec1, &want1, 56);
+
+    /* TRANSIENT: the newest slot's first read errors, then the drive settles.
+     * Without the retry the load would take slot 1 (seq 56) and the very next
+     * save would write seq 57 over slot 0 — the user's newest settings. */
+    fail_sectors(CFG_LBA0, CONFIG_SLOT_SECTORS, 1);
+    int rc = load_with(rec0, rec1, &fs, &got);
+    check("transient slot-0 read error: the retry gets the newest record",
+          rc == 1 && config_seq() == 57u && settings_eq(&got, &want0));
+    check("transient slot-0 read error: exactly one read was refused",
+          g_fail_hits == 1);
+    check("transient slot-0 read error: still writable", config_writable() == 1);
+    fail_none();
+
+    /* BOTH slots unreadable, for good. The record we cannot see may be the
+     * newest one; a save from seq 0 would lose to it on the next boot. The
+     * module must not write this session — and must not touch the bus. */
+    fail_sectors(CFG_LBA0, CONFIG_SECTORS, -1);
+    rc = load_with(rec0, rec1, &fs, &got);
+    settings_t def; defaults(&def);
+    check("both slots unreadable: load fails and keeps defaults",
+          rc == 0 && settings_eq(&got, &def));
+    check("both slots unreadable: each slot was retried",
+          g_fail_hits == 2 * (1 + (int)CONFIG_READ_RETRIES));
+    check("both slots unreadable: NOT writable this session",
+          config_writable() == 0 && config_seq() == 0u);
+    arm_drive_ready();
+    check("both slots unreadable: save refuses", config_save(&got) < 0);
+    check("both slots unreadable: refused save emitted ZERO bus events",
+          mmio_mock_log_len() == 0);
+    fail_none();
+
+    /* One slot unreadable, the other garbage: same thing — there is no record
+     * to anchor a sequence number on. */
+    for (unsigned i = 0; i < sizeof rec1; i++) rec1[i] = (uint8_t)(i * 3u);
+    fail_sectors(CFG_LBA0, CONFIG_SLOT_SECTORS, -1);
+    rc = load_with(rec0, rec1, &fs, &got);
+    check("unreadable slot + garbage slot: NOT writable",
+          rc == 0 && config_writable() == 0);
+    fail_none();
+    config_encode(rec1, &want1, 56);
+
+    /* One slot unreadable, the other VALID: writable. The next write must go
+     * to the unreadable slot with a seq that beats anything it could hold —
+     * that is both how a power-cut-spoiled slot is recovered and why nothing
+     * can invert. Asserted on the wire, not assumed. */
+    fail_sectors(CFG_LBA0, CONFIG_SLOT_SECTORS, -1);
+    rc = load_with(rec0, rec1, &fs, &got);
+    check("unreadable slot 0 + valid slot 1: loads slot 1 and stays writable",
+          rc == 1 && config_seq() == 56u && settings_eq(&got, &want1) &&
+          config_writable() == 1);
+    got.volume = 41;
+    config_encode(expect, &got, 57);
+    arm_drive_ready();
+    check("unreadable slot 0: save succeeds", config_save(&got) == 0);
+    check("unreadable slot 0: save bumped seq past the good slot's",
+          config_seq() == 57u);
+    trace_cursor tc = trace_begin("cfg-write-into-unreadable-slot0");
+    expect_write_trace(&tc, CFG_LBA0, expect);
+    trace_expect_end(&tc);
+    if (trace_done(&tc) != 0) {
+        g_fails++;
+    }
+    fail_none();
+
+    /* The ROOT walk that locates the file goes through the same retry: one
+     * failed read of the root directory must not disable settings for the
+     * session, and a root that never reads must. */
+    fail_sectors(ROOT_LBA, IMG_BPS / 512u, 1);
+    rc = load_with(rec0, rec1, &fs, &got);
+    check("transient root-directory read error: the retry finds the file",
+          rc == 1 && config_seq() == 57u && config_writable() == 1);
+    fail_none();
+
+    fail_sectors(ROOT_LBA, IMG_BPS / 512u, -1);
+    rc = load_with(rec0, rec1, &fs, &got);
+    check("root directory unreadable: load fails, NOT writable",
+          rc == 0 && config_writable() == 0);
+    check("root directory unreadable: the walk was retried",
+          g_fail_hits == 1 + (int)CONFIG_READ_RETRIES);
+    fail_none();
+}
 
 static void test_probe(void)
 {
@@ -1078,7 +1283,9 @@ int main(int argc, char **argv)
     test_seq_order();
     test_two_slot();
     test_write_trace();
+    test_fresh_file_slot();
     test_save_refusals();
+    test_load_read_errors();
     test_probe();
     if (argc > 1) {
         test_host_fixture(argv[1]);
