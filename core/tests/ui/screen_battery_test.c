@@ -91,12 +91,15 @@ static int count_not(int x, int y, int w, int h, uint16_t bg)
 #define STEP 5000000u
 
 /* Feed a sample and report whether the toast came UP on this very sample:
- * the "shows exactly once" assertions count these, not the level. */
+ * the "shows exactly once" assertions count these, not the level. A toast
+ * that comes up is painted on the same pass, as the lit-panel render loop
+ * does, so its 4 s window starts at `now`. */
 static int feed_shows(int mv, int level, int ext, uint32_t now)
 {
     int before = battwarn_toast_up(now);
     battwarn_feed(mv, level, ext, now);
     int after = battwarn_toast_up(now);
+    if (!before && after) battwarn_toast_shown(now);
     return !before && after;
 }
 
@@ -358,6 +361,59 @@ int main(void)
     battwarn_feed(3500, 1, 0, now); now += STEP;
     xpect(&c, "unplugging at DISKSAFE raises the modal",
           battwarn_screen() == BATTWARN_DISKSAFE);
+
+    /* Cable IN with the modal already up, then out again at the same level:
+     * the modal must come back. prev_level is already 1 here, so this is
+     * the case the level edge alone cannot see — without the unplug edge
+     * the person unplugs to a normal screen while writes are refused. */
+    battwarn_reset();
+    battwarn_feed(3500, 1, 0, now); now += STEP;
+    xpect(&c, "setup: modal up unplugged", battwarn_screen() == BATTWARN_DISKSAFE);
+    battwarn_feed(3500, 1, 1, now); now += STEP;
+    xpect(&c, "plugging in hides the live modal", battwarn_screen() == BATTWARN_NONE);
+    battwarn_feed(3500, 1, 0, now); now += STEP;
+    xpect(&c, "unplugging with the modal hidden re-raises it",
+          battwarn_screen() == BATTWARN_DISKSAFE);
+    /* Same, but the modal had been dismissed before the cable went in: the
+     * cable answered the warning, so pulling it re-asks the question. */
+    battwarn_input(now);
+    xpect(&c, "setup: dismissed", battwarn_screen() == BATTWARN_NONE);
+    battwarn_feed(3500, 1, 1, now); now += STEP;
+    battwarn_feed(3480, 1, 1, now); now += STEP;
+    battwarn_feed(3480, 1, 0, now); now += STEP;
+    xpect(&c, "unplugging after a dismissed modal re-raises it",
+          battwarn_screen() == BATTWARN_DISKSAFE);
+    battwarn_feed(3470, 1, 0, now); now += STEP;
+    xpect(&c, "...and it stays up (no flicker on the next sample)",
+          battwarn_screen() == BATTWARN_DISKSAFE);
+    /* But a cable that charged the cell back to OK raises nothing on unplug. */
+    battwarn_feed(3900, 0, 1, now); now += STEP;
+    battwarn_feed(3900, 0, 0, now); now += STEP;
+    xpect(&c, "unplugging at OK raises no modal", battwarn_screen() == BATTWARN_NONE);
+
+    /* The toast's clock runs from its first PAINT, not from the sample. A
+     * toast that fires while the backlight is off is never painted; if its
+     * 4 s ran anyway the only LOW warning would expire unseen, and the latch
+     * would not re-arm until 3800. */
+    battwarn_reset();
+    battwarn_feed(3690, 0, 0, now);
+    xpect(&c, "unpainted toast is up", battwarn_toast_up(now) == 1);
+    now += 30 * STEP;                       /* 150 s dark, sampling all along */
+    battwarn_feed(3680, 0, 0, now);
+    xpect(&c, "unpainted toast is still up 150 s later",
+          battwarn_toast_up(now) == 1);
+    battwarn_toast_shown(now);              /* backlight on: first paint */
+    xpect(&c, "painted toast is up for 4 s from the paint",
+          battwarn_toast_up(now + 3999999u) == 1);
+    battwarn_toast_shown(now + 1000000u);   /* a repaint does not restart it */
+    xpect(&c, "toast expires 4 s after the FIRST paint",
+          battwarn_toast_up(now + 4000000u) == 0);
+    now += STEP;
+    battwarn_feed(3680, 0, 0, now);
+    xpect(&c, "an expired toast does not re-show below 3800",
+          battwarn_toast_up(now) == 0);
+    xpect(&c, "toast_shown on a down toast is a no-op",
+          (battwarn_toast_shown(now), battwarn_toast_up(now) == 0));
 
     /* SHUTOFF is terminal: input does not clear it, nor do later samples,
      * nor a cable. */

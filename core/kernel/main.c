@@ -5122,6 +5122,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                                       player_total_s(), player_buf_pct());
                     if (toast) {
                         screen_battery_toast_render();
+                        battwarn_toast_shown(nowv);   /* its 4 s start here */
                         g_mq.active = 0;      /* see the list branch below */
                     }
                     toast_prev = toast;
@@ -5186,7 +5187,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                     }
                 }
                 if (az_letter) az_overlay_render(az_letter);
-                if (toast) screen_battery_toast_render();
+                if (toast) {
+                    screen_battery_toast_render();
+                    battwarn_toast_shown(now);        /* its 4 s start here */
+                }
                 /* The plate owns the screen. The repaint above re-registered
                  * the selected row with the marquee, whose tick would then
                  * punch a hole straight through whatever is covering it. */

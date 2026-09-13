@@ -44,6 +44,12 @@
  *      OK->DISKSAFE edge, is latched until dismissed, and the latch clears
  *      only on the DISKSAFE->OK recovery.
  *   5. External power hides LOW and DISKSAFE: a cable is the answer to both.
+ *      Pulling the cable while the policy is still at DISKSAFE re-raises the
+ *      modal, even one that was dismissed before the plug-in.
+ *   6. The toast's 4 s run from the first PAINT, not from the sample that
+ *      fired it: the caller reports the paint (battwarn_toast_shown), so a
+ *      toast that fires behind a dark backlight is still waiting when the
+ *      panel comes back rather than having expired unseen.
  *
  * The state machine (battwarn_*) is PURE — the caller supplies the sample and
  * the clock — so the whole sequence above is proven on the host in
@@ -151,7 +157,16 @@ battwarn_kind_t battwarn_screen(void);
  * 1 while the LOW toast should be painted. Elapsed-time compare against the
  * show stamp, and the toast DISARMS ITSELF on expiry, so a clock wrap 71 min
  * later can never bring a stale one back (the ui_window_t rule in main.c).
+ * Until the caller has reported a paint (below) it stays 1 regardless of the
+ * clock: an unseen toast has not started its 4 s.
  */
 int battwarn_toast_up(uint32_t now_us);
+
+/*
+ * The caller PAINTED the toast: call right after screen_battery_toast_render()
+ * with the same clock. The first call after a show stamps the 4 s window;
+ * later calls are no-ops, so it is safe on every repaint.
+ */
+void battwarn_toast_shown(uint32_t now_us);
 
 #endif /* CORE_UI_SCREEN_BATTERY_H */

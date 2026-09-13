@@ -130,26 +130,30 @@ void screen_battery_toast_render(void)
 typedef struct {
     int      low_armed;        /* LOW may fire on the next <= 3700 sample     */
     int      toast_on;         /* toast is (or was, until it expires) showing */
-    uint32_t toast_t0;         /* clock stamp when it was shown               */
+    int      toast_shown;      /* ...and has actually been painted once       */
+    uint32_t toast_t0;         /* clock stamp of that first paint             */
     int      modal_pending;    /* a DISKSAFE edge happened and has not cleared */
     int      modal_dismissed;  /* ...and the person has pressed a button since */
     int      shutoff;          /* SHUTOFF seen: terminal                      */
     int      prev_level;       /* last policy level fed, for edge detection   */
+    int      prev_external;    /* last cable state fed, for the unplug edge   */
 } battwarn_t;
 
 /* Armed from power-on: the first crossing of 3700 after boot should toast
  * without waiting for a climb to 3800 that a discharging cell never makes. */
-static battwarn_t g_bw = { 1, 0, 0, 0, 0, 0, 0 };
+static battwarn_t g_bw = { 1, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 void battwarn_reset(void)
 {
     g_bw.low_armed       = 1;
     g_bw.toast_on        = 0;
+    g_bw.toast_shown     = 0;
     g_bw.toast_t0        = 0;
     g_bw.modal_pending   = 0;
     g_bw.modal_dismissed = 0;
     g_bw.shutoff         = 0;
     g_bw.prev_level      = 0;
+    g_bw.prev_external   = 0;
 }
 
 void battwarn_feed(int filt_mv, int level, int external, uint32_t now_us)
@@ -169,20 +173,30 @@ void battwarn_feed(int filt_mv, int level, int external, uint32_t now_us)
     }
 
     /* A cable is the answer to both LOW and DISKSAFE, so it hides whatever is
-     * showing. prev_level is deliberately NOT updated here: if the policy is
-     * at DISKSAFE while plugged in and the cable comes out, the next sample
-     * sees 0 -> 1 and puts the modal up — which is exactly the moment the
-     * person needs it. low_armed is left alone as well: the latch has its own
-     * memory of whether the toast has been shown, and a plug that did not
-     * charge the cell above 3800 should not silently forfeit the one toast
-     * the person has not seen yet. */
+     * showing. low_armed is left alone: the latch has its own memory of
+     * whether the toast has been shown, and a plug that did not charge the
+     * cell above 3800 should not silently forfeit the one toast the person
+     * has not seen yet. */
     if (external) {
         b->toast_on      = 0;
         b->modal_pending = 0;
+        b->prev_level    = level;
+        b->prev_external = 1;
         return;
     }
 
-    if (level == 1 && b->prev_level == 0) {
+    /* Cable OUT while the policy is still at DISKSAFE: the modal comes back,
+     * whether the edge happened while plugged in (hidden above) or the modal
+     * was up — or already dismissed — when the cable went in. Unplugging is
+     * exactly the moment the person needs telling that writes are refused,
+     * and the level edge below cannot say so: prev_level is already 1. */
+    int unplugged = b->prev_external;
+    b->prev_external = 0;
+    if (unplugged && level == 1) {
+        b->modal_pending   = 1;
+        b->modal_dismissed = 0;
+        b->toast_on        = 0;
+    } else if (level == 1 && b->prev_level == 0) {
         /* OK -> DISKSAFE edge: the modal. It supersedes any toast. */
         b->modal_pending   = 1;
         b->modal_dismissed = 0;
@@ -198,9 +212,10 @@ void battwarn_feed(int filt_mv, int level, int external, uint32_t now_us)
      * means the filter is not ready and must not move the trigger either way. */
     if (level == 0 && filt_mv >= 0) {
         if (b->low_armed && filt_mv <= BATTWARN_MV_LOW) {
-            b->toast_on  = 1;
-            b->toast_t0  = now_us;
-            b->low_armed = 0;              /* one show per arming */
+            b->toast_on    = 1;
+            b->toast_shown = 0;            /* timed from the first paint  */
+            b->toast_t0    = now_us;
+            b->low_armed   = 0;            /* one show per arming */
         } else if (!b->low_armed && filt_mv >= BATTWARN_MV_LOW_CLEAR) {
             b->low_armed = 1;
         }
@@ -229,10 +244,25 @@ battwarn_kind_t battwarn_screen(void)
     return BATTWARN_NONE;
 }
 
+void battwarn_toast_shown(uint32_t now_us)
+{
+    if (g_bw.toast_on && !g_bw.toast_shown) {
+        g_bw.toast_shown = 1;
+        g_bw.toast_t0    = now_us;
+    }
+}
+
 int battwarn_toast_up(uint32_t now_us)
 {
     if (!g_bw.toast_on) {
         return 0;
+    }
+    /* Not painted yet (the backlight was off when it fired): the 4 s window
+     * has not started, so it cannot have expired. Without this the one LOW
+     * warning could time out unseen behind a dark panel, and the latch would
+     * not re-arm until a climb to 3800 that a discharging cell never makes. */
+    if (!g_bw.toast_shown) {
+        return 1;
     }
     if ((uint32_t)(now_us - g_bw.toast_t0) < BATTWARN_TOAST_US) {
         return 1;
