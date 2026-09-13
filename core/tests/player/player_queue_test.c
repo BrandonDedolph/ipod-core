@@ -858,9 +858,10 @@ int main(void)
               stub_audio_suspends_while_running == 0);
     }
 
-    /* A skip while powered down: the new track's bring-up is a full init, so
-     * the codec is up again — and still paused, as a paused skip must be. The
-     * new pause then times out on its own. */
+    /* A skip while powered down: nothing is brought up for a track nobody
+     * has asked to hear yet — the codec stays down, no init, no wake — and
+     * still paused, as a paused skip must be. There is then nothing for the
+     * new track's pause to power down. (13e'' below is the full account.) */
     {
         uint32_t t = 200000000u;
         set_usec(t);
@@ -868,16 +869,20 @@ int main(void)
         set_usec(t + PLAYER_PAUSE_CODEC_OFF_US);
         player_pump();
         int suspends_before = stub_audio_suspends;
+        int inits_at_skip    = stub_audio_inits;
+        int wakes_at_skip    = stub_audio_wakes;
         player_next();
-        xpect(&c, "a skip while powered down brings the codec up with the new "
-                  "track", stub_audio_cold == 0 && player_queue_current() == 1);
+        xpect(&c, "a skip while powered down leaves the codec down: no init, "
+                  "no wake", stub_audio_cold == 1 &&
+              stub_audio_inits == inits_at_skip &&
+              stub_audio_wakes == wakes_at_skip && player_queue_current() == 1);
         xpect(&c, "a skip while powered down stays paused",
               player_paused() == 1 && player_playing() == 0 &&
               stub_audio_running == 0);
         set_usec(t + PLAYER_PAUSE_CODEC_OFF_US + PLAYER_PAUSE_CODEC_OFF_US);
         player_pump();
-        xpect(&c, "the pause on the new track times out and powers down again",
-              stub_audio_suspends == suspends_before + 1 && stub_audio_cold == 1);
+        xpect(&c, "the new track's pause has nothing to power down again",
+              stub_audio_suspends == suspends_before && stub_audio_cold == 1);
         /* Seek while powered down: paused, stopped, flushed — and the resume
          * that follows wakes the codec and starts from the seek target. */
         stub_set_track_frames(44100u * 10u);
@@ -1217,6 +1222,193 @@ int main(void)
         xpect(&c, "a paused skip's power-down is timed from the skip: now",
               stub_audio_suspends == suspends_before + 1);
     }
+    stub_set_track_frames(8192u);
+
+    /* ---- 13e''. a paused skip owes its bring-up to the resume ----------- *
+     *
+     * 13e' stopped the paused skip from kicking the DMA, but the open still
+     * ran the whole per-track codec bring-up — hal_audio_init: a WM_RESET and
+     * a VMID charge over I2C — and the persistent-pause timer then powered
+     * the codec down again five seconds later. Ten Nexts while paused were
+     * ten bring-up/power-down cycles for tracks the listener had not asked
+     * to hear. A paused open now touches the HAL only to flush its buffers
+     * of the old track, and the resume performs the one bring-up that is
+     * actually owed: at the LAST track's rate, an init if that differs from
+     * what the DAC is clocked at, a wake (if the pause went cold) and a start
+     * otherwise. See the state table above g_pl_bringup_pending in player.c.
+     */
+    stub_reset();
+    stub_set_track_frames(44100u * 10u);
+    make_entries(ents, 4, 0);
+    player_set_repeat(1);                        /* Repeat All: Next wraps */
+    player_play_queue(ents, 4, 0, 0, 0);
+    set_usec(0);
+    player_pause();
+    set_usec(PLAYER_PAUSE_CODEC_OFF_US);
+    player_pump();
+    xpect(&c, "deferred: the pause went cold first",
+          stub_audio_cold == 1 && stub_audio_suspends == 1 &&
+          stub_audio_inits == 1);
+    {
+        /* Ten Nexts on a cold pause: zero inits, zero wakes, zero DMA
+         * starts, and — the codec being down already — zero further
+         * power-downs however long each skip's pause lasts. */
+        int      inits = stub_audio_inits, wakes = stub_audio_wakes;
+        int      starts = stub_audio_starts, susp = stub_audio_suspends;
+        uint32_t t = PLAYER_PAUSE_CODEC_OFF_US;
+        int      quiet = 1, landed = 1, flushed = 1;
+        for (int k = 0; k < 10; k++) {
+            t += 1000000u;
+            set_usec(t);
+            player_next();
+            if (player_queue_current() != (k + 1) % 4 || !player_paused() ||
+                !player_active() || player_playing()) {
+                landed = 0;
+            }
+            if (stub_audio_primed != 0) {
+                flushed = 0;               /* the old track's PCM must go */
+            }
+            t += PLAYER_PAUSE_CODEC_OFF_US + 1000000u;
+            set_usec(t);
+            player_pump();
+            player_pump();
+            if (stub_audio_inits != inits || stub_audio_wakes != wakes ||
+                stub_audio_starts != starts || stub_audio_suspends != susp ||
+                stub_audio_cold != 1 || stub_audio_running != 0) {
+                quiet = 0;
+            }
+        }
+        xpect(&c, "ten Nexts while paused-cold each land paused on the next "
+                  "track", landed && player_queue_current() == 2);
+        xpect(&c, "ten Nexts while paused-cold: no init, no wake, no DMA "
+                  "start, no power-down", quiet);
+        xpect(&c, "a paused open drops the skipped track's buffered PCM",
+              flushed);
+        xpect(&c, "a paused open holds the clock at 0:00",
+              player_elapsed_s() == 0u);
+        /* The resume is the one bring-up owed: same rate as the DAC is
+         * clocked at, so no init — a wake and a start. */
+        t += 1000000u;
+        set_usec(t);
+        player_resume();
+        xpect(&c, "resume after them: one wake, one start, no init",
+              stub_audio_inits == inits && stub_audio_wakes == wakes + 1 &&
+              stub_audio_starts == starts + 1 && stub_audio_cold == 0 &&
+              stub_audio_running == 1 && player_playing() == 1);
+        xpect(&c, "resume after them plays the last track from its primed ring",
+              stub_drain(1024) == 1024 && player_queue_current() == 2);
+        xpect(&c, "resume after them runs the clock from 0:00",
+              player_elapsed_s() == 0u);
+        /* The DAC's rate is right, so the next hand-over is gapless: the
+         * deferred bring-up left the player's idea of the DAC's rate intact. */
+        int opens = stub_opens;
+        pump_to_track_end(5000);
+        xpect(&c, "...and the following hand-over is gapless (no re-init)",
+              player_queue_current() == 3 && stub_opens == opens + 1 &&
+              stub_audio_inits == inits);
+    }
+    {
+        /* Warm variant: skips within the timeout. Still no init and no
+         * start; the timer is re-armed by each skip (there IS a codec to
+         * power down here), and the resume is a bare start. */
+        set_usec(100000000u);
+        player_pause();
+        int inits = stub_audio_inits, wakes = stub_audio_wakes;
+        int starts = stub_audio_starts, susp = stub_audio_suspends;
+        set_usec(101000000u);
+        player_next();
+        set_usec(102000000u);
+        player_next();
+        set_usec(103000000u);
+        player_prev();
+        xpect(&c, "warm paused skips: no init, no wake, no start, codec up",
+              stub_audio_inits == inits && stub_audio_wakes == wakes &&
+              stub_audio_starts == starts && stub_audio_cold == 0 &&
+              player_paused() == 1);
+        set_usec(103000000u + PLAYER_PAUSE_CODEC_OFF_US - 1u);
+        player_pump();
+        xpect(&c, "warm paused skips re-arm the power-down from the last skip",
+              stub_audio_suspends == susp);
+        set_usec(104000000u);
+        player_resume();
+        xpect(&c, "resume after warm paused skips is a bare start",
+              stub_audio_inits == inits && stub_audio_wakes == wakes &&
+              stub_audio_starts == starts + 1 && stub_audio_running == 1);
+    }
+    {
+        /* A rate change across paused skips: the resume inits ONCE, at the
+         * rate of the track it lands on, and the DAC is then clocked at
+         * that rate for the hand-over that follows. */
+        set_usec(200000000u);
+        player_pause();
+        int inits = stub_audio_inits, starts = stub_audio_starts;
+        stub_set_rate(48000u);
+        player_next();                           /* a 48 kHz track, deferred */
+        stub_set_rate(44100u);
+        player_next();                           /* a 44.1 kHz track         */
+        stub_set_rate(48000u);
+        player_next();                           /* 48 kHz again: the final  */
+        xpect(&c, "paused skips across a rate change bring nothing up",
+              stub_audio_inits == inits && stub_audio_starts == starts &&
+              player_paused() == 1);
+        set_usec(201000000u);
+        player_resume();
+        xpect(&c, "resume after a rate change inits once, at the final "
+                  "track's rate", stub_audio_inits == inits + 1 &&
+              stub_last_init_rate == 48000u &&
+              stub_audio_starts == starts + 1 && stub_audio_running == 1 &&
+              player_playing() == 1);
+        int opens = stub_opens, cur = player_queue_current();
+        pump_to_track_end(5000);
+        xpect(&c, "...and the 48 kHz hand-over after it is gapless",
+              player_queue_current() == (cur + 1) % 4 &&
+              stub_opens == opens + 1 && stub_audio_inits == inits + 1);
+        stub_set_rate(44100u);
+    }
+    {
+        /* Seek while paused after a deferred open: the seek re-primes the
+         * ring, and the bring-up stays owed to the resume. */
+        set_usec(300000000u);
+        player_pause();
+        stub_set_rate(44100u);
+        player_next();                           /* deferred, 44.1 kHz */
+        int inits = stub_audio_inits, starts = stub_audio_starts;
+        xpect(&c, "a paused seek after a deferred open succeeds",
+              player_seek_to(4u) == 0 && player_paused() == 1);
+        xpect(&c, "a paused seek after a deferred open brings nothing up",
+              stub_audio_inits == inits && stub_audio_starts == starts &&
+              stub_audio_running == 0);
+        set_usec(301000000u);
+        player_resume();
+        xpect(&c, "resume after it starts once from the seek target",
+              stub_audio_starts == starts + 1 && stub_audio_running == 1 &&
+              player_elapsed_s() == 4u && stub_drain(1024) == 1024);
+    }
+    {
+        /* A rate the DAC cannot clock. An unpaused open refuses it at the
+         * open and the skip loop moves on; a paused open cannot know (the
+         * HAL's rate check IS the bring-up), so the refusal comes at the
+         * resume — and the player moves on then, playing, rather than
+         * sitting paused on a track it can never start. */
+        stub_reset();
+        stub_set_track_frames(44100u * 10u);
+        make_entries(ents, 4, 0);
+        player_set_repeat(0);
+        player_play_queue(ents, 4, 0, 0, 0);
+        set_usec(400000000u);
+        player_pause();
+        stub_set_rate(96000u);
+        player_next();                           /* track 1 reports 96 kHz */
+        stub_set_rate(44100u);                   /* ...which init now refuses */
+        xpect(&c, "an unclockable track opens paused (nothing is checked yet)",
+              player_queue_current() == 1 && player_paused() == 1);
+        player_resume();
+        xpect(&c, "resume refuses the rate and skips to the next playable "
+                  "track, playing", player_queue_current() == 2 &&
+              player_playing() == 1 && stub_audio_running == 1 &&
+              stub_last_init_rate == 44100u);
+    }
+    player_set_repeat(0);
     stub_set_track_frames(8192u);
 
     /* ---- 13e. quiet playback parks the drive ONCE ---------------------- *

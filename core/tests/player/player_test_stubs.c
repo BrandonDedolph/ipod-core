@@ -99,6 +99,7 @@ static uint32_t g_dac_played;      /* the count the HAL reports        */
 static uint32_t g_played_origin;   /* what init restarts it at         */
 static uint32_t g_stub_rate = 44100u;  /* stub_set_rate(): the decoder's, and accepted by init */
 int  stub_audio_inits;
+uint32_t stub_last_init_rate;
 
 void stub_set_seek_ok(int ok)          { g_seek_ok = ok ? 1 : 0; }
 void stub_set_seek_max(uint64_t m)     { g_seek_max = m; }
@@ -149,6 +150,7 @@ void stub_reset(void)
     g_played_origin = 0;
     g_stub_rate   = 44100u;
     stub_audio_inits = 0;
+    stub_last_init_rate = 0;
 }
 
 void stub_break_cluster(uint32_t clus)
@@ -425,6 +427,7 @@ int hal_audio_init(uint32_t rate, uint16_t channels)
     /* A full bring-up: the codec is up and, as on the device, the buffers are
      * severed from whatever stream came before — and the DAC's count restarts. */
     stub_audio_inits++;
+    stub_last_init_rate = rate;
     stub_audio_cold   = 0;
     stub_audio_primed = 0;
     g_dac_pipe   = 0;

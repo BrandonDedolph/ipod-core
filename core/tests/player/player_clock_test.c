@@ -481,5 +481,63 @@ int main(void)
     xpect(&c, "rate: ...with the clock at 0:00", player_elapsed_s() == 0u);
     stub_reset();
 
+    /* ---- 11. a deferred bring-up re-pairs them too ----------------------- *
+     * A skip while paused no longer brings the DAC up; the resume does. Both
+     * shapes of that bring-up have to leave frames_heard() honest for the
+     * hand-over that follows: the same-rate one (no init — the HAL's count
+     * stands, the open flushed what the HAL held) and the new-rate one (an
+     * init, which restarts the count — here right next to the wrap). Track 0
+     * plays a little, the listener pauses and skips to track 1, resumes;
+     * track 2 is then prefetched gapless behind track 1, and its boundary
+     * must present exactly when the DAC reaches it. */
+    for (int newrate = 0; newrate < 2; newrate++) {
+        stub_reset();
+        stub_set_dac_depth(HAL_INFLIGHT_FRAMES);
+        stub_set_track_frames(TRACK_FRAMES);
+        make_entries(ents, 3);
+        player_play_queue(ents, 3, 0, 0, 0);
+        player_pump();
+        xpect(&c, "deferred: track 0 played a little before the pause",
+              drain_exact(PULL * 5u));
+        set_usec(1000000u);
+        player_pause();
+        if (newrate) {
+            stub_set_rate(48000u);
+            stub_set_played_origin(0xFFFFFF00u); /* the init lands by the wrap */
+        }
+        player_next();                          /* -> track 1, bring-up owed */
+        xpect(&c, newrate ? "deferred/new rate: the skip brought nothing up"
+                          : "deferred/same rate: the skip brought nothing up",
+              stub_audio_inits == 1 && stub_audio_starts == 1 &&
+              player_paused() == 1);
+        set_usec(2000000u);
+        player_resume();
+        xpect(&c, newrate ? "deferred/new rate: the resume inits at 48 kHz"
+                          : "deferred/same rate: the resume needs no init",
+              stub_audio_inits == (newrate ? 2 : 1) &&
+              (!newrate || stub_last_init_rate == 48000u) &&
+              stub_audio_running == 1);
+        for (int i = 0; i < 400; i++) {
+            player_pump();                      /* decode track 1, prefetch 2 */
+        }
+        seq0 = player_open_seq();
+        xpect(&c, "deferred: track 2 is prefetched gapless behind track 1",
+              stub_opens == 3 && player_queue_current() == 1 &&
+              stub_audio_inits == (newrate ? 2 : 1));
+        xpect(&c, "deferred: one frame short of the boundary is still track 1",
+              drain_exact(TRACK_FRAMES + HAL_INFLIGHT_FRAMES - 1u));
+        player_pump();
+        xpect(&c, "deferred: ...",
+              player_queue_current() == 1 && player_open_seq() == seq0);
+        xpect(&c, "deferred: the frame that crosses it presents track 2",
+              drain_exact(1u));
+        player_pump();
+        xpect(&c, "deferred: ...",
+              player_queue_current() == 2 && player_open_seq() == seq0 + 1);
+        xpect(&c, "deferred: ...with the clock at 0:00",
+              player_elapsed_s() == 0u);
+    }
+    stub_reset();
+
     return xfail_done(&c);
 }

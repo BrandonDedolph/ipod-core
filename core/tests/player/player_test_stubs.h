@@ -46,11 +46,17 @@ int stub_drain(int frames);
 void stub_set_dac_depth(uint32_t frames);
 void stub_set_played_origin(uint32_t frames);
 extern int stub_audio_inits;
+/* The rate the most recent hal_audio_init was asked for (0 until one is).
+ * A paused skip defers its bring-up to the resume, and this is how a test
+ * sees WHICH track's rate that bring-up used. */
+extern uint32_t stub_last_init_rate;
 
 /* Sample rate the fake decoder reports on every later open (44100 until
  * changed; stub_reset restores it). hal_audio_init accepts 44100 and this, so
  * two consecutive tracks at different rates take the player's format-change
- * hand-over rather than the gapless one. */
+ * hand-over rather than the gapless one — and a track opened at one rate
+ * becomes UNCLOCKABLE once this is set to another, which is how a test
+ * reaches the "the DAC can't clock this file" refusal after the fact. */
 void stub_set_rate(uint32_t hz);
 
 /* Cluster of the file most recently opened — i.e. which queue entry the player

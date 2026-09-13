@@ -608,6 +608,46 @@ static int            g_pl_paused;         /* DMA suspended, position held      
  */
 static int            g_pl_codec_cold;
 /*
+ * The DAC bring-up for the CURRENT stream has been DEFERRED: the track was
+ * opened while paused (a Next/Prev/jump on a paused transport) and nothing on
+ * the HAL side has been touched for it — no hal_audio_init, no wake. The HAL
+ * still stands as the PREVIOUS stream left it (clocked at g_out_rate, codec
+ * warm or cold per g_pl_codec_cold), only flushed, so it holds no PCM of the
+ * old track to resume into. g_pl_pending_rate is what the eventual bring-up
+ * must clock the DAC at. Owed by player_resume (see bringup_pending); cleared
+ * by every full bring-up (audio_bringup) and by player_stop.
+ *
+ * Why: a paused skip used to run the whole per-track bring-up —
+ * hal_audio_init, i.e. a WM_RESET and a VMID charge over I2C — only for the
+ * persistent-pause timer (PLAYER_PAUSE_CODEC_OFF_US) to power the codec down
+ * again five seconds later. Ten Nexts while paused were ten bring-up /
+ * power-down cycles, each a VMID charge (an audible-pop risk, and wasted mA)
+ * for a track the listener had not yet asked to hear. Deferring the bring-up
+ * to the resume makes a paused skip cost exactly what it looks like: a file
+ * open and a ring prime.
+ *
+ * The player/HAL codec state table. "HAL" columns are audio.c's g_cold and
+ * g_primed; the player mirrors them so it issues each I2C sequence once.
+ *
+ *   transport        pending  pl_cold | HAL cold  HAL primed  HAL rate
+ *   ---------------  -------  ------- | --------  ----------  --------------
+ *   playing            0        0     |   0        (running)  = stream's
+ *   paused, short      0        0     |   0          1        = stream's
+ *   paused, persisted  0        1     |   1          1        = stream's
+ *   paused skip, warm  1        0     |   0          0        = OLD stream's
+ *   paused skip, cold  1        1     |   1          0        = OLD stream's
+ *
+ * Resume owes, per row: nothing / start / wake + start / start (same rate) or
+ * init (new rate) / wake + start (same rate) or init (new rate). A paused
+ * skip lands in one of the last two rows, and stays in it across further
+ * paused skips and paused seeks; the codec-off timer runs only in the warm
+ * row (there is nothing left to power down in the cold one). hal_audio_init
+ * clears the HAL's cold flag itself, which is why the new-rate path never
+ * wakes first.
+ */
+static int            g_pl_bringup_pending;
+static uint32_t       g_pl_pending_rate;
+/*
  * The elapsed clock. USEC_TIMER is a free-running 32-bit 1 MHz counter, so it
  * wraps every 4294.97 s (71:35) — shorter than a podcast or a DJ mix. The
  * clock used to be (now - track_start) in 32-bit microseconds, which snapped
@@ -1047,8 +1087,10 @@ static void clock_set_us(uint64_t us)
     g_pl_last_us    = mmio_read32(USEC_TIMER_ADDR);
 }
 
+static void player_advance(void);   /* fwd: a refused bring-up skips too */
+
 /*
- * Bring the DAC up at `rate` and, if `start`, begin pulling from the ring.
+ * Bring the DAC up at `rate` and begin pulling from the ring.
  *
  * hal_audio_init RESETS the WM8758 and writes 0 dB headphone gain, so the
  * user's volume and balance have to be re-applied — and re-applied BEFORE the
@@ -1060,18 +1102,18 @@ static void clock_set_us(uint64_t us)
  * for the WHOLE track — full-scale into someone's headphones at a "20%"
  * setting. Doing it here covers every path into playback by construction.
  *
- * `start` is 0 when the transport is being opened PAUSED (a skip while
- * paused). The codec is brought up and the source is registered, but the DMA
- * is not kicked: hal_audio_init leaves the HAL with no buffered PCM, so the
- * hal_audio_start() that the eventual resume issues cold-primes both buffers
- * from the ring — the same first sound a normal open produces, just later.
- * Kicking here and pausing straight after, which is what a paused skip used
- * to do, played the first ~1-30 ms of the new track at the user's gain and
- * then muted it over I2C: an audible click on every Next/Prev while paused.
+ * Never called for a transport being opened PAUSED (a skip while paused):
+ * that path brings nothing up and owes the bring-up to the resume — see
+ * g_pl_bringup_pending and bringup_pending(). Kicking the DMA and pausing
+ * straight after, which is what a paused skip once did, played the first
+ * ~1-30 ms of the new track at the user's gain and then muted it over I2C: an
+ * audible click on every Next/Prev while paused. Bringing the codec up and
+ * NOT kicking, the next shape, was silent but still paid a WM_RESET + VMID
+ * charge per skip for the persistent-pause timer to undo five seconds later.
  *
  * Returns 0, or -1 if the HAL can't clock this format.
  */
-static int audio_bringup(uint32_t rate, int start)
+static int audio_bringup(uint32_t rate)
 {
     if (hal_audio_init(rate, 2u) != 0) {
         return -1;
@@ -1080,11 +1122,10 @@ static int audio_bringup(uint32_t rate, int start)
     hal_volume_set(hal_volume_get());
     hal_balance_set(hal_balance_get());
     hal_audio_set_source(ring_source, 0);
-    if (start) {
-        hal_audio_start();
-    }
-    g_out_rate      = rate;
-    g_pl_codec_cold = 0;                 /* init is a full bring-up */
+    hal_audio_start();
+    g_out_rate           = rate;
+    g_pl_codec_cold      = 0;            /* init is a full bring-up */
+    g_pl_bringup_pending = 0;            /* ...and settles any deferred one */
     return 0;
 }
 
@@ -1119,11 +1160,51 @@ static void codec_wake(void)
     g_pl_codec_cold = 0;
 }
 
-/* Open g_queue[g_queue_idx] and start the DAC — or, with `paused`, bring
- * the codec up and leave the transport paused at 0:00 with the DMA never
- * kicked (see audio_bringup). Returns 0, or -1 on failure; player_last_error()
- * then says whether the file was unreadable or simply a format the DAC can't
- * clock, so the UI can eventually explain the skip. */
+/*
+ * Settle a deferred bring-up (g_pl_bringup_pending) and start the DAC on the
+ * stream the paused open primed. The resume after a paused skip lands here.
+ *
+ * Two cases, decided by the rate the HAL is still clocked at:
+ *   - the same rate: the DAC's clock is already right, so it is treated like
+ *     a seek — no hal_audio_init (which would reset the codec's gain for
+ *     nothing) — just a wake if the pause powered the codec down, and a
+ *     start that cold-primes from the ring, because the open flushed the
+ *     HAL's buffers of the previous track.
+ *   - a different rate: the full audio_bringup at the pending rate, exactly
+ *     what an unpaused open does. hal_audio_init clears the HAL's cold state
+ *     itself, so no wake precedes it.
+ *
+ * The played-count pairing is re-based either way: the HAL holds nothing in
+ * flight here (flushed at the open, or freshly initialised), which is the one
+ * moment heard_rebase() is valid. audio_bringup does its own after the init.
+ *
+ * Returns 0, or -1 when the HAL cannot clock the pending rate — the check an
+ * unpaused open performs at the open itself, and which a deferred bring-up
+ * can only perform now. The caller skips the track, the way a format-change
+ * hand-over skips an unclockable file (pending_commit).
+ */
+static int bringup_pending(void)
+{
+    g_pl_bringup_pending = 0;
+    if (g_pl_pending_rate != g_out_rate) {
+        return audio_bringup(g_pl_pending_rate);
+    }
+    if (g_pl_codec_cold) {
+        codec_wake();
+    }
+    hal_audio_set_source(ring_source, 0);
+    heard_rebase();
+    hal_audio_start();
+    return 0;
+}
+
+/* Open g_queue[g_queue_idx] and start the DAC — or, with `paused`, leave the
+ * transport paused at 0:00 with the DAC untouched and its bring-up owed to
+ * the resume (see g_pl_bringup_pending). Returns 0, or -1 on failure;
+ * player_last_error() then says whether the file was unreadable or simply a
+ * format the DAC can't clock, so the UI can eventually explain the skip. (A
+ * paused open cannot make the second judgement — the HAL's rate check IS the
+ * bring-up — so it is made at the resume instead, which skips the track.) */
 static int player_open_current(int paused)
 {
     load_track_art(&g_queue[g_queue_idx]);
@@ -1148,7 +1229,20 @@ static int player_open_current(int paused)
      * scrolled past unplayed and unexplained. Mono is up-mixed to stereo in
      * the decode step, so the DAC only ever sees 2 channels and we depend on
      * the HAL for nothing but the rate. */
-    if (audio_bringup(g_dec.sample_rate, !paused) != 0) {
+    if (paused) {
+        /* Opened paused: the DAC is not brought up for this stream at all —
+         * see g_pl_bringup_pending. The HAL keeps whatever state the previous
+         * stream left (codec warm or cold, clocked at that stream's rate);
+         * only its buffered PCM is dropped, so that the eventual start
+         * cold-primes from the ring just filled rather than resuming into
+         * the tail of the track the listener skipped away from. With the HAL
+         * holding nothing in flight, the played-count pairing is re-based
+         * here (and again at the bring-up). No I2C traffic on this path. */
+        hal_audio_flush();
+        heard_rebase();
+        g_pl_pending_rate    = g_dec.sample_rate;
+        g_pl_bringup_pending = 1;
+    } else if (audio_bringup(g_dec.sample_rate) != 0) {
         g_last_err = PLAYER_ERR_RATE;
         return -1;
     }
@@ -1159,7 +1253,10 @@ static int player_open_current(int paused)
     if (paused) {
         /* A fresh pause on the new track: the codec power-down in the pump
          * is timed from here, exactly as if the listener had just pressed
-         * pause. The clock is frozen at 0:00 (nothing folds while paused). */
+         * pause — when there is a codec to power down. Under a pause that
+         * already went cold, g_pl_codec_cold stays set and the timer is
+         * inert: nothing was brought up, so there is nothing to take down.
+         * The clock is frozen at 0:00 (nothing folds while paused). */
         g_pl_pause_us = mmio_read32(USEC_TIMER_ADDR);
     }
     g_last_err    = PLAYER_OK;
@@ -1175,8 +1272,9 @@ static int player_open_current(int paused)
  * normally and then call player_pause(), which was silent on paper and not
  * in the ear: the open kicked the DMA at the user's gain and the pause then
  * muted it over I2C, so every skip while paused clicked. The pause is now
- * part of the open itself — the DMA is never started (audio_bringup), so
- * there is nothing to cut.
+ * part of the open itself — the DAC is not even brought up until the
+ * resume (g_pl_bringup_pending), so there is nothing to cut and nothing to
+ * power down again.
  */
 static int open_current_keep_pause(int was_paused)
 {
@@ -1215,6 +1313,19 @@ void player_resume(void)
     }
     g_pl_last_us = mmio_read32(USEC_TIMER_ADDR);
     g_pl_paused  = 0;
+    if (g_pl_bringup_pending) {
+        /* The track was opened paused: this is its first bring-up. */
+        if (bringup_pending() != 0) {
+            /* The DAC can't clock this file — the refusal an unpaused open
+             * would have made at the skip. Don't leave the transport wedged
+             * on it: move on, playing, as pending_commit does for a
+             * format-change hand-over the HAL refuses. */
+            g_last_err  = PLAYER_ERR_RATE;
+            g_pl_active = 0;
+            player_advance();
+        }
+        return;
+    }
     if (g_pl_codec_cold) {
         codec_wake();
     }
@@ -1239,8 +1350,9 @@ void player_stop(void)
         return;
     }
     hal_audio_stop();
-    g_pl_paused = 0;
-    g_pending   = 0;                     /* drop any queued hand-over */
+    g_pl_paused          = 0;
+    g_pl_bringup_pending = 0;            /* nothing left to bring up for   */
+    g_pending            = 0;            /* drop any queued hand-over      */
     /* NOTE: do NOT close the decoder here. Closing it MID-DECODE (song switch)
      * hard-freezes the device (marker 9), while closing at end-of-track
      * (auto-advance) is fine — a decode-in-progress teardown hazard. The next
@@ -1269,8 +1381,6 @@ static int auto_next_index(int from)
  * spin-up) is covered by up to 5.94 s of audio that is already decoded — where
  * before it happened in dead silence after the ring had drained.
  */
-static void player_advance(void);        /* fwd: the commit path can skip too */
-
 static void prefetch_next(void)
 {
     int nxt = auto_next_index(g_queue_idx);
@@ -1373,7 +1483,7 @@ static void pending_commit(void)
         hal_audio_drain(500u);
         hal_audio_stop();
         decode_pump();
-        if (audio_bringup(g_dec.sample_rate, 1) != 0) {
+        if (audio_bringup(g_dec.sample_rate) != 0) {
             /* The DAC can't clock this file. Don't let one odd-rate track end
              * the album — skip it the way a corrupt file is skipped. */
             g_last_err  = PLAYER_ERR_RATE;
