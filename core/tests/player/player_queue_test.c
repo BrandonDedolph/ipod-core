@@ -1152,6 +1152,73 @@ int main(void)
     xpect(&c, "a button press does NOT wait for the buffers to drain",
           stub_audio_drains == 0);
 
+    /* ---- 13e'. a skip while paused never runs the DMA ------------------ *
+     *
+     * Next / Prev / a queue jump while paused stayed paused, but only after
+     * the fact: the open brought the codec up, kicked the DMA at the user's
+     * gain, and THEN player_pause() muted it over I2C — a click on every
+     * paused skip. The open must now bring the transport up already paused,
+     * with hal_audio_start() never called, and the resume that follows is
+     * the first time the DAC runs on the new track. */
+    stub_reset();
+    stub_set_track_frames(44100u * 10u);
+    make_entries(ents, 4, 0);
+    player_play_queue(ents, 4, 1, 0, 0);
+    set_usec(0);
+    player_pause();
+    {
+        int starts_before = stub_audio_starts;
+        int stops_before  = stub_audio_stops;
+        player_next();                           /* -> 2 */
+        xpect(&c, "Next while paused moves to the next track, still paused",
+              player_queue_current() == 2 && player_paused() == 1 &&
+              player_active() == 1);
+        xpect(&c, "Next while paused never starts the DAC",
+              stub_audio_starts == starts_before && stub_audio_running == 0);
+        player_prev();                           /* -> 1 (clock at 0:00) */
+        xpect(&c, "Prev while paused goes back, still paused",
+              player_queue_current() == 1 && player_paused() == 1);
+        xpect(&c, "Prev while paused never starts the DAC",
+              stub_audio_starts == starts_before && stub_audio_running == 0);
+        player_jump(3);
+        xpect(&c, "a queue jump while paused lands paused",
+              player_queue_current() == 3 && player_paused() == 1);
+        xpect(&c, "a queue jump while paused never starts the DAC",
+              stub_audio_starts == starts_before && stub_audio_running == 0);
+        xpect(&c, "a paused open holds the clock at 0:00",
+              player_elapsed_s() == 0u);
+        (void)stops_before;
+        /* The eventual resume is the new track's first sound: the DAC comes
+         * up and pulls the PCM the open primed. */
+        set_usec(3000000u);
+        player_resume();
+        xpect(&c, "resume after a paused skip starts the DAC once",
+              stub_audio_starts == starts_before + 1 && stub_audio_running == 1);
+        xpect(&c, "resume after a paused skip plays from the primed ring",
+              stub_drain(1024) == 1024);
+        xpect(&c, "resume after a paused skip runs the clock from 0:00",
+              player_elapsed_s() == 0u);
+        set_usec(4000000u);
+        xpect(&c, "...and a second later it reads 1", player_elapsed_s() == 1u);
+        /* A paused skip must still time the codec power-down from the skip,
+         * as a normal pause would from the button press. */
+        player_pause();
+        set_usec(4000000u + 1000000u);
+        player_prev();                           /* 1 s in: a real skip, -> 2 */
+        xpect(&c, "the paused skip under test happened",
+              player_queue_current() == 2 && player_paused() == 1);
+        int suspends_before = stub_audio_suspends;
+        set_usec(4000000u + 1000000u + PLAYER_PAUSE_CODEC_OFF_US - 1u);
+        player_pump();
+        xpect(&c, "a paused skip's power-down is timed from the skip: not yet",
+              stub_audio_suspends == suspends_before);
+        set_usec(4000000u + 1000000u + PLAYER_PAUSE_CODEC_OFF_US);
+        player_pump();
+        xpect(&c, "a paused skip's power-down is timed from the skip: now",
+              stub_audio_suspends == suspends_before + 1);
+    }
+    stub_set_track_frames(8192u);
+
     /* ---- 13e. quiet playback parks the drive ONCE ---------------------- *
      *
      * Between refill bursts the anti-skip buffer is topped up and idle, and

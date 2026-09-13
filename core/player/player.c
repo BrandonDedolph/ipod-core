@@ -971,7 +971,7 @@ static void clock_set_us(uint64_t us)
 }
 
 /*
- * Bring the DAC up at `rate` and start pulling from the ring.
+ * Bring the DAC up at `rate` and, if `start`, begin pulling from the ring.
  *
  * hal_audio_init RESETS the WM8758 and writes 0 dB headphone gain, so the
  * user's volume and balance have to be re-applied — and re-applied BEFORE the
@@ -983,9 +983,18 @@ static void clock_set_us(uint64_t us)
  * for the WHOLE track — full-scale into someone's headphones at a "20%"
  * setting. Doing it here covers every path into playback by construction.
  *
+ * `start` is 0 when the transport is being opened PAUSED (a skip while
+ * paused). The codec is brought up and the source is registered, but the DMA
+ * is not kicked: hal_audio_init leaves the HAL with no buffered PCM, so the
+ * hal_audio_start() that the eventual resume issues cold-primes both buffers
+ * from the ring — the same first sound a normal open produces, just later.
+ * Kicking here and pausing straight after, which is what a paused skip used
+ * to do, played the first ~1-30 ms of the new track at the user's gain and
+ * then muted it over I2C: an audible click on every Next/Prev while paused.
+ *
  * Returns 0, or -1 if the HAL can't clock this format.
  */
-static int audio_bringup(uint32_t rate)
+static int audio_bringup(uint32_t rate, int start)
 {
     if (hal_audio_init(rate, 2u) != 0) {
         return -1;
@@ -993,7 +1002,9 @@ static int audio_bringup(uint32_t rate)
     hal_volume_set(hal_volume_get());
     hal_balance_set(hal_balance_get());
     hal_audio_set_source(ring_source, 0);
-    hal_audio_start();
+    if (start) {
+        hal_audio_start();
+    }
     g_out_rate      = rate;
     g_pl_codec_cold = 0;                 /* init is a full bring-up */
     return 0;
@@ -1030,10 +1041,12 @@ static void codec_wake(void)
     g_pl_codec_cold = 0;
 }
 
-/* Open g_queue[g_queue_idx] and start the DAC. Returns 0, or -1 on failure;
- * player_last_error() then says whether the file was unreadable or simply a
- * format the DAC can't clock, so the UI can eventually explain the skip. */
-static int player_open_current(void)
+/* Open g_queue[g_queue_idx] and start the DAC — or, with `paused`, bring
+ * the codec up and leave the transport paused at 0:00 with the DMA never
+ * kicked (see audio_bringup). Returns 0, or -1 on failure; player_last_error()
+ * then says whether the file was unreadable or simply a format the DAC can't
+ * clock, so the UI can eventually explain the skip. */
+static int player_open_current(int paused)
 {
     load_track_art(&g_queue[g_queue_idx]);
 
@@ -1057,38 +1070,39 @@ static int player_open_current(void)
      * scrolled past unplayed and unexplained. Mono is up-mixed to stereo in
      * the decode step, so the DAC only ever sees 2 channels and we depend on
      * the HAL for nothing but the rate. */
-    if (audio_bringup(g_dec.sample_rate) != 0) {
+    if (audio_bringup(g_dec.sample_rate, !paused) != 0) {
         g_last_err = PLAYER_ERR_RATE;
         return -1;
     }
     clock_set_us(0);
     g_pl_low_fill = RING_FRAMES;
     g_pl_active   = 1;
-    g_pl_paused   = 0;
+    g_pl_paused   = paused;
+    if (paused) {
+        /* A fresh pause on the new track: the codec power-down in the pump
+         * is timed from here, exactly as if the listener had just pressed
+         * pause. The clock is frozen at 0:00 (nothing folds while paused). */
+        g_pl_pause_us = mmio_read32(USEC_TIMER_ADDR);
+    }
     g_last_err    = PLAYER_OK;
     g_open_seq++;
     return 0;
 }
 
 /*
- * Open the current entry, restoring a paused transport if we were paused.
+ * Open the current entry, keeping a paused transport paused.
  *
  * Every manual skip (Next / Prev / queue jump) funnels through here. Without
- * it, skipping while paused silently RESUMED playback: player_open_current
- * unconditionally clears g_pl_paused and calls hal_audio_start(). The codec
- * still comes up at the user's gain either way — audio_bringup re-latches
- * volume before the DMA is kicked, and the pause below only suspends the DMA
- * again, it doesn't touch the gain.
+ * it, skipping while paused silently RESUMED playback. It used to open
+ * normally and then call player_pause(), which was silent on paper and not
+ * in the ear: the open kicked the DMA at the user's gain and the pause then
+ * muted it over I2C, so every skip while paused clicked. The pause is now
+ * part of the open itself — the DMA is never started (audio_bringup), so
+ * there is nothing to cut.
  */
 static int open_current_keep_pause(int was_paused)
 {
-    if (player_open_current() != 0) {
-        return -1;
-    }
-    if (was_paused) {
-        player_pause();
-    }
-    return 0;
+    return player_open_current(was_paused);
 }
 
 /* Pause: suspend the DMA but keep the decoder, ring, and position — resume
@@ -1282,7 +1296,7 @@ static void pending_commit(void)
         hal_audio_drain(500u);
         hal_audio_stop();
         decode_pump();
-        if (audio_bringup(g_dec.sample_rate) != 0) {
+        if (audio_bringup(g_dec.sample_rate, 1) != 0) {
             /* The DAC can't clock this file. Don't let one odd-rate track end
              * the album — skip it the way a corrupt file is skipped. */
             g_last_err  = PLAYER_ERR_RATE;
@@ -1324,7 +1338,7 @@ static void player_advance(void)
     }
     /* Repeat One: replay the same track (single attempt — falling into the skip
      * loop below with Repeat-One set would retry a lone broken track forever). */
-    if (g_repeat == 2 && player_open_current() == 0) {
+    if (g_repeat == 2 && player_open_current(0) == 0) {
         return;
     }
     for (int tries = 0; tries <= g_queue_n; tries++) {
@@ -1339,7 +1353,7 @@ static void player_advance(void)
             return;
         }
         g_queue_idx = nxt;
-        if (player_open_current() == 0) {
+        if (player_open_current(0) == 0) {
             return;                      /* next track playing */
         }
         /* else: broken track, loop to skip it (bounded by `tries`) */
@@ -1364,7 +1378,7 @@ void player_play_queue(const browse_entry_t *src, int n, int start,
      * suppressed for the life of this queue. */
     g_queue_art_shared = (art_clus != 0);
     load_folder_art(g_pl_fs, art_clus, art_size);  /* queue-level art */
-    if (player_open_current() != 0) {
+    if (player_open_current(0) != 0) {
         player_advance();                /* skip a broken first track */
     }
 }
@@ -1399,7 +1413,7 @@ void player_queue_commit(int start)
      * previous track's artwork. */
     g_queue_art_shared = 0;
     load_folder_art(g_pl_fs, 0, 0);      /* mixed queue: per-track art loads on open */
-    if (player_open_current() != 0) {
+    if (player_open_current(0) != 0) {
         player_advance();                /* skip a broken first track */
     }
 }
