@@ -101,12 +101,18 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   slot alternation confirmed from a raw disk dump, and `chkdsk` found no
   problems afterwards.
 - **Resume on boot** — comes back on the track you left, **paused**, at the
-  saved position. Bound by the folded `name_hash()` of the filename (not an
-  index or a cluster), cross-checked against duration ±2 s and required to
-  be unique otherwise, so it survives a library rebuild. Positions under
-  10 s aren't seeked. Any doubt at any step leaves the device exactly as if
-  nothing had been saved. Parity between the C and host implementations is
-  gated by `check_resume_parity.py` in `make verify-hw`.
+  saved position, **in the queue you were playing it in**: Songs, an
+  artist's songs, a genre, or the same Shuffle Songs draw, with the same
+  shuffle order (Next is still the track that was coming next). Bound by
+  the folded `name_hash()` of the filename (not an index or a cluster),
+  cross-checked against duration ±2 s and required to be unique otherwise,
+  so it survives a library rebuild. The queue is rebuilt from a kind byte
+  plus two seeds (the record grew 24 → 44 bytes under the same version;
+  old records still load and fall back to the album). Positions under 10 s
+  aren't seeked. Any doubt at any step falls back to the track's album,
+  and past that leaves the device exactly as if nothing had been saved.
+  Parity between the C and host implementations is gated by
+  `check_resume_parity.py` in `make verify-hw`. Not yet flashed.
 - **Boot Details** (Settings → Boot Details) — a live per-phase breakdown of
   the last cold boot: LCD/BCM, disk + mount, library, resume (split into
   dir / open / seek), and OTHER derived as total-minus-named so unmeasured

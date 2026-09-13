@@ -619,7 +619,7 @@ static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repain
 static int            g_shuffle;          /* walk g_order instead of the queue     */
 static int            g_repeat;           /* 0 off, 1 all (loop queue), 2 one       */
 static flac_meta_t    g_cur_meta;         /* tags/duration of the current track     */
-static uint32_t       g_rng = 0x2545F491u;/* LCG state for shuffle (varies w/ USEC) */
+static uint32_t       g_rng = 0x2545F491u;/* LCG state for shuffle (see rng_next)  */
 
 /*
  * The shuffle ORDER: every playable queue index, dealt into a random
@@ -645,6 +645,15 @@ static uint32_t       g_rng = 0x2545F491u;/* LCG state for shuffle (varies w/ US
 _Static_assert(QUEUE_MAX <= 65535, "g_order indexes the queue with uint16_t");
 static uint16_t       g_order[QUEUE_MAX];
 static int            g_order_n;          /* playable entries in g_order (0 = none) */
+/*
+ * What the current g_order was dealt FROM, so it can be dealt again: the LCG
+ * seed and the `keep` index handed to shuffle_deal(). Together they describe
+ * the order completely (see player_order_seed), which is what lets a saved
+ * resume position bring back the same "what plays next" after a power cut
+ * instead of a fresh draw. g_order_seed is 0 until the first deal.
+ */
+static uint32_t       g_order_seed;
+static int            g_order_keep = PLAYER_KEEP_NONE;
 static int            g_last_err;         /* why the last open/skip failed          */
 
 /* Format the DAC is currently clocked at. hal_audio_init is only re-issued
@@ -716,14 +725,22 @@ void player_set_repeat(int mode)  { g_repeat  = mode; }
  * a permutation of exactly the playable queue indices. It is dealt at every
  * queue (re)start (player_play_queue / player_queue_commit) and on every
  * off->on toggle, so it can never be stale against the queue it indexes.
+ * Every deal records the (seed, keep) pair it came from, and the same pair
+ * over the same queue deals the same order (player_reshuffle_with_seed).
  * ------------------------------------------------------------------------- */
 
-/* The one LCG, stirred with the free-running microsecond timer so two boots
- * (and two toggles) don't deal the same order. The low bits of an LCG are
- * the least random, hence the >> 8. */
+/*
+ * The one LCG. A PURE generator: its output is a function of g_rng alone, so
+ * a deal is reproducible from the seed it started at. It used to stir the
+ * free-running microsecond timer into every step, which made two boots deal
+ * different orders (good) but also made every order unrepeatable (bad — the
+ * resume path could never bring back "what was going to play next"). The
+ * entropy now goes in ONCE per deal, in shuffle_build(). The low bits of an
+ * LCG are the least random, hence the >> 8.
+ */
 static uint32_t rng_next(void)
 {
-    g_rng = g_rng * 1103515245u + 12345u + mmio_read32(USEC_TIMER_ADDR);
+    g_rng = g_rng * 1103515245u + 12345u;
     return g_rng >> 8;
 }
 
@@ -777,20 +794,31 @@ static void order_swap(int a, int b)
 }
 
 /*
- * Deal a fresh order: every playable index, Fisher-Yates shuffled. When
- * `keep` is a playable index it is moved to the FRONT afterwards, so the
- * track that is playing right now stays current and the shuffle only decides
- * what comes after it — turning Shuffle on mid-album must not restart or
- * change the song. Moving one element to the front of a uniform permutation
- * leaves the remainder uniformly random, so nothing is biased by it.
+ * Deal an order from `seed`: every playable index, Fisher-Yates shuffled by
+ * the LCG started at `seed`. When `keep` is a playable index it is moved to
+ * the FRONT afterwards, so the track that is playing right now stays current
+ * and the shuffle only decides what comes after it — turning Shuffle on
+ * mid-album must not restart or change the song. Moving one element to the
+ * front of a uniform permutation leaves the remainder uniformly random, so
+ * nothing is biased by it. PLAYER_KEEP_QUEUE skips the shuffle: the order is
+ * the queue's own (for a queue that was enqueued already shuffled).
+ *
+ * Deterministic: the same (seed, keep) over the same queue deals the same
+ * order, and both are recorded so it can be asked for again.
  */
-static void shuffle_build(int keep)
+static void shuffle_deal(uint32_t seed, int keep)
 {
     int n = 0;
     for (int i = 0; i < g_queue_n; i++) {
         if (!g_queue[i].is_dir) g_order[n++] = (uint16_t)i;
     }
-    g_order_n = n;
+    g_order_n    = n;
+    g_order_seed = seed;
+    g_order_keep = keep;
+    if (keep == PLAYER_KEEP_QUEUE) {
+        return;                           /* queue order IS the order */
+    }
+    g_rng = seed;
     for (int i = n - 1; i > 0; i--) {
         int j = (int)(rng_next() % (uint32_t)(i + 1));
         order_swap(i, j);
@@ -799,6 +827,20 @@ static void shuffle_build(int keep)
         int p = order_pos_of(keep);
         if (p > 0) order_swap(0, p);
     }
+}
+
+/*
+ * Deal a FRESH order. The free-running microsecond timer is stirred into the
+ * LCG here — once per deal, not per step — so two boots (and two toggles)
+ * don't deal the same order, while the deal itself stays a pure function of
+ * the seed it records. Never seeds 0: that value means "no order dealt" to
+ * player_order_seed().
+ */
+static void shuffle_build(int keep)
+{
+    uint32_t seed = g_rng * 1103515245u + 12345u + mmio_read32(USEC_TIMER_ADDR);
+    if (seed == 0) seed = 1;
+    shuffle_deal(seed, keep);
 }
 
 /* The entry after `from` in SHUFFLE order. -1 once the order is used up and
@@ -820,7 +862,16 @@ static int shuffle_next(int from)
     int pos = order_pos_of(from);         /* -1 (not in the order) starts at the top */
     if (pos + 1 < g_order_n) return g_order[pos + 1];
     if (g_repeat != 1) return -1;
-    shuffle_build(-1);
+    /* Re-deal until the new first track isn't the one that just finished.
+     * Dealing again rather than swapping keeps the order exactly what its
+     * (seed, keep) says it is. Each try is a fresh seed and the chance of
+     * the same first track is 1/n per try, so the bound only ever matters
+     * on a two-track queue, where the swap fallback costs that one order
+     * its replayability and nothing else. */
+    for (int tries = 0; tries < 8; tries++) {
+        shuffle_build(PLAYER_KEEP_NONE);
+        if (g_order_n == 1 || g_order[0] != from) break;
+    }
     if (g_order_n > 1 && g_order[0] == from) {
         order_swap(0, 1 + (int)(rng_next() % (uint32_t)(g_order_n - 1)));
     }
@@ -861,9 +912,23 @@ void player_set_shuffle(int on)
 {
     on = on ? 1 : 0;
     if (on && !g_shuffle) {
-        shuffle_build(g_queue_n > 0 ? g_queue_idx : -1);
+        shuffle_build(g_queue_n > 0 ? g_queue_idx : PLAYER_KEEP_NONE);
     }
     g_shuffle = on;
+}
+
+uint32_t player_order_seed(void) { return g_order_n ? g_order_seed : 0u; }
+int      player_order_keep(void) { return g_order_n ? g_order_keep : PLAYER_KEEP_NONE; }
+
+void player_reshuffle_with_seed(uint32_t seed, int keep)
+{
+    if (g_queue_n == 0) {
+        return;
+    }
+    if (keep >= g_queue_n) {
+        keep = PLAYER_KEEP_NONE;          /* a stale index pins nothing */
+    }
+    shuffle_deal(seed, keep);
 }
 
 void player_init(fat32_t *fs)
@@ -1373,6 +1438,8 @@ void player_play_queue(const browse_entry_t *src, int n, int start,
     g_queue_idx = start;
     if (g_shuffle) {
         shuffle_build(start);            /* the picked track first, then the rest */
+    } else {
+        g_order_n = 0;                   /* the old order indexed the old queue */
     }
     /* One album, one cover: every entry shares it, so per-track art loading is
      * suppressed for the life of this queue. */

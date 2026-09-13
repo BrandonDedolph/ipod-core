@@ -163,6 +163,13 @@ void settings_defaults(settings_t *s)
     s->resume_hash       = 0;
     s->resume_secs       = 0;
     s->resume_total      = 0;
+    s->resume_kind       = RESUME_KIND_NONE;
+    s->resume_flags      = 0;
+    s->resume_qidx       = 0;
+    s->resume_seed       = 0;
+    s->resume_order_seed = 0;
+    s->resume_order_keep = 0;
+    s->resume_ctx_hash   = 0;
 }
 
 int settings_count(int screen)

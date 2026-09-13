@@ -33,6 +33,7 @@
 #include "console.h"
 #include "panic.h"
 #include "config.h"
+#include "resume_ctx.h"
 #include "../ui/text.h"
 #include "../ui/thumb.h"
 #include "../ui/artcache.h"
@@ -2337,10 +2338,22 @@ static void library_ensure(fat32_t *fs)
  */
 /* Whose songs the current view holds ("" = everyone's), for the header. */
 static char g_songview_artist[NAME_MAX + 1];
+static int  g_songview_kind;             /* RESUME_KIND_* of the current view */
+
+/*
+ * What the player's queue was built FROM, for the resume capture: the kind
+ * (RESUME_KIND_*) and, for Shuffle Songs, the library-order seed. Every
+ * builder below sets both; player_jump keeps them (same queue). Together
+ * with the song's own artist/genre fields and the player's order seed they
+ * are enough to build the same queue again at boot (resume_restore).
+ */
+static int      g_queue_kind = RESUME_KIND_NONE;
+static uint32_t g_queue_seed;
 
 static void songview_build(int genre, const char *artist)
 {
     g_list_epoch++;
+    g_songview_kind = resume_kind_of_view(genre, artist);
     copy_display_name(g_songview_artist, artist ? artist : "", 0 /*keep ext*/);
     g_songview_n = 0;
     for (int i = 0; i < g_songs_n; i++) {
@@ -2357,19 +2370,26 @@ static void songview_build(int genre, const char *artist)
     g_song_sel = g_song_accum = 0;
 }
 
-/* Launch a library song in its album's queue (so Next/Prev walk the album). */
 /* Play a song picked on the Songs list: the queue is the ENTIRE current song
  * view (all songs, in the displayed order), started at the picked track — so
  * "N of M" is the song's position in the whole library and Prev/Next walk every
  * song, not just the one album. (Same full-queue build as Shuffle Songs, minus
- * the shuffle.) */
-static void library_play_song(fat32_t *fs, int songview_idx)
+ * the shuffle.) Returns the queue index the pick landed on, -1 if nothing was
+ * queued.
+ *
+ * Does NOT un-mute: the caller re-applies g_volume over the codec re-init.
+ * The boot-time restore runs this under a mute, and an un-mute in here would
+ * land between the DAC starting and the pause — an audible burst of the
+ * track on every power-up. */
+static int library_play_song(fat32_t *fs, int songview_idx)
 {
     (void)fs;
-    if (songview_idx < 0 || songview_idx >= g_songview_n) return;
+    if (songview_idx < 0 || songview_idx >= g_songview_n) return -1;
     uint16_t sel_song = g_songview[songview_idx];
 
     load_bar_begin();
+    g_queue_kind = g_songview_kind;
+    g_queue_seed = 0;
     /* Shuffle is the user's setting, not something picking a song turns off:
      * forcing it off here left the player un-shuffled for the rest of the
      * session while the UI kept showing the SHUF token. */
@@ -2400,49 +2420,53 @@ static void library_play_song(fat32_t *fs, int songview_idx)
         added++;
     }
     if (start >= added) start = (added > 0) ? added - 1 : 0;   /* nothing after it */
+    if (added == 0) return -1;
     player_queue_commit(start);
-    hal_volume_set(g_volume);
+    return start;
 }
 
-/* Tiny LCG for the shuffle pick (no libc; seeded from the free-running timer so
- * each invocation differs). */
-static uint32_t g_rng;
-static uint32_t rng_next(void)
-{
-    g_rng = g_rng * 1664525u + 1013904223u;
-    return g_rng >> 1;                       /* drop the low bit (poor LCG entropy) */
-}
-
-/* "Shuffle Songs": fill the play queue with tracks drawn from randomly-ordered
- * albums (bounded by the queue capacity) and start in shuffle mode, so the
- * order is randomised too. A fresh random draw each time it's chosen. Mixed
- * albums => no single cover, so the now-playing art is left empty. */
-static void shuffle_songs_play(fat32_t *fs)
+/*
+ * Build the Shuffle Songs queue: the WHOLE library (not a sample) in the
+ * order lib_shuffle_order() deals from `seed`, and start it at song index
+ * `start_si` (-1 = the first). Returns the queue index that song landed on,
+ * -1 when the library is empty or the song is not on the disk.
+ *
+ * The queue IS the shuffle, so the player is told to walk it in queue order
+ * (PLAYER_KEEP_QUEUE): the Queue view then shows what will actually play.
+ * It used to force the player's shuffle off for the build and push the
+ * user's setting back afterwards, which is an off->on edge — the player
+ * dealt a second permutation over the already-shuffled queue, and the view
+ * and the playback disagreed. The setting is pushed BEFORE the build now,
+ * so the SHUF token stays honest and there is exactly one deal, which the
+ * KEEP_QUEUE re-deal then replaces with the queue's own order.
+ *
+ * Mixed albums => no single cover, so the queue-level art is left empty and
+ * each entry carries its own. Does NOT un-mute (see library_play_song).
+ */
+static int shuffle_songs_build(fat32_t *fs, uint32_t seed, int start_si)
 {
     library_ensure(fs);
-    if (g_songs_n == 0) return;
+    if (g_songs_n == 0) return -1;
 
     load_bar_begin();
+    g_queue_kind = RESUME_KIND_SHUFFLE;
+    g_queue_seed = seed;
 
-    /* Shuffle ALL song indices (Fisher-Yates) — the WHOLE library, not a sample. */
     static uint16_t ord[LIB_MAX_SONGS];
     int ns = g_songs_n;
-    for (int i = 0; i < ns; i++) ord[i] = (uint16_t)i;
-    g_rng = mmio_read32(USEC_TIMER_ADDR) | 1u;
-    for (int i = ns - 1; i > 0; i--) {
-        int j = (int)(rng_next() % (uint32_t)(i + 1));
-        uint16_t t = ord[i]; ord[i] = ord[j]; ord[j] = t;
-    }
+    lib_shuffle_order(ord, ns, seed);
 
     /* Build the full queue from the resolved song index (file cluster + per-track
      * album cover) — every song, in the shuffled order. The Queue view then shows
      * that order, and Now Playing shows each song's own art. */
-    player_set_shuffle(0);                 /* already shuffled; play in order */
+    player_set_shuffle(g_settings.shuffle);
     player_queue_begin();
+    int start = -1, added = 0;
     for (int i = 0; i < ns; i++) {
         if ((i & 255) == 0) load_bar_progress("Shuffling Songs", i * 100 / ns);
         lib_song_t *s = &g_songs[ord[i]];
         if (!s->file_clus) continue;       /* unresolved (missing on disk) — skip */
+        if (ord[i] == start_si) start = added;
         browse_entry_t e;
         int k = 0;
         for (; s->file[k] && k < NAME_MAX; k++) e.name[k] = s->file[k];
@@ -2455,13 +2479,20 @@ static void shuffle_songs_play(fat32_t *fs)
         e.art_clus = (ai >= 0) ? g_albums[ai].art_clus : 0;
         e.art_size = (ai >= 0) ? g_albums[ai].art_size : 0;
         player_queue_add(&e);
+        added++;
     }
-    player_queue_commit(0);
-    /* The queue is ALREADY shuffled, so it was committed in plain order — but
-     * restore the user's setting now, or Shuffle stays off for everything played
-     * afterwards while the UI still shows SHUF. */
-    player_set_shuffle(g_settings.shuffle);
-    hal_volume_set(g_volume);
+    if (added == 0) return -1;
+    player_queue_commit(start < 0 ? 0 : start);
+    player_reshuffle_with_seed(0, PLAYER_KEEP_QUEUE);   /* the queue is the order */
+    return start;
+}
+
+/* "Shuffle Songs" from the Music menu: a fresh random draw each time it's
+ * chosen. The seed is the free-running timer, ORed with 1 so it is never 0
+ * (0 is "no seed" in the settings record). */
+static void shuffle_songs_play(fat32_t *fs)
+{
+    (void)shuffle_songs_build(fs, mmio_read32(USEC_TIMER_ADDR) | 1u, -1);
 }
 
 /*
@@ -3798,6 +3829,23 @@ static void ui_click(void)
  * cross-check and the restore declines an ambiguous match outright. Resuming
  * nothing is a shrug; resuming the WRONG track is a bug.
  *
+ * WHAT ELSE IS STORED: THE QUEUE
+ *
+ * A track alone is not where the user was — it was the 412th of Songs, or
+ * halfway through a Shuffle Songs draw, and coming back in its ALBUM
+ * instead (which is all the record used to allow) is the "the playlist
+ * switches to the album" bug. Every queue this firmware builds is a
+ * function of the library plus a few words, so the record carries those
+ * words (settings.h, RESUME_KIND_*): the kind of queue; for Songs / an
+ * artist / a genre nothing more, because songview_build() over the resumed
+ * song's own artist or genre is that list again; for Shuffle Songs the LCG
+ * seed the library order was dealt from; and the player's own shuffle deal
+ * as its (seed, keep) pair, so Next after the power cut is still the track
+ * that was going to come next. Suspend keeps all of this in RAM; this is
+ * for the cold boot — PMU standby, the battery cutting out, a battery pull.
+ * The album stays the fallback for a record from before the context
+ * existed and for any rebuild that does not land on the track.
+ *
  * WHEN IT IS CAPTURED (the write budget)
  *
  * Never per second, and never per pass. The position is snapshotted only at
@@ -3851,10 +3899,7 @@ static void resume_capture(void)
          * stored. Otherwise turning it back on next month resumes whatever the
          * user was listening to before they turned it off, which reads as the
          * device remembering something it was told to forget. */
-        if (g_settings.resume_hash != 0) {
-            g_settings.resume_hash  = 0;
-            g_settings.resume_secs  = 0;
-            g_settings.resume_total = 0;
+        if (resume_ctx_clear(&g_settings)) {
             settings_touch();
         }
         return;
@@ -3867,15 +3912,23 @@ static void resume_capture(void)
         return;
     }
 
-    uint32_t h = name_hash(nm);
-    uint32_t e = player_elapsed_s();
-    if (h == g_settings.resume_hash && e == g_settings.resume_secs) {
-        return;                        /* nothing moved — no write to schedule */
+    /* The locator, plus what the track is playing IN: the queue kind and seed
+     * the builder recorded, where in the queue it sits, and the player's
+     * shuffle deal — enough for resume_restore to build the same queue and
+     * the same order, so Next after a power cut is the track that was going
+     * to come next. */
+    resume_ctx_t c;
+    c.hash       = name_hash(nm);
+    c.secs       = player_elapsed_s();
+    c.total      = player_total_s();
+    c.kind       = g_queue_kind;
+    c.qidx       = player_queue_current();
+    c.seed       = g_queue_seed;
+    c.order_seed = player_order_seed();
+    c.order_keep = player_order_keep();
+    if (resume_ctx_store(&g_settings, &c)) {
+        settings_touch();              /* something moved — schedule a write */
     }
-    g_settings.resume_hash  = h;
-    g_settings.resume_secs  = e;
-    g_settings.resume_total = player_total_s();
-    settings_touch();
 }
 
 /*
@@ -3925,44 +3978,34 @@ static int resume_find_song(uint32_t hash, uint32_t total_s)
 }
 
 /*
- * Re-open the saved track at the saved position, PAUSED, at boot.
- *
- * Three things this deliberately does NOT do:
- *
- *   - it does not play. Coming back on and having music start on its own is
- *     hostile, so the transport is left paused with the position already set;
- *     the user presses PLAY. The codec is muted across the open because
- *     player_open_current() unconditionally starts the DAC off a primed ring —
- *     without the mute there is a click between the open and the pause;
- *   - it does not guess. Any failure at any step — setting off, no locator, no
- *     unambiguous song, the album folder no longer lists the file, the open
- *     falling through to a different track — leaves the device exactly as if
- *     nothing had been saved;
- *   - it does not seek an MP3. dr_mp3 has no seek table and scans from the
- *     start, which for a podcast resumed at 50 minutes is a multi-second
- *     freeze on the boot path. FLAC seeks through its SEEKTABLE in O(log n),
- *     so it gets the position and MP3 gets the track cued at 0:00.
+ * Did a rebuilt queue land on the saved track? The builders skip forward
+ * over a track they cannot open — right for a user pressing SELECT, wrong
+ * for a silent restore: being handed a different song than the one you left
+ * is precisely the failure this whole path is written to avoid. The guard is
+ * the same locator the capture wrote: the current entry's name must hash to
+ * resume_hash. (Run under the mute; the caller pauses.)
  */
-static void resume_restore(fat32_t *fs)
+static int resume_landed(void)
 {
-    if (!g_settings.resume_on_startup || g_settings.resume_hash == 0) {
-        return;
+    if (!player_active()) {
+        return 0;
     }
-    int si = resume_find_song(g_settings.resume_hash, g_settings.resume_total);
-    if (si < 0) {
-        return;                        /* deleted, renamed, or ambiguous */
-    }
+    const char *nm = player_queue_name(player_queue_current());
+    return nm[0] != '\0' && name_hash(nm) == g_settings.resume_hash;
+}
 
-    /*
-     * Rebuild the queue as the track's ALBUM — the context Next/Prev should
-     * walk, and the one context we can reconstruct honestly. The real queue
-     * might have been a shuffle of the whole library or a genre view; none of
-     * that survives a power cut, and inventing it would be a worse lie than
-     * the album the track actually lives in.
-     *
-     * browse_collect() only lists FILES at depth 1 (depth 0 is the album
-     * list), so borrow the depth for the read and hand it straight back.
-     */
+/*
+ * The track's ALBUM — the folder it lives in, as the browser would list it.
+ * The one context that needs nothing but the song, so it is the fallback
+ * for every other kind. Writes the entry's format to *fmt (the album can
+ * hold an MP3; the library builders below only ever queue FLAC).
+ *
+ * browse_collect() only lists FILES at depth 1 (depth 0 is the album list),
+ * so borrow the depth for the read and hand it straight back. The browser's
+ * copy of the listing is the caller's to clear.
+ */
+static int resume_open_album(fat32_t *fs, int si, int *fmt)
+{
     int saved_depth = g_dir_depth;
     g_dir_depth = 1;
     uint32_t rt0 = boot_ms_now();
@@ -3981,30 +4024,158 @@ static void resume_restore(fat32_t *fs)
         }
     }
     if (idx < 0) {
-        g_browse_n = 0;                /* the folder no longer holds the file */
+        return 0;                      /* the folder no longer holds the file */
+    }
+    *fmt = g_browse[idx].fmt;
+    g_queue_kind = RESUME_KIND_ALBUM;
+    g_queue_seed = 0;
+    player_play_queue(g_browse, g_browse_n, idx, g_art_clus, g_art_size);
+    return player_queue_current() == idx && resume_landed();
+}
+
+/*
+ * Songs / an artist's songs / a genre's songs. songview_build() matches by
+ * the song's own artist (folded through artist_key, exactly as the Artists
+ * list merged them) or genre, so building it again from the resumed song's
+ * fields is the list the user picked from — no extra key had to be saved.
+ * The saved queue index is only a hint: it is where the song sat last time,
+ * and after a library change it is checked, not trusted.
+ */
+static int resume_open_view(fat32_t *fs, int si, int kind)
+{
+    const lib_song_t *s = &g_songs[si];
+    switch (kind) {
+    case RESUME_KIND_SONGS:  songview_build(-1, 0);             break;
+    case RESUME_KIND_ARTIST: songview_build(-1, s->artist);     break;
+    case RESUME_KIND_GENRE:
+        if (s->genre < 0) return 0;    /* untagged: it was never in a genre */
+        songview_build(s->genre, 0);
+        break;
+    default:
+        return 0;
+    }
+    int vi = -1, hint = g_settings.resume_qidx;
+    if (hint < g_songview_n && g_songview[hint] == si) {
+        vi = hint;
+    }
+    for (int i = 0; vi < 0 && i < g_songview_n; i++) {
+        if (g_songview[i] == si) vi = i;
+    }
+    if (vi < 0) {
+        return 0;                      /* the song is not in that list now */
+    }
+    return library_play_song(fs, vi) >= 0 && resume_landed();
+}
+
+/* Shuffle Songs: the library dealt again from the saved seed. The draw is
+ * a pure function of (seed, library size), so over an unchanged library it
+ * is the same queue in the same order; over a changed one it is a shuffle
+ * that still contains the track, which resume_landed() confirms. */
+static int resume_open_shuffle(fat32_t *fs, int si)
+{
+    if (g_settings.resume_seed == 0) {
+        return 0;
+    }
+    return shuffle_songs_build(fs, g_settings.resume_seed, si) >= 0 &&
+           resume_landed();
+}
+
+/*
+ * Re-open the saved track at the saved position, PAUSED, at boot — in the
+ * queue it was playing in, with the same shuffle order, so Next after a
+ * power cut is the track that was going to come next.
+ *
+ * The queue is rebuilt from the saved kind: Songs, an artist, a genre or a
+ * Shuffle Songs draw, each from the resumed song's own fields plus the seed
+ * the record carries. When the kind is unknown (a record from before the
+ * context existed), the album, or a rebuild that does not land on the track
+ * (the library changed under it), the track's ALBUM is built instead — the
+ * one context that needs nothing but the song.
+ *
+ * Three things this deliberately does NOT do:
+ *
+ *   - it does not play. Coming back on and having music start on its own is
+ *     hostile, so the transport is left paused with the position already set;
+ *     the user presses PLAY. The codec is muted across every open because
+ *     player_open_current() unconditionally starts the DAC off a primed ring —
+ *     without the mute there is a click between the open and the pause;
+ *   - it does not guess. Any failure at every step — setting off, no locator,
+ *     no unambiguous song, neither the saved queue nor the album holding the
+ *     file, an open falling through to a different track — leaves the device
+ *     exactly as if nothing had been saved, codec powered down;
+ *   - it does not seek an MP3. dr_mp3 has no seek table and scans from the
+ *     start, which for a podcast resumed at 50 minutes is a multi-second
+ *     freeze on the boot path. FLAC seeks through its SEEKTABLE in O(log n),
+ *     so it gets the position and MP3 gets the track cued at 0:00.
+ */
+static void resume_restore(fat32_t *fs)
+{
+    if (!g_settings.resume_on_startup || g_settings.resume_hash == 0) {
         return;
     }
+    int si = resume_find_song(g_settings.resume_hash, g_settings.resume_total);
+    if (si < 0) {
+        return;                        /* deleted, renamed, or ambiguous */
+    }
 
-    /* Mute BEFORE the open: audio_bringup() re-latches whatever gain the HAL
-     * currently holds, so a 0 here means the DAC comes up silent and the pause
-     * lands before a single audible sample. Restored at the bottom. */
+    /* Mute BEFORE any open: audio_bringup() re-latches whatever gain the HAL
+     * currently holds, so a 0 here means the DAC comes up silent and the
+     * pause lands before a single audible sample. Restored at the bottom. */
     hal_volume_set(0);
-    uint32_t ot0 = boot_ms_now();
-    player_play_queue(g_browse, g_browse_n, idx, g_art_clus, g_art_size);
-    player_pause();
+    uint32_t ot0  = boot_ms_now();
+    uint32_t seq0 = player_open_seq();   /* bumps iff a track was opened */
+    int kind = g_settings.resume_kind;
+    int fmt  = 0;                      /* the library builders queue FLAC */
+    int ok   = 0;
+    switch (kind) {
+    case RESUME_KIND_SONGS:
+    case RESUME_KIND_ARTIST:
+    case RESUME_KIND_GENRE:   ok = resume_open_view(fs, si, kind); break;
+    case RESUME_KIND_SHUFFLE: ok = resume_open_shuffle(fs, si);    break;
+    default:                  break;   /* album, none, or not wired (playlist) */
+    }
+    if (!ok) {
+        ok = resume_open_album(fs, si, &fmt);
+    }
+    if (ok) {
+        player_pause();
+    }
     g_boot_res_open_ms = boot_ms_now() - ot0;
 
-    /* player_play_queue() skips forward over a track it cannot open. That is
-     * right for a user pressing SELECT and wrong for a silent restore — being
-     * handed a different song than the one you left is precisely the failure
-     * this whole path is written to avoid. */
-    if (!player_active() || player_queue_current() != idx) {
+    /* The album path borrowed the browser's listing; hand it back empty on
+     * every exit, success included. The player copied what it needed, and
+     * a listing left behind at depth 0 is one the album list never shows
+     * but every depth-1 accessor would still read. */
+    g_browse_n = 0;
+    g_cur_dir  = 0;
+    g_art_clus = g_art_size = 0;
+
+    if (!ok) {
+        /* A rebuild that opened the wrong track, or none: stop, and power
+         * the codec down — an open brought the WM8758 up, and a bare
+         * player_stop() would leave it drawing until the next play. Only
+         * if one did: with nothing ever opened the codec was never up. */
         player_stop();
+        if (player_open_seq() != seq0) {
+            hal_audio_close();
+        }
         hal_volume_set(g_volume);
         return;
     }
 
-    if (g_browse[idx].fmt == 0 && g_settings.resume_secs >= RESUME_MIN_SECS) {
+    /* The shuffle order. The build above dealt a fresh one (a boot's worth
+     * of timer entropy); deal the SAVED one back over it so Prev/Next walk
+     * the order the user was walking — but only when the queue really is the
+     * saved one. A fallback to the album is a different queue, and the saved
+     * pair would only describe a deal that never happened to it. */
+    if (g_queue_kind == kind &&
+        (g_settings.resume_order_seed != 0 ||
+         g_settings.resume_order_keep == PLAYER_KEEP_QUEUE)) {
+        player_reshuffle_with_seed(g_settings.resume_order_seed,
+                                   g_settings.resume_order_keep);
+    }
+
+    if (fmt == 0 && g_settings.resume_secs >= RESUME_MIN_SECS) {
         /* Clamped to the track length inside player_seek_to, and a refusal is
          * simply "resumed at 0:00" — never a reason to abandon the track. */
         uint32_t st0 = boot_ms_now();
@@ -4637,7 +4808,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                         songview_build(-1, 0);         /* all songs, all artists */
                         scr_push(SCR_SONGS);
                     } else if (g_music_sel == MU_SHUFFLE) {
-                        shuffle_songs_play(fs);        /* random albums, shuffled */
+                        shuffle_songs_play(fs);        /* the library, shuffled */
+                        hal_volume_set(g_volume);      /* re-apply over codec re-init */
                         if (player_active()) {
                             scr_push(SCR_NOWPLAYING);
                             np_first = 1;
@@ -4690,7 +4862,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                     dirty = 1;
                 }
                 if ((ev.buttons & WHEEL_BTN_SELECT) && g_songview_n > 0) {
-                    library_play_song(fs, g_song_sel);
+                    (void)library_play_song(fs, g_song_sel);
+                    hal_volume_set(g_volume);          /* re-apply over codec re-init */
                     scr_push(SCR_NOWPLAYING);
                     np_first = 1;
                     dirty = 1;
@@ -4747,6 +4920,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                         detail_load_meta(fs);
                         g_det_sel = g_det_accum = 0;
                     } else {
+                        g_queue_kind = RESUME_KIND_ALBUM;
+                        g_queue_seed = 0;
                         player_play_queue(g_browse, g_browse_n, g_det_sel,
                                           g_art_clus, g_art_size);
                         hal_volume_set(g_volume);  /* re-apply over codec re-init */
