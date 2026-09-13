@@ -25,8 +25,33 @@ void stub_set_track_frames(uint32_t frames);
  * it the PCM ring never empties and end-of-track auto-advance never fires, so
  * any test of the queue's advance behaviour has to drive it. Returns the
  * frames actually drained (0 when stopped/paused or the ring is empty).
+ *
+ * Every pull, empty ring or not, also advances the modelled DAC: the real
+ * HAL pads a short pull with silence and clocks the whole buffer out, so a
+ * pull of `frames` while running is `frames` more the listener has sat
+ * through — see the DAC model in player_test_stubs.c.
  */
 int stub_drain(int frames);
+
+/*
+ * The DAC model behind hal_audio_frames_played(): a pipe of pulled-but-unheard
+ * frames between the ring and the converter. stub_set_dac_depth() sets how
+ * deep — the device's two 8192-frame buffers by default (stub_reset puts it
+ * back), the sim's 1024, or 16 for the bare I2S FIFO. What overflows the pipe
+ * has been heard; a flush empties it unheard; a drain plays it out.
+ * stub_set_played_origin() is what hal_audio_init restarts the count at, so
+ * a scenario can start it next to the uint32 wrap. stub_audio_inits counts
+ * the bring-ups (a format change between tracks costs one).
+ */
+void stub_set_dac_depth(uint32_t frames);
+void stub_set_played_origin(uint32_t frames);
+extern int stub_audio_inits;
+
+/* Sample rate the fake decoder reports on every later open (44100 until
+ * changed; stub_reset restores it). hal_audio_init accepts 44100 and this, so
+ * two consecutive tracks at different rates take the player's format-change
+ * hand-over rather than the gapless one. */
+void stub_set_rate(uint32_t hz);
 
 /* Cluster of the file most recently opened — i.e. which queue entry the player
  * actually chose, independent of what its index says. */

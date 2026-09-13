@@ -19,15 +19,19 @@
  * The real player.c runs unmodified over the fakes in player_test_stubs.c.
  * stub_drain() is the DMA feeder: what this test pulls through the source
  * callback is, by definition, `consumed`, so the relationship between pulls
- * and the presented state is pinned exactly. The in-flight depth asserted
- * here (2 x 8192) is the device's — hal/hw/audio.c's AUDIO_FRAMES_PER_BUF,
- * doubled for the ping-pong pair — and is what player.c compensates by. If
- * that buffer changes, this test and DAC_INFLIGHT_FRAMES move together.
+ * and the presented state is pinned exactly. `heard` comes back to the player
+ * through hal_audio_frames_played(), which the stub models as a pipe of
+ * pulled-but-unheard frames of a settable depth. The first sections run it at
+ * the device's depth (2 x 8192, hal/hw/audio.c's ping-pong pair), because
+ * that is the case the bug was found in; section 6 runs the same crossing at
+ * the sim's depth and the bare FIFO's, because the player no longer knows
+ * the depth at all — it used to subtract the device's two buffers, which
+ * was 0..186 ms late on the device and ~350 ms late on the sim.
  *
- * The last section is the other side of the same ring: how much the pump
- * pushes per pass. One step while the ring is healthy, a refill to two pulls'
- * worth when it is thin — the ration a blocking caller (the library scan)
- * would otherwise starve the DMA through.
+ * Section 4 is the other side of the same ring: how much the pump pushes
+ * per pass. One step while the ring is healthy, a refill to two pulls' worth
+ * when it is thin — the ration a blocking caller (the library scan) would
+ * otherwise starve the DMA through.
  */
 
 #include <stdio.h>
@@ -102,9 +106,14 @@ static uint32_t drain_all(void)
  */
 #define TRACK_FRAMES 131072u   /* ~2.97 s: long enough to overshoot by >1 s */
 
-static void start_two_tracks(browse_entry_t *ents)
+/* `depth` is the modelled HAL depth (see the header); `origin` is where the
+ * HAL's played count starts, 0 unless a scenario wants it near the wrap. */
+static void start_two_tracks(browse_entry_t *ents, uint32_t depth,
+                             uint32_t origin)
 {
     stub_reset();
+    stub_set_dac_depth(depth);
+    stub_set_played_origin(origin);
     stub_set_track_frames(TRACK_FRAMES);
     make_entries(ents, 2);
     player_play_queue(ents, 2, 0, 0, 0);
@@ -125,7 +134,7 @@ int main(void)
     player_init(&g_fs);
 
     /* ---- 1. the boundary is presented when HEARD, not when consumed ----- */
-    start_two_tracks(ents);
+    start_two_tracks(ents, HAL_INFLIGHT_FRAMES, 0u);
     xpect(&c, "setup: track 1 was prefetched behind track 0",
           stub_opens == 2 && player_queue_current() == 0);
     uint32_t seq0 = player_open_seq();
@@ -164,7 +173,7 @@ int main(void)
      * The pump only looks between passes. If it first sees the crossing 45056
      * frames (1.0217 s at 44.1 kHz) after the fact, the clock must read that,
      * not restart from zero. */
-    start_two_tracks(ents);
+    start_two_tracks(ents, HAL_INFLIGHT_FRAMES, 0u);
     seq0 = player_open_seq();
     xpect(&c, "credit: the ring held track 0 and the overshoot",
           drain_exact(TRACK_FRAMES + HAL_INFLIGHT_FRAMES + 11u * PULL));
@@ -297,6 +306,180 @@ int main(void)
     xpect(&c, "wrap: a relative seek from 1:30:17", player_seek_seconds(-17) == 0);
     xpect(&c, "wrap: ...lands on 1:30:00", player_elapsed_s() == 5400u);
     stub_set_track_frames(8192u);
+
+    /* ---- 6. the hand-over follows the HAL's count, whatever its depth ---- *
+     * The player used to subtract the device's two buffers from what it had
+     * pulled. It now asks hal_audio_frames_played(), so the same crossing
+     * must present at the exact frame for the bare I2S FIFO (16), the sim's
+     * SDL buffer (1024) and the device's ping-pong pair (16384) alike — and
+     * credit the overshoot exactly in each case. The residual left is the
+     * pump's own pass granularity, which these pumps make zero. */
+    {
+        static const uint32_t depths[3] = { 16u, 1024u, HAL_INFLIGHT_FRAMES };
+        for (int d = 0; d < 3; d++) {
+            uint32_t depth = depths[d];
+            char label[96];
+
+            start_two_tracks(ents, depth, 0u);
+            seq0 = player_open_seq();
+            snprintf(label, sizeof label,
+                     "depth %u: one frame short of the boundary is still track 0",
+                     (unsigned)depth);
+            xpect(&c, label, drain_exact(TRACK_FRAMES + depth - 1u));
+            player_pump();
+            xpect(&c, label,
+                  player_queue_current() == 0 && player_open_seq() == seq0);
+            snprintf(label, sizeof label,
+                     "depth %u: the frame that crosses it presents track 1",
+                     (unsigned)depth);
+            xpect(&c, label, drain_exact(1u));
+            set_usec(30000000u);
+            player_pump();
+            xpect(&c, label,
+                  player_queue_current() == 1 && player_open_seq() == seq0 + 1);
+            snprintf(label, sizeof label,
+                     "depth %u: ...with the clock at 0:00", (unsigned)depth);
+            xpect(&c, label, player_elapsed_s() == 0u);
+
+            /* Late by 45056 frames (1.0217 s): credited, at this depth too. */
+            start_two_tracks(ents, depth, 0u);
+            snprintf(label, sizeof label,
+                     "depth %u: an overshoot seen a pass late is credited",
+                     (unsigned)depth);
+            xpect(&c, label, drain_exact(TRACK_FRAMES + depth + 11u * PULL));
+            set_usec(40000000u);
+            player_pump();
+            xpect(&c, label,
+                  player_queue_current() == 1 && player_elapsed_s() == 1u);
+            set_usec(40978000u);
+            xpect(&c, label, player_elapsed_s() == 1u);
+            set_usec(40979000u);
+            xpect(&c, label, player_elapsed_s() == 2u);
+        }
+    }
+
+    /* ---- 7. the HAL's count wraps under the crossing -------------------- *
+     * hal.h: a uint32, take differences. Start it 256 frames short of 2^32 so
+     * it wraps inside track 0; the crossing and the credit must not notice. */
+    start_two_tracks(ents, HAL_INFLIGHT_FRAMES, 0xFFFFFF00u);
+    seq0 = player_open_seq();
+    xpect(&c, "hal wrap: one frame short is still track 0",
+          drain_exact(TRACK_FRAMES + HAL_INFLIGHT_FRAMES - 1u));
+    player_pump();
+    xpect(&c, "hal wrap: ...",
+          player_queue_current() == 0 && player_open_seq() == seq0);
+    xpect(&c, "hal wrap: the crossing presents track 1 and credits nothing",
+          drain_exact(1u));
+    set_usec(50000000u);
+    player_pump();
+    xpect(&c, "hal wrap: ...",
+          player_queue_current() == 1 && player_elapsed_s() == 0u);
+    start_two_tracks(ents, HAL_INFLIGHT_FRAMES, 0xFFFFFF00u);
+    xpect(&c, "hal wrap: an overshoot across the wrap is credited exactly",
+          drain_exact(TRACK_FRAMES + HAL_INFLIGHT_FRAMES + 11u * PULL));
+    set_usec(60000000u);
+    player_pump();
+    xpect(&c, "hal wrap: ...",
+          player_queue_current() == 1 && player_elapsed_s() == 1u);
+
+    /* ---- 8. a pause in the middle moves nothing ------------------------- *
+     * The count is frozen by the stop and carries on from the resume: the
+     * boundary is still reached by the same pull, not one earlier or later,
+     * however long the pause (long enough here to power the codec down). */
+    start_two_tracks(ents, HAL_INFLIGHT_FRAMES, 0u);
+    seq0 = player_open_seq();
+    xpect(&c, "pause: half of track 0 is pulled", drain_exact(TRACK_FRAMES / 2u));
+    set_usec(70000000u);
+    player_pause();
+    xpect(&c, "pause: nothing is pulled while paused", stub_drain(PULL) == 0);
+    for (int k = 0; k < 20; k++) {
+        set_usec(70000000u + (uint32_t)(k + 1) * 3000000u);   /* a minute */
+        player_pump();
+    }
+    xpect(&c, "pause: the codec went cold underneath", stub_audio_suspends == 1);
+    player_resume();
+    xpect(&c, "pause: the other half, less one frame, is still track 0",
+          drain_exact(TRACK_FRAMES / 2u + HAL_INFLIGHT_FRAMES - 1u));
+    player_pump();
+    xpect(&c, "pause: ...",
+          player_queue_current() == 0 && player_open_seq() == seq0);
+    xpect(&c, "pause: the same frame as without the pause presents track 1",
+          drain_exact(1u));
+    player_pump();
+    xpect(&c, "pause: ...",
+          player_queue_current() == 1 && player_open_seq() == seq0 + 1);
+
+    /* ---- 9. a seek re-pairs the counts ---------------------------------- *
+     * A seek resets the ring (g_written restarts at 0) and flushes the HAL,
+     * but the HAL's played count carries on. The player must re-pair the two
+     * at that moment, or the next boundary would be judged against a count
+     * that is off by everything heard before the seek. */
+    start_two_tracks(ents, HAL_INFLIGHT_FRAMES, 0u);
+    xpect(&c, "seek: some of track 0 is heard first",
+          drain_exact(3u * HAL_BUF_FRAMES));      /* 8192 heard, 16384 in flight */
+    set_usec(80000000u);
+    xpect(&c, "seek: a scrub to 0:01 succeeds", player_seek_to(1u) == 0);
+    xpect(&c, "seek: ...which flushed the HAL", stub_audio_flushes == 1);
+    for (int i = 0; i < 400; i++) {
+        player_pump();                              /* decode the rest, prefetch */
+    }
+    seq0 = player_open_seq();
+    xpect(&c, "seek: track 1 is prefetched behind the seeked track 0",
+          player_queue_current() == 0);
+    /* Track 0 has TRACK_FRAMES - 44100 frames left from 0:01; the boundary
+     * sits there in the fresh ring's numbering. */
+    xpect(&c, "seek: one frame short of the new boundary is still track 0",
+          drain_exact((TRACK_FRAMES - 44100u) + HAL_INFLIGHT_FRAMES - 1u));
+    player_pump();
+    xpect(&c, "seek: ...",
+          player_queue_current() == 0 && player_open_seq() == seq0);
+    xpect(&c, "seek: the frame that crosses it presents track 1", drain_exact(1u));
+    player_pump();
+    xpect(&c, "seek: ...",
+          player_queue_current() == 1 && player_open_seq() == seq0 + 1);
+    xpect(&c, "seek: ...with the clock at 0:00", player_elapsed_s() == 0u);
+
+    /* ---- 10. a format change re-pairs them through hal_audio_init -------- *
+     * Track 0 at 44.1 kHz, tracks 1 and 2 at 48 kHz. The 0->1 hand-over
+     * re-clocks the DAC (a hal_audio_init, which zeroes the HAL's count) while
+     * the ring's numbering runs on; the 1->2 hand-over is then gapless and
+     * must be judged against the re-paired counts. */
+    stub_reset();
+    stub_set_track_frames(TRACK_FRAMES);
+    make_entries(ents, 3);
+    player_play_queue(ents, 3, 0, 0, 0);            /* track 0 opens at 44.1 kHz */
+    stub_set_rate(48000u);                          /* everything after: 48 kHz */
+    for (int i = 0; i < 400; i++) {
+        player_pump();
+    }
+    xpect(&c, "rate: track 1 is prefetched and decode is held at the boundary",
+          stub_opens == 2 && player_queue_current() == 0 &&
+          stub_audio_inits == 1);
+    xpect(&c, "rate: the ring holds exactly track 0", drain_exact(TRACK_FRAMES));
+    xpect(&c, "rate: ...and nothing more", stub_drain(PULL) == 0);
+    set_usec(90000000u);
+    player_pump();                                  /* the ring ran dry: commit */
+    xpect(&c, "rate: the format change re-clocks the DAC and presents track 1",
+          player_queue_current() == 1 && stub_audio_inits == 2 &&
+          stub_audio_running == 1);
+    xpect(&c, "rate: ...with the clock at 0:00", player_elapsed_s() == 0u);
+    for (int i = 0; i < 400; i++) {
+        player_pump();                              /* decode track 1, prefetch 2 */
+    }
+    seq0 = player_open_seq();
+    xpect(&c, "rate: track 2 is prefetched gapless behind track 1",
+          stub_opens == 3 && player_queue_current() == 1);
+    xpect(&c, "rate: one frame short of the gapless boundary is still track 1",
+          drain_exact(TRACK_FRAMES + HAL_INFLIGHT_FRAMES - 1u));
+    player_pump();
+    xpect(&c, "rate: ...",
+          player_queue_current() == 1 && player_open_seq() == seq0);
+    xpect(&c, "rate: the frame that crosses it presents track 2", drain_exact(1u));
+    player_pump();
+    xpect(&c, "rate: ...",
+          player_queue_current() == 2 && player_open_seq() == seq0 + 1);
+    xpect(&c, "rate: ...with the clock at 0:00", player_elapsed_s() == 0u);
+    stub_reset();
 
     return xfail_done(&c);
 }
