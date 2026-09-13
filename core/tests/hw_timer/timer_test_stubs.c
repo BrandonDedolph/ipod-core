@@ -34,6 +34,17 @@ void audio_dma_isr(void)
 {
 }
 
+/* timer_tick_isr() runs the backlight's screen-off countdown once per
+ * RECONCILED tick (so its 10 ms-per-call contract survives a slowed
+ * timer). Counted here so the slow-rate case can assert exactly that; it
+ * emits no MMIO, so the grammar assertions elsewhere are unaffected. */
+int backlight_service_calls;
+
+void backlight_service(void)
+{
+    backlight_service_calls++;
+}
+
 /* timer_tick_isr() now also samples the click wheel each tick. The timer
  * test asserts the tick's register grammar (advance + ack TIMER1_VAL) in
  * isolation and never arms the wheel, so a no-op stub satisfies the link

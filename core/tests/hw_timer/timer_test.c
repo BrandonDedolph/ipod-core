@@ -209,6 +209,78 @@ static int test_sleep_halt_under_audio_deadline(void)
     return fails;
 }
 
+/*
+ * Case 6: timer_set_rate — the suspend loop's slow tick.
+ *
+ *   a. timer_set_rate(10) emits the same four-access arm grammar as
+ *      timer_init with a 100 ms reload (99 999), and timer_set_rate(HZ)
+ *      puts the 9 999 reload back.
+ *   b. At the slow rate the tick COUNTER still advances in 10 ms units:
+ *      an ISR that finds 100 ms on USEC_TIMER adds ten, not one, and the
+ *      backlight's per-10-ms service runs ten times for it.
+ *   c. Out-of-range rates fall back to HZ rather than programming a zero
+ *      or a wrapped period.
+ */
+extern int backlight_service_calls;
+
+static int test_set_rate(void)
+{
+    int fails = 0;
+
+    /* a. grammar, slow then fast */
+    mmio_mock_reset();
+    timer_set_rate(10);
+    trace_cursor tc = trace_begin("timer_set_rate(10)");
+    expect_w(&tc, 32, TIMER1_CFG_ADDR, 0);
+    expect_r(&tc, 32, TIMER1_VAL_ADDR);
+    expect_w(&tc, 32, TIMER1_CFG_ADDR,
+             TIMER_CFG_ENABLE | TIMER_CFG_IRQEN | (100000u - 1u));
+    expect_w(&tc, 32, CPU_INT_EN_ADDR, 1u << TIMER1_IRQ);
+    trace_expect_end(&tc);
+    fails += trace_done(&tc);
+
+    mmio_mock_reset();
+    timer_set_rate(HZ);
+    tc = trace_begin("timer_set_rate(HZ)");
+    expect_w(&tc, 32, TIMER1_CFG_ADDR, 0);
+    expect_r(&tc, 32, TIMER1_VAL_ADDR);
+    expect_w(&tc, 32, TIMER1_CFG_ADDR,
+             TIMER_CFG_ENABLE | TIMER_CFG_IRQEN | (10000u - 1u));
+    expect_w(&tc, 32, CPU_INT_EN_ADDR, 1u << TIMER1_IRQ);
+    trace_expect_end(&tc);
+    fails += trace_done(&tc);
+
+    /* b. the counter keeps its unit: seed at t=0, then one interrupt at
+     * t=100 ms is ten ticks and ten backlight services. */
+    mmio_mock_reset();
+    timer_test_set_tick(0);
+    const uint32_t us[] = { 0, 100000u, 200000u };
+    mmio_mock_queue_read(USEC_TIMER_ADDR, us, 3);
+    timer_tick_isr();                            /* seeds: +1 */
+    backlight_service_calls = 0;
+    timer_tick_isr();                            /* 100 ms later: +10 */
+    fails += check("slow rate: one ISR at +100 ms advances 10 ticks",
+                   current_tick() == 11u);
+    fails += check("slow rate: backlight_service ran once per 10 ms tick",
+                   backlight_service_calls == 10);
+    timer_tick_isr();                            /* another 100 ms: +10 */
+    fails += check("slow rate: no drift across a second interrupt",
+                   current_tick() == 21u && backlight_service_calls == 20);
+
+    /* c. bad rates fall back to HZ */
+    mmio_mock_reset();
+    timer_set_rate(0);
+    fails += check("timer_set_rate(0) arms at HZ",
+                   mmio_mock_log()[2].value ==
+                       (TIMER_CFG_ENABLE | TIMER_CFG_IRQEN | (10000u - 1u)));
+    mmio_mock_reset();
+    timer_set_rate(TIMER_FREQ + 1u);
+    fails += check("timer_set_rate(>1 MHz) arms at HZ",
+                   mmio_mock_log()[2].value ==
+                       (TIMER_CFG_ENABLE | TIMER_CFG_IRQEN | (10000u - 1u)));
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
@@ -217,6 +289,7 @@ int main(void)
     fails += test_irq_dispatch();
     fails += test_sleep_ms();
     fails += test_sleep_halt_under_audio_deadline();
+    fails += test_set_rate();
 
     if (fails == 0) {
         printf("ALL PASS\n");
