@@ -626,9 +626,14 @@ int config_load(fat32_t *fs, settings_t *s)
             return 0;
         }
         /* File is usable but holds no valid record (fresh, or both slots
-         * damaged). Saving stays ENABLED — the first write is exactly how we
+         * damaged). Saving stays ENABLED — writing slot 0 is exactly how we
          * recover — but the caller keeps its defaults. seq restarts at 0 so
-         * the first save writes 1. */
+         * the first save writes 1. No record came from anywhere, so `slot`
+         * is not "where the newest record is": it is set so the alternation
+         * in config_save (the OTHER slot) lands the first write in slot 0,
+         * which is what this comment and tools/make_config.py --verify have
+         * always told the person watching the bring-up to expect. */
+        g_cfg.slot = 1;
         return 0;
     }
 

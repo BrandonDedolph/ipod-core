@@ -23,13 +23,17 @@
  *      a torn/garbage slot is ignored in favour of the good one, sequence
  *      WRAPAROUND resolves the right way round, both-bad falls back to
  *      defaults, and a missing/too-small file disables writing entirely.
+ *      Plus READ ERRORS, which are not the same thing as a bad slot: a
+ *      failed read is retried, and a slot still unreadable with no good
+ *      record to anchor on makes the module refuse to write for the session.
  *
  *   4. WRITE GRAMMAR. config_save() compiled against the recording mock bus
  *      (-DMMIO_MOCK), asserting the exact register sequence ata.c emits:
  *      WRITE SECTORS 0x30 with the resolved LBA in the task registers, two
  *      DRQ-out data phases of 256 halfwords each, then FLUSH CACHE 0xE7.
- *      Also that a refused save emits ZERO bus events, and that consecutive
- *      saves ALTERNATE slots.
+ *      Also that a refused save emits ZERO bus events, that consecutive
+ *      saves ALTERNATE slots, and that a fresh (or both-bad) file takes its
+ *      first write in slot 0, as the host tool tells the operator to expect.
  *
  * WHAT THIS CANNOT PROVE: that the drive does what the trace says. The
  * register grammar, the alignment and the addresses are checked; the physical
@@ -827,6 +831,64 @@ static void test_write_trace(void)
     }
 }
 
+/*
+ * A FRESH file (both slots zero) — the state make_config.py --create leaves
+ * behind, and what --verify describes as "will write slot 0 on the first
+ * save". The comment in config_load said the same. The code disagreed: with
+ * no record loaded g_cfg.slot stayed 0, config_save alternated to the OTHER
+ * slot, and the first write went to slot 1. Pinned on the wire, both saves.
+ */
+static void test_fresh_file_slot(void)
+{
+    uint8_t expect[CONFIG_SLOT_BYTES];
+    settings_t s;
+    fat32_t fs;
+
+    check("fresh setup: load finds no record but the file is writable",
+          load_with(0, 0, &fs, &s) == 0 && config_writable() == 1 &&
+          config_seq() == 0u);
+
+    s.volume = 55;
+    config_encode(expect, &s, 1);
+    arm_drive_ready();
+    check("fresh file: first save returns 0", config_save(&s) == 0);
+    check("fresh file: first save is seq 1", config_seq() == 1u);
+    trace_cursor tc = trace_begin("cfg-fresh-first-write-slot0");
+    expect_write_trace(&tc, CFG_LBA0, expect);
+    trace_expect_end(&tc);
+    if (trace_done(&tc) != 0) {
+        g_fails++;
+    }
+
+    s.theme = 2;
+    config_encode(expect, &s, 2);
+    arm_drive_ready();
+    check("fresh file: second save returns 0", config_save(&s) == 0);
+    trace_cursor tc2 = trace_begin("cfg-fresh-second-write-slot1");
+    expect_write_trace(&tc2, CFG_LBA1, expect);
+    trace_expect_end(&tc2);
+    if (trace_done(&tc2) != 0) {
+        g_fails++;
+    }
+
+    /* Both slots damaged is the same "no record" state and takes the same
+     * path: recovery starts in slot 0. */
+    uint8_t a[CONFIG_SLOT_BYTES], b[CONFIG_SLOT_BYTES];
+    for (unsigned i = 0; i < sizeof a; i++) a[i] = 0xFF;
+    for (unsigned i = 0; i < sizeof b; i++) b[i] = 0x5A;
+    check("both-bad setup: load finds no record but stays writable",
+          load_with(a, b, &fs, &s) == 0 && config_writable() == 1);
+    config_encode(expect, &s, 1);
+    arm_drive_ready();
+    check("both slots bad: first save returns 0", config_save(&s) == 0);
+    trace_cursor tc3 = trace_begin("cfg-bothbad-first-write-slot0");
+    expect_write_trace(&tc3, CFG_LBA0, expect);
+    trace_expect_end(&tc3);
+    if (trace_done(&tc3) != 0) {
+        g_fails++;
+    }
+}
+
 static void test_save_refusals(void)
 {
     settings_t s;
@@ -1081,6 +1143,7 @@ int main(int argc, char **argv)
     test_seq_order();
     test_two_slot();
     test_write_trace();
+    test_fresh_file_slot();
     test_save_refusals();
     test_load_read_errors();
     test_probe();
