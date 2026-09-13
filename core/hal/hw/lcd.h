@@ -67,27 +67,45 @@ void lcd_present_fb(const uint16_t *fb);
 void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h);
 
 /*
- * Panel sleep/wake for suspend (EXPERIMENTAL — see lcd.c). lcd_sleep() blanks
- * the panel via the BCM LCD_SLEEP command without power-gating the BCM (so no
- * firmware re-upload is needed to wake). After lcd_wake(), present a frame to
- * re-light + repaint the panel.
+ * Panel sleep/wake (suspend, and the backlight-off idle state; DEVICE-
+ * UNVERIFIED — see lcd.c). lcd_sleep() blanks the panel via the BCM
+ * LCD_SLEEP command without power-gating the BCM (so no firmware re-upload
+ * is needed to wake). After lcd_wake(), present a frame to re-light + repaint
+ * the panel.
  *
- * Both are idempotent. While slept, lcd_fill / lcd_present_fb /
- * lcd_present_rect are no-ops: streaming a frame into a BCM that is sleeping,
- * or into the internal panel init that follows a wake, latches it permanently
- * (the "screen wakes to solid white, needs a reboot" failure) and we have no
- * bcm_init() to recover with.
+ * Both are idempotent, so two owners of the sleep compose: a panel already
+ * slept at idle that then enters suspend is slept once and woken once.
  *
- * SEQUENCING ON WAKE — the caller must: lcd_wake(); present ONE frame (which
- * absorbs up to ~500 ms of BCM panel init and returns when it has retired);
- * THEN raise the backlight. Lighting the panel before that first present
- * completes shows the panel init as a white flash (02-lcd.md).
+ * While slept, lcd_fill / lcd_present_fb / lcd_present_rect are REFUSED (no
+ * bus traffic; counted by lcd_presents_refused): streaming a frame into a BCM
+ * that is sleeping, or into the internal panel init that follows a wake,
+ * latches it permanently (the "screen wakes to solid white, needs a reboot"
+ * failure). The recovery for that latch, lcd_recover(), exists but is
+ * compiled out (LCD_RECOVER_ON_WAKE) until it has run on silicon. A refused
+ * present means the BCM's framebuffer still holds the LAST frame from before
+ * the sleep, not what the caller drew — so the caller's first frame after
+ * lcd_wake() must be a FULL repaint, never a partial on top of stale pixels.
+ *
+ * SEQUENCING ON WAKE — the caller must: lcd_wake(); present ONE FULL frame
+ * (which issues the update and then absorbs up to ~500 ms of BCM panel init,
+ * returning only when it has retired); THEN raise the backlight. Lighting the
+ * panel before that first present returns shows the panel init as a white
+ * flash (02-lcd.md). kernel/main.c does this in three places — suspend's
+ * wake, the refused-standby fallback, and the main loop's panel-wake block —
+ * and the battery SHUTOFF notice and panic() do the same before they draw.
  */
 void lcd_sleep(void);
 void lcd_wake(void);
 
-/* Nonzero while the panel is slept (presents are being ignored). */
+/* Nonzero while the panel is slept (presents are being refused). */
 int lcd_is_slept(void);
+
+/* How many presents (lcd_fill / lcd_present_fb / lcd_present_rect) have been
+ * refused since boot because the panel was slept. Monotonic; a caller that
+ * wants "did anything try to draw while I was dark" snapshots it at sleep and
+ * compares at wake. Nonzero on a device is not an error — it says a partial
+ * painter ran into the slept panel and the wake frame had to be full. */
+uint32_t lcd_presents_refused(void);
 
 /*
  * How many times a BCM handshake has exhausted its budget since boot. These

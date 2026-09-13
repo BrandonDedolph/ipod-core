@@ -197,6 +197,14 @@ static void bcm_wall_delay(uint32_t us)
 /* Panel-slept flag: while set, NOTHING may stream pixels (see lcd_sleep). */
 static int lcd_slept;
 
+/* Presents (lcd_fill / lcd_present_rect) refused because the panel was
+ * slept. A refused present leaves the BCM's framebuffer holding whatever it
+ * held before the sleep, so the pixels the caller drew never reached the
+ * panel; the caller's first frame after lcd_wake() must therefore be a FULL
+ * one. Counted so a caller can tell that happened (see lcd_presents_refused)
+ * and so the UART line shows it on the device. */
+static uint32_t lcd_refused;
+
 /* Set by lcd_wake: the next commit must absorb the long panel-init update. */
 static int lcd_post_wake;
 
@@ -564,7 +572,8 @@ void lcd_fill(uint16_t rgb565)
     uint32_t n = BCM_FRAME_WORDS;
 
     if (lcd_slept) {
-        return;      /* panel is asleep — never stream into a powering-down BCM */
+        lcd_refused++;   /* panel asleep — never stream into a powering-down BCM */
+        return;
     }
 
     /* ONLY the pixel stream must be uninterrupted: an ISR stalling the push
@@ -637,8 +646,11 @@ void lcd_present_rect(const uint16_t *fb, int x, int y, int w, int h)
 {
     /* Panel asleep: refuse. Streaming pixels while the BCM is sleeping — or
      * while it is running the panel init that follows a wake — is what latches
-     * it permanently (see lcd_sleep / bcm_frame_commit). */
+     * it permanently (see lcd_sleep / bcm_frame_commit). Counted: the
+     * pixels never reached the BCM, and the caller's wake frame must be a
+     * full one to make up for it. */
     if (lcd_slept) {
+        lcd_refused++;
         return;
     }
 
@@ -802,6 +814,11 @@ void lcd_wake(void)
 int lcd_is_slept(void)
 {
     return lcd_slept;
+}
+
+uint32_t lcd_presents_refused(void)
+{
+    return lcd_refused;
 }
 
 /* ---- BCM bootstrap and firmware upload (RECOVERY PATH ONLY) ----------------

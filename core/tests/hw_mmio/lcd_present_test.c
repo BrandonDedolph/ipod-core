@@ -531,6 +531,147 @@ static int test_lcd_present_post_wake(void)
 }
 
 /*
+ * Refusal is REPORTED, and the sleep has two owners that compose. The main
+ * loop's idle panel sleep (kernel/main.c PANEL_SLEEP_AT_IDLE) rests on both:
+ *   - a present that lands on a slept panel is refused with NO bus traffic
+ *     and is COUNTED (lcd_presents_refused), so a caller can know that the
+ *     BCM's framebuffer is stale and its wake frame must be a full one;
+ *   - lcd_sleep() / lcd_wake() are idempotent: a panel already slept at
+ *     idle that then enters suspend — which sleeps it again — is slept once
+ *     (the second sleep is silent), and ONE wake brings it back and arms
+ *     exactly one absorb; a second wake is silent too.
+ * Runs after the post-wake case (that one wants the panel awake on entry)
+ * and leaves the panel awake with the absorb consumed.
+ */
+static int test_lcd_present_refused_reported(void)
+{
+    int fails = 0;
+    const uint32_t before = lcd_presents_refused();
+
+    /* Owner 1 (idle timeout) sleeps the panel. */
+    mmio_mock_reset();
+    program_idle_seq();
+    mmio_mock_set_read(BCM_DATA_ADDR, 0);          /* drain: idle at once */
+    lcd_sleep();
+    if (!lcd_is_slept() || mmio_mock_log_len() == 0) {
+        fprintf(stderr, "[lcd_present_refused] FAIL: first lcd_sleep() did "
+                        "not sleep the panel (slept=%d, %zu events)\n",
+                lcd_is_slept(), mmio_mock_log_len());
+        fails++;
+    }
+    if (lcd_presents_refused() != before) {
+        fprintf(stderr, "[lcd_present_refused] FAIL: sleeping counted as a "
+                        "refused present\n");
+        fails++;
+    }
+
+    /* Owner 2 (suspend) sleeps it again: nothing must go out. */
+    mmio_mock_reset();
+    program_idle_seq();
+    mmio_mock_set_read(BCM_DATA_ADDR, 0);
+    lcd_sleep();
+    if (mmio_mock_log_len() != 0 || !lcd_is_slept()) {
+        fprintf(stderr, "[lcd_present_refused] FAIL: second lcd_sleep() "
+                        "emitted %zu bus events (want 0, still slept)\n",
+                mmio_mock_log_len());
+        fails++;
+    }
+
+    /* Three presents of three kinds while slept: refused, silent, counted. */
+    mmio_mock_reset();
+    program_idle_seq();
+    fill_pattern();
+    lcd_present_fb(g_fb);                          /* the full frame        */
+    lcd_present_rect(g_fb, 4, 8, 8, 4);            /* a marquee-sized band  */
+    lcd_fill(0x1234);                              /* the fill path         */
+    if (mmio_mock_log_len() != 0) {
+        fprintf(stderr, "[lcd_present_refused] FAIL: %zu bus events from "
+                        "presents while slept, expected 0\n",
+                mmio_mock_log_len());
+        fails++;
+    }
+    if (lcd_presents_refused() != before + 3u) {
+        fprintf(stderr, "[lcd_present_refused] FAIL: refused count %u, "
+                        "expected %u (three presents refused)\n",
+                (unsigned)lcd_presents_refused(), (unsigned)(before + 3u));
+        fails++;
+    } else {
+        printf("[lcd_present_refused] 3 presents refused while slept, "
+               "0 bus events, counter %u -> %u\n",
+               (unsigned)before, (unsigned)lcd_presents_refused());
+    }
+
+    /* ONE wake brings it back... */
+    mmio_mock_reset();
+    program_idle_seq();
+    mmio_mock_set_read(BCM_DATA_ADDR, 0);
+    lcd_wake();
+    if (lcd_is_slept() || mmio_mock_log_len() == 0) {
+        fprintf(stderr, "[lcd_present_refused] FAIL: lcd_wake() did not "
+                        "wake the panel (slept=%d, %zu events)\n",
+                lcd_is_slept(), mmio_mock_log_len());
+        fails++;
+    }
+    /* ...and a second wake is silent. */
+    mmio_mock_reset();
+    program_idle_seq();
+    mmio_mock_set_read(BCM_DATA_ADDR, 0);
+    lcd_wake();
+    if (mmio_mock_log_len() != 0 || lcd_is_slept()) {
+        fprintf(stderr, "[lcd_present_refused] FAIL: second lcd_wake() "
+                        "emitted %zu bus events (want 0, still awake)\n",
+                mmio_mock_log_len());
+        fails++;
+    }
+
+    /* Awake: the first present goes out as the ONE post-wake frame (a full
+     * stream, exactly one LCD_UPDATE, no re-kick) and is not counted. */
+    mmio_mock_reset();
+    program_idle_seq();                            /* busy, remnant, idle */
+    fill_pattern();
+    lcd_present_fb(g_fb);
+    if (lcd_presents_refused() != before + 3u) {
+        fprintf(stderr, "[lcd_present_refused] FAIL: a present while awake "
+                        "was counted as refused\n");
+        fails++;
+    }
+    size_t pixel_writes = mmio_mock_count(MMIO_OP_WRITE, BCM_DATA_ADDR) - 1u;
+    size_t updates = 0;
+    const mmio_event *log = mmio_mock_log();
+    size_t len = mmio_mock_log_len();
+    for (size_t k = 0; k < len; k++) {
+        if (log[k].op == MMIO_OP_WRITE && log[k].width == 32 &&
+            log[k].addr == BCM_DATA_ADDR && log[k].value == BCMCMD_LCD_UPDATE) {
+            updates++;
+        }
+    }
+    if (pixel_writes != FRAME_WORDS || updates != 1) {
+        fprintf(stderr, "[lcd_present_refused] FAIL: post-wake present: %zu "
+                        "pixel words (want %u), %zu LCD_UPDATE (want 1)\n",
+                pixel_writes, FRAME_WORDS, updates);
+        fails++;
+    }
+
+    /* The window was one present wide: sleep+sleep+wake+wake armed ONE
+     * absorb, and it is spent. The next present is the ordinary path. */
+    mmio_mock_reset();
+    program_idle_seq();
+    fill_pattern();
+    lcd_present_fb(g_fb);
+    trace_cursor tc = trace_begin("lcd_present_after_refused");
+    expect_write_addr(&tc, BCMA_CMDPARAM);
+    for (unsigned i = 0; i < FRAME_WORDS; i++) {
+        expect_w(&tc, 32, BCM_DATA_ADDR, expected_pair(i));
+    }
+    expect_wait_for_idle(&tc);
+    expect_command_strobe(&tc);
+    trace_expect_end(&tc);
+    fails += trace_done(&tc);
+
+    return fails;
+}
+
+/*
  * The two Now Playing partials, driven the way kernel/main.c drives them:
  * draw (or report) into console.c's damage rect, read it back, hand it to
  * lcd_present_rect. This pins the BCM cost of each — the numbers the
@@ -647,7 +788,9 @@ int main(void)
     /* order matters: the first present flips the file-static
      * lcd_first_frame flag, so the first-frame case must run first. All
      * cases after it are non-first-frame (idle-seq programmed); the
-     * post-wake case arms and consumes lcd_post_wake itself and runs last. */
+     * post-wake case arms and consumes lcd_post_wake itself; the refused
+     * case after it sleeps twice, wakes twice and consumes its own absorb,
+     * so it too leaves the panel awake and the window spent. */
     fails += test_lcd_present_first_frame();
     fails += test_lcd_present_subsequent();
     fails += test_lcd_present_rect_band();
@@ -656,5 +799,6 @@ int main(void)
     fails += test_lcd_present_rect_noop();
     fails += test_nowplaying_partials();
     fails += test_lcd_present_post_wake();
+    fails += test_lcd_present_refused_reported();
     return fails == 0 ? 0 : 1;
 }
