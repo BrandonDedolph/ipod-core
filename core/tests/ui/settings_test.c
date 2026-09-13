@@ -321,6 +321,22 @@ int main(void)
     settings_adjust(SETTINGS_DISPLAY, &s, 0, +100);        /* clamp at 60 */
     check("adj-bl-rail",      settings_adjust(SETTINGS_DISPLAY, &s, 0, +1) == 0);
     check("adj-bl-rail-val",  s.backlight_secs == 60);
+    /* Every Sound row and both rails: main.c gates apply + settings_touch on
+     * this return, so a row that reported "moved" at its rail would put the
+     * per-tick disk write back for that slider only. */
+    settings_adjust(SETTINGS_SOUND, &s, 0, -1000);          /* volume 0     */
+    check("adj-vol-rail-lo",  settings_adjust(SETTINGS_SOUND, &s, 0, -1) == 0);
+    settings_adjust(SETTINGS_DISPLAY, &s, 1, -1000);        /* brightness 1 */
+    check("adj-bright-rail-lo", settings_adjust(SETTINGS_DISPLAY, &s, 1, -1) == 0);
+    for (int row = 1; row <= 3; row++) {                    /* bass/treble/bal */
+        check("adj-row-mid",  settings_adjust(SETTINGS_SOUND, &s, row, +1) == 1);
+        settings_adjust(SETTINGS_SOUND, &s, row, +1000);
+        check("adj-row-hi",   settings_adjust(SETTINGS_SOUND, &s, row, +1) == 0);
+        check("adj-row-off",  settings_adjust(SETTINGS_SOUND, &s, row, -1) == 1);
+        settings_adjust(SETTINGS_SOUND, &s, row, -1000);
+        check("adj-row-lo",   settings_adjust(SETTINGS_SOUND, &s, row, -1) == 0);
+    }
+    check("adj-rails-vals",   s.bass == -12 && s.treble == -12 && s.balance == -100);
     check("adj-non-slider",   settings_adjust(SETTINGS_PLAYBACK, &s, 0, +1) == 0);
     check("adj-bad-row",      settings_adjust(SETTINGS_SOUND, &s, 9, +1) == 0);
 

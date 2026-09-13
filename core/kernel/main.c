@@ -4839,14 +4839,21 @@ _Noreturn static void run_ui(fat32_t *fs)
                         int dd = ev.wheel_delta;
                         if (dd >  4) dd =  4;
                         if (dd < -4) dd = -4;
-                        settings_adjust(g_set_screen, &g_settings, g_set_sel, dd);
-                        settings_apply();                  /* live volume/etc.  */
-                        settings_touch();                  /* debounced save    */
-                        /* Brightness slider: light up to the new level as you
-                         * turn, so the wheel drives the panel in real time. */
-                        if (g_set_screen == SETTINGS_DISPLAY && g_set_sel == 1) {
-                            backlight_set(g_settings.backlight_bright);
-                            bl_state = BL_FULL;
+                        /* Only a value that MOVED earns an apply and a disk
+                         * write: a wheel pinned at a rail (volume 100,
+                         * brightness 32) is not a change — settings_adjust
+                         * says so, and a48510f made SELECT honour the same
+                         * answer. */
+                        if (settings_adjust(g_set_screen, &g_settings, g_set_sel, dd)) {
+                            settings_apply();              /* live volume/etc.  */
+                            settings_touch();              /* debounced save    */
+                            /* Brightness slider: light up to the new level as
+                             * you turn, so the wheel drives the panel in real
+                             * time. */
+                            if (g_set_screen == SETTINGS_DISPLAY && g_set_sel == 1) {
+                                backlight_set(g_settings.backlight_bright);
+                                bl_state = BL_FULL;
+                            }
                         }
                     } else if (scount > 0) {               /* move selection    */
                         g_set_sel = wheel_move(g_set_sel, scount,
