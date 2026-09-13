@@ -235,6 +235,121 @@ static fat32_t g_fs_fatfail, g_fs_datfail, g_fs_persist;
 /* And one for the BPB whose geometry does not fit in 32 bits. */
 static fat32_t g_fs_overflow;
 
+/* ---- fourth image: long-name runs with stale fragments in front of them ----
+ *
+ * Same 512-byte geometry; the root spans clusters 2 -> 3 (two sectors, 32
+ * slots) because the shapes below need more than 16. File clusters are never
+ * read, so every file points at cluster 4 with a token size.
+ *
+ * The VFAT 8.3 checksum (byte 13 of every LFN fragment) is what binds a run
+ * to its 8.3 entry, and the 0x40 flag on a fragment marks the physically
+ * FIRST piece of a run. The reader used to latch "bad" the moment a
+ * fragment's checksum differed from the run in progress — which is the first
+ * fragment of the REAL run whenever a stale fragment precedes it — so the
+ * file fell back to its 8.3 name with name_lossy 0, and the library (which
+ * binds a file to its index record by the hash of the full name) never
+ * matched it: listed, unplayable. */
+static fat32_t g_fs_lfn;
+
+static uint8_t lfn_sum(const char *raw11)
+{
+    uint8_t s = 0;
+    for (int i = 0; i < 11; i++) {
+        s = (uint8_t)(((s & 1u) << 7) + (s >> 1) + (uint8_t)raw11[i]);
+    }
+    return s;
+}
+
+/* One LFN fragment: sequence `seq` (1-based), `last` sets the 0x40 first-
+ * piece flag, checksum `sum`, and the 13 units this fragment carries taken
+ * from `name` at (seq-1)*13 — characters, then one 0x0000 terminator, then
+ * 0xFFFF padding, exactly as a conforming writer lays them out. */
+static void put_lfn(uint8_t *e, int seq, int last, uint8_t sum, const char *name)
+{
+    static const uint8_t pos[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+    size_t len = strlen(name);
+    memset(e, 0, 32);
+    e[0]  = (uint8_t)(seq | (last ? 0x40 : 0));
+    e[11] = 0x0F;
+    e[13] = sum;
+    for (int k = 0; k < 13; k++) {
+        size_t   idx = (size_t)(seq - 1) * 13u + (size_t)k;
+        uint16_t u   = idx < len ? (uint8_t)name[idx] : idx == len ? 0x0000u : 0xFFFFu;
+        put16(&e[pos[k]], u);
+    }
+}
+
+/* A whole run for `name`, bound to the 8.3 entry `raw11`, in physical order
+ * (highest sequence first, 0x40 on it). Returns the number of slots used. */
+static int put_lfn_run(uint8_t *e, const char *name, const char *raw11)
+{
+    int     n   = (int)((strlen(name) + 1u + 12u) / 13u);   /* incl. terminator */
+    uint8_t sum = lfn_sum(raw11);
+    for (int i = 0; i < n; i++) {
+        int seq = n - i;
+        put_lfn(e + i * 32, seq, seq == n, sum, name);
+    }
+    return n;
+}
+
+static void build_lfn_image(void)
+{
+    memset(g_mem, 0, sizeof g_mem);
+
+    uint8_t *bs = g_mem;
+    bs[0] = 0xEB; bs[1] = 0x58; bs[2] = 0x90;
+    memcpy(&bs[3], "MSDOS5.0", 8);
+    put16(&bs[11], MEM_BPS);
+    bs[13] = 1;
+    put16(&bs[14], 1);
+    bs[16] = 1;
+    bs[21] = 0xF8;
+    put32(&bs[36], 1);
+    put32(&bs[44], 2);
+    bs[510] = 0x55; bs[511] = 0xAA;
+
+    uint8_t *fat = &g_mem[1 * MEM_BPS];
+    put32(&fat[0 * 4], 0x0FFFFFF8u);
+    put32(&fat[1 * 4], 0x0FFFFFFFu);
+    put32(&fat[2 * 4], 3);             /* root 2 -> 3 */
+    put32(&fat[3 * 4], 0x0FFFFFFFu);
+    put32(&fat[4 * 4], 0x0FFFFFFFu);
+
+    uint8_t *e = &g_mem[2 * MEM_BPS];  /* root: clusters 2 and 3 are adjacent */
+
+    /* 1. THE BUG. One stale fragment (seq 1, no 0x40, a checksum for a short
+     *    name that is not here) directly ahead of a good two-fragment run. */
+    put_lfn(e, 1, 0, lfn_sum("NOTTHIS FLA"), "Ghost.flac");            e += 32;
+    e += 32 * put_lfn_run(e, "Intentions.flac", "INTENT~1FLA");
+    put_dirent(e, "INTENT~1FLA", 0x20, 4, 100);                          e += 32;
+
+    /* 2. A whole stale run (0x40 and all) ahead of a good one: two runs back
+     *    to back, no 8.3 entry between them. */
+    e += 32 * put_lfn_run(e, "Stale name.txt", "STALE   TXT");
+    e += 32 * put_lfn_run(e, "Second file.txt", "SECOND~1TXT");
+    put_dirent(e, "SECOND~1TXT", 0x20, 4, 100);                          e += 32;
+
+    /* 3. A stale fragment carrying the SAME checksum as the run that follows
+     *    (the leftover of a rewrite of this very entry). Only the 0x40 flag
+     *    separates them, and it must. */
+    put_lfn(e, 1, 0, lfn_sum("THIRD~1 TXT"), "Third fXXX.txt");        e += 32;
+    e += 32 * put_lfn_run(e, "Third file.txt", "THIRD~1 TXT");
+    put_dirent(e, "THIRD~1 TXT", 0x20, 4, 100);                          e += 32;
+
+    /* 4. A good run with ONE corrupt checksum byte, on its seq-1 fragment.
+     *    Restarting on the mismatch must not leave a partial run that names
+     *    the file by its first 13 characters: this is a fallback to 8.3. */
+    e += 32 * put_lfn_run(e, "Fourth file.txt", "FOURTH~1TXT");
+    e[-32 + 13] ^= 0x55;                                                 /* seq 1 is the last slot written */
+    put_dirent(e, "FOURTH~1TXT", 0x20, 4, 100);                          e += 32;
+
+    /* 5. The case that already worked and must keep working: a stale run
+     *    directly ahead of an 8.3 entry it does not belong to. */
+    e += 32 * put_lfn_run(e, "Ghost.flac", "NOTTHIS FLA");
+    put_dirent(e, "REAL    TXT", 0x20, 4, 100);                          e += 32;
+    /* e[0] == 0x00 from here: end of directory */
+}
+
 static int check(const char *label, int cond)
 {
     printf("[%s] %s\n", label, cond ? "PASS" : "FAIL");
@@ -726,6 +841,51 @@ int main(int argc, char **argv)
         uint32_t c = 0, s = 0;
         fails += check("open_in on an unaddressable directory is ECORRUPT, not ENOENT",
                        fat32_open_in(&sfs, BAD_CLUS, "X.TXT", &c, &s) == FAT32_ECORRUPT);
+    }
+
+    /* ---- long-name runs with stale fragments in front of them ----
+     * See build_lfn_image. Five entries come out; what matters is WHICH name
+     * each carries, and that none of the good ones is flagged lossy. */
+    {
+        build_lfn_image();
+        struct { fat32_dirent_t v[8]; int n; } r = { .n = 0 };
+        fails += check("lfn-image mount returns 0",
+                       fat32_mount(&g_fs_lfn, mem_read, NULL, 0) == 0);
+        fails += check("lfn-image: readdir lists exactly 5 entries",
+                       fat32_readdir(&g_fs_lfn, g_fs_lfn.root_clus, dir_collect, &r) == 0 &&
+                       r.n == 5);
+        const fat32_dirent_t *by[5] = { 0 };
+        for (int i = 0; i < r.n && i < 5; i++) {
+            by[i] = &r.v[i];
+        }
+        fails += check("a stale fragment ahead of a good run: the good run names the file",
+                       by[0] && strcmp(by[0]->name, "Intentions.flac") == 0 &&
+                       by[0]->name_lossy == 0);
+        fails += check("a stale WHOLE run ahead of a good run: the good run names the file",
+                       by[1] && strcmp(by[1]->name, "Second file.txt") == 0 &&
+                       by[1]->name_lossy == 0);
+        fails += check("a stale fragment with the SAME checksum: the 0x40 piece starts the real run",
+                       by[2] && strcmp(by[2]->name, "Third file.txt") == 0 &&
+                       by[2]->name_lossy == 0);
+        fails += check("one corrupt checksum byte mid-run: 8.3 fallback, not a 13-char name",
+                       by[3] && strcmp(by[3]->name, "FOURTH~1.TXT") == 0);
+        fails += check("a stale run ahead of an unrelated 8.3 entry is still discarded",
+                       by[4] && strcmp(by[4]->name, "REAL.TXT") == 0 &&
+                       by[4]->name_lossy == 0);
+        int no_ghosts = 1;
+        for (int i = 0; i < r.n; i++) {
+            if (strcmp(r.v[i].name, "Ghost.flac") == 0 ||
+                strcmp(r.v[i].name, "Stale name.txt") == 0 ||
+                strcmp(r.v[i].name, "Third fXXX.txt") == 0) {
+                no_ghosts = 0;
+            }
+        }
+        fails += check("no stale name is ever surfaced", no_ghosts);
+        /* And the lookup built on the walk finds the file by its real name. */
+        uint32_t c = 0, s = 0;
+        fails += check("open by the long name behind a stale fragment succeeds",
+                       fat32_open(&g_fs_lfn, "Intentions.flac", &c, &s) == 0 &&
+                       c == 4 && s == 100);
     }
 
     /* ---- a BPB whose data-region start wraps 32 bits ----

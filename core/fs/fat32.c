@@ -316,7 +316,17 @@ typedef struct {
                              * run's checksum binds it to the entry.          */
     int  have_sum;          /* at least one fragment contributed a checksum   */
     uint8_t sum;            /* 8.3 checksum every fragment in the run carries */
+    uint32_t top;           /* seq of the run's 0x40 (physically first) piece,
+                             * 0 until one is seen                            */
+    uint32_t seen;          /* bit (seq-1) per fragment folded in: a run is
+                             * usable only when 1..top are all present       */
 } lfn_acc_t;
+
+/* Highest sequence index a name within FAT_LFN_MAX can need (13 units per
+ * fragment, the last one holding the terminator): 20 for 255. Anything above
+ * addresses slots past the accumulator and is refused up front — which also
+ * keeps the `seen` mask a plain 32-bit shift. */
+#define FAT_LFN_MAX_SEQ ((FAT_LFN_MAX + 12u) / 13u)
 
 /*
  * Standard VFAT 8.3 checksum (byte 13 of every LFN entry): the ONE field
@@ -343,6 +353,8 @@ static void lfn_reset(lfn_acc_t *a)
     a->overflow = 0;
     a->have_sum = 0;
     a->sum      = 0;
+    a->top      = 0;
+    a->seen     = 0;
     /* Zero the code units too. `lfn_acc_t acc` is a plain stack local in the
      * directory walk, so without this a run with holes in it named the file
      * after uninitialised stack. */
@@ -352,22 +364,45 @@ static void lfn_reset(lfn_acc_t *a)
 /* Fold one 0x0F LFN entry into the accumulator. */
 static void lfn_add(lfn_acc_t *a, const uint8_t *e)
 {
-    uint32_t seq = (uint32_t)(e[0] & 0x3Fu);   /* strip the 0x40 last-marker */
+    uint32_t seq   = (uint32_t)(e[0] & 0x3Fu);
+    int      first = (e[0] & 0x40u) != 0;      /* the run's physically-first piece */
+    uint8_t  sum   = e[13];
     if (seq == 0) {
         a->bad = 1;                            /* not a valid sequence index */
         return;
     }
 
-    /* Every fragment of one run carries the same 8.3 checksum; a change of
-     * checksum mid-run means these fragments do not belong together. */
-    uint8_t sum = e[13];
+    /*
+     * A run starts at its 0x40 fragment and every fragment of it carries the
+     * same 8.3 checksum. So a 0x40 fragment while a run is in progress, or a
+     * fragment whose checksum differs from the run's, is the start of a NEW
+     * run: the one in progress was orphaned — a stale run left by a rename
+     * or a torn write — and is not the name of the entry coming up. Drop it
+     * and start afresh from this fragment.
+     *
+     * The old rule latched `bad` on the mismatch instead, i.e. on the FIRST
+     * fragment of the real run, so one stale fragment ahead of a perfectly
+     * good name made the entry fall back to its mangled 8.3 name with
+     * name_lossy 0 — and the library, which binds a file to its index record
+     * by the hash of the full name, never matched it: the track listed and
+     * would not play. The 0x40 flag was stripped and ignored throughout.
+     */
+    if (a->have_sum && (first || a->sum != sum)) {
+        lfn_reset(a);
+    }
     if (!a->have_sum) {
         a->sum      = sum;
         a->have_sum = 1;
-    } else if (a->sum != sum) {
-        a->bad = 1;
+    }
+    if (seq > FAT_LFN_MAX_SEQ) {
+        a->bad      = 1;                       /* addresses slots we do not have */
+        a->overflow = 1;
         return;
     }
+    if (first) {
+        a->top = seq;
+    }
+    a->seen |= 1u << (seq - 1u);
 
     uint32_t base = (seq - 1u) * 13u;
     for (int k = 0; k < 13; k++) {
@@ -401,13 +436,29 @@ static int lfn_length(const lfn_acc_t *a, uint8_t sum)
     if (a->bad || !a->have_sum || a->sum != sum) {
         return -1;
     }
+    /* Whole runs only: the 0x40 piece seen, and every sequence index below
+     * it. Restarting on a checksum mismatch (lfn_add) means a run with ONE
+     * corrupt checksum byte now ends as a fresh partial run with the right
+     * checksum; without this it would name the file by its first 13
+     * characters and call that the full name. */
+    if (a->top == 0 || a->seen != ((1u << a->top) - 1u)) {
+        return -1;
+    }
+    int n;
     if (a->term >= 0) {
-        return a->term;
+        n = a->term;
+    } else if (a->max_idx >= 0) {
+        n = a->max_idx + 1;
+    } else {
+        return -1;
     }
-    if (a->max_idx >= 0) {
-        return a->max_idx + 1;
+    /* A terminator can sit past the last stored unit (seq 20 reaches slot
+     * 259) with nothing but padding between; the name is then longer than
+     * the accumulator, not a name the encoder may read past the end for. */
+    if (n > (int)FAT_LFN_MAX) {
+        return -1;
     }
-    return -1;
+    return n;
 }
 
 /* UTF-8-encode the assembled long name into `dst` (capacity `cap`, always
