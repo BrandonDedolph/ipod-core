@@ -531,5 +531,50 @@ int main(void)
     xpect(&c, "close after suspend severed the buffers: start primes cold",
           g_calls == 2 && last_kick_first_sample() == sample_for(0));
 
+    /* --- 10. a completion dropped in the stop window is not replayed --- *
+     * hal_audio_stop() clears g_running, THEN masks the IRQ, THEN stops the
+     * engine. A completion landing in that window (or swallowed by the
+     * engine's status read) reaches audio_dma_isr with g_running == 0: acked
+     * and dropped, no refill. The buffer it announced IS finished, so the
+     * stop samples it as done and resume moves to the other (fresh) one —
+     * and the completion after that kicks the dropped buffer again, still
+     * holding what the listener already heard: ~186 ms replayed. */
+    fresh_start();                    /* kick A=chunk0; B=chunk1             */
+    audio_dma_isr();                  /* kick B=chunk1; A refilled = chunk2  */
+    xpect(&c, "dropped: the DAC is on the chunk at 1*frames",
+          last_kick_first_sample() == sample_for((uint32_t)frames));
+    /* B finishes. Its completion lands after the stop cleared g_running. */
+    mmio_mock_set_read(USEC_TIMER_ADDR, 1000000u);   /* well past 186 ms */
+    hal_audio_stop();
+    audio_dma_isr();                  /* the late completion: dropped        */
+    int calls_before_resume = g_calls;
+    bus_ready();
+    hal_audio_start();
+    collect_kicks();
+    xpect(&c, "dropped: resume moves on to the fresh buffer (chunk 2)",
+          g_kicks == 1 && last_kick_first_sample() ==
+              sample_for(2u * (uint32_t)frames));
+    xpect(&c, "dropped: resume refills the finished buffer the ISR never did",
+          g_calls == calls_before_resume + 1);
+    audio_dma_isr();
+    xpect(&c, "dropped: the next completion plays chunk 3, not chunk 1 again",
+          last_kick_first_sample() == sample_for(3u * (uint32_t)frames));
+    xpect(&c, "dropped: no chunk was skipped either",
+          g_calls == calls_before_resume + 2);
+
+    /* And the ordinary pause — no completion lost — still refills nothing on
+     * resume: the on-demand refill must not turn into an unconditional one,
+     * or every unpause would skip a buffer. */
+    fresh_start();
+    audio_dma_isr();
+    hal_audio_stop();                 /* mid-buffer, nothing dropped         */
+    calls_before_resume = g_calls;
+    bus_ready();
+    hal_audio_start();
+    xpect(&c, "not dropped: a plain pause/resume pulls nothing new",
+          g_calls == calls_before_resume);
+    xpect(&c, "not dropped: and resumes inside the chunk it was on",
+          last_kick_first_sample() == sample_for((uint32_t)frames));
+
     return xfail_done(&c);
 }

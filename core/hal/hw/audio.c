@@ -107,6 +107,21 @@ static uint32_t          g_rate     = 44100u;
 static volatile int      g_primed;
 static volatile uint32_t g_kick_us;
 static volatile uint32_t g_kick_bytes;   /* byte count of the outstanding kick */
+/*
+ * Per-buffer: it holds PCM pulled from the source that the DMA has not yet
+ * been pointed at. Set by fill_buffer, cleared by audio_kick.
+ *
+ * Exists for one window. hal_audio_stop() clears g_running, then masks the
+ * completion IRQ, then stops the engine and reads its status. A completion
+ * that lands inside that window — after the clear, or one dma_playback_stop's
+ * status read swallows — is acked and dropped by audio_dma_isr without the
+ * refill it would normally do. The engine HAS finished that buffer, so the
+ * stop samples it as fully done and hal_audio_start() moves on to the other
+ * one, which is fresh; but the completion after THAT kicks the dropped buffer
+ * again, still holding the PCM the listener already heard: ~186 ms replayed
+ * on resume. The resume path checks the flags and refills on demand.
+ */
+static volatile int      g_filled[2];
 
 /*
  * LATE RE-KICKS — the one audio failure this driver could not see.
@@ -182,13 +197,15 @@ static uint32_t buf_phys(int i)
     return SDRAM_NATIVE_BASE + (uint32_t)(uintptr_t)audio_buf[i];
 }
 
-/* Kick the DMA at `phys` for `bytes`, recording when and how much so a later
- * pause can work out how far it got. */
-static void audio_kick(uint32_t phys, uint32_t bytes)
+/* Kick the DMA at buffer `i` from byte offset `off` for `bytes`, recording
+ * when and how much so a later pause can work out how far it got. The buffer
+ * is now the DMA's: whatever it holds is being consumed (see g_filled). */
+static void audio_kick(int i, uint32_t off, uint32_t bytes)
 {
+    g_filled[i]  = 0;
     g_kick_us    = mmio_read32(USEC_TIMER_ADDR);
     g_kick_bytes = bytes;
-    dma_playback_kick(phys, bytes);
+    dma_playback_kick(buf_phys(i) + off, bytes);
 }
 
 /*
@@ -253,6 +270,7 @@ static void fill_buffer(int i)
         }
     }
     cache_commit();      /* flush so the DMA reads fresh PCM, not stale SDRAM */
+    g_filled[i] = 1;
 }
 
 int hal_audio_init(uint32_t sample_rate, uint16_t channels)
@@ -293,6 +311,8 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels)
     g_active      = 0;
     g_running     = 0;
     g_primed      = 0;
+    g_filled[0]   = 0;
+    g_filled[1]   = 0;
     g_cold        = 0;       /* wm8758_init + i2s_init just brought it all up */
     g_completions = 0;
     g_underruns   = 0;
@@ -361,15 +381,34 @@ void hal_audio_start(void)
             done = g_kick_bytes;         /* defensive: kick changed under us */
         }
         uint32_t left = g_kick_bytes - done;
-        g_running = 1;
-        if (left >= 4u) {                 /* SIZE is bytes-4: 4 is the minimum */
-            audio_kick(buf_phys(g_active) + done, left);
-            return;
+        int switched  = 0;
+        if (left < 4u) {                  /* SIZE is bytes-4: 4 is the minimum */
+            /* The active buffer had effectively finished: go straight to the
+             * other one, which the completion ISR loaded. */
+            g_active = g_active ^ 1;
+            done     = 0;
+            left     = AUDIO_BUF_BYTES;
+            switched = 1;
         }
-        /* The active buffer had effectively finished; go straight to the other
-         * one, which fill_buffer already loaded. */
-        g_active = g_active ^ 1;
-        audio_kick(buf_phys(g_active), AUDIO_BUF_BYTES);
+        /*
+         * Whatever the completion after this one kicks must be fresh. It
+         * normally is — the ISR that kicked the active buffer refilled the
+         * other — but a completion dropped inside hal_audio_stop's window
+         * (see g_filled) leaves that other buffer holding PCM the listener
+         * has already heard. Refill on demand, BEFORE kicking: with only a
+         * few bytes left in the active buffer the completion is immediate.
+         * The refill runs with g_running still 0, so a stray completion
+         * during it is a no-op rather than a double kick.
+         */
+        int other = g_active ^ 1;
+        if (!g_filled[other]) {
+            fill_buffer(other);
+        }
+        if (switched && !g_filled[g_active]) {
+            fill_buffer(g_active);       /* defensive: never kick stale PCM */
+        }
+        g_running = 1;
+        audio_kick(g_active, done, left);
         return;
     }
 
@@ -381,7 +420,7 @@ void hal_audio_start(void)
     g_completions = 0;
     g_running     = 1;
     g_primed      = 1;
-    audio_kick(buf_phys(0), AUDIO_BUF_BYTES);
+    audio_kick(0, 0, AUDIO_BUF_BYTES);
 }
 
 void audio_dma_isr(void)
@@ -419,7 +458,7 @@ void audio_dma_isr(void)
     /* Keep the FIFO fed with the already-filled other buffer FIRST, then
      * refill the one that just drained. This ordering is what makes the
      * deadline a FIFO depth rather than zero — see the header comment. */
-    audio_kick(buf_phys(next), AUDIO_BUF_BYTES);
+    audio_kick(next, 0, AUDIO_BUF_BYTES);
     g_active = next;
     g_completions++;
     fill_buffer(just);
