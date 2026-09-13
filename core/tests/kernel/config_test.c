@@ -700,9 +700,9 @@ static void test_two_slot(void)
 static void expect_write_trace(trace_cursor *tc, uint32_t lba,
                                const uint8_t *data)
 {
-    /* ata_wait_ready: BSY poll, then RDY poll. */
-    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
-    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
+    /* ata_wait_ready: timed (USEC_TIMER start), !BSY && RDY on first read. */
+    expect_r(tc, 32, USEC_TIMER_ADDR);
+    expect_r(tc, 8,  ATA_ALT_STATUS_ADDR);
 
     /* LBA28 task-file programming. This is where a wrong address would show
      * up, so the values are checked, not just the addresses. */
@@ -728,7 +728,8 @@ static void expect_write_trace(trace_cursor *tc, uint32_t lba,
             uint32_t hw  = (uint32_t)data[off] | ((uint32_t)data[off + 1] << 8);
             expect_w(tc, 16, ATA_DATA_ADDR, hw);
         }
-        expect_r(tc, 8, ATA_ALT_STATUS_ADDR);        /* ERR/DF check       */
+        expect_r(tc, 32, USEC_TIMER_ADDR);           /* post-sector: wait  */
+        expect_r(tc, 8,  ATA_ALT_STATUS_ADDR);       /* !BSY, ERR/DF check */
     }
 
     /* Post-data completion wait (the drive holds BSY while it commits). */
@@ -738,8 +739,8 @@ static void expect_write_trace(trace_cursor *tc, uint32_t lba,
 
     /* FLUSH CACHE — load-bearing: the drive's write cache is on by default,
      * so without this the record is only in the drive's DRAM. */
-    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);            /* wait_ready: BSY    */
-    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);            /* wait_ready: RDY    */
+    expect_r(tc, 32, USEC_TIMER_ADDR);               /* wait_ready: start  */
+    expect_r(tc, 8,  ATA_ALT_STATUS_ADDR);           /* !BSY && RDY        */
     expect_w(tc, 8, ATA_SELECT_ADDR,  ATA_SELECT_OBS);
     expect_w(tc, 8, ATA_COMMAND_ADDR, 0xE7u);        /* FLUSH CACHE        */
     expect_r(tc, 32, USEC_TIMER_ADDR);

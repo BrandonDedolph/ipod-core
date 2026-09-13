@@ -22,17 +22,27 @@
 #include "ata.h"
 
 /*
- * Bounded polls so a wedged/absent drive can't hang the kernel. The disk
- * is already spun up (the boot ROM just read our image off it) so waits are
- * short in practice; 1<<20 trips is generously past a healthy PIO sector.
+ * Poll ceilings, in microseconds on the free-running USEC_TIMER (04-ata.md,
+ * "Timeouts": wait_for_rdy 10 s, and the ATA spec's 31 s spin-up allowance
+ * after a soft reset). These used to be ITERATION counts (1<<20 polls, i.e.
+ * ~0.2-0.5 s at 80 MHz), which is fine for a drive that is already spinning
+ * — the boot ROM just read our image off it — and wrong for every case where
+ * the drive is legitimately busy for seconds: BSY held after STANDBY
+ * IMMEDIATE while the drive flushes and parks (the wait returned -1, so
+ * g_ata_parked stayed 0 and the main loop re-issued STANDBY every pass), BSY
+ * after the SRST in ata_recover while the drive re-spins, and a slow spin-up
+ * on a low battery. A wedged or absent drive still cannot hang the kernel:
+ * the ceiling is just measured in the unit the drive's behaviour is
+ * specified in.
  */
-#define ATA_BSY_SPIN_LIMIT (1u << 20)
-/* Data-phase (DRQ) wait ceiling is TIME-based (microseconds), not an iteration
- * count, so it's robust to bus poll speed AND gives a spun-DOWN drive (parked by
+#define ATA_READY_US        10000000u   /* !BSY / RDY: wait_for_rdy, 10 s   */
+#define ATA_SRST_READY_US   31000000u   /* ...after a soft reset: 31 s spin-up */
+/* Data-phase (DRQ) wait ceiling. Gives a spun-DOWN drive (parked by
  * ata_standby during playback/suspend) room to spin back up on the next read —
- * ~1-3 s typical. Kept under the PCM ring's depth so a stuck read errors before
- * audio underruns. Normal reads set DRQ in microseconds, so this never bites. */
-#define ATA_SPINUP_US      4000000u
+ * ~1-3 s typical, more on a low battery, where the ~4 s the old value allowed
+ * was seen to expire mid-spin-up and issue an SRST into it. Normal reads set
+ * DRQ in microseconds, so this never bites on a spinning drive. */
+#define ATA_SPINUP_US        8000000u
 
 /*
  * Logical (512-byte) sectors per PHYSICAL sector. The stock 80 GB 5.5G
@@ -55,27 +65,53 @@
 /* One physical sector's worth of scratch for the alignment bounce. */
 static uint16_t ata_bounce[ATA_SECTOR_SZ * ATA_PHYS_LOG / 2u];
 
-/* Wait for BSY to clear (bounded). */
-static int ata_wait_not_busy(void)
+/*
+ * Wait for BSY to clear within `limit_us`. Returns the status byte that
+ * satisfied the wait (so a caller can test ERR/DF on a status that is
+ * actually valid — every other bit is undefined while BSY is set), or -1 on
+ * timeout.
+ */
+static int ata_wait_not_busy_us(uint32_t limit_us)
 {
-    uint32_t spin = ATA_BSY_SPIN_LIMIT;
-    while ((mmio_read8(ATA_ALT_STATUS_ADDR) & ATA_STATUS_BSY) && --spin != 0) {
-        /* poll */
+    uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
+    for (;;) {
+        uint8_t s = mmio_read8(ATA_ALT_STATUS_ADDR);
+        if (!(s & ATA_STATUS_BSY)) {
+            return s;
+        }
+        if ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - t0) > limit_us) {
+            return -1;
+        }
     }
-    return spin != 0 ? 0 : -1;
 }
 
-/* Wait for BSY clear, then RDY set (bounded). */
+/* Wait for BSY to clear (ATA_READY_US). 0 on success, -1 on timeout. */
+static int ata_wait_not_busy(void)
+{
+    return ata_wait_not_busy_us(ATA_READY_US) < 0 ? -1 : 0;
+}
+
+/* Wait for BSY clear AND RDY set within `limit_us`. 0 on success, -1 on
+ * timeout. One poll loop rather than two chained ones: the deadline is on
+ * the whole wait, which is what the doc's timeout table specifies. */
+static int ata_wait_ready_us(uint32_t limit_us)
+{
+    uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
+    for (;;) {
+        uint8_t s = mmio_read8(ATA_ALT_STATUS_ADDR);
+        if ((s & (ATA_STATUS_BSY | ATA_STATUS_RDY)) == ATA_STATUS_RDY) {
+            return 0;
+        }
+        if ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - t0) > limit_us) {
+            return -1;
+        }
+    }
+}
+
+/* Wait for BSY clear, then RDY set (ATA_READY_US). */
 static int ata_wait_ready(void)
 {
-    if (ata_wait_not_busy() != 0) {
-        return -1;
-    }
-    uint32_t spin = ATA_BSY_SPIN_LIMIT;
-    while (!(mmio_read8(ATA_ALT_STATUS_ADDR) & ATA_STATUS_RDY) && --spin != 0) {
-        /* poll */
-    }
-    return spin != 0 ? 0 : -1;
+    return ata_wait_ready_us(ATA_READY_US);
 }
 
 /*
@@ -167,9 +203,10 @@ int ata_init(void)
     ata_bus_reset();
 
     /* Select the master device (with the obsolete must-be-1 bits) and wait
-     * for it to come ready. */
+     * for it to come ready — with the post-reset allowance, since the drive
+     * may re-spin after the SRST. */
     mmio_write8(ATA_SELECT_ADDR, ATA_SELECT_OBS);
-    return ata_wait_ready();
+    return ata_wait_ready_us(ATA_SRST_READY_US);
 }
 
 /*
@@ -205,10 +242,17 @@ static int ata_recover(int cause)
         (void)mmio_read16(ATA_DATA_ADDR);
     }
 
-    /* 3. Clean slate for the next command. */
+    /* 3. Clean slate for the next command. The drive may re-spin after the
+     *    reset, so the wait carries the spec's 31 s spin-up allowance — and
+     *    its result is NOT discarded: a drive that never comes back from the
+     *    reset is not "recovered", whatever the original cause was, and the
+     *    caller must hear "never came ready" (-1) rather than a retryable
+     *    error that sends it straight back into the same wedged drive. */
     ata_bus_reset();
     mmio_write8(ATA_SELECT_ADDR, ATA_SELECT_OBS);
-    (void)ata_wait_ready();
+    if (ata_wait_ready_us(ATA_SRST_READY_US) != 0) {
+        return -1;
+    }
 
     /* 4. IDNF means the LBA does not exist on this drive (or violates its
      *    physical-sector alignment rule) — re-issuing the identical command
@@ -325,7 +369,16 @@ static int ata_read_raw_locked(uint32_t lba, uint32_t count, void *buf)
         for (int w = 0; w < 256; w++) {
             *out++ = mmio_read16(ATA_DATA_ADDR);
         }
-        uint8_t st = mmio_read8(ATA_ALT_STATUS_ADDR);
+        /* The drive raises BSY after the last word of a DRQ block while it
+         * fetches the next one (or completes the command), and every other
+         * status bit is undefined while BSY is set — so testing ERR/DF on
+         * the first read after the data can see a stale or transient byte
+         * and run a needless recovery, or miss a real one. Wait for BSY to
+         * clear and test the status that cleared it. */
+        int st = ata_wait_not_busy_us(ATA_SPINUP_US);
+        if (st < 0) {
+            return ata_recover(-2);
+        }
         if (st & (ATA_STATUS_ERR | ATA_STATUS_DF)) {
             return ata_recover(-3);
         }
@@ -486,19 +539,12 @@ int ata_wakeup(void)
 #define ATA_CMD_WRITE_SECTORS 0x30   /* LBA28 PIO write (one DRQ per sector) */
 #define ATA_CMD_FLUSH_CACHE   0xE7   /* non-EXT flush (ATA-6+)               */
 
-/* Wait for BSY to clear, bounded by TIME rather than poll count. FLUSH CACHE
- * on a spun-down or busy drive can hold BSY for seconds — far past
- * ATA_BSY_SPIN_LIMIT — so the flush needs the same time-based ceiling the
- * DRQ wait uses. Returns 0 on success, -1 on timeout. */
+/* Wait for BSY to clear with the data-phase deadline. FLUSH CACHE on a
+ * spun-down or busy drive can hold BSY for seconds, and a write's commit
+ * after the last sector likewise. Returns 0 on success, -1 on timeout. */
 static int ata_wait_not_busy_timed(void)
 {
-    uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
-    while (mmio_read8(ATA_ALT_STATUS_ADDR) & ATA_STATUS_BSY) {
-        if ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - t0) > ATA_SPINUP_US) {
-            return -1;
-        }
-    }
-    return 0;
+    return ata_wait_not_busy_us(ATA_SPINUP_US) < 0 ? -1 : 0;
 }
 
 /*
@@ -561,7 +607,12 @@ static int ata_write_raw(uint32_t lba, uint32_t count, const void *buf)
         for (int w = 0; w < 256; w++) {
             mmio_write16(ATA_DATA_ADDR, *in++);
         }
-        uint8_t st = mmio_read8(ATA_ALT_STATUS_ADDR);
+        /* As on the read: BSY follows the last word while the drive takes
+         * the block, and ERR/DF are only meaningful once it clears. */
+        int st = ata_wait_not_busy_us(ATA_SPINUP_US);
+        if (st < 0) {
+            return ata_recover(-2);
+        }
         if (st & (ATA_STATUS_ERR | ATA_STATUS_DF)) {
             return ata_recover(-3);
         }
