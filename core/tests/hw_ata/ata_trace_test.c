@@ -27,7 +27,11 @@
  *              drained word by word, soft reset, reselect — plus the IDNF
  *              upgrade; and the >256-sector split into two commands.
  *   power    — STANDBY IMMEDIATE grammar and the parked flag; wake through a
- *              spin-up (BSY) then normal reads; parked reconciled to 0 on a
+ *              spin-up (BSY) then normal reads; the SLEEP grammar (flush,
+ *              standby, SLEEP 0xE6) and the reset-to-wake it requires, both
+ *              from ata_wakeup and from a plain read that skipped it; a
+ *              flush error inside sleep still parking the heads; a wedged
+ *              drive refusing to sleep; parked reconciled to 0 on a
  *              failed wake and on any plain read; a wedged drive can't park.
  *   write    — the full WRITE SECTORS + FLUSH CACHE grammar with every data
  *              word checked; and the recovery the write path used to skip:
@@ -61,6 +65,7 @@
 #define SPIN_LIMIT        (1u << 20)   /* ATA_BSY_SPIN_LIMIT: polls per wait */
 #define SPINUP_US         4000000u     /* ATA_SPINUP_US: timed DRQ deadline  */
 #define CMD_STANDBY_IMM   0xE0u
+#define CMD_SLEEP         0xE6u
 #define CMD_WRITE_SECTORS 0x30u
 #define CMD_FLUSH_CACHE   0xE7u
 #define ERROR_ABRT        0x04u        /* any non-IDNF error bit will do     */
@@ -648,6 +653,142 @@ static void test_power(xfail_ctx *c)
           count_writes(ATA_COMMAND_ADDR) == 0 && only_status_reads_from(0));
     xpect(c, "standby: exactly one spin budget of polls",
           total_events() == SPIN_LIMIT);
+
+    /* --- SLEEP: flush, standby, SLEEP — in that order ------------------- *
+     * The grammar the suspend and power-off paths rely on before a rail
+     * cut: FLUSH CACHE (the write path's durability point), then STANDBY
+     * IMMEDIATE (heads parked), then SLEEP 0xE6. A healthy drive answers
+     * every poll first time. */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY);
+    rc = ata_sleep();
+    xpect(c, "sleep: returns 0", rc == 0);
+    xpect(c, "sleep: reports the drive parked", ata_is_parked() == 1);
+    tc = trace_begin("sleep-grammar");
+    expect_flush(&tc);
+    expect_wait_ready(&tc);
+    expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+    expect_w(&tc, 8, ATA_COMMAND_ADDR, CMD_STANDBY_IMM);
+    expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);        /* accepted (BSY clear) */
+    expect_wait_ready(&tc);
+    expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+    expect_w(&tc, 8, ATA_COMMAND_ADDR, CMD_SLEEP);
+    expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);        /* completed (BSY clear) */
+    finish(c, &tc);
+    xpect(c, "sleep: FLUSH before STANDBY before SLEEP",
+          nth_write(ATA_COMMAND_ADDR, 0) == CMD_FLUSH_CACHE &&
+          nth_write(ATA_COMMAND_ADDR, 1) == CMD_STANDBY_IMM &&
+          nth_write(ATA_COMMAND_ADDR, 2) == CMD_SLEEP);
+
+    /* --- idempotent while slept: a second sleep issues nothing ---------- *
+     * The interface is inactive; commands at it would go nowhere. */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY);
+    xpect(c, "sleep: a second sleep is a no-op that returns 0",
+          ata_sleep() == 0 && mmio_mock_log_len() == 0);
+
+    /* --- wake from SLEEP: a soft reset FIRST, then the throwaway read ---- *
+     * SLEEP is the one state a READ cannot undo (04-ata.md: only a reset
+     * recovers from it). So ata_wakeup must pulse SRST on the control
+     * register, reselect, wait out the post-reset spin-up on the TIMED wait
+     * (a poll budget is not enough for a spin-up), and only then probe.
+     * RDY|DRQ throughout: every wait passes first time. */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_wakeup();
+    xpect(c, "wakeup from sleep: returns 0", rc == 0);
+    xpect(c, "wakeup from sleep: not parked", ata_is_parked() == 0);
+    tc = trace_begin("wakeup-from-sleep-grammar");
+    expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_SRST | ATA_CONTROL_NIEN);
+    expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
+    expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+    expect_r(&tc, 32, USEC_TIMER_ADDR);           /* timed spin-up wait   */
+    expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);        /* BSY clear            */
+    expect_wait_ready(&tc);
+    expect_command(&tc, 0, ATA_PHYS_LOG, ATA_CMD_READ_SECTORS);
+    expect_sector_in(&tc, 0);
+    expect_sector_in(&tc, 0);
+    finish(c, &tc);
+
+    /* --- and the reset happens ONCE: the next wake is the plain probe ---- */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_wakeup();
+    xpect(c, "wakeup after a wake: no reset, just the probe",
+          rc == 0 && count_writes(ATA_CONTROL_ADDR) == 0);
+
+    /* --- a plain read after SLEEP resets too (no explicit wakeup) -------- *
+     * The "any access wakes the drive" contract STANDBY has must survive
+     * SLEEP, or a caller that skips ata_wakeup — the player's refill, a
+     * settings save — reads a drive that cannot hear it and times out. */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY);
+    xpect(c, "sleep: parks again", ata_sleep() == 0 && ata_is_parked());
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_read_sectors(0x1000u, 2, g_buf);
+    xpect(c, "read after sleep: returns 0", rc == 0);
+    xpect(c, "read after sleep: reset the channel before the command",
+          count_writes(ATA_CONTROL_ADDR) == 2 &&
+          first_index(MMIO_OP_WRITE, ATA_CONTROL_ADDR) <
+          first_index(MMIO_OP_WRITE, ATA_COMMAND_ADDR));
+    xpect(c, "read after sleep: clears parked", ata_is_parked() == 0);
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_read_sectors(0x1000u, 2, g_buf);
+    xpect(c, "read after sleep: the second read does not reset again",
+          rc == 0 && count_writes(ATA_CONTROL_ADDR) == 0);
+
+    /* --- a FLUSH that errors still parks and sleeps the drive ------------ *
+     * Power is about to be cut; the heads matter more than the code. The
+     * flush runs the documented recovery (ERROR latched, reset, reselect,
+     * ready), then STANDBY and SLEEP are issued on the recovered drive and
+     * the flush's -3 is what comes back. Status: ready for the flush's two
+     * ready polls and its BSY-clear, ERR on its final status, then RDY for
+     * everything after (the recovery's DRQ-drain poll sees no DRQ). */
+    {
+        static const uint32_t seq[] = { RDY, RDY, RDY, RDY | ERR, RDY };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 5);
+        mmio_mock_set_read(ATA_ERROR_ADDR, ERROR_ABRT);
+        rc = ata_sleep();
+        xpect(c, "sleep: a failed flush is reported as -3", rc == -3);
+        xpect(c, "sleep: but the drive is still parked", ata_is_parked() == 1);
+        tc = trace_begin("sleep-flush-error");
+        expect_flush(&tc);
+        expect_recovery(&tc, 0);
+        expect_wait_ready(&tc);
+        expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+        expect_w(&tc, 8, ATA_COMMAND_ADDR, CMD_STANDBY_IMM);
+        expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);
+        expect_wait_ready(&tc);
+        expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+        expect_w(&tc, 8, ATA_COMMAND_ADDR, CMD_SLEEP);
+        expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);
+        finish(c, &tc);
+        /* leave the drive awake for the cases that follow */
+        mmio_mock_reset();
+        mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+        xpect(c, "sleep: wake after the flush-error sleep", ata_wakeup() == 0);
+    }
+
+    /* --- a wedged drive cannot be put to sleep, and does not hang -------- */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, BSY);
+    GUARDED(rc, ata_sleep());
+    xpect(c, "sleep: a permanently-BSY drive does not hang", rc != 999);
+    xpect(c, "sleep: a permanently-BSY drive returns -1", rc == -1);
+    xpect(c, "sleep: and is not reported parked", ata_is_parked() == 0);
+    xpect(c, "sleep: no command was issued to it",
+          count_writes(ATA_COMMAND_ADDR) == 0 && only_status_reads_from(0));
+    xpect(c, "sleep: exactly one spin budget of polls",
+          total_events() == SPIN_LIMIT);
+    /* and it did not get marked slept: the next read must not reset */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_read_sectors(0x1000u, 2, g_buf);
+    xpect(c, "sleep: a refused sleep leaves the next read reset-free",
+          rc == 0 && count_writes(ATA_CONTROL_ADDR) == 0);
 }
 
 /* ======================================================================= */

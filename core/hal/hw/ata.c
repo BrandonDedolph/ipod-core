@@ -263,7 +263,34 @@ int ata_identify(void *buf)
  * logic share ONE truth about the drive instead of each guessing. */
 static int g_ata_parked;
 
+/* 1 after ata_sleep() has issued SLEEP: the drive's interface is INACTIVE and
+ * ignores commands until a reset. Every command path checks it and runs
+ * ata_leave_sleep() first, so a caller that skips ata_wakeup() still gets a
+ * working drive — the same "any access wakes it" contract STANDBY has. */
+static int g_ata_slept;
+
 int ata_is_parked(void) { return g_ata_parked; }
+
+/* Defined with the write path below; SLEEP needs the flush first. */
+static int ata_flush_cache(void);
+static int ata_wait_not_busy_timed(void);
+
+/*
+ * Bring the drive out of SLEEP. Unlike STANDBY, SLEEP shuts the interface
+ * down and the drive answers nothing — a READ issued at it just times out.
+ * The ATA-defined way back is a reset (software here, on the control
+ * register: the same SRST pulse ata_init and the error recovery use), after
+ * which the drive spins up and holds BSY for the duration, so the wait is
+ * the TIMED one, not the poll-count one. Clears the slept flag first so a
+ * failure here cannot make the next access reset again forever.
+ */
+static int ata_leave_sleep(void)
+{
+    g_ata_slept = 0;
+    ata_bus_reset();
+    mmio_write8(ATA_SELECT_ADDR, ATA_SELECT_OBS);
+    return ata_wait_not_busy_timed();
+}
 
 /*
  * LBA28 address-space guard. The register programming below carries only 28
@@ -290,6 +317,9 @@ static int ata_read_raw_locked(uint32_t lba, uint32_t count, void *buf)
     }
     if (!ata_lba28_in_range(lba, count)) {
         return -1;
+    }
+    if (g_ata_slept) {
+        (void)ata_leave_sleep();        /* a READ cannot wake a SLEEPing drive */
     }
     if (ata_wait_ready() != 0) {
         return -1;
@@ -392,19 +422,35 @@ int ata_read_sectors(uint32_t lba, uint32_t count, void *buf)
 }
 
 /* ---------------------------------------------------------------------------
- * Drive power management (for suspend). STANDBY IMMEDIATE spins the platters
- * down but leaves the drive able to accept commands; the next media access
- * auto-spins it back up, holding BSY for the (multi-second) spin-up. So sleep
- * = ata_standby(), and wake = ata_wakeup() which kicks a 1-sector read and
- * tolerates the long spin-up before normal reads resume.
+ * Drive power management. Two depths:
+ *
+ *   ata_standby()  STANDBY IMMEDIATE (0xE0): platters down, interface up.
+ *                  The next media access auto-spins it back up, holding BSY
+ *                  for the (multi-second) spin-up. The idle-timer park.
+ *   ata_sleep()    FLUSH CACHE, STANDBY IMMEDIATE, then SLEEP (0xE6): the
+ *                  drive's lowest state — the interface logic is powered
+ *                  down too, and the drive answers NOTHING until a reset.
+ *                  For suspend and power-off, where the drive will not be
+ *                  touched for minutes-to-hours and every mA counts.
+ *
+ * ata_wakeup() undoes either: a reset first if the drive was put to SLEEP
+ * (nothing else reaches it), then a whole-physical-sector throwaway read
+ * that pre-pays the spin-up. 04-ata.md, "Spin-up / spin-down" and "Power-
+ * management commands".
+ *
+ * UNVERIFIED ON THE DEVICE: the STANDBY path has run on hardware, the
+ * SLEEP + reset-to-wake path has not (2026-09-13). The MK8010GAH lists
+ * SLEEP as mandatory (it is, for every ATA-6 drive); what is not known is
+ * how long its post-reset spin-up takes, which is why the wake wait is
+ * the 4 s timed one rather than a poll count.
  * ------------------------------------------------------------------------- */
 #define ATA_CMD_STANDBY_IMM   0xE0
+#define ATA_CMD_SLEEP         0xE6
 
-int ata_standby(void)
+/* STANDBY IMMEDIATE, clock already held. */
+static int ata_standby_locked(void)
 {
-    ata_clock_hold();
     if (ata_wait_ready() != 0) {
-        ata_clock_release();
         return -1;
     }
     mmio_write8(ATA_SELECT_ADDR, ATA_SELECT_OBS);          /* master */
@@ -416,12 +462,75 @@ int ata_standby(void)
     if (rc == 0) {
         g_ata_parked = 1;
     }
+    return rc;
+}
+
+int ata_standby(void)
+{
+    ata_clock_hold();
+    int rc = ata_standby_locked();
     ata_clock_release();
     return rc;
 }
 
+int ata_sleep(void)
+{
+    if (g_ata_slept) {
+        return 0;                       /* already there; it would not hear us */
+    }
+    ata_clock_hold();
+
+    /*
+     * FLUSH CACHE first. STANDBY IMMEDIATE is documented to flush the drive's
+     * own cache on the way down, but the explicit flush is what the write
+     * path's durability rests on and it costs nothing when the cache is
+     * clean. -1 means the drive never came READY: nothing after it can be
+     * issued either, so stop. Any other failure has already been RECOVERED
+     * (reset, reselect, ready) by ata_flush_cache, which leaves the drive in
+     * a known state — so carry on and park it anyway: power is about to be
+     * cut, and parked heads matter more than the code, which is still
+     * reported.
+     */
+    int rc = ata_flush_cache();
+    if (rc == -1) {
+        ata_clock_release();
+        return -1;
+    }
+
+    int rcs = ata_standby_locked();     /* heads parked, platters down */
+    if (rcs != 0) {
+        ata_clock_release();
+        return rc != 0 ? rc : rcs;
+    }
+
+    /* SLEEP. The command completes (BSY clears) BEFORE the drive enters
+     * Sleep mode, so the ordinary bounded wait reads its completion; after
+     * that the interface goes quiet and the flag below is the only truth. */
+    if (ata_wait_ready() == 0) {
+        mmio_write8(ATA_SELECT_ADDR, ATA_SELECT_OBS);          /* master */
+        mmio_write8(ATA_COMMAND_ADDR, ATA_CMD_SLEEP);
+        for (volatile uint32_t g = 0; g < 64; g++) {
+            /* command-to-status settle */
+        }
+        rcs = ata_wait_not_busy();
+        g_ata_slept = 1;                /* issued: only a reset reaches it now */
+    } else {
+        rcs = -1;
+    }
+
+    ata_clock_release();
+    return rc != 0 ? rc : rcs;
+}
+
 int ata_wakeup(void)
 {
+    ata_clock_hold();
+    if (g_ata_slept) {
+        /* A READ cannot wake a SLEEPing drive — only a reset can (above).
+         * The result is not decisive: the read below has its own ready wait
+         * and reports the failure properly if the drive really is gone. */
+        (void)ata_leave_sleep();
+    }
     /*
      * The drive reports "ready" in standby (BSY clear, RDY set) but is spun
      * down; a READ is what triggers spin-up. The throwaway read MUST cover a
@@ -438,7 +547,8 @@ int ata_wakeup(void)
      * issued; the extended (time-based) DRQ wait inside it tolerates the
      * multi-second spin-up.
      */
-    int rc = ata_read_raw(0, ATA_PHYS_LOG, ata_bounce);
+    int rc = ata_read_raw_locked(0, ATA_PHYS_LOG, ata_bounce);
+    ata_clock_release();
 
     /*
      * Reconcile on EVERY exit path. Even a failed wake means we can no longer
@@ -528,6 +638,9 @@ static int ata_write_raw(uint32_t lba, uint32_t count, const void *buf)
     }
     if (!ata_lba28_in_range(lba, count)) {
         return -1;
+    }
+    if (g_ata_slept) {
+        (void)ata_leave_sleep();        /* a WRITE cannot wake a SLEEPing drive */
     }
     if (ata_wait_ready() != 0) {
         return -1;

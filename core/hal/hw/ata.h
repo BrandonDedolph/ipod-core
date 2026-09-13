@@ -87,12 +87,31 @@ int ata_identify(void *buf);
 int ata_standby(void);
 
 /*
- * Spin the drive back UP after ata_standby() and confirm it can transfer:
- * kicks a throwaway read of one whole PHYSICAL sector (this drive IDNFs a
- * sub-physical-sector read, so a 1-sector probe always failed) and waits out
- * the multi-second spin-up. Call once on wake before resuming normal reads.
- * Returns 0, or negative per the code table above. ata_is_parked() is
- * reconciled to 0 on EVERY exit path, success or not.
+ * Put the drive in its LOWEST power state for a long suspend or a power-off:
+ * FLUSH CACHE (so a returned write is on the platters), STANDBY IMMEDIATE
+ * (heads parked, platters down), then SLEEP (0xE6), which also powers the
+ * drive's interface logic down. After this the drive answers NOTHING — a
+ * READ at it just times out — and only a reset brings it back, which
+ * ata_wakeup() (and, as a fallback, every read/write path) issues. Returns
+ * 0, or negative per the code table above; a flush that errors still parks
+ * and sleeps the drive (the code is reported, the heads are what matter
+ * before a power cut). Idempotent while slept.
+ *
+ * The SLEEP + reset-to-wake sequence is UNVERIFIED on the device; the
+ * STANDBY-only path (ata_standby) is the one that has run on hardware.
+ */
+int ata_sleep(void);
+
+/*
+ * Spin the drive back UP after ata_standby() or ata_sleep() and confirm it
+ * can transfer. After a SLEEP the drive is unreachable until a reset, so
+ * this issues a soft reset on the control register first (and waits out
+ * the post-reset spin-up, timed). Then a throwaway read of one whole
+ * PHYSICAL sector (this drive IDNFs a sub-physical-sector read, so a
+ * 1-sector probe always failed) that waits out the multi-second spin-up.
+ * Call once on wake before resuming normal reads. Returns 0, or negative
+ * per the code table above. ata_is_parked() is reconciled to 0 on EVERY
+ * exit path, success or not.
  */
 int ata_wakeup(void);
 
