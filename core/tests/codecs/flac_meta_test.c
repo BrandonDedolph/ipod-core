@@ -11,8 +11,12 @@
  *      VORBIS_COMMENT with zero tags, so the tag fields stay empty.
  *   2. A synthetic FLAC we build in RAM with a full VORBIS_COMMENT block —
  *      exercises the tag parse path (TITLE/ARTIST/ALBUMARTIST fallback/ALBUM/
- *      GENRE/TRACKNUMBER "n/total"/DATE "YYYY-MM-DD"), UTF-8 stripping, and
- *      the last-block flag.
+ *      GENRE/TRACKNUMBER "n/total"/DATE "YYYY-MM-DD") and the last-block flag.
+ *   2b. Tag text is UTF-8: well-formed sequences (2, 3 and 4 bytes) pass
+ *      through whole, C0 controls / DEL / bytes that are not UTF-8 (stray
+ *      continuations, overlongs, surrogates, a sequence cut short) are
+ *      dropped, and a field that fills up truncates on a sequence boundary.
+ *      The scan fallback showed "Beyonc" for "Beyoncé" before this.
  *   3. Robustness: a truncated / non-FLAC buffer returns -1 without crashing,
  *      and a VORBIS_COMMENT with an absurd declared length can't run away.
  *
@@ -135,7 +139,8 @@ static void put_comment(uint8_t **pp, const char *s)
 
 /* Returns total length written into buf. */
 static size_t build_tagged_flac(uint8_t *buf, uint32_t sample_rate,
-                                uint64_t total_samples)
+                                uint64_t total_samples,
+                                const char *const *comments, size_t n_comments)
 {
     uint8_t *p = buf;
 
@@ -178,15 +183,10 @@ static size_t build_tagged_flac(uint8_t *buf, uint32_t sample_rate,
     uint8_t *count_at = p;       /* comment_count, filled below */
     p += 4;
     uint32_t count = 0;
-    put_comment(&p, "TITLE=Blue Sky"); count++;
-    put_comment(&p, "ARTIST=The Testers"); count++;
-    put_comment(&p, "ALBUMARTIST=Various"); count++;   /* ignored: ARTIST set */
-    put_comment(&p, "ALBUM=Greatest Hits"); count++;
-    put_comment(&p, "GENRE=Rock"); count++;
-    put_comment(&p, "tracknumber=7/12"); count++;      /* lowercase key */
-    put_comment(&p, "DATE=2021-05-01"); count++;
-    /* A comment with a UTF-8 multibyte char that must be stripped. */
-    put_comment(&p, "COMMENT=caf\xC3\xA9 time"); count++;
+    for (size_t i = 0; i < n_comments; i++) {
+        put_comment(&p, comments[i]);
+        count++;
+    }
     put_le32(count_at, count);
 
     put_be24(vc_len, (uint32_t)(p - body));
@@ -224,8 +224,19 @@ int main(int argc, char **argv)
 
     /* --- Test 2: synthetic FLAC with a full tag set --- */
     {
+        static const char *const tags[] = {
+            "TITLE=Blue Sky",
+            "ARTIST=The Testers",
+            "ALBUMARTIST=Various",            /* ignored: ARTIST set */
+            "ALBUM=Greatest Hits",
+            "GENRE=Rock",
+            "tracknumber=7/12",               /* lowercase key */
+            "DATE=2021-05-01",
+            "COMMENT=caf\xC3\xA9 time",       /* an unread key, UTF-8 in it */
+        };
         static uint8_t buf[1024];
-        size_t len = build_tagged_flac(buf, 48000, 48000ull * 217); /* 217 s */
+        size_t len = build_tagged_flac(buf, 48000, 48000ull * 217,   /* 217 s */
+                                       tags, sizeof tags / sizeof tags[0]);
         src_init(&ms, &src, buf, len);
         int rc = flac_meta_read(&src, &m);
         check("syn-parse-ok", rc == 0 && m.have == 1);
@@ -241,6 +252,55 @@ int main(int argc, char **argv)
                "genre=\"%s\" track=%d year=%d\n",
                m.sample_rate, m.duration_s, m.title, m.artist, m.album,
                m.genre, m.track, m.year);
+    }
+
+    /* --- Test 2b: tag text keeps UTF-8, drops what is not text --- */
+    {
+        static const char *const tags[] = {
+            "TITLE=Beyonc\xC3\xA9",                        /* 2-byte: é */
+            "ARTIST=caf\xC3\xA9 \xE2\x80\x93 It\xE2\x80\x99s \xF0\x9F\x8E\xB5",
+                                    /* 2-, 3- and 4-byte sequences intact */
+            "ALBUM=a\x01" "b\x7F" "c\xFF" "d\x80" "e\xC0\xAF" "f\xED\xA0\x80" "g",
+                                    /* C0, DEL, F5..FF lead, stray cont.,
+                                     * overlong "/", surrogate: all dropped */
+            "GENRE=Pop\xC3",                                /* cut short at the end */
+        };
+        static uint8_t buf[1024];
+        size_t len = build_tagged_flac(buf, 44100, 44100, tags,
+                                       sizeof tags / sizeof tags[0]);
+        src_init(&ms, &src, buf, len);
+        int rc = flac_meta_read(&src, &m);
+        check("utf8-parse-ok", rc == 0 && m.have == 1);
+        check("utf8-2byte-kept", strcmp(m.title, "Beyonc\xC3\xA9") == 0);
+        check("utf8-3byte-4byte-kept",
+              strcmp(m.artist,
+                     "caf\xC3\xA9 \xE2\x80\x93 It\xE2\x80\x99s \xF0\x9F\x8E\xB5") == 0);
+        check("utf8-junk-dropped", strcmp(m.album, "abcdefg") == 0);
+        check("utf8-truncated-seq-dropped", strcmp(m.genre, "Pop") == 0);
+        printf("  utf8: title=\"%s\" artist=\"%s\" album=\"%s\" genre=\"%s\"\n",
+               m.title, m.artist, m.album, m.genre);
+    }
+
+    /* --- Test 2c: a full field truncates on a sequence boundary --- */
+    {
+        /* genre[32] holds 31 bytes. 30 'g' + "é" is 32: the é must be left
+         * out whole, never its first byte. 29 'g' + "é" is 31: fits exactly. */
+        char g30[64] = "GENRE=", g29[64] = "GENRE=";
+        memset(g30 + 6, 'g', 30); memcpy(g30 + 36, "\xC3\xA9", 3);
+        memset(g29 + 6, 'g', 29); memcpy(g29 + 35, "\xC3\xA9", 3);
+        const char *const tags[] = { g30 };
+        const char *const tags2[] = { g29 };
+        static uint8_t buf[1024];
+        size_t len = build_tagged_flac(buf, 44100, 44100, tags, 1);
+        src_init(&ms, &src, buf, len);
+        check("utf8-trunc-parse", flac_meta_read(&src, &m) == 0);
+        check("utf8-trunc-on-boundary",
+              strlen(m.genre) == 30 && strspn(m.genre, "g") == 30);
+        len = build_tagged_flac(buf, 44100, 44100, tags2, 1);
+        src_init(&ms, &src, buf, len);
+        check("utf8-fit-parse", flac_meta_read(&src, &m) == 0);
+        check("utf8-fit-exactly",
+              strlen(m.genre) == 31 && strcmp(m.genre + 29, "\xC3\xA9") == 0);
     }
 
     /* --- Test 3: non-FLAC / truncated buffers return -1, don't crash --- */

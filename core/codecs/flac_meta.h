@@ -19,9 +19,10 @@
  *
  * Freestanding-clean: no libc/libm/malloc, no allocation — all buffers are
  * on the caller's stack (the flac_meta_t) or small locals. Strings are
- * bounded and copied as printable ASCII 0x20..0x7E only, dropping UTF-8
- * multibyte bytes to match the atlas font's coverage (same policy as
- * kernel/main.c's copy_display_name).
+ * bounded and copied as UTF-8: printable ASCII and well-formed multibyte
+ * sequences pass through, C0 controls / DEL / bytes that are not UTF-8 are
+ * dropped, and a full field truncates on a sequence boundary (same policy
+ * as library/names.c's copy_display_name; the renderer decodes UTF-8).
  */
 #ifndef CORE_CODECS_FLAC_META_H
 #define CORE_CODECS_FLAC_META_H
@@ -34,7 +35,7 @@ typedef struct {
     int      have;          /* 1 if the file parsed as FLAC (STREAMINFO seen) */
     uint32_t duration_s;    /* total_samples / sample_rate, 0 if unknown      */
     uint32_t sample_rate;   /* Hz, from STREAMINFO (0 if unknown)             */
-    char     title[64];     /* NUL-terminated, printable-ASCII, truncated     */
+    char     title[64];     /* NUL-terminated UTF-8, truncated on a boundary  */
     char     artist[64];    /* prefers ARTIST, falls back to ALBUMARTIST      */
     char     album[64];
     char     genre[32];
