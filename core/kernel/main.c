@@ -840,11 +840,19 @@ static int battery_refresh(int force)
          * The hold is a USEC_TIMER spin, not cpu_wait_ms(): that takes a
          * uint8_t of milliseconds and may wake early on an IRQ, and this is
          * the one message the user gets.
+         *
+         * Order: panel awake, frame presented, THEN backlight. This can fire
+         * from inside a suspend, where the panel is asleep (LCD_SLEEP) and
+         * a present is a no-op until lcd_wake(); and light behind a panel
+         * that is still running its wake-init is the white flash. lcd_wake
+         * is a no-op when the panel is already up, and the present is then
+         * the ordinary one — so the order costs nothing on the main loop.
          */
         player_pause();
-        backlight_set(g_settings.backlight_bright);
+        lcd_wake();
         screen_battery_render(BATTWARN_SHUTOFF);
         lcd_present_fb(console_framebuffer());
+        backlight_set(g_settings.backlight_bright);
         {
             uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
             while ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - t0) < 1500000u) {
@@ -4125,9 +4133,30 @@ static int enter_standby(void)
 #define SUSPEND_PANEL_SLEEP 1
 #endif
 
+/*
+ * How long a suspend may last on battery before it escalates to a real PMU
+ * standby (enter_standby). Suspend keeps the CPU, RAM, PLL and the 100 Hz
+ * tick alive so that wake is instant; that is the right trade for "off for
+ * a minute", and the wrong one for "off overnight", where the same draw
+ * just takes the cell to the PMU's hard cut with nothing saved. Not applied
+ * while on external power: a docked device can sit suspended for as long
+ * as it likes. The cost of escalating is a cold boot on the next wake.
+ */
+#ifndef SUSPEND_TO_STANDBY_US
+#define SUSPEND_TO_STANDBY_US  (30u * 60u * 1000000u)     /* 30 minutes */
+#endif
+
+/* Idle-loop period while suspended. Nothing in the loop needs to be
+ * prompt: the 100 Hz tick samples the wheel into the latch regardless, so a
+ * press is seen within one period, and the battery sample is on its own
+ * 5 s cadence. Longer periods mean fewer wakeups of a core that is
+ * otherwise halted (cpu_wait_ms). */
+#define SUSPEND_IDLE_MS        100u
+
 static void suspend_to_ram(uint32_t play_down_us)
 {
     wheel_event_t drain;
+    uint32_t suspend_t0 = mmio_read32(USEC_TIMER_ADDR);
     int was_playing = player_active() && !player_paused();
     if (was_playing) {
         player_pause();                   /* silence + stop feeding the disk */
@@ -4215,7 +4244,50 @@ static void suspend_to_ram(uint32_t play_down_us)
          * would defeat the whole exercise.
          */
         player_pump();
-        cpu_wait_ms(30);
+
+        /*
+         * Watch the battery. battery_refresh() only ever ran from the main
+         * loop, so a suspended device took no samples at all: it discharged
+         * straight past the DISKSAFE and SHUTOFF lines to the PMU's hard cut,
+         * with nothing flushed and no goodbye. Same call, same 5 s cadence,
+         * same policy — the DISKSAFE edge makes its last write (which wakes
+         * the slept drive, so put it back to sleep afterwards if the handler
+         * left it up), and the SHUTOFF edge powers the device off through
+         * enter_standby(). If the PMU refuses THAT, enter_standby has already
+         * stopped the player and relit the screen: leave the loop the way a
+         * refused hold-escalation does, and do not resume.
+         */
+        if (battery_refresh(0)) {
+            if (g_standby_refused) {
+                standby_refused = 1;
+                was_playing     = 0;
+                break;
+            }
+            if (!ata_is_parked()) {
+                ata_sleep();
+            }
+        }
+
+        /* Keep the jack debouncer fed (a GPIO read), so the answer it gives
+         * at wake reflects what happened during the suspend, not before it. */
+        (void)hal_headphones_present();
+
+        /*
+         * Escalate. Past SUSPEND_TO_STANDBY_US on battery this is no longer
+         * a short "off": trade the instant wake for a real power-down before
+         * the cell is spent. Checked every pass, so a device unplugged after
+         * the deadline escalates on the next one.
+         */
+        if (!power_is_external() &&
+            (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - suspend_t0) >
+                SUSPEND_TO_STANDBY_US) {
+            if (enter_standby() != 0) {   /* normally no return */
+                standby_refused = 1;
+                was_playing     = 0;
+                break;
+            }
+        }
+        cpu_wait_ms(SUSPEND_IDLE_MS);
     }
     /* Swallow the wake press so it isn't also acted on as navigation. */
     while (clickwheel_buttons() != 0) {
@@ -4245,7 +4317,16 @@ static void suspend_to_ram(uint32_t play_down_us)
     lcd_present_fb(console_framebuffer()); /* ...retire the panel init...     */
     backlight_set(g_settings.backlight_bright);  /* ...then light up straight to it */
     if (was_playing) {
-        player_resume();
+        /*
+         * Resume only into a seated plug. The main loop pauses on an unplug
+         * edge but was not running to see one during the suspend; the
+         * debouncer was kept fed above, so this is the current answer. -1
+         * (detect not yet trusted on this device, hal/hw/headphone.h) keeps
+         * today's behaviour: resume. 0 leaves it paused, one PLAY away.
+         */
+        if (hal_headphones_present() != 0) {
+            player_resume();
+        }
     }
 }
 

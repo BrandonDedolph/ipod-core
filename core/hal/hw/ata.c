@@ -655,6 +655,7 @@ static int ata_write_raw(uint32_t lba, uint32_t count, const void *buf)
                 (uint8_t)(ATA_SELECT_OBS | ATA_SELECT_LBA |
                           ((lba >> 24) & 0x0F)));
     mmio_write8(ATA_COMMAND_ADDR, ATA_CMD_WRITE_SECTORS);
+    g_ata_parked = 0;               /* a WRITE spins the drive up just as a READ does */
 
     /* Command-to-status pipeline guard (~sub-microsecond), as on the read. */
     for (volatile uint32_t g = 0; g < 64; g++) {

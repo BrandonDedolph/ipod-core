@@ -624,6 +624,18 @@ static void test_power(xfail_ctx *c)
     rc = ata_read_sectors(0x1000u, 2, g_buf);
     xpect(c, "parked: any READ clears it", rc == 0 && ata_is_parked() == 0);
 
+    /* --- and so does a WRITE ---------------------------------------------- *
+     * The write path used to leave the flag alone, so an idle settings save
+     * (which happens with the drive parked and nothing playing) spun the
+     * platters up while ata_is_parked() kept saying 1 — and the idle timer,
+     * gated on that flag, never parked them again until the next READ. */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    xpect(c, "parked: standby parks (before a write)",
+          ata_standby() == 0 && ata_is_parked());
+    rc = ata_write_sectors(0x1000u, 2, g_pattern);
+    xpect(c, "parked: any WRITE clears it too", rc == 0 && ata_is_parked() == 0);
+
     /* --- a FAILED wake still reconciles parked to 0 --------------------- *
      * The read either spun the platters up or left the drive in a state we
      * cannot characterise; either way "parked" would be a lie that suppresses
