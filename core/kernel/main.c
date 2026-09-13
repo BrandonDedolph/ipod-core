@@ -3175,17 +3175,32 @@ static void music_menu_render(void)
 typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_SONGS, SCR_GENRES,
                SCR_BROWSER, SCR_NOWPLAYING, SCR_QUEUE, SCR_SETTINGS,
                SCR_BATTERY, SCR_CHARGING } screen_t;
-/* Exactly reached by the deepest legal path: MENU, MUSIC, ARTISTS, BROWSER,
- * NOWPLAYING, QUEUE, BATTERY, CHARGING. A new screen needs this bumped. */
-#define SCR_STACK_MAX 8
+/* The deepest legal path is 8: MENU, MUSIC, ARTISTS, BROWSER, SONGS,
+ * NOWPLAYING, QUEUE, plus ONE modal (scr_push_modal replaces a modal with a
+ * modal, so BATTERY and CHARGING never stack). The headroom is deliberate:
+ * this used to be exactly 8 without SONGS counted, and a DISKSAFE edge at
+ * the bottom of that path retried the push every pass with dirty set — a
+ * full-repaint loop until a button cleared it. A new screen still deserves
+ * a look at the arithmetic; the UART line is what says it was wrong. */
+#define SCR_STACK_MAX 12
 static screen_t g_scr[SCR_STACK_MAX];
 static int      g_scr_n;
 
 static void      scr_push(screen_t s) { g_list_epoch++;
-                                        if (g_scr_n < SCR_STACK_MAX) g_scr[g_scr_n++] = s; }
+                                        if (g_scr_n < SCR_STACK_MAX) g_scr[g_scr_n++] = s;
+                                        else uart_puts("core: scr_push overflow, dropped\n"); }
 static void      scr_pop(void)        { g_list_epoch++;
                                         if (g_scr_n > 1) g_scr_n--; }
 static screen_t  scr_cur(void)        { return g_scr[g_scr_n - 1]; }
+static int       scr_is_modal(screen_t s) { return s == SCR_BATTERY || s == SCR_CHARGING; }
+/* A modal (BATTERY, CHARGING) over a modal takes its slot instead of a new
+ * one: the two are alternatives for the same panel, and popping the top one
+ * lands on the real screen underneath, which is what both auto-dismiss paths
+ * expect. */
+static void      scr_push_modal(screen_t s) { if (scr_is_modal(scr_cur())) {
+                                                  g_list_epoch++;
+                                                  g_scr[g_scr_n - 1] = s;
+                                              } else scr_push(s); }
 
 /* Why the last browse_load produced what it did: 0, or the FAT32_* code of a
  * directory read that failed even after retries. An empty g_browse with a
@@ -4426,7 +4441,7 @@ _Noreturn static void run_ui(fat32_t *fs)
          * button also dismisses it (handled in the input switch below). */
         int ext = power_is_external() ? 1 : 0;
         if (ext && !ext_prev && scr_cur() != SCR_CHARGING) {
-            scr_push(SCR_CHARGING);
+            scr_push_modal(SCR_CHARGING);
             dirty = 1;
         } else if (!ext && scr_cur() == SCR_CHARGING) {
             scr_pop();
@@ -4441,7 +4456,7 @@ _Noreturn static void run_ui(fat32_t *fs)
          * the screen stack underneath it. */
         if (battwarn_screen() == BATTWARN_DISKSAFE &&
             scr_cur() != SCR_BATTERY && scr_cur() != SCR_CHARGING) {
-            scr_push(SCR_BATTERY);
+            scr_push_modal(SCR_BATTERY);
             dirty = 1;
         } else if (scr_cur() == SCR_BATTERY &&
                    battwarn_screen() != BATTWARN_DISKSAFE) {
