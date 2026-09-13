@@ -881,6 +881,16 @@ static void draw_battery(int x, int y, int pct)
     }
 }
 
+/* What draw_battery() would actually put on the panel for `pct`: the fill
+ * width in pixels and whether it is red. Two samples that round to the same
+ * picture are the same picture, and must not cost a repaint. */
+static int battery_glyph_key(int pct)
+{
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    return ((18 * pct) / 100) | ((pct <= 20) ? 0x100 : 0);
+}
+
 /* The top status strip: the now-playing track name on the left (so you always
  * see what's playing while browsing), battery on the right. During bring-up the
  * right side also shows raw millivolts (to calibrate the %-curve; see
@@ -4290,6 +4300,7 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      lock_flashing = 0;          /* a lock/unlock plate is on screen     */
     char     az_prev = 0;                /* A-Z locator letter on screen         */
     int      toast_prev = 0;             /* low-battery toast on screen          */
+    int      bat_glyph_prev = battery_glyph_key(g_bat_pct); /* strip gauge as drawn */
     int      play_held = 0;              /* PLAY currently down (long-press off)  */
     uint32_t play_down_us = 0;           /* when PLAY went down                   */
     g_locked = hold_prev;
@@ -4407,8 +4418,18 @@ _Noreturn static void run_ui(fat32_t *fs)
             dirty = 1;
         }
         was_active = now_active;
-        if (battery_refresh(0) && scr_cur() == SCR_CHARGING) {
-            dirty = 1;                    /* refresh the % on the charging screen  */
+        if (battery_refresh(0)) {
+            /* The strip's gauge is only ever painted on `dirty`, and an idle
+             * list screen sets it for nothing, so a menu left alone showed
+             * the boot-time gauge indefinitely. Repaint when the glyph as
+             * DRAWN changes — at most once per 5 s sample, and not at all
+             * for a sample that rounds to the same picture. The charging
+             * screen shows the number itself, so every sample is a change. */
+            int key = battery_glyph_key(g_bat_pct);
+            if (key != bat_glyph_prev || scr_cur() == SCR_CHARGING) {
+                bat_glyph_prev = key;
+                dirty = 1;
+            }
         }
 
         /*
