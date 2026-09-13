@@ -15,17 +15,21 @@
  * two cases now live here, alongside the ones that were missing.
  *
  * WHAT EACH GROUP PROVES:
- *   init     — the reset+select+wait grammar, and that BOTH bounded polls
- *              (BSY clear, then RDY set) really spin: N busy reads then ready
- *              is accepted, and a drive that never comes ready gets EXACTLY
- *              its spin budget of polls and a -1, not a hang.
+ *   init     — the reset+select+wait grammar, and that the ready poll really
+ *              spins on BOTH conditions (BSY clear, then RDY set); that a
+ *              drive that never comes ready is given up on by the TIMER —
+ *              elapsed > the ceiling, not a poll count — and that the
+ *              ceiling after a soft reset is the ATA spin-up allowance
+ *              (31 s), not the plain 10 s one.
  *   read     — the moved 2-sector odd-LBA case, now as an exact trace; the
  *              spin-up-tolerant DRQ wait (BSY N times, then DRQ); the TIMED
  *              DRQ deadline (elapsed > ATA_SPINUP_US, not a poll count); the
- *              ERR path before and after data, asserting the recovery grammar
- *              — ERROR latched BEFORE the reset clears it, residual DRQ
- *              drained word by word, soft reset, reselect — plus the IDNF
- *              upgrade; and the >256-sector split into two commands.
+ *              post-sector status waited for !BSY before ERR/DF is believed;
+ *              the ERR path before and after data, asserting the recovery
+ *              grammar — ERROR latched BEFORE the reset clears it, residual
+ *              DRQ drained word by word, soft reset, reselect, and the
+ *              post-reset ready wait's result actually checked — plus the
+ *              IDNF upgrade; and the >256-sector split into two commands.
  *   power    — STANDBY IMMEDIATE grammar and the parked flag; wake through a
  *              spin-up (BSY) then normal reads; parked reconciled to 0 on a
  *              failed wake and on any plain read; a wedged drive can't park.
@@ -37,6 +41,10 @@
  *   lba28    — an LBA range past 2^28 is rejected before a single register
  *              write, instead of having its top bits masked off and quietly
  *              aliasing a lower sector (and, on a write, overwriting it).
+ *   clock    — every command is bracketed in a balanced cpu_boost/unboost,
+ *              and a boost the clock driver REFUSED (frequency still below
+ *              CPUFREQ_MAX) is reported on the UART, once per command, while
+ *              the command still goes out (the refusal policy is unchanged).
  *
  * Values are hand-derived from core/docs/hw/04-ata.md via pp5022.h, never
  * from Rockbox source. Private ata.c constants are MIRRORED here rather than
@@ -55,11 +63,69 @@
 #include "mmio_mock.h"
 #include "trace_expect.h"
 #include "../xfail.h"
+#include "../../kernel/clock.h"   /* CPUFREQ_MAX / CPUFREQ_NORMAL */
+
+/* ---- the kernel's stand-in: clock bracket + UART ----------------------- *
+ * ata.c declares cpu_boost / cpu_unboost / cpu_frequency / uart_puts WEAK so
+ * it links alone; defining them here makes them observable. cpu_boost raises
+ * the reported frequency unless the test has marked the boost REFUSED — the
+ * shape kernel/clock.c has while the audio DMA streams: the counter bumps,
+ * nothing else happens, cpu_frequency() keeps telling the truth. */
+static int      g_boosts, g_unboosts;
+static int      g_boost_refused;
+static uint32_t g_freq = CPUFREQ_MAX;
+static char     g_uart[512];
+static size_t   g_uart_len;
+
+void cpu_boost(void)
+{
+    g_boosts++;
+    if (!g_boost_refused) {
+        g_freq = CPUFREQ_MAX;
+    }
+}
+
+void cpu_unboost(void)
+{
+    g_unboosts++;
+}
+
+uint32_t cpu_frequency(void)
+{
+    return g_freq;
+}
+
+void uart_puts(const char *str)
+{
+    size_t n = strlen(str);
+    if (g_uart_len + n + 1 > sizeof g_uart) {
+        n = sizeof g_uart - g_uart_len - 1;
+    }
+    memcpy(g_uart + g_uart_len, str, n);
+    g_uart_len += n;
+    g_uart[g_uart_len] = '\0';
+}
+
+static void uart_clear(void)
+{
+    g_uart_len = 0;
+    g_uart[0]  = '\0';
+}
+
+static size_t uart_lines(void)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < g_uart_len; i++) {
+        n += (g_uart[i] == '\n');
+    }
+    return n;
+}
 
 /* ---- mirrors of ata.c's private constants ---------------------------- */
 
-#define SPIN_LIMIT        (1u << 20)   /* ATA_BSY_SPIN_LIMIT: polls per wait */
-#define SPINUP_US         4000000u     /* ATA_SPINUP_US: timed DRQ deadline  */
+#define READY_US          10000000u    /* ATA_READY_US: !BSY / RDY ceiling   */
+#define SRST_READY_US     31000000u    /* ATA_SRST_READY_US: after soft reset */
+#define SPINUP_US         8000000u     /* ATA_SPINUP_US: timed DRQ deadline  */
 #define CMD_STANDBY_IMM   0xE0u
 #define CMD_WRITE_SECTORS 0x30u
 #define CMD_FLUSH_CACHE   0xE7u
@@ -73,8 +139,9 @@
 /* ---- watchdog: "bounded" is the claim, so a hang must be a FAIL -------- *
  * A driver that spins forever on a wedged status register would otherwise
  * hang the binary until meson's timeout kills it, which reports as a timeout
- * rather than as the specific assertion that failed. 5 s is far past the
- * legitimate bounded spin (1<<20 logged mock calls, well under a second). */
+ * rather than as the specific assertion that failed. 5 s is far past any
+ * legitimate wait here: the deadlines are on the scripted usec timer, so a
+ * wait that gives up correctly does so in a handful of polls. */
 
 static sigjmp_buf g_escape;
 static volatile sig_atomic_t g_hung;
@@ -155,19 +222,6 @@ static size_t first_index(mmio_op op, uint32_t addr)
     return len;
 }
 
-/* Are all recorded events reads of ALT_STATUS from index `from` on? */
-static int only_status_reads_from(size_t from)
-{
-    const mmio_event *log = mmio_mock_log();
-    size_t len = mmio_mock_log_len();
-    for (size_t i = from; i < len; i++) {
-        if (log[i].op != MMIO_OP_READ || log[i].addr != ATA_ALT_STATUS_ADDR) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
 static int all_halfwords(const uint16_t *p, size_t n, uint16_t v)
 {
     for (size_t i = 0; i < n; i++) {
@@ -180,11 +234,35 @@ static int all_halfwords(const uint16_t *p, size_t n, uint16_t v)
 
 /* ---- grammar fragments ------------------------------------------------ */
 
-/* ata_wait_ready with both polls satisfied on their first read. */
+/* A timed wait (ready, or not-busy) satisfied after `busy` unsatisfied
+ * polls: the usec timer is read once for the start time and once per
+ * unsatisfied poll, then the status read that satisfies it. */
+static void expect_timed_wait(trace_cursor *tc, size_t busy)
+{
+    expect_r(tc, 32, USEC_TIMER_ADDR);
+    for (size_t i = 0; i < busy; i++) {
+        expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
+        expect_r(tc, 32, USEC_TIMER_ADDR);
+    }
+    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
+}
+
+/* A timed wait that GIVES UP after `polls` unsatisfied polls: no final
+ * satisfied status read — the last thing it does is read the timer and find
+ * the deadline passed. */
+static void expect_timed_timeout(trace_cursor *tc, size_t polls)
+{
+    expect_r(tc, 32, USEC_TIMER_ADDR);
+    for (size_t i = 0; i < polls; i++) {
+        expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
+        expect_r(tc, 32, USEC_TIMER_ADDR);
+    }
+}
+
+/* ata_wait_ready satisfied on its first read. */
 static void expect_wait_ready(trace_cursor *tc)
 {
-    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);     /* BSY clear */
-    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);     /* RDY set   */
+    expect_timed_wait(tc, 0);
 }
 
 /* The LBA28 task-file programming for one command. NSECTOR carries the
@@ -201,39 +279,35 @@ static void expect_command(trace_cursor *tc, uint32_t lba, uint32_t count,
     expect_w(tc, 8, ATA_COMMAND_ADDR, cmd);
 }
 
-/* One DRQ block arriving after `busy` BSY polls. The wait reads the usec
- * timer once for its start time and once per unsatisfied poll. */
+/* One DRQ block arriving after `busy` BSY polls (same shape as any timed
+ * wait). */
 static void expect_drq_wait(trace_cursor *tc, size_t busy)
 {
-    expect_r(tc, 32, USEC_TIMER_ADDR);
-    for (size_t i = 0; i < busy; i++) {
-        expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
-        expect_r(tc, 32, USEC_TIMER_ADDR);
-    }
-    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
+    expect_timed_wait(tc, busy);
 }
 
-/* A DRQ wait that GIVES UP after `polls` unsatisfied polls: the same shape
- * with no final satisfied status read — the last thing it does is read the
- * timer and find the deadline passed. */
 static void expect_drq_timeout(trace_cursor *tc, size_t polls)
 {
-    expect_r(tc, 32, USEC_TIMER_ADDR);
-    for (size_t i = 0; i < polls; i++) {
-        expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
-        expect_r(tc, 32, USEC_TIMER_ADDR);
-    }
+    expect_timed_timeout(tc, polls);
 }
 
-/* One sector streamed IN: status ack, 256 halfwords, post-sector status. */
-static void expect_sector_in(trace_cursor *tc, size_t busy)
+/* One sector streamed IN: status ack, 256 halfwords, then the post-sector
+ * status — waited for !BSY (`post_busy` BSY polls) before ERR/DF is read
+ * off it. */
+static void expect_sector_in_post(trace_cursor *tc, size_t busy,
+                                  size_t post_busy)
 {
     expect_drq_wait(tc, busy);
     expect_r(tc, 8, ATA_COMMAND_ADDR);
     for (int w = 0; w < 256; w++) {
         expect_r(tc, 16, ATA_DATA_ADDR);
     }
-    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
+    expect_timed_wait(tc, post_busy);
+}
+
+static void expect_sector_in(trace_cursor *tc, size_t busy)
+{
+    expect_sector_in_post(tc, busy, 0);
 }
 
 /* One sector streamed OUT, every data word checked against `words`. */
@@ -244,7 +318,7 @@ static void expect_sector_out(trace_cursor *tc, const uint16_t *words)
     for (int w = 0; w < 256; w++) {
         expect_w(tc, 16, ATA_DATA_ADDR, words[w]);
     }
-    expect_r(tc, 8, ATA_ALT_STATUS_ADDR);
+    expect_timed_wait(tc, 0);
 }
 
 /* The documented mid-transfer recovery (04-ata.md, "Per-sector error
@@ -307,7 +381,9 @@ static void test_init(xfail_ctx *c)
     expect_wait_ready(&tc);
     finish(c, &tc);
 
-    /* --- BSY three times, then ready: the not-busy poll must spin ------- */
+    /* --- BSY three times, then ready: the poll must spin on BSY --------- *
+     * The timer reads 0 throughout, so the deadline never trips; the driver
+     * must keep polling, consulting the timer after each miss. */
     {
         static const uint32_t seq[] = { BSY, BSY, BSY, RDY };
         mmio_mock_reset();
@@ -319,53 +395,74 @@ static void test_init(xfail_ctx *c)
         expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_SRST | ATA_CONTROL_NIEN);
         expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
         expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
-        for (int i = 0; i < 4; i++) {
-            expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);   /* BSY,BSY,BSY,clear */
-        }
-        expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);       /* RDY               */
+        expect_timed_wait(&tc, 3);                   /* BSY x3, then RDY  */
         finish(c, &tc);
     }
 
-    /* --- BSY clear at once but RDY late: the SECOND poll must spin too --- *
-     * Distinguishes the two loops: a driver that only waited for !BSY would
-     * return after one read and issue commands to a drive that is not ready. */
+    /* --- BSY clear at once but RDY late: the poll must spin on RDY too --- *
+     * A driver that only waited for !BSY would return after one read and
+     * issue commands to a drive that is not ready. */
     {
-        /* The first 0 is consumed by the not-busy poll (BSY clear, so it
-         * passes at once); the ready poll then sees 0, 0, 0, RDY. */
         static const uint32_t seq[] = { 0, 0, 0, 0, RDY };
         mmio_mock_reset();
         mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 5);
         rc = ata_init();
-        xpect(c, "init: accepts a drive that is !BSY but not RDY for 3 polls",
+        xpect(c, "init: accepts a drive that is !BSY but not RDY for 4 polls",
               rc == 0);
 
         tc = trace_begin("init-ready-late");
         expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_SRST | ATA_CONTROL_NIEN);
         expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
         expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
-        expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);       /* not busy          */
-        for (int i = 0; i < 4; i++) {
-            expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);   /* 0,0,0,RDY         */
-        }
+        expect_timed_wait(&tc, 4);                   /* 0 x4, then RDY    */
         finish(c, &tc);
     }
 
-    /* --- permanently BSY: exactly the spin budget, then -1, no hang ----- *
-     * The log saturates long before 1<<20 reads, so the grammar is asserted
-     * as: every recorded event after the three writes is a status read, and
-     * the TOTAL (recorded + dropped) is the three writes plus exactly one
-     * spin budget. Anything else the driver did would change that total. */
-    mmio_mock_reset();
-    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, BSY);
-    GUARDED(rc, ata_init());
-    xpect(c, "init: a permanently-BSY drive does not hang", rc != 999);
-    xpect(c, "init: a permanently-BSY drive returns -1", rc == -1);
-    xpect(c, "init: the log saturated (the driver really spun)",
-          mmio_mock_dropped() > 0);
-    xpect(c, "init: nothing but status polls after the select",
-          only_status_reads_from(3));
-    xpect(c, "init: exactly one spin budget of polls, then it gave up",
-          total_events() == 3 + SPIN_LIMIT);
+    /* --- permanently BSY: the TIMER gives up, at the post-reset ceiling -- *
+     * The wait after the SRST carries the ATA spin-up allowance (31 s), not
+     * the plain 10 s ceiling. The timer is scripted: 0 at the start, then 0,
+     * 5 s, exactly the deadline (which must NOT trip: the test is `>`), then
+     * past it — four unsatisfied polls, then -1. Under the old iteration-
+     * bounded wait this took 1<<20 polls regardless of time; under a 10 s
+     * ceiling it would have given up on the second poll. */
+    {
+        static const uint32_t usec[] = { 0, 0, 5000000u, SRST_READY_US,
+                                         SRST_READY_US + 1u };
+        mmio_mock_reset();
+        mmio_mock_set_read(ATA_ALT_STATUS_ADDR, BSY);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 5);
+        GUARDED(rc, ata_init());
+        xpect(c, "init: a permanently-BSY drive does not hang", rc != 999);
+        xpect(c, "init: a permanently-BSY drive returns -1", rc == -1);
+
+        tc = trace_begin("init-busy-forever");
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_SRST | ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+        expect_timed_timeout(&tc, 4);   /* 0, 5 s, ==deadline, >deadline */
+        finish(c, &tc);
+    }
+
+    /* --- a drive that takes 20 s to come back from the reset is FINE ----- *
+     * The spec allows 31 s of spin-up after SRST; with a 10 s ceiling this
+     * init would fail and the boot with it. Timer: start 0, then 10 s + 1 us
+     * (past the plain ceiling — must keep polling), then 20 s, then RDY. */
+    {
+        static const uint32_t seq[]  = { BSY, BSY, RDY };
+        static const uint32_t usec[] = { 0, READY_US + 1u, 20000000u };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 3);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 3);
+        GUARDED(rc, ata_init());
+        xpect(c, "init: a 20 s post-reset spin-up is accepted (31 s ceiling)",
+              rc == 0);
+        tc = trace_begin("init-slow-spinup");
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_SRST | ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+        expect_timed_wait(&tc, 2);
+        finish(c, &tc);
+    }
 }
 
 /* ======================================================================= */
@@ -411,9 +508,9 @@ static void test_read(xfail_ctx *c)
      * driver must keep polling, consulting the timer each time, and then
      * transfer normally. */
     {
-        static const uint32_t seq[] = { RDY, RDY, BSY, BSY, BSY, RDY | DRQ };
+        static const uint32_t seq[] = { RDY, BSY, BSY, BSY, RDY | DRQ };
         mmio_mock_reset();
-        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 6);
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 5);
         rc = ata_read_sectors(0x1000u, 2, g_buf);
         xpect(c, "read: DRQ after 3 BSY polls returns 0", rc == 0);
 
@@ -427,17 +524,17 @@ static void test_read(xfail_ctx *c)
 
     /* --- DRQ never arrives: the TIMED deadline, then recovery ----------- *
      * Status is !BSY, RDY, no DRQ, no ERR — a drive that accepted the command
-     * and then said nothing. The timer is scripted so that the elapsed time
-     * reads 0, 1 s, exactly the deadline (which must NOT trip: the test is
-     * `>`), then past it — four unsatisfied polls. The driver must give up
-     * with -2 and, because the drive is still mid-command from our point of
-     * view, run the recovery. */
+     * and then said nothing. The timer is scripted (after the ready wait's
+     * own start read) so that the elapsed time reads 0, 1 s, exactly the
+     * deadline (which must NOT trip: the test is `>`), then past it — four
+     * unsatisfied polls. The driver must give up with -2 and, because the
+     * drive is still mid-command from our point of view, run the recovery. */
     {
-        static const uint32_t usec[] = { 0, 0, 1000000u, SPINUP_US,
+        static const uint32_t usec[] = { 0, 0, 0, 1000000u, SPINUP_US,
                                          SPINUP_US + 1u };
         mmio_mock_reset();
         mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY);
-        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 5);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 6);
         GUARDED(rc, ata_read_sectors(0x1000u, 2, g_buf));
         xpect(c, "read: a DRQ that never comes does not hang", rc != 999);
         xpect(c, "read: a DRQ that never comes returns -2 (timeout)", rc == -2);
@@ -483,14 +580,14 @@ static void test_read(xfail_ctx *c)
      * SECTORS returns data shifted by three halfwords, reported as success. */
     {
         static const uint32_t seq[] = {
-            RDY, RDY,               /* wait ready                       */
+            RDY,                    /* wait ready                       */
             RDY | DRQ,              /* sector 0 DRQ                     */
             RDY | DRQ | ERR,        /* post-sector status: ERR, DRQ up  */
             RDY | DRQ, RDY | DRQ, RDY | DRQ,   /* drain: 3 words        */
             RDY,                    /* drained; also serves wait ready  */
         };
         mmio_mock_reset();
-        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 8);
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 7);
         mmio_mock_set_read(ATA_ERROR_ADDR, ERROR_ABRT);
         rc = ata_read_sectors(0x1000u, 2, g_buf);
         xpect(c, "read: ERR after sector 0 returns -3", rc == -3);
@@ -550,16 +647,111 @@ static void test_read(xfail_ctx *c)
         xpect(c, "split: and the copy stopped there", g_buf[258 * 256] == 0);
     }
 
-    /* --- a drive that never comes ready: bounded, no command issued ----- */
-    mmio_mock_reset();
-    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, BSY);
-    GUARDED(rc, ata_read_sectors(0x1000u, 2, g_buf));
-    xpect(c, "read: a permanently-BSY drive does not hang", rc != 999);
-    xpect(c, "read: a permanently-BSY drive returns -1", rc == -1);
-    xpect(c, "read: no command was issued to it",
-          count_writes(ATA_COMMAND_ADDR) == 0 && only_status_reads_from(0));
-    xpect(c, "read: exactly one spin budget of polls",
-          total_events() == SPIN_LIMIT);
+    /* --- a drive that never comes ready: timed out, no command issued --- *
+     * The plain (no reset) ready wait has the 10 s ceiling. Timer: start 0,
+     * then 0, past the OLD 4 s data deadline and the new 8 s one (must keep
+     * polling — this is the ready wait, not the DRQ wait), exactly 10 s
+     * (must not trip), then past it. */
+    {
+        static const uint32_t usec[] = { 0, 0, SPINUP_US + 1u, READY_US,
+                                         READY_US + 1u };
+        mmio_mock_reset();
+        mmio_mock_set_read(ATA_ALT_STATUS_ADDR, BSY);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 5);
+        GUARDED(rc, ata_read_sectors(0x1000u, 2, g_buf));
+        xpect(c, "read: a permanently-BSY drive does not hang", rc != 999);
+        xpect(c, "read: a permanently-BSY drive returns -1", rc == -1);
+        xpect(c, "read: no command was issued to it",
+              count_writes(ATA_COMMAND_ADDR) == 0);
+        tc = trace_begin("read-busy-forever");
+        expect_timed_timeout(&tc, 4);   /* 0, 8 s+, ==10 s, >10 s */
+        finish(c, &tc);
+    }
+
+    /* --- the post-sector status is waited for !BSY before it is believed - *
+     * After the 256th word the drive raises BSY while it fetches the next
+     * block, and every other status bit is undefined while it does. Sector
+     * 0's post-sector status reads BSY|ERR — a stale ERR bit under BSY —
+     * then BSY, then clear: the driver must poll through it and NOT run a
+     * recovery. Under the old code the first read after the data was taken
+     * at face value and this transfer failed with -3. */
+    {
+        static const uint32_t seq[] = {
+            RDY,                    /* wait ready                       */
+            RDY | DRQ,              /* sector 0 DRQ                     */
+            BSY | ERR, BSY,         /* post-sector: BSY (bits invalid)  */
+            RDY | DRQ,              /* !BSY: clean, and sector 1's DRQ  */
+            RDY | DRQ,              /* sector 1 DRQ wait                */
+            RDY,                    /* post-sector: clean               */
+        };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 7);
+        mmio_mock_set_read(ATA_ERROR_ADDR, ERROR_ABRT);
+        GUARDED(rc, ata_read_sectors(0x1000u, 2, g_buf));
+        xpect(c, "read: ERR under BSY after a sector is not an error", rc == 0);
+        xpect(c, "read: and no recovery ran", count_writes(ATA_CONTROL_ADDR) == 0
+              && mmio_mock_count(MMIO_OP_READ, ATA_ERROR_ADDR) == 0);
+        tc = trace_begin("read-post-sector-busy");
+        expect_wait_ready(&tc);
+        expect_command(&tc, 0x1000u, 2, ATA_CMD_READ_SECTORS);
+        expect_sector_in_post(&tc, 0, 2);
+        expect_sector_in(&tc, 0);
+        finish(c, &tc);
+    }
+
+    /* --- the post-reset ready wait in the recovery is CHECKED ----------- *
+     * ERR before data, then the drive comes back from the SRST only after
+     * 20 s (BSY past the plain 10 s ceiling): the 31 s allowance applies and
+     * the recovery completes, reporting the original -3. Then a drive that
+     * NEVER comes back: the recovery must not report -3 as though the drive
+     * were reset and ready for a retry — it reports -1 (never came ready).
+     * Under the old code the wait's result was discarded. */
+    {
+        static const uint32_t seq[]  = { RDY, RDY | ERR, RDY | ERR, BSY, BSY, RDY };
+        static const uint32_t usec[] = { 0, 0, 0, READY_US + 1u, 20000000u };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 6);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 5);
+        mmio_mock_set_read(ATA_ERROR_ADDR, ERROR_ABRT);
+        GUARDED(rc, ata_read_sectors(0x1000u, 2, g_buf));
+        xpect(c, "recover: a 20 s post-SRST spin-up completes the recovery (-3)",
+              rc == -3);
+        tc = trace_begin("recover-slow-spinup");
+        expect_wait_ready(&tc);
+        expect_command(&tc, 0x1000u, 2, ATA_CMD_READ_SECTORS);
+        expect_drq_wait(&tc, 0);                     /* sees ERR at once  */
+        expect_r(&tc, 8, ATA_ERROR_ADDR);
+        expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);       /* drain: no DRQ     */
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_SRST | ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+        expect_timed_wait(&tc, 2);                   /* BSY 10 s+, 20 s, RDY */
+        finish(c, &tc);
+    }
+    {
+        static const uint32_t seq[]  = { RDY, RDY | ERR, RDY | ERR, BSY };
+        static const uint32_t usec[] = { 0, 0, 0, SRST_READY_US + 1u };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 4);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 4);
+        mmio_mock_set_read(ATA_ERROR_ADDR, ERROR_ABRT);
+        GUARDED(rc, ata_read_sectors(0x1000u, 2, g_buf));
+        xpect(c, "recover: a drive that never returns from SRST does not hang",
+              rc != 999);
+        xpect(c, "recover: and reports -1 (never came ready), not the cause",
+              rc == -1);
+        tc = trace_begin("recover-srst-timeout");
+        expect_wait_ready(&tc);
+        expect_command(&tc, 0x1000u, 2, ATA_CMD_READ_SECTORS);
+        expect_drq_wait(&tc, 0);
+        expect_r(&tc, 8, ATA_ERROR_ADDR);
+        expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_SRST | ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+        expect_timed_timeout(&tc, 1);                /* BSY, then >31 s   */
+        finish(c, &tc);
+    }
 }
 
 /* ======================================================================= */
@@ -580,8 +772,32 @@ static void test_power(xfail_ctx *c)
     expect_wait_ready(&tc);
     expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
     expect_w(&tc, 8, ATA_COMMAND_ADDR, CMD_STANDBY_IMM);
-    expect_r(&tc, 8, ATA_ALT_STATUS_ADDR);        /* accepted (BSY clear) */
+    expect_timed_wait(&tc, 0);                    /* accepted (BSY clear) */
     finish(c, &tc);
+
+    /* --- STANDBY holds BSY for seconds while the drive flushes and parks -- *
+     * The real failure: the drive keeps BSY up for 2-3 s after accepting
+     * STANDBY IMMEDIATE, the old 1<<20-poll wait (well under a second)
+     * returned -1, g_ata_parked stayed 0, and the main loop re-issued
+     * STANDBY every pass. Timer: 0, then past the 8 s DATA-phase deadline
+     * (this is the 10 s ready ceiling, so it must keep polling), 9 s, then
+     * BSY clears: 0 and parked. */
+    {
+        static const uint32_t seq[]  = { RDY, BSY, BSY, RDY };
+        static const uint32_t usec[] = { 0, 0, SPINUP_US + 1u, 9000000u };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 4);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 4);
+        GUARDED(rc, ata_standby());
+        xpect(c, "standby: BSY for 9 s while parking still returns 0", rc == 0);
+        xpect(c, "standby: and reports the drive parked", ata_is_parked() == 1);
+        tc = trace_begin("standby-slow-park");
+        expect_wait_ready(&tc);
+        expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+        expect_w(&tc, 8, ATA_COMMAND_ADDR, CMD_STANDBY_IMM);
+        expect_timed_wait(&tc, 2);
+        finish(c, &tc);
+    }
 
     /* --- wake: a whole-physical-sector read at LBA 0 through a spin-up -- *
      * The drive reports ready while spun down; the READ is what spins it up,
@@ -590,9 +806,9 @@ static void test_power(xfail_ctx *c)
      * probe must be count=2 — a count=1 probe IDNFs on this drive and left
      * the parked flag stuck at 1 for the rest of the session. */
     {
-        static const uint32_t seq[] = { RDY, RDY, BSY, BSY, BSY, RDY | DRQ };
+        static const uint32_t seq[] = { RDY, BSY, BSY, BSY, RDY | DRQ };
         mmio_mock_reset();
-        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 6);
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 5);
         rc = ata_wakeup();
         xpect(c, "wakeup: returns 0 through a spin-up", rc == 0);
         xpect(c, "wakeup: reports the drive no longer parked",
@@ -638,16 +854,21 @@ static void test_power(xfail_ctx *c)
           count_writes(ATA_CONTROL_ADDR) == 2);
 
     /* --- a wedged drive cannot be parked, and does not hang ------------- */
-    mmio_mock_reset();
-    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, BSY);
-    GUARDED(rc, ata_standby());
-    xpect(c, "standby: a permanently-BSY drive does not hang", rc != 999);
-    xpect(c, "standby: a permanently-BSY drive returns -1", rc == -1);
-    xpect(c, "standby: and is not reported parked", ata_is_parked() == 0);
-    xpect(c, "standby: no STANDBY was issued to it",
-          count_writes(ATA_COMMAND_ADDR) == 0 && only_status_reads_from(0));
-    xpect(c, "standby: exactly one spin budget of polls",
-          total_events() == SPIN_LIMIT);
+    {
+        static const uint32_t usec[] = { 0, 0, READY_US, READY_US + 1u };
+        mmio_mock_reset();
+        mmio_mock_set_read(ATA_ALT_STATUS_ADDR, BSY);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 4);
+        GUARDED(rc, ata_standby());
+        xpect(c, "standby: a permanently-BSY drive does not hang", rc != 999);
+        xpect(c, "standby: a permanently-BSY drive returns -1", rc == -1);
+        xpect(c, "standby: and is not reported parked", ata_is_parked() == 0);
+        xpect(c, "standby: no STANDBY was issued to it",
+              count_writes(ATA_COMMAND_ADDR) == 0);
+        tc = trace_begin("standby-busy-forever");
+        expect_timed_timeout(&tc, 3);   /* 0, ==10 s, >10 s */
+        finish(c, &tc);
+    }
 }
 
 /* ======================================================================= */
@@ -719,13 +940,13 @@ static void test_write(xfail_ctx *c)
     /* --- ERR after sector 0's data --------------------------------------- */
     {
         static const uint32_t seq[] = {
-            RDY, RDY,           /* wait ready              */
+            RDY,                /* wait ready              */
             RDY | DRQ,          /* sector 0 DRQ            */
             RDY | ERR,          /* post-sector status: ERR */
             RDY,                /* drain check, wait ready */
         };
         mmio_mock_reset();
-        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 5);
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 4);
         mmio_mock_set_read(ATA_ERROR_ADDR, ERROR_ABRT);
         rc = ata_write_sectors(0x1000u, 2, g_pattern);
         xpect(c, "write: ERR after sector 0 returns -3", rc == -3);
@@ -739,21 +960,22 @@ static void test_write(xfail_ctx *c)
 
     /* --- completion BSY that never clears: timed out, then recovered ---- *
      * Both sectors go out, then the drive holds BSY while "committing" and
-     * never lets go. Timer: two per-sector start reads, the completion start,
-     * one in-deadline poll, one past it. */
+     * never lets go. Timer: the ready wait's start, two per-sector DRQ starts
+     * and two post-sector starts, the completion start, one in-deadline poll,
+     * one past it. */
     {
         static const uint32_t seq[] = {
-            RDY, RDY,
+            RDY,
             RDY | DRQ, RDY | DRQ,       /* sector 0: DRQ, post-status */
             RDY | DRQ, RDY | DRQ,       /* sector 1                   */
             BSY, BSY,                   /* committing... forever      */
             RDY,                        /* recovery's drain check +   *
                                          * wait ready after the reset */
         };
-        static const uint32_t usec[] = { 0, 0, 0, 0, SPINUP_US + 1u };
+        static const uint32_t usec[] = { 0, 0, 0, 0, 0, 0, 0, SPINUP_US + 1u };
         mmio_mock_reset();
-        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 9);
-        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 5);
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 8);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 8);
         GUARDED(rc, ata_write_sectors(0x1000u, 2, g_pattern));
         xpect(c, "write: a completion that never comes does not hang", rc != 999);
         xpect(c, "write: a completion that never comes returns -2", rc == -2);
@@ -776,17 +998,17 @@ static void test_write(xfail_ctx *c)
      * drive is not in a state to take the next command unreset. */
     {
         static const uint32_t seq[] = {
-            RDY, RDY,
+            RDY,
             RDY | DRQ, RDY,             /* sector 0                    */
             RDY | DRQ, RDY,             /* sector 1                    */
             RDY, RDY,                   /* completion: !BSY, no ERR    */
-            RDY, RDY,                   /* flush: wait ready           */
+            RDY,                        /* flush: wait ready           */
             RDY,                        /* flush: !BSY                 */
             RDY | ERR,                  /* flush: status carries ERR   */
             RDY,                        /* drain check, wait ready     */
         };
         mmio_mock_reset();
-        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 13);
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 11);
         mmio_mock_set_read(ATA_ERROR_ADDR, ERROR_ABRT);
         rc = ata_write_sectors(0x1000u, 2, g_pattern);
         xpect(c, "write: a failed FLUSH CACHE returns -3", rc == -3);
@@ -866,6 +1088,77 @@ static void test_lba28(xfail_ctx *c)
     xpect(c, "lba28: the last physical sector writes", rc == 0);
 }
 
+/* ======================================================================= */
+/*  clock: the boost bracket, and the refused-boost report                 */
+/* ======================================================================= */
+
+static void test_clock(xfail_ctx *c)
+{
+    fill_pattern();
+
+    /* --- honoured boost: balanced bracket, silent -------------------------- */
+    g_boost_refused = 0;
+    g_freq = CPUFREQ_NORMAL;
+    g_boosts = g_unboosts = 0;
+    uart_clear();
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    int rc = ata_read_sectors(0x1000u, 2, g_buf);
+    xpect(c, "clock: read under an honoured boost returns 0", rc == 0);
+    xpect(c, "clock: one boost, one unboost per command",
+          g_boosts == 1 && g_unboosts == 1);
+    xpect(c, "clock: nothing on the UART when the boost took",
+          g_uart_len == 0);
+
+    /* Split read: two commands, two brackets, still silent. */
+    g_boosts = g_unboosts = 0;
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_read_sectors(0x2000u, 258, g_buf);
+    xpect(c, "clock: a split read brackets each command",
+          rc == 0 && g_boosts == 2 && g_unboosts == 2);
+    xpect(c, "clock: and stays silent", g_uart_len == 0);
+
+    /* --- REFUSED boost (audio DMA live in clock.c): report, still issue --- *
+     * The frequency stays at 30 MHz after cpu_boost(). The transfer must
+     * still go out — the refusal policy is clock.c's and is not second-
+     * guessed here — but the UART must hear exactly one line about it, per
+     * command, naming the ATA driver and the boost. */
+    g_boost_refused = 1;
+    g_freq = CPUFREQ_NORMAL;
+    g_boosts = g_unboosts = 0;
+    uart_clear();
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_read_sectors(0x1000u, 2, g_buf);
+    xpect(c, "clock: a read under a refused boost still goes out", rc == 0);
+    xpect(c, "clock: READ SECTORS was issued",
+          count_writes(ATA_COMMAND_ADDR) == 1);
+    xpect(c, "clock: the bracket is still balanced",
+          g_boosts == 1 && g_unboosts == 1);
+    xpect(c, "clock: the refused boost is reported on the UART",
+          strstr(g_uart, "ata") != NULL && strstr(g_uart, "boost") != NULL);
+    xpect(c, "clock: exactly one line for one command", uart_lines() == 1);
+
+    /* A write too: the settings save is the case that matters most. */
+    uart_clear();
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_write_sectors(0x1000u, 2, g_pattern);
+    xpect(c, "clock: a write under a refused boost still goes out", rc == 0);
+    xpect(c, "clock: and is reported once", uart_lines() == 1 &&
+          strstr(g_uart, "boost") != NULL);
+
+    /* Honoured again: quiet again (the check is per call, not latched). */
+    g_boost_refused = 0;
+    uart_clear();
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_read_sectors(0x1000u, 2, g_buf);
+    xpect(c, "clock: quiet again once the boost is honoured",
+          rc == 0 && g_uart_len == 0);
+}
+
 int main(void)
 {
     xfail_ctx c = { "hw-ata", 0, 0, 0 };
@@ -874,5 +1167,6 @@ int main(void)
     test_power(&c);
     test_write(&c);
     test_lba28(&c);
+    test_clock(&c);
     return xfail_done(&c);
 }

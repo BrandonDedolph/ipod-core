@@ -8,7 +8,9 @@
  * is the on-device proof; this proves the bytes are right.
  *
  * Proves:
- *   1. i2c_init emits the exact clock-gate/reset/poke grammar.
+ *   1. i2c_init emits the exact clock-gate/idle-wait/reset/poke grammar,
+ *      waits out an in-flight transaction BEFORE the reset, and only
+ *      drains the bus on every later call (the reset is one-shot).
  *   2. i2c_send emits the exact controller sequence (addr, write-mode,
  *      data, count, strobe) and rejects bad lengths / BUSY timeout.
  *   3. wm8758_init issues all 30 codec writes, with correct 9-bit
@@ -82,11 +84,16 @@ static int has_codec_write(uint8_t b0, uint8_t b1)
 
 /* ---- cases ----------------------------------------------------------- */
 
+/* From i2c.c, host-test-only (MMIO_MOCK-guarded): forget the one-shot init. */
+extern void i2c_test_reset(void);
+
 /* Case 1: i2c_init grammar. DEV_EN/DEV_RS RMW sources read 0, STATUS
- * reads idle, so the sequence is fully determined: gate on, reset pulse,
- * the two clock-config pokes, and the settling idle read. */
+ * reads idle, so the sequence is fully determined: gate on, the idle wait
+ * that must precede the reset, reset pulse, the two clock-config pokes,
+ * and the settling idle read. */
 static int test_i2c_init_grammar(void)
 {
+    i2c_test_reset();
     mmio_mock_reset();
     mmio_mock_set_read(DEV_EN_ADDR,     0);
     mmio_mock_set_read(DEV_RS_ADDR,     0);
@@ -97,6 +104,7 @@ static int test_i2c_init_grammar(void)
     trace_cursor tc = trace_begin("i2c_init");
     expect_r(&tc, 32, DEV_EN_ADDR);
     expect_w(&tc, 32, DEV_EN_ADDR, DEV_I2C);
+    expect_r(&tc, 8,  I2C_STATUS_ADDR);            /* idle BEFORE reset */
     expect_r(&tc, 32, DEV_RS_ADDR);
     expect_w(&tc, 32, DEV_RS_ADDR, DEV_I2C);
     expect_r(&tc, 32, DEV_RS_ADDR);
@@ -106,6 +114,82 @@ static int test_i2c_init_grammar(void)
     expect_r(&tc, 8,  I2C_STATUS_ADDR);
     trace_expect_end(&tc);
     return trace_done(&tc);
+}
+
+/* Case 1b: the reset waits for an in-flight transaction. i2c_send returns
+ * before its transaction completes, and hal_audio_init calls i2c_init right
+ * behind wm8758_mute's write on every track change; a DEV_RS pulse landing
+ * on that write truncates it mid-byte and can leave the codec holding SDA,
+ * with no bit-bang path to free it. STATUS reads BUSY three times, then
+ * idle: every one of those polls must come BEFORE the first DEV_RS write. */
+static int test_i2c_init_waits_before_reset(void)
+{
+    static const uint32_t seq[] = { I2C_BUSY, I2C_BUSY, I2C_BUSY, 0 };
+    i2c_test_reset();
+    mmio_mock_reset();
+    mmio_mock_set_read(DEV_EN_ADDR, 0);
+    mmio_mock_set_read(DEV_RS_ADDR, 0);
+    mmio_mock_queue_read(I2C_STATUS_ADDR, seq, 4);
+
+    i2c_init();
+
+    trace_cursor tc = trace_begin("i2c_init_waits_before_reset");
+    expect_r(&tc, 32, DEV_EN_ADDR);
+    expect_w(&tc, 32, DEV_EN_ADDR, DEV_I2C);
+    for (int i = 0; i < 4; i++) {
+        expect_r(&tc, 8, I2C_STATUS_ADDR);         /* BUSY x3, then idle */
+    }
+    expect_r(&tc, 32, DEV_RS_ADDR);
+    expect_w(&tc, 32, DEV_RS_ADDR, DEV_I2C);
+    expect_r(&tc, 32, DEV_RS_ADDR);
+    expect_w(&tc, 32, DEV_RS_ADDR, 0);
+    expect_w(&tc, 32, I2C_CLKCFG_ADDR, 0x00000000);
+    expect_w(&tc, 32, I2C_CLKCFG_ADDR, 0x00000080);
+    expect_r(&tc, 8,  I2C_STATUS_ADDR);
+    trace_expect_end(&tc);
+    return trace_done(&tc);
+}
+
+/* Case 1c: re-init is a drain, not a reset. The second (and every later)
+ * i2c_init only waits for the bus to go idle — no DEV_EN/DEV_RS traffic, no
+ * clock poke — so the per-track call in hal_audio_init can never reset the
+ * controller out from under a codec write. A pending transaction is waited
+ * out here too: BUSY twice, then idle. */
+static int test_i2c_reinit_is_idempotent(void)
+{
+    static const uint32_t seq[] = { I2C_BUSY, I2C_BUSY, 0 };
+    i2c_test_reset();
+    mmio_mock_reset();
+    mmio_mock_set_read(DEV_EN_ADDR,     0);
+    mmio_mock_set_read(DEV_RS_ADDR,     0);
+    mmio_mock_set_read(I2C_STATUS_ADDR, 0);
+    i2c_init();                                    /* first: full sequence */
+
+    mmio_mock_reset();
+    mmio_mock_queue_read(I2C_STATUS_ADDR, seq, 3);
+    i2c_init();                                    /* second: drain only   */
+
+    trace_cursor tc = trace_begin("i2c_reinit_idempotent");
+    for (int i = 0; i < 3; i++) {
+        expect_r(&tc, 8, I2C_STATUS_ADDR);         /* BUSY x2, then idle */
+    }
+    trace_expect_end(&tc);
+    int fails = trace_done(&tc);
+    fails += check("i2c_init again: no DEV_RS write",
+                   mmio_mock_count(MMIO_OP_WRITE, DEV_RS_ADDR) == 0);
+    fails += check("i2c_init again: no DEV_EN write",
+                   mmio_mock_count(MMIO_OP_WRITE, DEV_EN_ADDR) == 0);
+    fails += check("i2c_init again: no clock poke",
+                   mmio_mock_count(MMIO_OP_WRITE, I2C_CLKCFG_ADDR) == 0);
+
+    /* A third call is the same drain. */
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_STATUS_ADDR, 0);
+    i2c_init();
+    fails += check("i2c_init a third time: one idle poll, nothing else",
+                   mmio_mock_log_len() == 1 &&
+                   mmio_mock_count(MMIO_OP_READ, I2C_STATUS_ADDR) == 1);
+    return fails;
 }
 
 /* Case 2: i2c_send emits the exact controller grammar for a 2-byte
@@ -362,6 +446,8 @@ int main(void)
 {
     int fails = 0;
     fails += test_i2c_init_grammar();
+    fails += test_i2c_init_waits_before_reset();
+    fails += test_i2c_reinit_is_idempotent();
     fails += test_i2c_send_grammar();
     fails += test_i2c_send_guards();
     fails += test_wm8758_init();

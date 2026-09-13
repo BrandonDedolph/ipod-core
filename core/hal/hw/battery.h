@@ -59,11 +59,13 @@ int battery_percent(void);
  * scaling against a meter at all.
  *
  * Fills `out` and returns 0, or returns -1 on I2C failure (in which case every
- * field is set to -1 rather than a plausible-looking zero). An ADC code of 0
- * is treated as a failure too: the I2C driver cannot see a missing ack, and
- * 0 V is not a voltage this cell can be at while the firmware is running to
- * ask. `mv_raw` is the unclamped conversion; `mv` is what the gauge should
- * use.
+ * field is set to -1 rather than a plausible-looking zero). A conversion
+ * outside ~2800..4600 mV is treated as a failure too: the I2C driver cannot
+ * see a missing ack, so an unanswered result read hands back the register
+ * file's stale bytes (1130 mV) or a floating bus (5994 mV), and neither is a
+ * voltage this cell can be at while the firmware is running to ask. Inside
+ * that band, `mv_raw` is the unclamped conversion and `mv` is clamped onto
+ * the cell's 3300..4200 mV operating range — the value the gauge should use.
  */
 typedef struct {
     int raw;      /* 10-bit ADC code as read (0..1023)                       */
@@ -111,7 +113,8 @@ int battery_percent_from_mv(int mv);
 /* Thresholds on the FILTERED, clamped millivolts (06-power.md, "Brown-out /
  * low-battery shutdown"). Compared with <=, not <: battery_sample() clamps mv
  * to a 3300 mV floor, which coincides with the shutoff line, so a strict
- * comparison could never fire on the clamped value. */
+ * comparison could never fire on the clamped value. Neither fires while
+ * external power is present — see battery_policy_feed(). */
 #define BATTERY_MV_DISKSAFE   3500   /* park the drive, refuse disk writes     */
 #define BATTERY_MV_SHUTOFF    3300   /* power off (PMU standby)                */
 
@@ -159,13 +162,22 @@ void battery_policy_reset(void);
  * glitch must never look like a flat battery (and cannot look like a
  * recovery either). Returns the edge this sample caused, or NONE.
  *
+ * `external` is power_is_external() at the time of the sample. While it is
+ * set the DESCENT is disabled: neither DISKSAFE nor SHUTOFF can fire, and the
+ * shutoff confirm run is held at zero, because a cell on a charger cannot
+ * brown the system out — the charger holds the rails and drives the cell UP.
+ * A cell so flat it reads under the lines while charging is exactly the one
+ * that must be left on the charger rather than powered off. The ring still
+ * fills (the gauge shows the real terminal voltage) and RECOVERED still fires
+ * off the median, so a DISKSAFE latched before the plug-in clears normally.
+ *
  * The policy is ARMED only once the ring is full (BATTERY_FILTER_N good
  * samples, ~20 s after boot at the 5 s cadence). Before that the median is
  * computed over what is present, for the gauge, but no event can fire — the
  * boot path is one long disk spin-up, exactly the sag the filter exists to
  * ride through.
  */
-battery_event_t battery_policy_feed(int mv);
+battery_event_t battery_policy_feed(int mv, int external);
 
 /* Current level (for a UI to read: warn at DISKSAFE, "goodbye" at SHUTOFF). */
 battery_level_t battery_policy_level(void);

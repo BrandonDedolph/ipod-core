@@ -39,17 +39,49 @@ static int i2c_wait_idle(void)
     return spin != 0 ? 0 : -1;
 }
 
+/*
+ * Set once the reset pulse + clock poke have run. i2c_init is NOT called once:
+ * main.c brings the bus up at boot, and hal_audio_init calls it again for
+ * every track and every seek (audio.c), immediately after wm8758_mute's
+ * register write — which, because i2c_send returns before its transaction
+ * completes (09-i2c.md, "Write transaction"), may still be on the wire. The
+ * old init asserted DEV_RS unconditionally with the idle wait at the END, so
+ * every track change could truncate that write mid-byte. A slave left
+ * mid-byte can hold SDA low; this controller exposes no SCL bit-bang, so
+ * there is no recovery, and every later write (including power_standby's,
+ * i.e. the power-off itself) burns its 65536 polls and fails.
+ *
+ * So the reset is one-shot. A re-init only drains the bus: it waits for the
+ * in-flight transaction to complete and returns, leaving the controller's
+ * state exactly as the first init left it.
+ */
+static int g_inited;
+
 void i2c_init(void)
 {
+    if (g_inited) {
+        /* Idempotent re-init: let whatever is on the wire finish. */
+        (void)i2c_wait_idle();
+        return;
+    }
+
     /* Clock-gate the I2C block on, then pulse its reset (09-i2c.md,
      * "Controller init"). DEV_EN/DEV_RS live in the 0x60006000 block and are
      * read-modify-written from the timer ISR too (clickwheel_service gates the
      * OPTO block there), so each RMW pair is IRQ-masked — see irqlock.h. The
      * reset HOLD sits outside the mask: it is a plain busy-wait with no shared
-     * state, and masking it would add a multi-thousand-cycle IRQ blackout to
-     * every hal_audio_init (i.e. every track change). */
+     * state, and masking it would add a multi-thousand-cycle IRQ blackout. */
     uint32_t f = hw_irq_save();
     mmio_write32(DEV_EN_ADDR, mmio_read32(DEV_EN_ADDR) | DEV_I2C);
+    hw_irq_restore(f);
+
+    /* The block is clocked now: let any transaction the boot ROM (or an
+     * earlier image) left in flight complete BEFORE the reset yanks the
+     * controller out from under it — see g_inited. Bounded; a dead bus just
+     * falls through to the reset that would fix it. */
+    (void)i2c_wait_idle();
+
+    f = hw_irq_save();
     mmio_write32(DEV_RS_ADDR, mmio_read32(DEV_RS_ADDR) | DEV_I2C);
     hw_irq_restore(f);
     for (volatile uint32_t i = 0; i < I2C_RESET_HOLD_SPIN; i++) {
@@ -70,7 +102,21 @@ void i2c_init(void)
      * skip the prime and simply let the controller settle to idle; the
      * first real transaction's leading BUSY-wait covers the rest. */
     (void)i2c_wait_idle();
+    g_inited = 1;
 }
+
+#ifdef MMIO_MOCK
+/*
+ * Host-test-only hook: forget that the one-shot init has run, so a trace
+ * test can assert the first-init grammar from a known state. Compiled out
+ * of the freestanding image — the arm-none-eabi build never defines
+ * MMIO_MOCK.
+ */
+void i2c_test_reset(void)
+{
+    g_inited = 0;
+}
+#endif
 
 int i2c_send(uint8_t dev, const uint8_t *bytes, int len)
 {

@@ -109,17 +109,35 @@ static void pmu_adc_settle(void)
 }
 
 /*
- * Plausibility clamp. The cell is a single Li-Ion: below the 3300 mV shutoff
- * threshold the system is unstable, and above ~4200 mV is past a full charge —
- * a reading outside that band is a bad sample (a stale/garbage result register,
- * a bus glitch), not a battery state. Clamping keeps a bogus sample from
- * driving the percent curve to 0% and triggering a spurious low-battery
- * shutdown. Thresholds from 06-power.md, "Brown-out / low-battery shutdown"
- * (battery_level_shutoff = 3300) and the 100% curve point (4180, rounded up to
- * the cell's 4200 mV charge ceiling).
+ * Plausibility band, in two tiers.
+ *
+ * i2c_read() cannot see a NACK: it waits for the controller to go idle and
+ * then latches whatever I2C_DATA0/1 hold, and reports success. When the PMU
+ * does not answer the result read, the data registers still hold the last
+ * bytes WRITTEN through them — the register-pointer write of ADCS1 (0x30) and,
+ * before it, the ADCC1 start byte (0x05) — so the "sample" assembles to raw
+ * 0xC1 = 1130 mV. The inverse failure (bus floating high, 0x3FF) reads 5994 mV.
+ * The old single-tier clamp pinned the first to the 3300 mV floor, which IS the
+ * shutoff line: three such failed reads inside 15 s walked the policy through
+ * DISKSAFE to a power-off on a healthy cell. The second pinned to 4200 mV and
+ * hid a flat battery behind a full one.
+ *
+ * So: a converted value outside the REJECT band is not a measurement of this
+ * cell at all — a single Li-Ion cannot run this CPU below ~2.8 V and cannot be
+ * charged past ~4.6 V without the PMU's own protection cutting it — and is
+ * reported as a FAILED read (-1). The caller already holds its last good
+ * reading on a failure and the policy already ignores -1, so a bad sample now
+ * enters nothing anywhere. Only a SMALL excursion — inside the reject band but
+ * outside the cell's normal 3300..4200 mV operating range, which a genuinely
+ * flat cell under load or a cell being driven by the charger can produce — is
+ * clamped onto the operating range. Thresholds from 06-power.md, "Brown-out /
+ * low-battery shutdown" (battery_level_shutoff = 3300) and the 100 % curve
+ * point (4180, rounded up to the cell's 4200 mV charge ceiling).
  */
-#define PMU_MV_MIN  3300
-#define PMU_MV_MAX  4200
+#define PMU_MV_REJECT_LO  2800   /* below: not a reading of this cell        */
+#define PMU_MV_REJECT_HI  4600   /* above: not a reading of this cell        */
+#define PMU_MV_MIN        3300   /* clamp floor for small excursions         */
+#define PMU_MV_MAX        4200   /* clamp ceiling for small excursions       */
 
 /* ---------- Power-state GPIO bits (no I2C) -------------------------- */
 
@@ -196,29 +214,28 @@ int battery_sample(battery_sample_t *out)
 
     /* Assemble the 10-bit sample and scale to millivolts. */
     int raw = ((int)data[0] << 2) | (data[1] & PMU_ADC_LOW_MASK);
+    int mv  = (raw * PMU_ADC_FULLSCALE_MV) >> PMU_ADC_BITS;
 
     /*
-     * An all-zero result is a FAILED read, not a measurement. i2c_read()
-     * checks only that the controller went idle, never that the PMU acked,
-     * so a transfer the PMU did not answer returns whatever the data
-     * registers hold and reports success. A code of 0 is 0 V on a cell that
-     * is, demonstrably, running this CPU — impossible as a reading, and
-     * dangerous as one: the plausibility clamp below pins it to the 3300 mV
-     * floor, which is the shutoff line, and three of those in a row would
-     * carry the low-battery policy straight through DISKSAFE to a power-off
-     * on a healthy battery. Returned as -1, it enters nothing anywhere.
+     * Outside the plausibility band this is a FAILED read, not a measurement
+     * — see PMU_MV_REJECT_LO/HI: i2c_read() cannot see a NACK, so an
+     * unanswered result read returns the register file's last written bytes
+     * (raw 0xC1, 1130 mV) or a floating bus (raw 0x3FF, 5994 mV), and an
+     * all-zero result (0 V on a cell that is demonstrably running this CPU)
+     * is the same failure. Any of those clamped onto a policy threshold is a
+     * spurious shutdown or a masked flat battery; returned as -1 it enters
+     * nothing anywhere. `out` keeps its -1 fill.
      */
-    if (raw == 0) {
+    if (mv < PMU_MV_REJECT_LO || mv > PMU_MV_REJECT_HI) {
         return -1;
     }
-    int mv  = (raw * PMU_ADC_FULLSCALE_MV) >> PMU_ADC_BITS;
 
     out->raw    = raw;
     out->mv_raw = mv;
 
-    /* Sanity-clamp to the cell's real operating band (see PMU_MV_MIN/MAX).
+    /* Clamp a small excursion onto the cell's operating band (PMU_MV_MIN/MAX).
      * mv_raw above keeps the unclamped value, because the clamp is exactly what
-     * makes a bus glitch and a flat cell indistinguishable. */
+     * makes a flat cell under load and a cell at the floor indistinguishable. */
     if (mv < PMU_MV_MIN) {
         mv = PMU_MV_MIN;
     } else if (mv > PMU_MV_MAX) {
@@ -268,7 +285,9 @@ int battery_percent(void)
  * coincide with a sample.
  *
  * Only the clamped mv is filtered, so the ring holds values in 3300..4200 by
- * construction and the arithmetic below is trivially in range.
+ * construction and the arithmetic below is trivially in range. External power
+ * gates the descent (see battery_policy_feed): a cell on a charger cannot brown
+ * the system out, so neither threshold fires while one is attached.
  */
 
 static int      bat_ring[BATTERY_FILTER_N];
@@ -324,7 +343,7 @@ int battery_disk_writes_allowed(void)
     return bat_level == BATTERY_LEVEL_OK;
 }
 
-battery_event_t battery_policy_feed(int mv)
+battery_event_t battery_policy_feed(int mv, int external)
 {
     /* Bus failure is not a flat battery. Nothing changes: the ring keeps its
      * history, the level keeps its state, and the caller keeps showing the
@@ -350,10 +369,24 @@ battery_event_t battery_policy_feed(int mv)
 
     int filt = battery_filtered_mv();
 
-    /* Second debounce, for the one irreversible action. Counts evaluations
-     * whose MEDIAN is at/below the line, so each count already represents a
-     * majority of the window; it resets the moment the median lifts. */
-    if (filt <= BATTERY_MV_SHUTOFF) {
+    /*
+     * ON EXTERNAL POWER THE DESCENT IS OFF. Both thresholds exist to keep the
+     * system from browning out mid-write (DISKSAFE) or mid-anything (SHUTOFF)
+     * as the cell runs down; with a charger attached the rails are held by the
+     * charger and the cell is being driven UP, so neither hazard exists — and
+     * a cell so flat it still reads under the lines while charging is exactly
+     * the one that must be allowed to sit on the charger, not powered off the
+     * moment the filter fills. The ring keeps filling (the gauge still shows
+     * the real terminal voltage) and RECOVERED still fires off the median, but
+     * no downward edge can, and the shutoff confirm run is held at zero so an
+     * unplug does not inherit a run counted while plugged in.
+     */
+    if (external) {
+        bat_shutoff_run = 0;
+    } else if (filt <= BATTERY_MV_SHUTOFF) {
+        /* Second debounce, for the one irreversible action. Counts evaluations
+         * whose MEDIAN is at/below the line, so each count already represents
+         * a majority of the window; it resets the moment the median lifts. */
         bat_shutoff_run++;
     } else {
         bat_shutoff_run = 0;
@@ -361,7 +394,7 @@ battery_event_t battery_policy_feed(int mv)
 
     switch (bat_level) {
     case BATTERY_LEVEL_OK:
-        if (filt <= BATTERY_MV_DISKSAFE) {
+        if (!external && filt <= BATTERY_MV_DISKSAFE) {
             /* Always the first stage, even if the median is already below the
              * shutoff line (a flat cell at boot): the caller gets to flush and
              * park BEFORE the confirm window for power-off starts running. */
@@ -379,7 +412,7 @@ battery_event_t battery_policy_feed(int mv)
             bat_level = BATTERY_LEVEL_OK;
             return BATTERY_EVENT_RECOVERED;
         }
-        if (bat_shutoff_run >= BATTERY_SHUTOFF_CONFIRM) {
+        if (!external && bat_shutoff_run >= BATTERY_SHUTOFF_CONFIRM) {
             bat_level = BATTERY_LEVEL_SHUTOFF;
             return BATTERY_EVENT_SHUTOFF;
         }
