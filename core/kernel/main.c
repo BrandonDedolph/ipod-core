@@ -46,6 +46,7 @@
 #include "../library/names.h"
 #include "../library/idx.h"
 #include "../library/sort.h"
+#include "../library/playlist.h"
 #include "../ui/wheel.h"
 #include "../ui/keyhold.h"
 #include "hw/volume.h"
@@ -2411,6 +2412,10 @@ static int  g_songview_kind;             /* RESUME_KIND_* of the current view */
  */
 static int      g_queue_kind = RESUME_KIND_NONE;
 static uint32_t g_queue_seed;
+/* For RESUME_KIND_PLAYLIST only: name_hash of the playlist's ext-trimmed
+ * filename — the one word that names WHICH playlist, since nothing in the
+ * song's own record does. Meaningless (and captured as 0) for other kinds. */
+static uint32_t g_queue_ctx_hash;
 
 static void songview_build(int genre, const char *artist)
 {
@@ -2720,6 +2725,224 @@ static void settings_apply(void)
     hal_balance_set(g_settings.balance);
     hal_tone_set(g_settings.bass, g_settings.treble);
     theme_set(g_settings.theme);           /* Linen / Onyx -> live palette swap */
+}
+
+/* ---------------------------------------------------------------------------
+ * Playlists (Music -> Playlists): the .m3u8 files under Music/Playlists,
+ * listed by name, and one of them opened into a tracklist that plays as a
+ * queue. library/playlist.c does the reading and resolving (host-tested);
+ * this section binds each row to its library record — title, artist,
+ * duration, cover — by the same test resolve_art_cb applies to a directory
+ * entry, and hands the rows to the player. Caps and the empty states are
+ * the library's (PLAYLIST_MAX playlists, PLAYLIST_TRACKS_MAX rows).
+ * ------------------------------------------------------------------------- */
+static playlist_t         g_playlists[PLAYLIST_MAX];
+static int                g_playlists_n;
+static int                g_playlists_err;      /* FAT32_* when the list could
+                                                 * not be read (not "none")    */
+static int                g_playlists_truncated;
+static int                g_pl_sel, g_pl_accum; /* Playlists list             */
+
+static playlist_track_t   g_pl_tracks[PLAYLIST_TRACKS_MAX];
+static int16_t            g_pl_song[PLAYLIST_TRACKS_MAX]; /* g_songs index, -1 */
+static int                g_pl_tracks_n;
+static int                g_pl_open = -1;       /* g_playlists index shown    */
+static int                g_pl_err;             /* negative: file unreadable  */
+static playlist_stats_t   g_pl_stats;
+static int                g_plt_sel, g_plt_accum; /* tracklist                */
+static playlist_scratch_t g_pl_scratch;         /* ~35 KB of .bss, one copy   */
+
+/* Where the playlists folder is looked for, and what a relative entry in a
+ * playlist is relative to: the library root (Music/ when it exists, else
+ * the volume root — lib_root() found which at load). */
+static uint32_t playlists_root_clus(fat32_t *fs)
+{
+    return g_lib_root_clus ? g_lib_root_clus : fs->root_clus;
+}
+static const char *playlists_base_dir(void)
+{
+    return g_lib_root_clus ? "Music/" PLAYLIST_DIR : PLAYLIST_DIR;
+}
+
+/* (Re)read the Playlists folder into g_playlists. Every entry into the list
+ * screen re-reads it — a playlist copied over USB should show up without a
+ * reboot, and the folder is one directory read. */
+static void playlists_load(fat32_t *fs)
+{
+    g_list_epoch++;
+    library_ensure(fs);                   /* sets g_lib_root_clus, binds songs */
+    uint32_t dir = 0;
+    int n = playlist_scan(fs, playlists_root_clus(fs), g_playlists,
+                          PLAYLIST_MAX, &dir, &g_playlists_truncated);
+    g_playlists_err = (n < 0) ? n : 0;
+    g_playlists_n   = (n < 0) ? 0 : n;
+    if (g_pl_sel >= g_playlists_n) {
+        g_pl_sel = 0;                     /* the row under the cursor is gone */
+    }
+    g_pl_accum = 0;
+}
+
+/*
+ * Which library song a playlist row IS — the same test resolve_art_cb
+ * applies when it binds a record to a directory entry: the folded hash of
+ * the FULL on-disk name equals the record's file_hash, within the same
+ * album folder. Then, when the record has bound to a cluster, that cluster
+ * must be this file's — a re-import can leave a fresh copy under an old
+ * name. -1 for a file the index has no record of: it plays all the same,
+ * it just shows its filename and no duration.
+ */
+static int playlist_bind_row(const playlist_track_t *t)
+{
+    uint32_t fh = t->file_hash;
+    if (fh == 0) {
+        return -1;                        /* lossy name: no locator */
+    }
+    for (int i = g_song_hh[fh & (SONG_HASH_BUCKETS - 1)]; i; i = g_song_hn[i - 1]) {
+        const lib_song_t *s = &g_songs[i - 1];
+        if (s->file_hash != fh || s->dir_clus != t->dir_clus) continue;
+        if (s->file_clus != 0 && s->file_clus != t->clus) continue;
+        return i - 1;
+    }
+    return -1;
+}
+
+/* Open playlist `pi`: parse it, resolve every entry, bind the rows. Rows
+ * that resolve to nothing are simply absent (counted in g_pl_stats); a
+ * playlist file that cannot be read leaves g_pl_err set and no rows. */
+static void playlist_open(fat32_t *fs, int pi)
+{
+    g_list_epoch++;
+    g_pl_open     = pi;
+    g_pl_tracks_n = 0;
+    g_pl_err      = 0;
+    g_plt_sel = g_plt_accum = 0;
+    if (pi < 0 || pi >= g_playlists_n) {
+        return;
+    }
+    int n = playlist_resolve(fs, &g_playlists[pi], playlists_base_dir(),
+                             g_pl_tracks, PLAYLIST_TRACKS_MAX,
+                             &g_pl_scratch, &g_pl_stats);
+    g_pl_err      = (n < 0) ? n : 0;
+    g_pl_tracks_n = (n < 0) ? 0 : n;
+    for (int i = 0; i < g_pl_tracks_n; i++) {
+        g_pl_song[i] = (int16_t)playlist_bind_row(&g_pl_tracks[i]);
+    }
+}
+
+/*
+ * Play the open playlist from row `start`: the whole playlist is the queue,
+ * in file order, each row carrying its own album's cover (a playlist mixes
+ * albums, so there is no queue-level art — as Shuffle Songs). Returns the
+ * queue index the pick landed on, -1 if nothing was queued. Does NOT
+ * un-mute: the caller re-applies g_volume (see library_play_song).
+ */
+static int playlist_play(int start)
+{
+    if (g_pl_open < 0 || g_pl_tracks_n == 0) {
+        return -1;
+    }
+    g_queue_kind     = RESUME_KIND_PLAYLIST;
+    g_queue_seed     = 0;
+    g_queue_ctx_hash = g_playlists[g_pl_open].hash;
+    player_set_shuffle(g_settings.shuffle);
+    player_queue_begin();
+    for (int i = 0; i < g_pl_tracks_n; i++) {
+        const playlist_track_t *t = &g_pl_tracks[i];
+        browse_entry_t e;
+        int k = 0;
+        for (; t->name[k] && k < NAME_MAX; k++) e.name[k] = t->name[k];
+        e.name[k]  = '\0';
+        e.clus     = t->clus;
+        e.size     = t->size;
+        e.fmt      = t->fmt;
+        e.is_dir   = 0;
+        int ai = album_by_clus(t->dir_clus);
+        e.art_clus = (ai >= 0) ? g_albums[ai].art_clus : 0;
+        e.art_size = (ai >= 0) ? g_albums[ai].art_size : 0;
+        player_queue_add(&e);
+    }
+    if (start < 0 || start >= g_pl_tracks_n) start = 0;
+    player_queue_commit(start);
+    return start;
+}
+
+static void playlists_row_draw(int r, int idx)
+{
+    list_row(r, g_playlists[idx].name, 0, 0, 1 /*chevron*/, idx == g_pl_sel, 0, 0);
+}
+
+static void playlists_render(int sel)
+{
+    console_clear(LINEN_SURFACE);
+    status_strip_render();
+    char right[12];
+    if (g_playlists_n > 0) fmt_count(right, sel + 1, g_playlists_n);
+    else                   right[0] = '\0';
+    ui_header("Playlists", right, 1);
+    if (g_playlists_n == 0) {
+        /* Two different nothings: a folder that is not there or is empty,
+         * and a disk that would not say. */
+        if (g_playlists_err) {
+            ui_text(14, LIST_Y0 + 20, "Could not read Playlists", FONT_ROW, LINEN_MUTED);
+        } else {
+            ui_text(14, LIST_Y0 + 20, "No playlists", FONT_ROW, LINEN_MUTED);
+            ui_text(14, LIST_Y0 + 40, "Put .m3u8 files in Music/Playlists",
+                    FONT_SMALL, LINEN_MUTED2);
+        }
+        return;
+    }
+    int top = ui_scroll_window(sel, g_playlists_n, LIST_ROWS);
+    for (int r = 0; r < LIST_ROWS; r++) {
+        int idx = top + r;
+        if (idx >= g_playlists_n) break;
+        playlists_row_draw(r, idx);
+    }
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS, g_playlists_n);
+}
+
+/* One tracklist row: the Songs-list shape (tag title, artist sub-line,
+ * duration on the right) for a row the library knows; the filename alone
+ * for one it does not. */
+static void playlist_row_draw(int r, int idx)
+{
+    const playlist_track_t *t = &g_pl_tracks[idx];
+    const char *title = track_display(t->name), *sub = 0;
+    char dur[FMT_TIME_MAX];
+    dur[0] = '\0';
+    int s = g_pl_song[idx];
+    if (s >= 0) {
+        const lib_song_t *sg = &g_songs[s];
+        if (sg->title[0])   title = sg->title;
+        if (sg->artist[0])  sub   = sg->artist;
+        if (sg->duration_s) fmt_time(dur, sg->duration_s);
+    }
+    list_row_titled(r, title, sub, dur[0] ? dur : 0, idx == g_plt_sel, 0);
+}
+
+static void playlist_render(int sel)
+{
+    console_clear(LINEN_SURFACE);
+    status_strip_render();
+    char right[12];
+    if (g_pl_tracks_n > 0) fmt_count(right, sel + 1, g_pl_tracks_n);
+    else                   right[0] = '\0';
+    ui_header(g_pl_open >= 0 ? g_playlists[g_pl_open].name : "Playlist", right, 1);
+    if (g_pl_tracks_n == 0) {
+        /* Say which nothing this is: the file would not read, it listed
+         * tracks none of which are on the disk, or it lists none. */
+        const char *why = g_pl_err            ? "Could not read playlist"
+                        : g_pl_stats.listed   ? "No tracks found on disk"
+                        :                       "Empty playlist";
+        ui_text(14, LIST_Y0 + 20, why, FONT_ROW, LINEN_MUTED);
+        return;
+    }
+    int top = ui_scroll_window(sel, g_pl_tracks_n, LIST_ROWS2);
+    for (int r = 0; r < LIST_ROWS2; r++) {
+        int idx = top + r;
+        if (idx >= g_pl_tracks_n) break;
+        playlist_row_draw(r, idx);
+    }
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS2, g_pl_tracks_n);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3186,7 +3409,7 @@ enum { MM_MUSIC, MM_PLAYLISTS, MM_PODCASTS, MM_AUDIOBOOKS, MM_SETTINGS,
        MM_NOWPLAYING, MM_COUNT };
 static menu_item_t g_main_menu[MM_COUNT] = {
     { "Music",       1 },
-    { "Playlists",   0 },
+    { "Playlists",   1 },
     { "Podcasts",    0 },
     { "Audiobooks",  0 },
     { "Settings",    1 },
@@ -3194,11 +3417,12 @@ static menu_item_t g_main_menu[MM_COUNT] = {
 };
 static int g_main_sel;
 
-/* Music sub-menu. ACTIVE: Albums (enters the junk-filtered folder browser). */
+/* Music sub-menu. ACTIVE: Playlists, Artists, Albums, Songs, Shuffle Songs,
+ * Genres; Composers and Audiobooks are greyed (no backing implementation). */
 enum { MU_PLAYLISTS, MU_ARTISTS, MU_ALBUMS, MU_SONGS, MU_SHUFFLE, MU_GENRES,
        MU_COMPOSERS, MU_AUDIOBOOKS, MU_COUNT };
 static const menu_item_t g_music_menu[MU_COUNT] = {
-    { "Playlists",     0 },
+    { "Playlists",     1 },
     { "Artists",       1 },
     { "Albums",        1 },
     { "Songs",         1 },
@@ -3262,6 +3486,7 @@ static void music_menu_render(void)
  * Screen stack
  * ------------------------------------------------------------------------- */
 typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_SONGS, SCR_GENRES,
+               SCR_PLAYLISTS, SCR_PLAYLIST,
                SCR_BROWSER, SCR_NOWPLAYING, SCR_QUEUE, SCR_SETTINGS,
                SCR_BATTERY, SCR_CHARGING } screen_t;
 /* The deepest legal path is 8: MENU, MUSIC, ARTISTS, BROWSER, SONGS,
@@ -3624,6 +3849,22 @@ static int list_view_current(list_view_t *v)
         v->row   = queue_row_draw;
         fmt_count(v->right, player_queue_current() + 1, v->count);
         break;
+    case SCR_PLAYLISTS:
+        v->title = "Playlists";
+        v->count = g_playlists_n;
+        v->sel   = g_pl_sel;
+        v->row   = playlists_row_draw;
+        fmt_count(v->right, v->sel + 1, v->count);
+        break;
+    case SCR_PLAYLIST:
+        v->title   = g_pl_open >= 0 ? g_playlists[g_pl_open].name : "Playlist";
+        v->count   = g_pl_tracks_n;
+        v->sel     = g_plt_sel;
+        v->row     = playlist_row_draw;
+        v->rh      = ROW_H2;
+        v->visible = LIST_ROWS2;
+        fmt_count(v->right, v->sel + 1, v->count);
+        break;
     case SCR_BROWSER:
         if (g_dir_depth == 0) {
             v->title   = g_artist_filter[0] ? g_artist_filter : "Albums";
@@ -3974,6 +4215,7 @@ static void resume_capture(void)
     c.seed       = g_queue_seed;
     c.order_seed = player_order_seed();
     c.order_keep = player_order_keep();
+    c.ctx_hash   = (g_queue_kind == RESUME_KIND_PLAYLIST) ? g_queue_ctx_hash : 0;
     if (resume_ctx_store(&g_settings, &c)) {
         settings_touch();              /* something moved — schedule a write */
     }
@@ -4129,13 +4371,62 @@ static int resume_open_shuffle(fat32_t *fs, int si)
 }
 
 /*
+ * A playlist: the .m3u8 whose ext-trimmed filename hashes to the saved
+ * context, re-read and re-resolved exactly as opening it from the
+ * Playlists screen does, then played from the row that holds the song.
+ * The row is the song's file — matched by cluster, the binding itself —
+ * with the saved queue index as the first guess, so a playlist that lists
+ * the track twice comes back on the copy that was playing. A renamed or
+ * deleted playlist, or one that no longer lists the track, declines and
+ * the caller falls back to the album. The read is counted under the
+ * "dir" boot phase (it is directory walks: one per entry).
+ */
+static int resume_open_playlist(fat32_t *fs, int si)
+{
+    uint32_t want = g_settings.resume_ctx_hash;
+    if (want == 0) {
+        return 0;
+    }
+    playlists_load(fs);
+    int pi = -1;
+    for (int i = 0; i < g_playlists_n; i++) {
+        if (g_playlists[i].hash == want) {
+            pi = i;
+            break;
+        }
+    }
+    if (pi < 0) {
+        return 0;                      /* renamed or deleted */
+    }
+    g_pl_sel = pi;                     /* Playlists opens on it later */
+    uint32_t rt0 = boot_ms_now();
+    playlist_open(fs, pi);
+    g_boot_res_dir_ms = boot_ms_now() - rt0;
+
+    uint32_t fc  = g_songs[si].file_clus;
+    int idx = -1, hint = g_settings.resume_qidx;
+    if (hint < g_pl_tracks_n && g_pl_tracks[hint].clus == fc) {
+        idx = hint;
+    }
+    for (int i = 0; idx < 0 && i < g_pl_tracks_n; i++) {
+        if (g_pl_tracks[i].clus == fc) idx = i;
+    }
+    if (idx < 0) {
+        return 0;                      /* the playlist no longer lists it */
+    }
+    g_plt_sel = idx;
+    return playlist_play(idx) == idx && resume_landed();
+}
+
+/*
  * Re-open the saved track at the saved position, PAUSED, at boot — in the
  * queue it was playing in, with the same shuffle order, so Next after a
  * power cut is the track that was going to come next.
  *
- * The queue is rebuilt from the saved kind: Songs, an artist, a genre or a
- * Shuffle Songs draw, each from the resumed song's own fields plus the seed
- * the record carries. When the kind is unknown (a record from before the
+ * The queue is rebuilt from the saved kind: Songs, an artist, a genre, a
+ * Shuffle Songs draw or a playlist, each from the resumed song's own fields
+ * plus the seed (or the playlist's name hash) the record carries. When the
+ * kind is unknown (a record from before the
  * context existed), the album, or a rebuild that does not land on the track
  * (the library changed under it), the track's ALBUM is built instead — the
  * one context that needs nothing but the song.
@@ -4180,7 +4471,8 @@ static void resume_restore(fat32_t *fs)
     case RESUME_KIND_ARTIST:
     case RESUME_KIND_GENRE:   ok = resume_open_view(fs, si, kind); break;
     case RESUME_KIND_SHUFFLE: ok = resume_open_shuffle(fs, si);    break;
-    default:                  break;   /* album, none, or not wired (playlist) */
+    case RESUME_KIND_PLAYLIST: ok = resume_open_playlist(fs, si);  break;
+    default:                  break;   /* album or none: the fallback below */
     }
     if (!ok) {
         ok = resume_open_album(fs, si, &fmt);
@@ -4248,6 +4540,8 @@ static void paint_current_screen(void)
     case SCR_ARTISTS: artists_render(g_artist_sel); break;
     case SCR_SONGS:   songs_render(g_song_sel);     break;
     case SCR_GENRES:  genres_render(g_genre_sel);   break;
+    case SCR_PLAYLISTS: playlists_render(g_pl_sel); break;
+    case SCR_PLAYLIST:  playlist_render(g_plt_sel); break;
     case SCR_BROWSER: browse_render(g_dir_depth ? g_det_sel : g_br_sel); break;
     case SCR_QUEUE:   queue_render(g_queue_sel); break;
     case SCR_SETTINGS: settings_render_cur(); break;
@@ -5054,6 +5348,9 @@ _Noreturn static void run_ui(fat32_t *fs)
                         g_set_sel = g_set_root_sel = g_set_accum = 0;
                         g_set_editing = 0;
                         scr_push(SCR_SETTINGS);
+                    } else if (g_main_sel == MM_PLAYLISTS) {
+                        playlists_load(fs);            /* same list as Music -> */
+                        scr_push(SCR_PLAYLISTS);       /* Playlists; MENU pops here */
                     }
                     /* other items are greyed: SELECT does nothing yet */
                     dirty = 1;
@@ -5096,6 +5393,9 @@ _Noreturn static void run_ui(fat32_t *fs)
                         library_ensure(fs);
                         g_genre_sel = g_genre_accum = 0;
                         scr_push(SCR_GENRES);
+                    } else if (g_music_sel == MU_PLAYLISTS) {
+                        playlists_load(fs);            /* Music/Playlists/NAME.m3u8 */
+                        scr_push(SCR_PLAYLISTS);
                     }
                     /* other items are greyed: SELECT does nothing yet */
                     dirty = 1;
@@ -5165,6 +5465,42 @@ _Noreturn static void run_ui(fat32_t *fs)
                 }
                 if (ev.buttons & WHEEL_BTN_MENU) {
                     scr_pop();                          /* back to Music menu */
+                    dirty = 1;
+                }
+                break;
+
+            case SCR_PLAYLISTS:
+                if (ev.wheel_delta && g_playlists_n > 0) {
+                    g_pl_sel = wheel_move(g_pl_sel, g_playlists_n,
+                                          ev.wheel_delta, &g_pl_accum);
+                    dirty = 1;
+                }
+                if ((ev.buttons & WHEEL_BTN_SELECT) && g_playlists_n > 0) {
+                    playlist_open(fs, g_pl_sel);        /* parse + resolve + bind */
+                    scr_push(SCR_PLAYLIST);
+                    dirty = 1;
+                }
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    scr_pop();                          /* back (Music or main) */
+                    dirty = 1;
+                }
+                break;
+
+            case SCR_PLAYLIST:
+                if (ev.wheel_delta && g_pl_tracks_n > 0) {
+                    g_plt_sel = wheel_move(g_plt_sel, g_pl_tracks_n,
+                                           ev.wheel_delta, &g_plt_accum);
+                    dirty = 1;
+                }
+                if ((ev.buttons & WHEEL_BTN_SELECT) && g_pl_tracks_n > 0) {
+                    (void)playlist_play(g_plt_sel);     /* whole playlist, from here */
+                    hal_volume_set(g_volume);          /* re-apply over codec re-init */
+                    scr_push(SCR_NOWPLAYING);
+                    np_first = 1;
+                    dirty = 1;
+                }
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    scr_pop();                          /* back to Playlists */
                     dirty = 1;
                 }
                 break;
@@ -5725,6 +6061,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                     case SCR_ARTISTS: artists_render(g_artist_sel);  break;
                     case SCR_SONGS:   songs_render(g_song_sel);      break;
                     case SCR_GENRES:  genres_render(g_genre_sel);    break;
+                    case SCR_PLAYLISTS: playlists_render(g_pl_sel);  break;
+                    case SCR_PLAYLIST:  playlist_render(g_plt_sel);  break;
                     case SCR_BROWSER: browse_render(g_dir_depth ? g_det_sel : g_br_sel);   break;
                     case SCR_QUEUE:   queue_render(g_queue_sel);     break;
                     case SCR_SETTINGS: settings_render_cur();        break;

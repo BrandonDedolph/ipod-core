@@ -259,10 +259,16 @@ if target == 'hw'
   # main.c, where the host test had to carry verbatim copies of it. Same
   # idx.c the host idx test compiles. sort.c is the stable index-array merge
   # sort every alphabetised list is built with; same sort.c the host sort test
-  # compiles against a stable reference.
+  # compiles against a stable reference. playlist.c is the Playlists read
+  # path: the .m3u8 files under <library root>/Playlists, and one of them
+  # parsed (fs/m3u.c) and resolved (fat32_resolve_path) into playable rows
+  # named and located exactly as browse rows are; the record binding stays
+  # in main.c. Same playlist.c the host playlist test compiles against an
+  # in-RAM volume.
   library_hw_lib = static_library(
     'core_library_hw',
-    sources: ['library/names.c', 'library/idx.c', 'library/sort.c'],
+    sources: ['library/names.c', 'library/idx.c', 'library/sort.c',
+              'library/playlist.c'],
     c_args: ['-DCORE_FREESTANDING'],
   )
 

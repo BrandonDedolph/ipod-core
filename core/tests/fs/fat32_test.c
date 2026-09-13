@@ -632,6 +632,133 @@ int main(int argc, char **argv)
                    song && song->is_dir == 0 && song->size == 100 &&
                    song->first_clus == 4);
 
+    /* ---- path resolution over the same volume ----
+     * fat32_resolve_path is the segment walk a playlist entry goes through:
+     * "Music/Artist - Album/track.flac" -> one directory entry. The same
+     * root -> MUSIC/ -> SONG.TXT image covers every shape of it: a file two
+     * levels down, a directory as the final entry, the separator and case
+     * forms a desktop tool writes, and every way a path fails. */
+    {
+        fat32_dirent_t d;
+        uint32_t parent;
+
+        memset(&d, 0, sizeof d); parent = 0;
+        fails += check("resolve MUSIC/SONG.TXT",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "MUSIC/SONG.TXT",
+                                          &d, &parent) == 0 &&
+                       d.first_clus == 4 && d.size == 100 && d.is_dir == 0 &&
+                       strcmp(d.name, "SONG.TXT") == 0 && parent == 3);
+        memset(&d, 0, sizeof d); parent = 0;
+        fails += check("resolve is ASCII case-insensitive per segment",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "music/song.txt",
+                                          &d, &parent) == 0 &&
+                       d.first_clus == 4 && strcmp(d.name, "SONG.TXT") == 0);
+        fails += check("resolve accepts a leading '/' (volume-root form)",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "/MUSIC/SONG.TXT",
+                                          &d, &parent) == 0 && d.first_clus == 4);
+        fails += check("resolve accepts '\\' separators and a leading one",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "\\MUSIC\\SONG.TXT",
+                                          &d, &parent) == 0 && d.first_clus == 4);
+        fails += check("resolve collapses repeated and trailing separators",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "MUSIC//SONG.TXT/",
+                                          &d, &parent) == 0 && d.first_clus == 4);
+        memset(&d, 0, sizeof d); parent = 0;
+        fails += check("resolve a directory as the final entry",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "MUSIC",
+                                          &d, &parent) == 0 &&
+                       d.first_clus == 3 && d.is_dir == 1 &&
+                       parent == mfs.root_clus);
+        fails += check("resolve a directory with a trailing separator",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "MUSIC/",
+                                          &d, &parent) == 0 && d.first_clus == 3);
+        memset(&d, 0, sizeof d); parent = 0;
+        fails += check("resolve relative to a non-root start directory",
+                       fat32_resolve_path(&mfs, 3, "SONG.TXT", &d, &parent) == 0 &&
+                       d.first_clus == 4 && parent == 3);
+
+        /* Not found, in each place it can be not found. */
+        fails += check("resolve: missing last segment is ENOENT",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "MUSIC/NOPE.TXT",
+                                          &d, &parent) == FAT32_ENOENT);
+        fails += check("resolve: missing first segment is ENOENT",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "NOPE/SONG.TXT",
+                                          &d, &parent) == FAT32_ENOENT);
+        fails += check("resolve: a file used as a folder is ENOENT",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "MUSIC/SONG.TXT/X",
+                                          &d, &parent) == FAT32_ENOENT);
+
+        /* Malformed: refused before any directory is read. */
+        fails += check("resolve: empty path is EINVAL",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "", &d, &parent)
+                           == FAT32_EINVAL);
+        fails += check("resolve: a bare separator is EINVAL",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "/", &d, &parent)
+                           == FAT32_EINVAL);
+        fails += check("resolve: '..' is never walked (EINVAL, not ENOENT)",
+                       fat32_resolve_path(&mfs, mfs.root_clus,
+                                          "MUSIC/../MUSIC/SONG.TXT",
+                                          &d, &parent) == FAT32_EINVAL);
+        fails += check("resolve: '.' is refused too",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "./MUSIC",
+                                          &d, &parent) == FAT32_EINVAL);
+        fails += check("resolve: a '...' segment is a NAME, not a dot entry",
+                       fat32_resolve_path(&mfs, mfs.root_clus, ".../SONG.TXT",
+                                          &d, &parent) == FAT32_ENOENT);
+        {
+            /* FAT32_PATH_SEGS_MAX + 1 segments of an existing name: refused
+             * by the count, not by the walk (the walk would fail on segment
+             * two, which is a file — so ENOENT would mean the cap was not
+             * checked first). */
+            char deep[FAT32_PATH_SEGS_MAX * 6 + 8];
+            int  di = 0;
+            for (uint32_t k = 0; k < FAT32_PATH_SEGS_MAX + 1; k++) {
+                memcpy(deep + di, "MUSIC/", 6);
+                di += 6;
+            }
+            deep[di] = '\0';
+            fails += check("resolve: more than FAT32_PATH_SEGS_MAX segments is EINVAL",
+                           fat32_resolve_path(&mfs, mfs.root_clus, deep,
+                                              &d, &parent) == FAT32_EINVAL);
+            deep[FAT32_PATH_SEGS_MAX * 6 - 1] = '\0';   /* exactly the cap */
+            fails += check("resolve: exactly FAT32_PATH_SEGS_MAX segments is walked",
+                           fat32_resolve_path(&mfs, mfs.root_clus, deep,
+                                              &d, &parent) == FAT32_ENOENT);
+        }
+        {
+            /* A segment longer than any legal long name. */
+            static char longseg[FAT32_NAME_BYTES + 2];
+            memset(longseg, 'A', FAT32_NAME_BYTES);
+            longseg[FAT32_NAME_BYTES] = '\0';
+            fails += check("resolve: an over-long segment is EINVAL",
+                           fat32_resolve_path(&mfs, mfs.root_clus, longseg,
+                                              &d, &parent) == FAT32_EINVAL);
+        }
+        {
+            /* No NUL within FAT32_PATH_MAX: refused by the bounded scan. */
+            static char unterminated[FAT32_PATH_MAX + 4];
+            memset(unterminated, 'M', sizeof unterminated);
+            fails += check("resolve: no NUL within FAT32_PATH_MAX is EINVAL",
+                           fat32_resolve_path(&mfs, mfs.root_clus, unterminated,
+                                              &d, &parent) == FAT32_EINVAL);
+        }
+        fails += check("resolve: null arguments are EINVAL",
+                       fat32_resolve_path(NULL, 2, "MUSIC", &d, &parent) == FAT32_EINVAL &&
+                       fat32_resolve_path(&mfs, 2, NULL, &d, &parent) == FAT32_EINVAL &&
+                       fat32_resolve_path(&mfs, 2, "MUSIC", NULL, &parent) == FAT32_EINVAL &&
+                       fat32_resolve_path(&mfs, 2, "MUSIC", &d, NULL) == FAT32_EINVAL);
+
+        /* A disk error in the middle of the walk is reported as one, not as
+         * "no such file": sector 3 is the MUSIC directory. */
+        fail_sector(3, -1);
+        fails += check("resolve: a failed directory read is EIO, not ENOENT",
+                       fat32_resolve_path(&mfs, mfs.root_clus, "MUSIC/SONG.TXT",
+                                          &d, &parent) == FAT32_EIO);
+        fail_sector(NO_FAIL, 0);
+        fails += check("resolve: an unaddressable start directory is ECORRUPT",
+                       fat32_resolve_path(&mfs, 0x1000u, "SONG.TXT",
+                                          &d, &parent) == FAT32_ECORRUPT);
+    }
+
     /* ---- the streaming reader on corrupt and half-written files ----
      *
      * THE BUG. fat32_stream_open on a garbage first cluster with a nonzero

@@ -62,7 +62,8 @@ What changed (see `git log 054c722..`):
 
 Still open from the audit: `DEV_EN` peripheral gating and PLL-off in
 suspend (moot once escalation lands), the BCM power gate, `PANEL_SLEEP_AT_IDLE`
-(still 0), and the reserved playlist queue kind. Closed since: the same-hash
+(still 0). The reserved playlist queue kind has since been wired — see
+**Playlists** under "What works". Closed since: the same-hash
 tiebreak (`name_bind_exact`, exact on-disk name wins when a bucket has two
 candidates), `flac_meta.c` keeping UTF-8 on the scan fallback, and
 `ata_identify()` waiting for !BSY before it reads ERR/DF. Nothing has been
@@ -189,8 +190,10 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   problems afterwards.
 - **Resume on boot** — comes back on the track you left, **paused**, at the
   saved position, **in the queue you were playing it in**: Songs, an
-  artist's songs, a genre, or the same Shuffle Songs draw, with the same
-  shuffle order (Next is still the track that was coming next). Bound by
+  artist's songs, a genre, the same Shuffle Songs draw, or a playlist (the
+  record's once-reserved context word now holds the playlist's name hash,
+  `RESUME_KIND_PLAYLIST`), with the same shuffle order (Next is still the
+  track that was coming next). Bound by
   the folded `name_hash()` of the filename (not an index or a cluster),
   cross-checked against duration ±2 s and required to be unique otherwise,
   so it survives a library rebuild. The queue is rebuilt from a kind byte
@@ -262,6 +265,24 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   the sub-line), album detail (hero art + tracklist with per-disc sections +
   durations), scrolling marquee for long titles, two-line rows with 28 px
   album-art chips, letter-stepping on a sustained fast spin (Songs only).
+- **Playlists — read path** (2026-09-13, **not yet flashed**) — Music →
+  Playlists (and the main menu's Playlists row) lists
+  `Music/Playlists/*.m3u8` (`.m3u` too) by filename, A–Z, re-read on every
+  entry. Open one and it is a tracklist in the Songs shape (tag title /
+  artist / duration for tracks the index knows, the filename for ones it
+  doesn't); SELECT plays the whole playlist from that row, each track with
+  its own album's cover. Entries may be volume-root-absolute
+  (`/Music/Artist - Album/01 Song.flac`) or relative to `Music/Playlists/`
+  (`../Artist - Album/01 Song.flac`); `\` separators and a drive letter are
+  tolerated. A missing, non-audio or unreadable entry is skipped and
+  counted, never fatal, and an empty result says which nothing it is.
+  Caps: **64 playlists, 128 tracks per playlist** (the first that many;
+  the overflow is reported, not silent). Rows bind to the library by the
+  same full-name locator hash the album tracklist uses. Lives in
+  `core/library/playlist.c` over `fs/m3u.c` + the new
+  `fat32_resolve_path()`, host-tested end to end on an in-RAM volume with
+  real VFAT long names. On the no-`Music/` layout the folder is
+  `Playlists/` at the root. Writing playlists is still item 1 below.
 - **Now Playing** — 120×120 cover, title/artist/album, TRACK N OF M,
   elapsed / −remaining, a rounded progress bar, shuffle/repeat tokens,
   battery, and wheel seek.
@@ -283,49 +304,43 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
 
 ## What's NOT done (pick up next)
 
-1. **Playlists — read path.** `core/fs/m3u.c` is a merged, unit-tested,
-   bounded M3U8 reader **wired to nothing**: no caller anywhere in
-   `kernel/`, `ui/` or `player/`, and `--gc-sections` strips it out of the
-   shipped image entirely. The next chunk is small and needs no new
-   filesystem capability: resolve each parsed path to a cluster with a
-   segment walk, add a Playlists list under Music, and hand the result to
-   `player_play_queue()`.
-2. **Playlists — write path.** Saving or editing a playlist means creating
-   and growing a file, which means **FAT32 cluster allocation**, which does
-   not exist. The only write we have is an in-place overwrite of one
-   pre-allocated file's first cluster (`config.c`). Do not conflate the
-   two: the read path is a day, the write path is a filesystem project.
-3. **Search** — not implemented.
-4. **A screen-tuned font face.** Advances, kerning and tracking are all
+1. **Playlists — write path.** Reading is done (above, unflashed). Saving
+   or editing a playlist means creating and growing a file, which means
+   **FAT32 cluster allocation**, which does not exist. The only write we
+   have is an in-place overwrite of one pre-allocated file's first cluster
+   (`config.c`). The read path was a day; the write path is a filesystem
+   project.
+2. **Search** — not implemented.
+3. **A screen-tuned font face.** Advances, kerning and tracking are all
    fixed and measured, and the type still reads wrong at 9–13 px. Nunito
    ships no hinting bytecode, so the next lever is swapping the face for
    one designed for small sizes — not more spacing tuning.
-5. **Flash and measure the power work** — the suspend/standby changes
+4. **Flash and measure the power work** — the suspend/standby changes
    above are entirely device-unverified; the first flash should check the
    panel wakes from `LCD_SLEEP`, the drive wakes from SLEEP, and read the
    suspend draw. Then **re-enable panel sleep at idle** — see above; the
    blockers it was disabled for have since been fixed, and the suspend path
    exercises the same wake sequence.
-6. **Podcasts / Audiobooks / Composers** — greyed placeholders in the
+5. **Podcasts / Audiobooks / Composers** — greyed placeholders in the
    menus; no backing implementation.
-7. **More codecs** — AAC / ALAC / Vorbis / Opus / WAV are stubbed in
+6. **More codecs** — AAC / ALAC / Vorbis / Opus / WAV are stubbed in
    `codecs/README.md`; only FLAC is wired (MP3 builds but is disabled).
-8. **On-device screenshot capture** — `lcd_screenshot_bmp()` is declared in
+7. **On-device screenshot capture** — `lcd_screenshot_bmp()` is declared in
    `hal.h` and implemented only in the sim HAL; nothing calls it. The
    README shots come from `docs/screens/render.py`, which is a **standalone
    Python/PIL reimplementation** of the UI (real Nunito faces, real
    palette, real layout — but not a single pixel from firmware code). It
    can drift from the device silently. A device capture path would end that.
-9. **Library sync is manual** — build the index on the host
+8. **Library sync is manual** — build the index on the host
    (`tools/build_index.py`), convert art (`tools/coreart.py`), pre-create
    `CORECFG.DAT` (`tools/make_config.py`), and copy to the device.
-10. **Host CLI install/flash/recover are stubs** —
+9. **Host CLI install/flash/recover are stubs** —
     `core/cli/internal/cli/install.go` says so outright; flashing is
     `ipodpatcher` by hand today.
 
 ## Testing
 
-`meson test -C build-sim` from `core/` (**36/36** green):
+`meson test -C build-sim` from `core/` (**54/54** green):
 
 - **Codec KAT** — FLAC + MP3 decoders bit-exact against reference PCM.
 - **MMIO golden traces** — each freestanding hw driver is host-compiled against a
@@ -346,10 +361,14 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   check against the host side.
 - **Settings persistence** — the config record layout, CRC, slot alternation,
   LBA resolution and the ATA write bus grammar.
-- **FAT32** — the happy path, plus corrupt images: cyclic FAT chains,
-  out-of-range clusters, a FAT16 boot sector, orphaned LFN runs, a truncated
-  volume.
+- **FAT32** — the happy path, path resolution (`fat32_resolve_path`: every
+  separator/case form, every refusal, EIO vs ENOENT), plus corrupt images:
+  cyclic FAT chains, out-of-range clusters, a FAT16 boot sector, orphaned
+  LFN runs, a truncated volume.
 - **M3U8** — the reader against the playlists that actually break parsers.
+- **Playlists** — `library/playlist.c` end to end on an in-RAM volume with
+  real VFAT long names: the listing, every entry shape, every failure as a
+  count, both caps, an unreadable album folder vs an unreadable playlist.
 - **readahead / diskbuf / scheduler / console / clickwheel / pcm-ring / text /
   thumb / FLAC metadata / MP3 tags** — unit tests.
 
@@ -359,8 +378,9 @@ are marked as expected failures where the fix belongs to another file. Run
 into a hard failure and see what is still outstanding.
 
 Note the suite only exists in a **sim** configure (`if target == 'sim'`); a hw
-build registers zero tests. Five of the 36 need `python3` — without it you get
-31, which is exactly the number this file used to claim.
+build registers zero tests. Seven of the 54 need `python3` (the generated
+FAT32 images and the four parity/consistency scripts) — without it you get
+47.
 
 **Read this before trusting a green suite.** For a long stretch this section
 said "25/25 green" and that number came from *stale gcc-14 binaries* — `meson

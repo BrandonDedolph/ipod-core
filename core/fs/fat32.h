@@ -138,6 +138,45 @@ int fat32_open(fat32_t *fs, const char *name,
                uint32_t *first_clus, uint32_t *size);
 
 /*
+ * Bounds on a path handed to fat32_resolve_path. FAT32_PATH_SEGS_MAX is the
+ * deepest walk this reader will make: the deepest real path on this device
+ * is three (Music/Artist - Album/track), and a playlist that names something
+ * sixteen folders down is not one we wrote. FAT32_PATH_MAX bounds the scan
+ * of the string itself, so a caller that hands over an unterminated buffer
+ * gets FAT32_EINVAL instead of a wild read.
+ */
+#define FAT32_PATH_SEGS_MAX 16u
+#define FAT32_PATH_MAX      1024u
+
+/*
+ * Resolve a '/'-separated path, one directory entry at a time, starting in
+ * the directory whose first cluster is `dir_clus` (fs->root_clus for a
+ * volume-root path). Each segment is looked up exactly as fat32_open_in does
+ * (long name or 8.3 short name, ASCII case-insensitive), and every segment
+ * but the last must be a directory. '\' is accepted as a separator too;
+ * leading, trailing and repeated separators are ignored, so "/Music/x.flac",
+ * "Music\x.flac" and "Music//x.flac/" all name the same entry.
+ *
+ * What is NOT accepted: "." and ".." segments (FAT32_EINVAL — a caller with
+ * a relative path canonicalises it first, as fs/m3u.c does; this walk never
+ * goes up, so a path can never escape the directory it started in), an
+ * empty path or one with no segments at all, more than FAT32_PATH_SEGS_MAX
+ * segments, a segment longer than a legal long name, or a string with no
+ * NUL within FAT32_PATH_MAX bytes.
+ *
+ * On success returns 0, copies the final entry (name as it is on the disk,
+ * cluster, size, is_dir) into *out, and sets *parent_clus to the cluster of
+ * the directory that entry was found in (the caller's dir_clus for a one
+ * segment path). May be a directory: the caller checks is_dir. Returns
+ * FAT32_ENOENT when any segment is missing or an intermediate one is a
+ * file, and passes FAT32_EIO / FAT32_ECORRUPT up from the directory reads.
+ * Bounded: at most FAT32_PATH_SEGS_MAX directory walks, each bounded as
+ * fat32_readdir is; no recursion.
+ */
+int fat32_resolve_path(fat32_t *fs, uint32_t dir_clus, const char *path,
+                       fat32_dirent_t *out, uint32_t *parent_clus);
+
+/*
  * Enumerate the directory whose first cluster is `dir_clus`, invoking
  * cb(ud, &ent) for each real entry (files AND subdirectories, is_dir set
  * accordingly). Pass fs->root_clus to enumerate the root. Skips: the

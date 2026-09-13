@@ -90,9 +90,12 @@ typedef struct {
      * (resume_seed), and the player's shuffle deal (resume_order_seed +
      * resume_order_keep, see player_order_seed). resume_qidx is where in that
      * queue the track sat, a hint for the rebuild and the "N of M" the user
-     * remembers. All meaningless while resume_kind is RESUME_KIND_NONE, and
+     * remembers. resume_ctx_hash names the one context the song's record
+     * cannot: under RESUME_KIND_PLAYLIST it is name_hash() of the playlist's
+     * ext-trimmed filename (the same folding as the locator), 0 for every
+     * other kind. All meaningless while resume_kind is RESUME_KIND_NONE, and
      * zeroed with the locator (hash 0) on both sides of the codec.
-     * resume_flags and resume_ctx_hash are reserved (written 0, ignored).
+     * resume_flags is reserved (written 0, ignored).
      */
     uint8_t  resume_kind;    /* RESUME_KIND_*                                 */
     uint8_t  resume_flags;   /* reserved                                      */
@@ -100,7 +103,7 @@ typedef struct {
     uint32_t resume_seed;    /* Shuffle Songs' library-order LCG seed         */
     uint32_t resume_order_seed;  /* player_order_seed() — 0 = no deal         */
     int      resume_order_keep;  /* player_order_keep(); PLAYER_KEEP_*        */
-    uint32_t resume_ctx_hash;/* reserved                                      */
+    uint32_t resume_ctx_hash;/* KIND_PLAYLIST: the playlist's name hash       */
 } settings_t;
 
 /* What kind of queue the resume locator's track was playing in. On disk as
@@ -112,7 +115,7 @@ enum {
     RESUME_KIND_ARTIST   = 3,  /* an artist's All Songs                       */
     RESUME_KIND_GENRE    = 4,  /* a genre's songs                             */
     RESUME_KIND_SHUFFLE  = 5,  /* Shuffle Songs: the library in seed order    */
-    RESUME_KIND_PLAYLIST = 6,  /* reserved for M3U playlists (not wired yet)  */
+    RESUME_KIND_PLAYLIST = 6,  /* an M3U8 playlist: resume_ctx_hash names it  */
     RESUME_KIND_MAX      = RESUME_KIND_PLAYLIST
 };
 

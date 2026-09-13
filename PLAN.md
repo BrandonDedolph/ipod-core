@@ -137,11 +137,11 @@ crash log to disk (nothing can; see cluster allocation, below).
 
 In the order they're worth doing.
 
-1. **Wire the M3U8 reader into a Playlists UI (read only).** The parser is
-   merged, unit-tested and bounded, and is currently wired to *nothing* —
-   `--gc-sections` strips it out of the shipped image. Resolving a parsed
-   path to a cluster is a segment walk; no new filesystem capability is
-   needed. This is the cheapest real feature left.
+1. ~~**Wire the M3U8 reader into a Playlists UI (read only).**~~ **Done
+   2026-09-13, not yet flashed** — `fat32_resolve_path()` is the segment
+   walk, `library/playlist.c` lists `Music/Playlists/*.m3u8` and resolves
+   one into rows, Music → Playlists shows them, and a playlist queue
+   resumes at boot (`RESUME_KIND_PLAYLIST`). See STATUS.md.
 2. **A screen-tuned font face.** Advances (26.6), kerning (1,700–3,700 pairs
    per face) and per-face tracking are all fixed and *measured* — and the
    type still reads wrong at 9–13 px. Nunito ships no TrueType hinting

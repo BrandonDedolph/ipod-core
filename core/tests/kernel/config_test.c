@@ -251,13 +251,14 @@ static void spicy(settings_t *s)
     s->backlight_secs = 60; s->backlight_bright = 1;
     s->theme = 3;    s->clicker = 2;
     s->resume_hash = 0xDEADBEEFu; s->resume_secs = 1234; s->resume_total = 5678;
-    /* The queue context: the largest kind, a queue index past any album, a
-     * negative keep (PLAYER_KEEP_QUEUE), and seeds with every byte distinct.
-     * The reserved words stay 0 — the codec writes them as 0 whatever the
-     * struct holds, which test_resume_context pins separately. */
+    /* The queue context: the largest kind (a playlist), a queue index past
+     * any album, a negative keep (PLAYER_KEEP_QUEUE), seeds and a context
+     * hash with every byte distinct. The reserved words stay 0 — the codec
+     * writes them as 0 whatever the struct holds, which test_resume_context
+     * pins separately. */
     s->resume_kind = 6;  s->resume_flags = 0; s->resume_qidx = 5999;
     s->resume_seed = 0xC0FFEE01u; s->resume_order_seed = 0xBADC0DE5u;
-    s->resume_order_keep = -2; s->resume_ctx_hash = 0;
+    s->resume_order_keep = -2; s->resume_ctx_hash = 0x5EEDF00Du;
 }
 
 /* ---- mock-bus programming ---------------------------------------------- */
@@ -654,7 +655,7 @@ static void test_resume_context(void)
           rec[T_OFF_CTX + 2] == (5999 & 0xFF) && rec[T_OFF_CTX + 3] == (5999 >> 8) &&
           get32le(&rec[T_OFF_CTX + 4])  == 0xC0FFEE01u &&
           get32le(&rec[T_OFF_CTX + 8])  == 0xBADC0DE5u &&
-          get32le(&rec[T_OFF_CTX + 12]) == 0 &&
+          get32le(&rec[T_OFF_CTX + 12]) == 0x5EEDF00Du &&
           rec[T_OFF_CTX + 16] == 0xFE && rec[T_OFF_CTX + 17] == 0xFF &&
           rec[T_OFF_CTX + 18] == 0 && rec[T_OFF_CTX + 19] == 0);
     memset(&out, 0xA5, sizeof out);
@@ -730,20 +731,33 @@ static void test_resume_context(void)
     config_encode(rec, &in, 17);
     check("encode writes an out-of-range kind as NONE", rec[T_OFF_CTX] == 0);
 
-    /* Reserved words: always 0 on disk, always 0 in RAM after a decode. */
+    /* Reserved words: always 0 on disk, always 0 in RAM after a decode. The
+     * context hash beside them is real — a playlist's name hash — and goes
+     * through verbatim, gated on the locator like the rest of the context. */
     defaults(&in);
     spicy(&in);
     in.resume_flags = 0xAB; in.resume_ctx_hash = 0x12345678u;
     config_encode(rec, &in, 18);
-    check("reserved context words are written as 0",
-          rec[T_OFF_CTX + 1] == 0 && get32le(&rec[T_OFF_CTX + 12]) == 0 &&
+    check("reserved context words are written as 0, the context hash as is",
+          rec[T_OFF_CTX + 1] == 0 && get32le(&rec[T_OFF_CTX + 12]) == 0x12345678u &&
           rec[T_OFF_CTX + 18] == 0 && rec[T_OFF_CTX + 19] == 0);
     rec[T_OFF_CTX + 1] = 0xCD;
     put32le(&rec[T_OFF_CTX + 12], 0xFEEDFACEu);
     recrc(rec);
-    check("reserved context words read back as 0",
+    check("reserved words read back as 0, the context hash as written",
           config_decode(rec, &out, &seq) == 1 &&
-          out.resume_flags == 0 && out.resume_ctx_hash == 0);
+          out.resume_flags == 0 && out.resume_ctx_hash == 0xFEEDFACEu);
+
+    /* No locator, no context: the hash is not written, and a stray one in
+     * a hand-edited record is not read. */
+    in.resume_hash = 0;
+    config_encode(rec, &in, 19);
+    check("no track: the context hash is written as 0",
+          get32le(&rec[T_OFF_CTX + 12]) == 0);
+    put32le(&rec[T_OFF_CTX + 12], 0xFEEDFACEu);
+    recrc(rec);
+    check("no track: a context hash on disk reads back as 0",
+          config_decode(rec, &out, &seq) == 1 && out.resume_ctx_hash == 0);
 }
 
 /* ---- seq ordering ------------------------------------------------------ */
