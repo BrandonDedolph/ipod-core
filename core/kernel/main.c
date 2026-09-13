@@ -2878,10 +2878,13 @@ static void draw_speaker(int sx, int sy, uint16_t c, int vol)
 }
 
 /* Centered volume overlay plate (volume-demo.jsx VolumeOverlay): speaker glyph +
- * ink fill bar + big percent, on a light near-surface plate. */
+ * ink fill bar + big percent, on a light near-surface plate. Everything it
+ * draws stays inside the VOL_PLATE_* rect (chrome.h) — the main loop presents
+ * exactly that rect for a volume tick, so ink outside it would never reach
+ * the panel. */
 static void volume_overlay_render(int vol)
 {
-    const int PX = 60, PY = 101, PW = 200, PH = 32;
+    const int PX = VOL_PLATE_X, PY = VOL_PLATE_Y, PW = VOL_PLATE_W, PH = VOL_PLATE_H;
     fill_round_rect_aa(PX, PY, PW, PH, 8, LINEN_PLATE);    /* raised plate, AA r8  */
 
     draw_speaker(PX + 16, PY + PH / 2, LINEN_INK, vol);
@@ -2994,8 +2997,8 @@ static const uint16_t *np_art_120(void)
  * track change: the clock tick redraws THIS band and presents only it, instead
  * of clearing the framebuffer, re-blitting the 120x120 cover and rebuilding
  * every metadata string every second and discarding all of it above y=128. */
-#define NP_TR_Y 184                        /* transport band top                 */
-#define NP_TR_H (LCD_HEIGHT - NP_TR_Y)     /* ...to the bottom of the panel      */
+/* NP_TR_Y / NP_TR_H (the band's rect) live in ui/chrome.h so the host present
+ * test can pin the word count this band costs on the BCM. */
 
 static void nowplaying_transport_render(uint32_t elapsed_s, uint32_t total_s)
 {
@@ -4660,6 +4663,7 @@ _Noreturn static void run_ui(fat32_t *fs)
     uint32_t np_last = 0xFFFFFFFFu;
     int      np_first = 1;
     int      np_vol_prev = 0;            /* volume overlay was up last NP paint  */
+    int      np_vol_dirty = 0;           /* g_volume moved since the plate paint */
     uint32_t last_present = 0;           /* rate-limit UI presents while playing */
     uint32_t last_bars = 0;              /* rate-limit the now-playing bar anim  */
     uint32_t last_chip = 0;              /* rate-limit album-cover chip loads    */
@@ -5190,8 +5194,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                     g_scrub_target_s = (uint32_t)t;
                     g_scrub_last_us  = mmio_read32(USEC_TIMER_ADDR);
                     g_scrub_dirty    = 1;
-                    np_last          = 0xFFFFFFFFu;   /* force a transport repaint */
-                    dirty            = 1;
+                    /* Only the transport band shows the target: force ITS
+                     * repaint (the clock-tick path) — not `dirty`, which
+                     * would re-render and push the whole frame. */
+                    np_last          = 0xFFFFFFFFu;
                 } else if (ev.wheel_delta) {             /* wheel = volume        */
                     /* The wheel reports raw position units (~CW_WHEEL_SENSITIVITY
                      * per detent), which is why volume used to leap ~10 at a time.
@@ -5216,7 +5222,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                     g_settings.volume = g_volume;         /* keep Settings in sync */
                     settings_touch();     /* debounced: one write per volume sweep */
                     ui_window_arm(&g_vol_show);
-                    dirty = 1;
+                    /* The plate is its own present (see the Now Playing
+                     * branch of the render step): not `dirty`, which would
+                     * push all 38400 words for a 3200-word rect. */
+                    np_vol_dirty = 1;
                 }
                 /* SELECT is now press-length sensitive here: a tap toggles the
                  * scrubber (what SELECT does on Now Playing on a real iPod, and
@@ -5481,8 +5490,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                 g_sel_pending = 0;
                 if (np_scrubbing()) scrub_exit();
                 else                scrub_enter();
-                np_last = 0xFFFFFFFFu;          /* repaint the transport band */
-                dirty   = 1;
+                /* Nothing above the transport band knows about the scrubber
+                 * (nowplaying_render only consults it there), so a forced
+                 * transport repaint is the whole change — no `dirty`. */
+                np_last = 0xFFFFFFFFu;
             }
         }
 
@@ -5500,12 +5511,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                 if (player_seek_to(g_scrub_target_s) != 0) {
                     g_scrub_target_s = player_elapsed_s();   /* refused: snap back */
                 }
-                np_last = 0xFFFFFFFFu;
-                dirty   = 1;
+                np_last = 0xFFFFFFFFu;          /* transport band only, as above */
             } else if (!g_scrub_dirty && quiet >= SCRUB_EXIT_US) {
                 scrub_exit();
                 np_last = 0xFFFFFFFFu;
-                dirty   = 1;
             }
             if (!player_active()) {
                 scrub_exit();                    /* track ended under the scrubber */
@@ -5573,17 +5582,21 @@ _Noreturn static void run_ui(fat32_t *fs)
             uint32_t nowv    = mmio_read32(USEC_TIMER_ADDR);
             uint32_t elapsed = player_elapsed_s();
             int vol_active = ui_window_up(&g_vol_show, VOL_SHOW_US, nowv);
-            int expiring   = np_vol_prev && !vol_active;   /* overlay just faded */
+            /* The volume plate needs a push when it appears, when the wheel
+             * moves it while it is up, and when it fades (to put back what it
+             * covered). None of those is a full-frame event. */
+            int vol_edge   = (vol_active != np_vol_prev) ||
+                             (vol_active && np_vol_dirty);
 
             /* A FULL repaint is needed only on a real change (dirty — which the
-             * loop's track-change edge sets for us) or to erase the fading volume
-             * overlay, which straddles the static art band. Everything else is
-             * just the clock ticking: that redraws ONLY the transport strip
-             * (elapsed/remaining/progress) and presents only its band, instead of
-             * re-rendering the whole screen — art, metadata and two anti-aliased
-             * bars — once a second and throwing all of it above y=128 away. */
-            int want_full = dirty || expiring || toast != toast_prev;
-            if (want_full) {
+             * loop's track-change edge sets for us) or a toast edge. Everything
+             * else is a partial: the clock tick redraws ONLY the transport strip
+             * (elapsed/remaining/progress) and presents only its band, and a
+             * volume edge presents only the plate rect, instead of re-rendering
+             * the whole screen — art, metadata and two anti-aliased bars — and
+             * pushing all 38400 words for a 3200-word plate. */
+            int want_full = dirty || toast != toast_prev;
+            if (want_full || vol_edge) {
                 if (np_first || !player_active() ||
                     (uint32_t)(nowv - last_present) >= present_gap_us()) {
                     g_mq.active = 0;
@@ -5596,25 +5609,50 @@ _Noreturn static void run_ui(fat32_t *fs)
                         g_mq.active = 0;      /* see the list branch below */
                     }
                     toast_prev = toast;
+                    if (!want_full) {
+                        /* Volume edge only. The screen was re-rendered in full
+                         * (the plate's anti-aliased corners blend into whatever
+                         * is under them, so a fresh background is the only way
+                         * to draw them — or to erase them — without drift), but
+                         * everything outside the plate came out as the pixels
+                         * the panel already shows. Push just the plate rect;
+                         * console.c's damage rect is a union, so replace it.
+                         * np_last is left alone: if the second rolled over in
+                         * this pass, the next one presents the transport band. */
+                        console_damage_reset();
+                        console_damage_add(VOL_PLATE_X, VOL_PLATE_Y,
+                                           VOL_PLATE_W, VOL_PLATE_H);
+                    }
                     ui_present_damage();
                     np_first = 0;
-                    np_last  = elapsed;
+                    if (want_full) {
+                        np_last = elapsed;
+                        dirty   = 0;
+                    }
                     np_vol_prev  = vol_active;
+                    np_vol_dirty = 0;
                     last_present = nowv;
                     player_note_presented();
-                    dirty = 0;
                     g_lp.valid = 0;             /* not a list screen */
                 }
-                /* else: throttled — keep dirty set, present in the next window */
+                /* else: throttled — keep dirty / the volume edge pending, present
+                 * in the next window (np_vol_prev is what makes a fade retry). */
             } else if (elapsed != np_last) {
                 /* Transport only: leave the marquee registered (its own tick
-                 * keeps the title scrolling) and don't touch the art/metadata. */
-                console_damage_reset();
-                nowplaying_transport_render(elapsed, player_total_s());
-                ui_present_damage();
-                np_last = elapsed;
-                np_vol_prev = vol_active;
-                player_note_presented();
+                 * keeps the title scrolling) and don't touch the art/metadata.
+                 * The clock lands here once a second; the scrubber lands here
+                 * on every detent (it forces np_last), so THAT case is paced by
+                 * the last present's cost like every other wheel-driven paint —
+                 * np_last stays forced until the band actually goes out. */
+                if (!np_scrubbing() ||
+                    (uint32_t)(nowv - last_present) >= present_gap_us()) {
+                    console_damage_reset();
+                    nowplaying_transport_render(elapsed, player_total_s());
+                    ui_present_damage();
+                    np_last = elapsed;
+                    if (np_scrubbing()) last_present = nowv;
+                    player_note_presented();
+                }
             }
         } else if (dirty || az_letter != az_prev || toast != toast_prev) {
             /* Repaints are paced by what the LAST present actually cost (see

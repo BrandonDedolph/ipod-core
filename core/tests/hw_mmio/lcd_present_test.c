@@ -43,6 +43,8 @@
 #include "lcd.h"
 #include "mmio_mock.h"
 #include "trace_expect.h"
+#include "console.h"      /* the damage rect main.c presents from          */
+#include "chrome.h"       /* NP_TR_* / VOL_PLATE_*: the Now Playing partials */
 
 #define FRAME_PIXELS  (LCD_WIDTH * LCD_HEIGHT)
 #define FRAME_WORDS   ((LCD_WIDTH * LCD_HEIGHT) / 2u)   /* 38400 */
@@ -528,6 +530,117 @@ static int test_lcd_present_post_wake(void)
     return fails;
 }
 
+/*
+ * The two Now Playing partials, driven the way kernel/main.c drives them:
+ * draw (or report) into console.c's damage rect, read it back, hand it to
+ * lcd_present_rect. This pins the BCM cost of each — the numbers the
+ * "volume overlay and scrub band trigger full-frame repaints" fix was about —
+ * so a geometry or damage-tracking change that quietly turns one of them
+ * back into a 38400-word push fails here instead of on the device:
+ *
+ *   - a scrubber detent / clock tick: the transport band, a full-width fill
+ *     of NP_TR_H rows -> ONE contiguous stream of 320*56/2 = 8960 words
+ *     addressed once at row NP_TR_Y;
+ *   - a volume tick / fade: the plate rect reported through
+ *     console_damage_add (main.c replaces the union with exactly this rect
+ *     after re-rendering) -> 200*32/2 = 3200 words, re-addressed per row.
+ */
+static size_t count_pixel_words(void)
+{
+    /* data writes = pixel words + the single BCMA_COMMAND word */
+    return mmio_mock_count(MMIO_OP_WRITE, BCM_DATA_ADDR) - 1u;
+}
+
+static uint32_t first_write_addr(void)
+{
+    const mmio_event *log = mmio_mock_log();
+    size_t len = mmio_mock_log_len();
+    for (size_t i = 0; i < len; i++) {
+        if (log[i].op == MMIO_OP_WRITE && log[i].addr == BCM_WR_ADDR_ADDR) {
+            return log[i].value;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+static int present_damage(const char *tag, int ex, int ey, int ew, int eh)
+{
+    int x = -1, y = -1, w = -1, h = -1;
+    if (!console_damage_get(&x, &y, &w, &h)) {
+        fprintf(stderr, "[%s] FAIL: nothing damaged\n", tag);
+        return 1;
+    }
+    if (x != ex || y != ey || w != ew || h != eh) {
+        fprintf(stderr, "[%s] FAIL: damage rect (%d,%d %dx%d), expected "
+                "(%d,%d %dx%d)\n", tag, x, y, w, h, ex, ey, ew, eh);
+        return 1;
+    }
+    mmio_mock_reset();
+    program_idle_seq();
+    lcd_present_rect(console_framebuffer(), x, y, w, h);
+    console_damage_reset();
+    return 0;
+}
+
+static int test_nowplaying_partials(void)
+{
+    int fails = 0;
+    const uint32_t stride_bytes = (uint32_t)LCD_WIDTH * 2u;
+
+    /* Transport band: what nowplaying_transport_render does first is a
+     * full-width fill of its band, which is also the whole of its damage. */
+    console_damage_reset();
+    console_fill_rect(0, NP_TR_Y, LCD_WIDTH, NP_TR_H, 0x1234);
+    fails += present_damage("np_transport", 0, NP_TR_Y, LCD_WIDTH, NP_TR_H);
+    {
+        const uint32_t want_words = (uint32_t)LCD_WIDTH * NP_TR_H / 2u;   /* 8960 */
+        const uint32_t want_addr  = BCMA_CMDPARAM + (uint32_t)NP_TR_Y * stride_bytes;
+        size_t   words = count_pixel_words();
+        uint32_t addr  = first_write_addr();
+        size_t   addrs = mmio_mock_count(MMIO_OP_WRITE, BCM_WR_ADDR_ADDR);
+        if (words != want_words || addr != want_addr || addrs != 2u) {
+            fprintf(stderr, "[np_transport] FAIL: %zu words (want %u), first "
+                    "addr %08X (want %08X), %zu addr writes (want 2: band + "
+                    "command)\n", words, want_words, addr, want_addr, addrs);
+            fails++;
+        } else {
+            printf("[np_transport] %zu words, one stream at row %d (not %u)\n",
+                   words, NP_TR_Y, FRAME_WORDS);
+        }
+    }
+
+    /* Volume plate: main.c re-renders the screen (console_clear -> whole
+     * panel damaged), then REPLACES the union with the plate rect. The
+     * replacement is the part under test: a reset that failed to forget the
+     * clear would present the frame. */
+    console_clear(0x0000);
+    console_damage_reset();
+    console_damage_add(VOL_PLATE_X, VOL_PLATE_Y, VOL_PLATE_W, VOL_PLATE_H);
+    fails += present_damage("np_volume", VOL_PLATE_X, VOL_PLATE_Y,
+                            VOL_PLATE_W, VOL_PLATE_H);
+    {
+        const uint32_t want_words = (uint32_t)VOL_PLATE_W * VOL_PLATE_H / 2u; /* 3200 */
+        const uint32_t want_addr  = BCMA_CMDPARAM +
+                                    (uint32_t)VOL_PLATE_Y * stride_bytes +
+                                    (uint32_t)VOL_PLATE_X * 2u;
+        size_t   words = count_pixel_words();
+        uint32_t addr  = first_write_addr();
+        size_t   addrs = mmio_mock_count(MMIO_OP_WRITE, BCM_WR_ADDR_ADDR);
+        if (words != want_words || addr != want_addr ||
+            addrs != (size_t)VOL_PLATE_H + 1u) {
+            fprintf(stderr, "[np_volume] FAIL: %zu words (want %u), first addr "
+                    "%08X (want %08X), %zu addr writes (want %d rows + "
+                    "command)\n", words, want_words, addr, want_addr, addrs,
+                    VOL_PLATE_H);
+            fails++;
+        } else {
+            printf("[np_volume] %zu words, %d rows re-addressed (not %u)\n",
+                   words, VOL_PLATE_H, FRAME_WORDS);
+        }
+    }
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
@@ -541,6 +654,7 @@ int main(void)
     fails += test_lcd_present_rect_arbitrary();
     fails += test_lcd_present_rect_fullframe();
     fails += test_lcd_present_rect_noop();
+    fails += test_nowplaying_partials();
     fails += test_lcd_present_post_wake();
     return fails == 0 ? 0 : 1;
 }

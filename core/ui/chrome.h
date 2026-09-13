@@ -90,6 +90,30 @@
 #define ROW_H2     32
 #define LIST_ROWS2 6      /* (240-42)/32 ~= 6                            */
 
+/* ---------- Now Playing partial-present rects ------------------------
+ * The two regions of Now Playing that repaint on their own, without the
+ * art/metadata above them (kernel/main.c nowplaying_render):
+ *
+ *   - the TRANSPORT band: elapsed / remaining times + progress bar, redrawn
+ *     by the clock tick and by every scrubber detent. Full-width, so the
+ *     BCM takes it as one contiguous stream (320*56/2 = 8960 words);
+ *   - the VOLUME plate: the overlay a wheel turn raises for 1.5 s. Painted
+ *     and presented on its own when it appears, moves and fades
+ *     (200*32/2 = 3200 words, per-row addressed).
+ *
+ * A full frame is 38400 words. Both rects are pinned by
+ * tests/hw_mmio/lcd_present_test.c so a geometry change that silently turns
+ * one of these back into a full-frame push fails on the host. The battery
+ * toast (screen_battery.h BATTWARN_TOAST_*) sits on the volume plate's
+ * origin by design; it is 4 px taller.
+ */
+#define NP_TR_Y      184                /* transport band top                   */
+#define NP_TR_H      56                 /* ...to the bottom of the 240px panel  */
+#define VOL_PLATE_X  60
+#define VOL_PLATE_Y  101
+#define VOL_PLATE_W  200
+#define VOL_PLATE_H  32
+
 /* ---------- Text ----------------------------------------------------
  * Thin wrappers over text.c with the panel dimensions baked in, plus the
  * damage reporting a partial present depends on. Drawing text through
