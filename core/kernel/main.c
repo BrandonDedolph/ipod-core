@@ -5004,6 +5004,21 @@ _Noreturn static void run_ui(fat32_t *fs)
          * the queue immediately (so the gesture confirms itself under your
          * thumb); released before it toggles the scrubber.
          */
+        if (g_sel_pending && (scr_cur() != SCR_NOWPLAYING || g_locked)) {
+            /* The press no longer belongs to Now Playing: MENU popped it, the
+             * track ended and truncated the stack, or Hold engaged mid-press.
+             * Hold is the nasty one — it zeroes clickwheel_buttons(), which
+             * reads below as a release and would scrub_enter() while locked;
+             * MENU-then-release used to toggle the scrubber on whatever
+             * screen was current, and the next Now Playing wheel turn then
+             * seeked instead of changing the volume. Drop it, and the
+             * scrubber with it. */
+            g_sel_pending = 0;
+            if (np_scrubbing()) {
+                scrub_exit();
+                np_last = 0xFFFFFFFFu;
+            }
+        }
         if (g_sel_pending) {
             uint32_t sel_held = mmio_read32(USEC_TIMER_ADDR) - g_sel_down_us;
             int      down     = (clickwheel_buttons() & WHEEL_BTN_SELECT) != 0;
