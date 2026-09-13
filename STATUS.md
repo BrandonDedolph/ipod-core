@@ -66,6 +66,28 @@ suspend (moot once escalation lands), the BCM power gate, `PANEL_SLEEP_AT_IDLE`
 stripping non-ASCII on the scan fallback, `ata_identify()`'s ERR check, and
 the reserved playlist queue kind. Nothing has been pushed.
 
+### 2026-09-13, later — the DAC's position is asked, not guessed
+
+`hal_audio_frames_played()` (hal.h) reports what the converter has actually
+clocked out. Hw: completed DMA buffers plus the timed part of the current
+one (kick timestamp x rate — the late-kick detector's own figures), so the
+residual is the 16-frame I2S FIFO (~0.4 ms) plus however late the pump pass
+that reads it lands; frozen across stop/start, unmoved by a flush, zeroed by
+init. Sim: SDL's pulls less the 1024-frame buffer in flight, interpolated
+the same way, so the residual is the host mixer's own latency rather than a
+guessed 350 ms (the sim does not link the player today; the backend is
+there for when it does). `player.c`'s `frames_heard()` now pairs that count
+with the ring's (`heard_rebase()` at every `hal_audio_init` and
+`hal_audio_flush`) instead of subtracting a hardcoded 2 x 8192, so the
+gapless hand-over — and the clock it anchors — lands on the true frame
+where it was 0..186 ms late. The elapsed clock's accumulator/anchor design
+is unchanged. Covered by `hw-audio-pingpong` (section 11) and
+`player-clock` (sections 6–10: FIFO/SDL/device depths, count wrap, a
+codec-cold pause, a seek, a 44.1 → 48 kHz hand-over). Unflashed: on the
+device, listen for the title and clock flipping exactly as the next track
+starts, and watch `audio_late_kicks()` — a late completion is now also a
+late position, capped at the buffer.
+
 ## Where we are right now (2026-07-28)
 
 **A full music player on real hardware, and it is now the device's own
