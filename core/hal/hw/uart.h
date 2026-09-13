@@ -28,4 +28,10 @@ void uart_puts(const char *s);
  * composable register dumps before printf exists. */
 void uart_put_hex32(uint32_t v);
 
+/* Suspend-to-RAM: gate the SER0 clock off (DEV_EN DEV_SER0) / restore it.
+ * The restore only re-sets a bit the suspend found set, and the next byte
+ * transmitted while gated restores it itself before polling THRE. */
+void uart_clock_suspend(void);
+void uart_clock_resume(void);
+
 #endif /* CORE_HAL_HW_UART_H */

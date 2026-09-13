@@ -28,6 +28,9 @@
 #include "clock.h"
 #include "hw/pp5022.h"
 #include "hw/mmio.h"
+#include "hw/uart.h"
+#include "hw/piezo.h"
+#include "hw/i2c.h"
 
 /*
  * Upper bound on the PLL-lock poll so a dead PLL — or the clicky
@@ -267,6 +270,49 @@ void clock_resume(void)
         return;
     }
     set_cpu_frequency(PLL_CONTROL_30MHZ, DEV_TIMING1_SLOW, CPUFREQ_NORMAL);
+}
+
+/*
+ * DEV_EN hygiene for suspend-to-RAM (01-soc-pp5022.md, "Power management").
+ *
+ * Three peripheral clocks are left running by their drivers with nothing
+ * to do while the device is asleep: SER0 (uart.c, on from boot for the
+ * debug channel), PWM0 (piezo.c, on from piezo_init for the click), and
+ * the I2C controller (i2c.c, on from the first codec bring-up). Each
+ * driver owns its own bit — it is the driver that set it, and it is the
+ * driver that must re-gate before touching the block — so this is only the
+ * orchestration: gate all three on the way in, restore on the way out, in
+ * reverse order. Every driver's suspend records whether its bit was on and
+ * its resume restores only that, so a build that never ran piezo_init
+ * ends up exactly where it started.
+ *
+ * The blocks are SELF-RESTORING on use (a UART byte, an I2C transaction,
+ * a click), so the suspend loop's battery sample and the PMU standby
+ * command work without the caller re-gating first — and so nothing can
+ * ever spin against an unclocked block. clock_gate_resume() after such a
+ * use is then partly a no-op, which is fine.
+ *
+ * NOT touched: DEV_OPTO — the wheel is the wake source and clickwheel.c
+ * gates it only while Hold is on — and whatever the ROM left set in the
+ * 0xC2000124 boot value (the doc names none of those bits, so USB /
+ * FireWire / IDE gating stays a device-verified follow-up). DEV_I2S and
+ * DEV_EXTCLOCKS are gated by hal/hw/audio.c's codec power-down, which the
+ * suspend loop drives through player_pump.
+ *
+ * What this saves is not in the doc and has not been measured.
+ */
+void clock_gate_suspend(void)
+{
+    uart_clock_suspend();
+    piezo_clock_suspend();
+    i2c_clock_suspend();
+}
+
+void clock_gate_resume(void)
+{
+    i2c_clock_resume();
+    piezo_clock_resume();
+    uart_clock_resume();
 }
 
 #ifdef MMIO_MOCK

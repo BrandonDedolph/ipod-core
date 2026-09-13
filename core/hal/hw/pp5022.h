@@ -577,6 +577,7 @@
 #define DEV_I2S               0x00000800  /* DEV_EN/RS bit 11: I2S serializer clock */
 #define DEV_I2C               0x00001000  /* DEV_EN/RS bit 12: I2C controller */
 #define DEV_OPTO              0x00010000  /* DEV_EN/RS bit 16: clickwheel (03-clickwheel) */
+#define DEV_PWM               0x00020000  /* DEV_EN bit 17: PWM0 (piezo click, piezo.h)   */
 
 #define DEV_EXTCLK_SEL_ADDR   0x70000018  /* clear the 24 MHz-select field to run EXT@24MHz */
 #define DEV_EXTCLK_24MHZ_MASK 0x0000000C  /* bits 3:2 */

@@ -55,6 +55,17 @@ int clock_suspend(void);
 void clock_resume(void);
 
 /*
+ * Suspend-to-RAM peripheral clock gating: clear DEV_SER0, DEV_PWM and
+ * DEV_I2C in DEV_EN (each through its owning driver, which records what
+ * was on) and restore exactly that on resume. The gated blocks re-gate
+ * themselves on their next use, so a UART line, an I2C transaction or a
+ * click issued while suspended still works. DEV_OPTO (the wake source) and
+ * the ROM's undocumented boot bits are never touched.
+ */
+void clock_gate_suspend(void);
+void clock_gate_resume(void);
+
+/*
  * Tell the clock driver whether the audio DMA is currently streaming PCM out
  * of SDRAM. While it is, cpu_boost/cpu_unboost/clock_init become no-ops: the
  * frequency switch reprograms DEV_TIMING1 (SDRAM/peripheral bus timing) and

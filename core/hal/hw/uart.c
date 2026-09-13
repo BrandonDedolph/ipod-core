@@ -12,6 +12,7 @@
 
 #include "pp5022.h"
 #include "mmio.h"
+#include "irqlock.h"   /* DEV_EN RMW vs the timer ISR, for the suspend gate */
 #include "uart.h"
 
 /*
@@ -67,8 +68,43 @@ static void uart_wait_us(uint32_t us)
     }
 }
 
+/*
+ * Suspend gating of the SER0 clock. Set by uart_clock_suspend() when it
+ * finds the bit on and clears it; the next byte out re-gates first. That
+ * self-restore is not a nicety: with SER0 unclocked the THRE poll below
+ * never sees ready, so every byte would burn its full UART_TX_SPIN_LIMIT
+ * — a 300-character battery line would hold the core busy for seconds —
+ * and a suspend-loop log line must never be that expensive to emit.
+ */
+static int g_gated;
+
+void uart_clock_suspend(void)
+{
+    uint32_t f = hw_irq_save();
+    uint32_t en = mmio_read32(DEV_EN_ADDR);
+    if (en & DEV_SER0) {
+        mmio_write32(DEV_EN_ADDR, en & ~DEV_SER0);
+        g_gated = 1;
+    }
+    hw_irq_restore(f);
+}
+
+void uart_clock_resume(void)
+{
+    if (!g_gated) {
+        return;
+    }
+    uint32_t f = hw_irq_save();
+    mmio_write32(DEV_EN_ADDR, mmio_read32(DEV_EN_ADDR) | DEV_SER0);
+    hw_irq_restore(f);
+    g_gated = 0;
+}
+
 static void uart_tx_byte(uint8_t b)
 {
+    if (g_gated) {
+        uart_clock_resume();
+    }
     uint32_t spin = UART_TX_SPIN_LIMIT;
     while (!(mmio_read32(SER0_LSR_ADDR) & SER0_LSR_THRE) && --spin != 0) {
         /* poll */
@@ -112,6 +148,7 @@ void uart_init(void)
      * second, all of it spent before the first byte of boot log. Ten
      * milliseconds on the microsecond counter is what was intended. */
     mmio_write32(DEV_EN_ADDR, mmio_read32(DEV_EN_ADDR) | DEV_SER0);
+    g_gated = 0;
     mmio_write32(DEV_RS_ADDR, mmio_read32(DEV_RS_ADDR) | DEV_SER0);
     uart_wait_us(UART_RESET_HOLD_US);
     mmio_write32(DEV_RS_ADDR, mmio_read32(DEV_RS_ADDR) & ~DEV_SER0);

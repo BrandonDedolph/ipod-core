@@ -57,8 +57,48 @@ static int i2c_wait_idle(void)
  */
 static int g_inited;
 
+/*
+ * Suspend gating of the I2C clock. The bus has two idle-time users — the
+ * codec's power-down write, which player_pump issues once early in a
+ * suspend, and the PMU battery ADC every 5 s (and the PMU standby command
+ * itself, which is the last thing a suspend does). Rather than track which
+ * of those is next, the gate is self-restoring: i2c_clock_suspend() clears
+ * DEV_I2C (recording that it was on), and the next transaction or init
+ * re-gates first. What a transaction against an unclocked controller would
+ * do is not documented (09-i2c.md) — BUSY might read clear and the write
+ * be silently lost, which for power_standby's GOSTDBY is "the power-off
+ * that did nothing" — so the restore is unconditional on every entry, not
+ * an optimisation.
+ */
+static int g_gated;
+
+void i2c_clock_suspend(void)
+{
+    uint32_t f = hw_irq_save();
+    uint32_t en = mmio_read32(DEV_EN_ADDR);
+    if (en & DEV_I2C) {
+        mmio_write32(DEV_EN_ADDR, en & ~DEV_I2C);
+        g_gated = 1;
+    }
+    hw_irq_restore(f);
+}
+
+void i2c_clock_resume(void)
+{
+    if (!g_gated) {
+        return;
+    }
+    uint32_t f = hw_irq_save();
+    mmio_write32(DEV_EN_ADDR, mmio_read32(DEV_EN_ADDR) | DEV_I2C);
+    hw_irq_restore(f);
+    g_gated = 0;
+}
+
 void i2c_init(void)
 {
+    if (g_gated) {
+        i2c_clock_resume();      /* the drain below needs a clocked STATUS */
+    }
     if (g_inited) {
         /* Idempotent re-init: let whatever is on the wire finish. If it never
          * does, the CONTROLLER is wedged (BUSY stuck) — nothing good is in
@@ -78,6 +118,7 @@ void i2c_init(void)
     uint32_t f = hw_irq_save();
     mmio_write32(DEV_EN_ADDR, mmio_read32(DEV_EN_ADDR) | DEV_I2C);
     hw_irq_restore(f);
+    g_gated = 0;
 
     /* The block is clocked now: let any transaction the boot ROM (or an
      * earlier image) left in flight complete BEFORE the reset yanks the
@@ -119,6 +160,7 @@ void i2c_init(void)
 void i2c_test_reset(void)
 {
     g_inited = 0;
+    g_gated  = 0;
 }
 #endif
 
@@ -126,6 +168,9 @@ int i2c_send(uint8_t dev, const uint8_t *bytes, int len)
 {
     if (len < 1 || len > I2C_MAX_BYTES) {
         return -1;
+    }
+    if (g_gated) {
+        i2c_clock_resume();      /* suspend gated the block; see g_gated */
     }
     if (i2c_wait_idle() != 0) {
         return -2;

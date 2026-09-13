@@ -9,10 +9,9 @@
 #include "pp5022.h"          /* DEV_INIT1_ADDR, DEV_EN_ADDR, USEC_TIMER_ADDR */
 #include "irqlock.h"         /* DEV_INIT1/DEV_EN RMW vs the timer ISR */
 
-/* PWM facts not already in pp5022.h. DEV_PWM is DEV_EN bit 17, one above
- * DEV_OPTO (bit 16, the clickwheel). Addresses are hardware facts. */
+/* PWM facts not already in pp5022.h (DEV_PWM, the DEV_EN clock bit, is
+ * there: bit 17, one above DEV_OPTO). Addresses are hardware facts. */
 #define DEV_INIT1_PWM_RT 0x0000000Cu   /* cleared to route PWM0 out to the piezo */
-#define DEV_EN_PWM       0x00020000u   /* PWM peripheral clock enable            */
 #define PWM0_CTRL_ADDR   0x7000A000u
 #define PWM0_ON          0x80000000u   /* CTRL bit 31: run                       */
 
@@ -29,6 +28,16 @@
                                          * crisp click, still far shorter than any
                                          * load so it can't buzz, ~4 ms latency. */
 
+/*
+ * Suspend gating of the PWM clock. The block idles between clicks with its
+ * clock running; nothing clicks while the device is asleep, so the clock
+ * can go. `g_gated` records that the bit WAS on when it was cleared, so
+ * resume restores only what was there (a build that never ran piezo_init
+ * has nothing to restore) and the next click re-gates on its own — a
+ * burst written into an unclocked block would simply be silent.
+ */
+static int g_gated;
+
 void piezo_init(void)
 {
     /* Route PWM0 to the piezo pin, then enable its peripheral clock. Both are
@@ -37,9 +46,32 @@ void piezo_init(void)
      * IRQ-masked — see irqlock.h. */
     uint32_t f = hw_irq_save();
     mmio_write32(DEV_INIT1_ADDR, mmio_read32(DEV_INIT1_ADDR) & ~DEV_INIT1_PWM_RT);
-    mmio_write32(DEV_EN_ADDR,    mmio_read32(DEV_EN_ADDR) | DEV_EN_PWM);
+    mmio_write32(DEV_EN_ADDR,    mmio_read32(DEV_EN_ADDR) | DEV_PWM);
     hw_irq_restore(f);
     mmio_write32(PWM0_CTRL_ADDR, 0);
+    g_gated = 0;
+}
+
+void piezo_clock_suspend(void)
+{
+    uint32_t f = hw_irq_save();
+    uint32_t en = mmio_read32(DEV_EN_ADDR);
+    if (en & DEV_PWM) {
+        mmio_write32(DEV_EN_ADDR, en & ~DEV_PWM);
+        g_gated = 1;
+    }
+    hw_irq_restore(f);
+}
+
+void piezo_clock_resume(void)
+{
+    if (!g_gated) {
+        return;
+    }
+    uint32_t f = hw_irq_save();
+    mmio_write32(DEV_EN_ADDR, mmio_read32(DEV_EN_ADDR) | DEV_PWM);
+    hw_irq_restore(f);
+    g_gated = 0;
 }
 
 /*
@@ -53,6 +85,7 @@ void piezo_init(void)
  */
 void piezo_click_ex(uint32_t hz, uint32_t us)
 {
+    piezo_clock_resume();            /* no-op unless a suspend gated us off */
     uint32_t inv = 91225u / (hz ? hz : 1u);
     mmio_write32(PWM0_CTRL_ADDR,
                  PWM0_ON | ((uint32_t)PIEZO_FORM << 16) | (inv & 0xFFFFu));
