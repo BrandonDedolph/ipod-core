@@ -5,8 +5,11 @@ what works, what doesn't, and what to pick up next.
 
 ## 2026-09-13 — issue sweep landed on `main`, NOT yet flashed
 
-Six read-only audits over the whole tree, then six fix branches merged
-(28 commits, 53 host suites green, ARM `-Werror` + `verify-hw` clean). The
+Six read-only audits over the whole tree, then six fix branches merged;
+a second wave the same day added Playlists (read path + resume kind),
+Now Playing partial repaints, `hal_audio_frames_played()`, the audit
+leftovers, and two rounds of cross-branch review fixes (52 commits in all,
+54 host suites green, ARM `-Werror` + `verify-hw` clean, nothing pushed). The
 two user-reported problems turned out to be one chain: a PLAY-hold "off"
 was suspend-to-RAM, which never escalated to PMU standby and drained the
 cell; the resulting cold boot then rebuilt the queue as the album.
@@ -68,6 +71,25 @@ tiebreak (`name_bind_exact`, exact on-disk name wins when a bucket has two
 candidates), `flac_meta.c` keeping UTF-8 on the scan fallback, and
 `ata_identify()` waiting for !BSY before it reads ERR/DF. Nothing has been
 pushed.
+
+### 2026-09-13, later — cross-branch review, two rounds
+
+Five reviewers went over the merged result looking for what each parallel
+author could not see. Fixed: a slow suspend entry (spin-up for a forced
+save) pushed the PLAY hold past the 5 s escalation and turned a requested
+sleep into a power-off — escalation is now also timed 2.5 s from when the
+screen went dark (`SUSPEND_ESCALATE_DARK_US`); an in-suspend DISKSAFE
+write left the drive in STANDBY instead of SLEEP (`ata_is_slept()` gate);
+`ata_sleep()` no longer flushes an already-parked drive; a wake reset that
+times out fails fast instead of stacking three budgets; the keyhold swallow
+works before the sampler shows the press but only for PLAY and only for a
+couple of feeds; a wedged I2C controller is reset on re-init; Next takes the
+prefetched hand-over (Repeat-All + Shuffle re-deal) unless it is the same
+track (Repeat-One); playlist resolution walks one folder per album instead
+of the root per track, stops on a failing disk, and reports unusable
+entries. Add to the first-flash checklist: open a 100-track playlist and
+time it; hold PLAY on a dirty settings record and confirm the device
+sleeps rather than powers off.
 
 ### 2026-09-13, later — the DAC's position is asked, not guessed
 
