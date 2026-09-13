@@ -156,6 +156,13 @@ static void bus_ready(void)
      * "idle / ready" state — so no bounded spin here runs to its limit. */
 }
 
+/* Set the free-running microsecond timer. Note bus_ready() puts it back to
+ * 0 along with everything else. */
+static void at_us(uint32_t us)
+{
+    mmio_mock_set_read(USEC_TIMER_ADDR, us);
+}
+
 /* The int16 sample the counting source writes for the n-th frame it ever
  * produced. Values start at 1 so 0 unambiguously means "silence padding". */
 static int16_t sample_for(uint32_t n)
@@ -556,6 +563,8 @@ int main(void)
               sample_for(2u * (uint32_t)frames));
     xpect(&c, "dropped: resume refills the finished buffer the ISR never did",
           g_calls == calls_before_resume + 1);
+    xpect(&c, "dropped: the buffer whose completion was lost still counts as "
+              "played", hal_audio_frames_played() == 2u * (uint32_t)frames);
     audio_dma_isr();
     xpect(&c, "dropped: the next completion plays chunk 3, not chunk 1 again",
           last_kick_first_sample() == sample_for(3u * (uint32_t)frames));
@@ -575,6 +584,107 @@ int main(void)
           g_calls == calls_before_resume);
     xpect(&c, "not dropped: and resumes inside the chunk it was on",
           last_kick_first_sample() == sample_for((uint32_t)frames));
+
+    /* --- 11. hal_audio_frames_played(): where the DAC actually is ------ *
+     * The player used to guess this by subtracting the driver's whole depth
+     * from what it had handed out. hal.h now promises the real thing:
+     * completed buffers plus the timed part of the current one, frozen
+     * across a stop, unmoved by a flush, zeroed by init, counted at the
+     * stream's rate. The mock's USEC_TIMER is set by hand, so every figure
+     * here is exact: 44.1 frames per millisecond. */
+    fresh_start();                               /* kicked at t = 0 */
+    xpect(&c, "played: zero at the instant of the first kick",
+          hal_audio_frames_played() == 0u);
+    at_us(100000u);                              /* 100 ms in */
+    xpect(&c, "played: 100 ms into a buffer at 44.1 kHz is 4410 frames",
+          hal_audio_frames_played() == 4410u);
+    at_us(5000000u);                             /* a completion that never came */
+    xpect(&c, "played: a stalled buffer is credited at most its own length",
+          hal_audio_frames_played() == (uint32_t)frames);
+    at_us(185760u);                              /* the buffer's real end */
+    audio_dma_isr();
+    xpect(&c, "played: a completion retires the whole buffer and the next "
+              "kick starts at zero",
+          hal_audio_frames_played() == (uint32_t)frames);
+    at_us(185760u + 50000u);
+    xpect(&c, "played: ...and the next buffer counts from its own kick",
+          hal_audio_frames_played() == (uint32_t)frames + 2205u);
+
+    /* Pause: frozen where the stop sampled it, paused time never counted,
+     * resume carrying on from the same figure. */
+    hal_audio_stop();
+    uint32_t at_stop = hal_audio_frames_played();
+    xpect(&c, "played: a stop freezes the count where the engine was cut",
+          at_stop == (uint32_t)frames + 2205u);
+    at_us(185760u + 50000u + 30000000u);         /* 30 s paused */
+    xpect(&c, "played: paused time is not played time",
+          hal_audio_frames_played() == at_stop);
+    hal_audio_stop();                            /* stop while stopped */
+    xpect(&c, "played: stopping again while stopped changes nothing",
+          hal_audio_frames_played() == at_stop);
+    bus_ready();
+    at_us(40000000u);
+    hal_audio_start();                           /* resume, 40 s on the clock */
+    xpect(&c, "played: resume carries on from the frozen count",
+          hal_audio_frames_played() == at_stop);
+    at_us(40000000u + 10000u);
+    xpect(&c, "played: ...and runs again from the resume, not from the pause",
+          hal_audio_frames_played() == at_stop + 441u);
+    at_us(45000000u);                            /* past the remainder's end */
+    audio_dma_isr();                             /* the resumed remainder completes */
+    xpect(&c, "played: completing a resumed remainder retires exactly the "
+              "remainder", hal_audio_frames_played() == 2u * (uint32_t)frames);
+
+    /* Flush (a seek): the unheard PCM is discarded, the heard part of the
+     * buffer is kept, and the cold start after it continues the count. */
+    fresh_start();                               /* t = 0 */
+    at_us(100000u);
+    hal_audio_stop();                            /* 4410 frames in */
+    hal_audio_flush();
+    xpect(&c, "played: a flush discards PCM, not the count of what was heard",
+          hal_audio_frames_played() == 4410u);
+    hal_audio_flush();
+    xpect(&c, "played: a second flush adds nothing",
+          hal_audio_frames_played() == 4410u);
+    bus_ready();
+    at_us(200000u);
+    hal_audio_start();                           /* cold prime from the source */
+    xpect(&c, "played: a cold start after a flush continues the count",
+          hal_audio_frames_played() == 4410u);
+    at_us(210000u);
+    xpect(&c, "played: ...timed from the new kick",
+          hal_audio_frames_played() == 4410u + 441u);
+    at_us(400000u);
+    audio_dma_isr();
+    xpect(&c, "played: the first completion after a flush retires one whole "
+              "buffer on top", hal_audio_frames_played() == 4410u + (uint32_t)frames);
+
+    /* The timer wraps under a kick: the in-flight part is a 32-bit
+     * difference, not a comparison. */
+    hal_audio_close();
+    bus_ready();
+    hal_audio_init(44100u, 2u);
+    source_reset();
+    bus_ready();
+    hal_audio_set_source(counting_source, 0);
+    at_us(0xFFFFFF00u);                          /* 256 us before the wrap */
+    hal_audio_start();
+    at_us(0x00000100u);                          /* 256 us after it: 512 us in */
+    xpect(&c, "played: the in-flight part survives the timer wrapping (512 us "
+              "= 22 frames)", hal_audio_frames_played() == 22u);
+
+    /* Init is a new stream, at that stream's rate. */
+    hal_audio_close();
+    bus_ready();
+    xpect(&c, "played: init starts a new stream at zero",
+          hal_audio_init(48000u, 2u) == 0 && hal_audio_frames_played() == 0u);
+    source_reset();
+    bus_ready();
+    hal_audio_set_source(counting_source, 0);
+    hal_audio_start();
+    at_us(100000u);
+    xpect(&c, "played: counts at the stream's own rate (48 kHz: 4800 in 100 ms)",
+          hal_audio_frames_played() == 4800u);
 
     return xfail_done(&c);
 }

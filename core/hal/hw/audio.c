@@ -170,6 +170,34 @@ static volatile uint32_t g_late_worst_us;/* worst overshoot seen, microseconds *
 static volatile uint32_t g_stop_done;
 
 /*
+ * WHERE THE DAC IS — hal_audio_frames_played().
+ *
+ * The player used to guess this: frames pulled from its ring, less the full
+ * two-buffer depth of this driver. Never ahead of the listener, but behind by
+ * 0..186 ms depending on where in the current buffer the DAC was, and every
+ * gapless hand-over anchored its clock that far late. Everything needed for a
+ * real answer was already here for the late-kick detector: the completion
+ * count and the kick timestamp.
+ *
+ * g_played_at_kick is the number of frames the DAC had clocked out when the
+ * outstanding kick began — every earlier kick's length summed: whole buffers
+ * retired by the completion ISR, plus, when a resume re-kicks the remainder
+ * of a buffer, the part of it the pause got through. The DAC's position NOW
+ * is that plus the in-flight part of the outstanding kick: while running,
+ * the frames the I2S clock has drained since g_kick_us (the same conversion
+ * hal_audio_stop uses for the resume offset, accurate to the 16-frame FIFO);
+ * stopped, the offset the stop sampled (g_stop_done), which is exactly where
+ * the resume will pick up, so the count does not move across a pause.
+ *
+ * Silence counts: a padded tail is clocked out like any other frame and the
+ * time it takes is time the listener waits through. Discarded PCM does not:
+ * hal_audio_flush() folds the heard part of the active buffer into the base
+ * and drops the rest unheard, so the count carries straight across a seek.
+ * hal_audio_init() zeroes it — a new stream, a new zero.
+ */
+static volatile uint32_t g_played_at_kick;
+
+/*
  * The codec is powered down and the I2S/MCLK clocks are gated — set by
  * hal_audio_suspend() and hal_audio_close(), cleared by hal_audio_wake() and
  * hal_audio_init(). It exists so the power-down sequence runs exactly once:
@@ -318,6 +346,11 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels)
     g_underruns   = 0;
     g_late_kicks  = 0;
     g_late_worst_us = 0;
+    /* A new stream: the DAC has played none of it, and no kick from the old
+     * one may be read as its in-flight part. */
+    g_played_at_kick = 0;
+    g_kick_bytes     = 0;
+    g_stop_done      = 0;
 
     /*
      * Propagate codec bring-up failure. Without this the UI shows a moving
@@ -382,6 +415,9 @@ void hal_audio_start(void)
         }
         uint32_t left = g_kick_bytes - done;
         int switched  = 0;
+        /* The part the pause got through is behind the kick that follows;
+         * the resumed kick then counts from zero (see g_played_at_kick). */
+        g_played_at_kick += done >> 2;
         if (left < 4u) {                  /* SIZE is bytes-4: 4 is the minimum */
             /* The active buffer had effectively finished: go straight to the
              * other one, which the completion ISR loaded. */
@@ -454,6 +490,10 @@ void audio_dma_isr(void)
 
     int just = g_active;
     int next = just ^ 1;
+
+    /* The kick that just completed has been clocked out in full. Retire it
+     * BEFORE the next kick overwrites g_kick_bytes. */
+    g_played_at_kick += g_kick_bytes >> 2;
 
     /* Keep the FIFO fed with the already-filled other buffer FIRST, then
      * refill the one that just drained. This ordering is what makes the
@@ -556,10 +596,48 @@ void hal_audio_flush(void)
      *
      * Only the flag is cleared. The PCM itself is overwritten by fill_buffer
      * during the cold prime, and zeroing 64 KB here would just be slower.
-     * g_stop_done goes too so a stale resume offset cannot outlive it.
+     * g_stop_done goes too so a stale resume offset cannot outlive it — but
+     * the frames it stands for WERE heard, so they move into the played
+     * count's base first; only the unheard remainder is discarded. Not while
+     * running: g_stop_done is stale then, and the count is being timed off
+     * the live kick anyway.
      */
+    if (!g_running) {
+        uint32_t heard = g_stop_done;
+        if (heard > g_kick_bytes) {
+            heard = g_kick_bytes;
+        }
+        g_played_at_kick += heard >> 2;
+    }
     g_primed    = 0;
     g_stop_done = 0;
+}
+
+uint32_t hal_audio_frames_played(void)
+{
+    /*
+     * One consistent (base, kick) pair: the completion ISR advances
+     * g_played_at_kick and restamps the kick together, and a read torn across
+     * that lands a whole buffer off. Masking IRQs for four loads is ~1 us,
+     * nowhere near the ~360 us FIFO deadline (and a no-op on the host).
+     */
+    uint32_t f     = hw_irq_save();
+    uint32_t base  = g_played_at_kick;
+    uint32_t kickf = g_kick_bytes >> 2;
+    uint32_t done;
+    if (g_running) {
+        uint32_t elapsed = mmio_read32(USEC_TIMER_ADDR) - g_kick_us;
+        done = (uint32_t)(((uint64_t)elapsed * g_rate) / 1000000u);
+    } else {
+        done = g_stop_done >> 2;     /* where the stop cut it; see there */
+    }
+    hw_irq_restore(f);
+    if (done > kickf) {
+        done = kickf;                /* a late completion: the buffer is out,
+                                      * the FIFO is repeating, nothing more
+                                      * has been heard */
+    }
+    return base + done;
 }
 
 /*

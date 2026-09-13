@@ -80,11 +80,44 @@ static int g_total_unknown; /* stub_set_total_unknown(): open reports no length 
 
 static uint32_t g_disk_ahead = 64u * 1024u * 1024u;
 
+/*
+ * The DAC's position, as the player reads it back through
+ * hal_audio_frames_played(). The real HAL holds pulled-but-unheard PCM
+ * between the ring and the converter — two 8192-frame ping-pong buffers on
+ * the device, one 1024-frame SDL buffer on the sim — and reports what is
+ * past it. Modelled as a pipe of g_dac_depth frames: a pull fills it, and
+ * only what overflows it has been heard. Silence counts (the DAC clocks a
+ * padded buffer like any other, so an empty-ring pull still advances it), a
+ * flush empties the pipe unheard, a drain plays it out, and hal_audio_init
+ * restarts the count at g_played_origin — a test can put that near the
+ * uint32 wrap. The depth defaults to the device's so the existing scenarios
+ * describe the device; a test that wants the sim's, or the FIFO's, sets it.
+ */
+static uint32_t g_dac_depth = 2u * 8192u;
+static uint32_t g_dac_pipe;        /* frames pulled and not yet heard */
+static uint32_t g_dac_played;      /* the count the HAL reports        */
+static uint32_t g_played_origin;   /* what init restarts it at         */
+static uint32_t g_stub_rate = 44100u;  /* stub_set_rate(): the decoder's, and accepted by init */
+int  stub_audio_inits;
+
 void stub_set_seek_ok(int ok)          { g_seek_ok = ok ? 1 : 0; }
 void stub_set_seek_max(uint64_t m)     { g_seek_max = m; }
 void stub_set_total_unknown(int u)     { g_total_unknown = u ? 1 : 0; }
 void stub_set_ata_read_ok(int ok)      { g_ata_read_ok = ok ? 1 : 0; }
 void stub_set_disk_ahead(uint32_t b)   { g_disk_ahead = b; }
+void stub_set_dac_depth(uint32_t f)    { g_dac_depth = f; }
+void stub_set_played_origin(uint32_t f){ g_played_origin = f; }
+void stub_set_rate(uint32_t hz)        { g_stub_rate = hz; }
+
+/* The DAC took `frames` from the source (real PCM or padding alike). */
+static void dac_pull(uint32_t frames)
+{
+    g_dac_pipe += frames;
+    if (g_dac_pipe > g_dac_depth) {
+        g_dac_played += g_dac_pipe - g_dac_depth;
+        g_dac_pipe    = g_dac_depth;
+    }
+}
 
 /* Frames the fake decoder produces before reporting end-of-stream. Small, so a
  * track ends after a bounded number of player_pump() calls. */
@@ -110,6 +143,12 @@ void stub_reset(void)
     g_ata_read_ok = 1;
     g_disk_ahead  = 64u * 1024u * 1024u;
     g_frames_left = 0;
+    g_dac_depth   = 2u * 8192u;
+    g_dac_pipe    = 0;
+    g_dac_played  = 0;
+    g_played_origin = 0;
+    g_stub_rate   = 44100u;
+    stub_audio_inits = 0;
 }
 
 void stub_break_cluster(uint32_t clus)
@@ -313,7 +352,7 @@ static int fake_open(decoder_t *d)
     }
     memset(d, 0, sizeof *d);
     d->ops             = &g_fake_ops;
-    d->sample_rate     = 44100;
+    d->sample_rate     = g_stub_rate;
     d->channels        = 2;
     d->bits_per_sample = 16;
     d->total_frames    = g_total_unknown ? 0u : g_track_frames;
@@ -378,14 +417,24 @@ decoder_alloc_t decoder_arena_allocator(decoder_arena_t *a)
 
 int hal_audio_init(uint32_t rate, uint16_t channels)
 {
-    if (rate != 44100u || channels != 2u) {
+    /* 44.1 kHz always; whatever rate the fake decoder has been told to report
+     * as well, so a format change between tracks is reachable. */
+    if ((rate != 44100u && rate != g_stub_rate) || channels != 2u) {
         return -1;
     }
     /* A full bring-up: the codec is up and, as on the device, the buffers are
-     * severed from whatever stream came before. */
+     * severed from whatever stream came before — and the DAC's count restarts. */
+    stub_audio_inits++;
     stub_audio_cold   = 0;
     stub_audio_primed = 0;
+    g_dac_pipe   = 0;
+    g_dac_played = g_played_origin;
     return 0;
+}
+
+uint32_t hal_audio_frames_played(void)
+{
+    return g_dac_played;
 }
 
 /* Codec gain/balance. player_open_current() re-applies these on every open so a
@@ -421,7 +470,9 @@ int stub_drain(int frames)
         return 0;
     }
     int want = (frames > 4096) ? 4096 : frames;
-    return g_src(g_src_ud, sink, want);
+    int got  = g_src(g_src_ud, sink, want);
+    dac_pull((uint32_t)want);      /* the DAC clocks the whole pull, padding too */
+    return got;
 }
 
 void hal_audio_start(void)
@@ -474,6 +525,7 @@ void hal_audio_flush(void)
 {
     stub_audio_flushes++;
     stub_audio_primed = 0;
+    g_dac_pipe = 0;                /* discarded unheard; the count stands */
 }
 
 int hal_audio_drain(uint32_t timeout_ms)
@@ -483,6 +535,10 @@ int hal_audio_drain(uint32_t timeout_ms)
     /* Ordering is what matters to the tests: a drain is only meaningful while
      * the engine is still running, i.e. before the stop it precedes. */
     stub_audio_drained_while_running += stub_audio_running ? 1 : 0;
+    if (stub_audio_running) {
+        g_dac_played += g_dac_pipe;   /* the pipe plays out */
+        g_dac_pipe    = 0;
+    }
     return 0;
 }
 

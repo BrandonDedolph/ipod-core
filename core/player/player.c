@@ -301,41 +301,53 @@ static int ring_source(void *ud, int16_t *buf, int frames)
 static uint32_t g_written;
 
 /*
- * What the HAL holds between the ring and the listener.
- *
- * hal/hw/audio.c drains the ring in whole ping-pong buffers of
- * AUDIO_FRAMES_PER_BUF frames: a cold hal_audio_start() pulls two at once, and
- * every completion ISR kicks the buffer already filled and pulls one more to
- * refill the one that just finished. So the frame the DAC is clocking out is
- * always BEHIND the last frame pulled: by exactly two buffers the instant an
- * ISR has refilled, shrinking to one buffer just before the next completion,
- * then two again. (Plus the 16-frame I2S FIFO, ~0.4 ms, below anything here
- * cares about.)
- *
- * The DMA engine exposes no residual byte count and hal.h has no
- * frames-played query, so the player cannot ask where the DAC actually is; it
- * can only subtract what it knows is in flight. We subtract the FULL two
- * buffers. A position derived that way is never ahead of what the listener
- * hears, and is behind it by 0..186 ms (one buffer at 44.1 kHz), 93 ms on
- * average — that is the residual error of everything built on frames_heard(),
- * and it is stated here rather than hidden. It replaces an accounting that
- * treated pulled frames as played and therefore ran 186..372 ms EARLY.
- *
- * The number describes the device. The sim's SDL backend pulls 1024 frames at
- * a time, so there the same subtraction over-corrects by up to ~350 ms. A
- * hal_audio_frames_played() built from the driver's completion count and kick
- * timestamp (both of which it already keeps for the late-kick detector) would
- * bring this down to the FIFO depth on both targets.
+ * How much one DMA pull takes from the ring: hal/hw/audio.c's
+ * AUDIO_FRAMES_PER_BUF. The ring's watermarks below are sized in it.
  */
-#define DAC_BUF_FRAMES      8192u                /* == AUDIO_FRAMES_PER_BUF     */
-#define DAC_INFLIGHT_FRAMES (2u * DAC_BUF_FRAMES)
+#define DAC_BUF_FRAMES      8192u
 
-/* Best estimate of the frame (in g_written's numbering) the DAC is clocking
- * out now. Wraps with g_written, and reads as a large unsigned value before
- * the first pull, so compare it with SIGNED differences, never directly. */
+/*
+ * Where the DAC is, in g_written's numbering.
+ *
+ * The frame being heard is always behind the last frame pulled from the
+ * ring: hal/hw/audio.c holds up to two DAC_BUF_FRAMES ping-pong buffers
+ * between the two (0..372 ms at 44.1 kHz), the sim's SDL backend one
+ * 1024-frame buffer. This used to be approximated by subtracting the
+ * device's full depth from the pulled count — never ahead of the listener,
+ * but behind by 0..186 ms on the device and ~350 ms on the sim, and every
+ * gapless track's clock was anchored that far late.
+ *
+ * The HAL answers directly now: hal_audio_frames_played() is what the DAC has
+ * clocked out since its count was last zeroed by hal_audio_init — on the
+ * device, completed buffers plus the timed part of the current one, accurate
+ * to the 16-frame I2S FIFO; on the sim, SDL's pulls less the one it is still
+ * playing, interpolated. Its zero and g_written's zero are different events,
+ * so heard_rebase() records the pair whenever either side restarts: the
+ * g_written frame at which the HAL held nothing in flight, and the HAL count
+ * at that instant. Everything after is a difference on each side, so both
+ * counts wrap harmlessly.
+ */
+static uint32_t g_heard_written;   /* g_written frame that g_heard_hal stands for */
+static uint32_t g_heard_hal;       /* hal_audio_frames_played() at that moment    */
+
+/*
+ * Re-pair the two counts. Call when the HAL holds nothing in flight — right
+ * after hal_audio_init (which zeroes its count) or hal_audio_flush (which
+ * drops its buffered PCM) — so that every frame pulled so far has either been
+ * heard or discarded, and the frames the HAL plays from here on are the next
+ * ones the ring hands out.
+ */
+static void heard_rebase(void)
+{
+    g_heard_written = g_written - pcm_ring_fill(&g_ring);
+    g_heard_hal     = hal_audio_frames_played();
+}
+
+/* The frame (in g_written's numbering) the DAC is clocking out now. Wraps
+ * with g_written: compare it with SIGNED differences, never directly. */
 static uint32_t frames_heard(void)
 {
-    return g_written - pcm_ring_fill(&g_ring) - DAC_INFLIGHT_FRAMES;
+    return g_heard_written + (hal_audio_frames_played() - g_heard_hal);
 }
 
 /* A mono file arrives as one sample per frame; the ring and the DAC are both
@@ -1064,6 +1076,7 @@ static int audio_bringup(uint32_t rate, int start)
     if (hal_audio_init(rate, 2u) != 0) {
         return -1;
     }
+    heard_rebase();                      /* init zeroed the HAL's played count */
     hal_volume_set(hal_volume_get());
     hal_balance_set(hal_balance_get());
     hal_audio_set_source(ring_source, 0);
@@ -1327,10 +1340,9 @@ static void pending_commit(void)
 {
     /*
      * How far past the boundary the DAC already is. The pump only looks
-     * between passes and frames_heard() moves a whole buffer at a time, so the
-     * crossing is never caught on the exact frame; anchoring the clock at zero
-     * here would make every gapless track's clock late by that overshoot on
-     * top of the estimate's own 0..186 ms. Credit it instead. Negative (the
+     * between passes, so the crossing is caught a pass late, never on the
+     * exact frame; anchoring the clock at zero here would make every gapless
+     * track's clock late by that overshoot. Credit it instead. Negative (the
      * ring-empty fall-through in handover_audible) means nothing has been
      * heard yet, so zero. The format-change path re-primes the DAC cold below
      * and its first frame is at the FIFO within ~0.4 ms of the start, so there
@@ -1983,6 +1995,7 @@ int player_seek_to(uint32_t sec)
         g_boundary       = 0;
         g_eos            = 0;
         g_prefetch_tried = 0;
+        heard_rebase();                  /* nothing in flight, a fresh ring */
         decode_pump_upto(SEEK_PRIME_FRAMES);
         clock_anchor(0);
         g_pl_low_fill = RING_FRAMES;
@@ -2005,6 +2018,7 @@ int player_seek_to(uint32_t sec)
      * jump landed — on every single scrub.
      */
     hal_audio_flush();
+    heard_rebase();                      /* nothing in flight, a fresh ring */
     /* Only enough to restart cleanly — the play loop fills the rest while the
      * audio runs, so first sound is not gated on the full anti-skip depth. */
     decode_pump_upto(SEEK_PRIME_FRAMES);
