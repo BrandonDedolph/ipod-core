@@ -131,14 +131,17 @@ void wheel_accel_reset(void)
     g_wheel_tps     = 0;
 }
 
-/* True while the list is flying past fast enough to want the letter cue. In
- * letter mode the plate stays up for the whole gesture: it IS the control
- * surface then, not a hint, so it must not blink out between detents. */
+/* True while the A-Z plate should be up: letter mode, within the hold of the
+ * last detent. The plate stays up for the whole gesture: it IS the control
+ * surface then, not a hint, so it must not blink out between detents.
+ * Letter mode is the only test — wheel_accel_step latches it in the same
+ * call that brings the velocity to WHEEL_AZ_VEL, so a velocity test here
+ * (and the shorter non-letter hold that once went with it) could never
+ * decide anything. */
 int wheel_accelerating(void)
 {
-    if (!g_wheel_letters && g_wheel_vel < WHEEL_AZ_VEL) return 0;
-    uint32_t hold = g_wheel_letters ? WHEEL_AZ_HOLD_LETTER : WHEEL_AZ_HOLD;
-    return (uint32_t)(now_us() - g_wheel_last_us) < hold;
+    if (!g_wheel_letters) return 0;
+    return (uint32_t)(now_us() - g_wheel_last_us) < WHEEL_AZ_HOLD_LETTER;
 }
 
 uint32_t wheel_last_us(void)

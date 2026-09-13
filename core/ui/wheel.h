@@ -56,10 +56,12 @@
  * events measures the main loop's period, not the wheel. See wheel_accel_step.) */
 #define WHEEL_IDLE_US   200000u            /* > this gap => new gesture, reset  */
 #define WHEEL_AZ_VEL    3                  /* velocity at which the letter shows */
-#define WHEEL_AZ_HOLD   500000u            /* ...and how long after the last tick */
-/* In letter mode the plate is the control surface, not a hint, so it lingers
- * well past the last detent — it must not blink out while you are still
- * deciding which letter to stop on. */
+/* How long the plate stays up after the last detent. The plate shows only in
+ * letter mode (wheel_accel_step latches letter mode at WHEEL_AZ_VEL, the same
+ * speed the plate appears at, so there is no "fast but not letters" state and
+ * no shorter hold for one). In letter mode the plate is the control surface,
+ * not a hint, so it lingers well past the last detent — it must not blink out
+ * while you are still deciding which letter to stop on. */
 #define WHEEL_AZ_HOLD_LETTER 1200000u
 
 /* Print the measured wheel speed (ticks/s) under the letter — a tuning aid for
