@@ -507,13 +507,18 @@ if target == 'sim'
 
   # hw-lcd-present: lcd_present() streams a caller framebuffer over the
   # BCM (same path as lcd_fill) — asserts the exact 38400-word grammar
-  # and pixel packing against the recording mock bus.
+  # and pixel packing against the recording mock bus. Also links the
+  # console (damage rect) so the Now Playing partials — transport band and
+  # volume plate, geometry from ui/chrome.h — are pinned to their word
+  # counts through the same damage -> lcd_present_rect chain main.c uses.
   lcd_present_test = executable(
     'lcd_present_test',
     sources: ['hw_mmio/lcd_present_test.c',
               'hw_mmio/mmio_mock.c',
-              '../hal/hw/lcd.c'],
-    include_directories: include_directories('../hal', '../hal/hw', 'hw_mmio'),
+              '../hal/hw/lcd.c',
+              '../kernel/console.c'],
+    include_directories: include_directories('../hal', '../hal/hw', 'hw_mmio',
+                                             '../kernel', '../ui'),
     c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,
   )
