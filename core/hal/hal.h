@@ -263,6 +263,33 @@ void hal_audio_stop(void);
 void hal_audio_flush(void);
 
 /*
+ * hal_audio_frames_played reports how many frames the DAC has actually
+ * clocked out since hal_audio_init() — what the listener has HEARD, as
+ * distinct from what the source has been asked for. The two differ by
+ * whatever the backend holds between the source and the converter: two
+ * 8192-frame ping-pong buffers on hw (up to ~370 ms), one 1024-frame SDL
+ * buffer on sim. A caller that wants "where is playback now" must not
+ * subtract a guess at that depth; it asks this.
+ *
+ * Hw: the frames of every DMA buffer that has completed, plus the part of
+ * the current one the I2S clock has drained since it was kicked (the DMA
+ * engine exposes no residual count, so that part is timed against
+ * USEC_TIMER at the stream's sample rate). Accurate to the 16-frame TX FIFO,
+ * ~0.4 ms. Sim: SDL's pulls less the one it is still playing, interpolated
+ * the same way.
+ *
+ * The count is monotonic while the stream lives. It does not move across a
+ * hal_audio_stop()/hal_audio_start() pair (paused time is not played time,
+ * and resume picks up where the stop sampled), and hal_audio_flush() leaves
+ * it alone: the PCM a flush discards was never heard, and the part of the
+ * current buffer that WAS heard stays counted. Padded silence counts — the
+ * DAC clocks it like any other frame. hal_audio_init() restarts it at zero.
+ * Wraps as a uint32 (27 h at 44.1 kHz): take differences against a
+ * snapshot, never compare absolute values.
+ */
+uint32_t hal_audio_frames_played(void);
+
+/*
  * hal_audio_close releases the output device. After this hal_audio_init
  * must be called again before further audio is possible.
  */

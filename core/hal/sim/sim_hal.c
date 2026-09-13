@@ -271,6 +271,41 @@ static audio_source_fn   g_audio_src   = NULL;
 static void             *g_audio_user  = NULL;
 
 /*
+ * Where the DAC is (hal_audio_frames_played). SDL pulls one device buffer
+ * (`samples` below, 1024 frames) per callback and plays it out over the next
+ * ~23 ms, so "pulled" runs one buffer ahead of "heard" — the same shape as
+ * the hw backend's ping-pong pair, just 16x shallower. The callback stamps
+ * every pull; the part of the last one already out is interpolated from the
+ * time since, exactly as hw/audio.c times its kick. A stop freezes that
+ * fraction and a start re-stamps the pull so it carries on from the frozen
+ * figure: paused time is not played time. Callback-thread state — read it
+ * under the device lock.
+ */
+static uint32_t g_audio_pulled;     /* frames every callback has taken, padding included */
+static uint32_t g_audio_last_pull;  /* frames the most recent callback took            */
+static uint32_t g_audio_pull_us;    /* clock_us() when it took them                    */
+static uint32_t g_audio_stop_frac;  /* of the last pull: frames out when stopped       */
+static int      g_audio_running;    /* between hal_audio_start and hal_audio_stop      */
+
+/* Frames of the last pull the DAC has got through, from the time since it.
+ * Capped at the pull: past that the device is waiting on the next callback,
+ * and nothing more has been heard. */
+static uint32_t audio_pull_frac(void) {
+    uint32_t rate = (uint32_t)g_audio_spec_active.freq;
+    uint32_t el   = clock_us() - g_audio_pull_us;
+    uint32_t f    = (uint32_t)(((uint64_t)el * rate) / 1000000u);
+    return f > g_audio_last_pull ? g_audio_last_pull : f;
+}
+
+/* A new stream: nothing of it has been pulled or heard. */
+static void audio_count_reset(void) {
+    g_audio_pulled    = 0;
+    g_audio_last_pull = 0;
+    g_audio_pull_us   = 0;
+    g_audio_stop_frac = 0;
+}
+
+/*
  * SDL2 calls this on its own audio thread. We translate to the HAL's
  * source callback (samples in s16 frames, not bytes), pad the rest
  * with silence on underrun.
@@ -293,15 +328,25 @@ static void sdl_audio_cb(void *user, Uint8 *stream, int len_bytes) {
         memset(out + got * channels, 0,
                (size_t)(frames - got) * channels * sizeof(int16_t));
     }
+
+    /* The whole buffer goes to the device, silence included: that is what
+     * the listener sits through, so that is what is counted. */
+    g_audio_pulled   += (uint32_t)frames;
+    g_audio_last_pull = (uint32_t)frames;
+    g_audio_pull_us   = clock_us();
 }
 
 int hal_audio_init(uint32_t sample_rate, uint16_t channels) {
     if (channels != 1 && channels != 2) return -1;
 
-    /* Idempotent: same params = no-op; different = re-open. */
+    /* Idempotent: same params = no-op; different = re-open. Either way it
+     * is a new stream to hal_audio_frames_played, which restarts at zero. */
     if (g_audio_dev != 0
         && (uint32_t)g_audio_spec_active.freq == sample_rate
         && g_audio_spec_active.channels       == channels) {
+        SDL_LockAudioDevice(g_audio_dev);
+        audio_count_reset();
+        SDL_UnlockAudioDevice(g_audio_dev);
         return 0;
     }
     if (g_audio_dev != 0) {
@@ -352,6 +397,8 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels) {
     }
 
     g_audio_spec_active = got;
+    audio_count_reset();          /* the device opens paused: no callback yet */
+    g_audio_running     = 0;
     log_printf("hal/sim: audio open (%d Hz, %d ch, fmt=0x%04x, samples=%d)",
                got.freq, got.channels, got.format, got.samples);
     return 0;
@@ -366,11 +413,30 @@ void hal_audio_set_source(audio_source_fn fn, void *userdata) {
 }
 
 void hal_audio_start(void) {
-    if (g_audio_dev != 0) SDL_PauseAudioDevice(g_audio_dev, 0);
+    if (g_audio_dev == 0) return;
+    SDL_LockAudioDevice(g_audio_dev);
+    if (!g_audio_running) {
+        /* Resume: re-stamp the last pull so its in-flight fraction carries on
+         * from where the stop froze it, instead of counting the pause. */
+        uint32_t rate    = (uint32_t)g_audio_spec_active.freq;
+        uint32_t back_us = rate
+            ? (uint32_t)(((uint64_t)g_audio_stop_frac * 1000000u) / rate) : 0u;
+        g_audio_pull_us = clock_us() - back_us;
+        g_audio_running = 1;
+    }
+    SDL_UnlockAudioDevice(g_audio_dev);
+    SDL_PauseAudioDevice(g_audio_dev, 0);
 }
 
 void hal_audio_stop(void) {
-    if (g_audio_dev != 0) SDL_PauseAudioDevice(g_audio_dev, 1);
+    if (g_audio_dev == 0) return;
+    SDL_PauseAudioDevice(g_audio_dev, 1);
+    SDL_LockAudioDevice(g_audio_dev);
+    if (g_audio_running) {
+        g_audio_stop_frac = audio_pull_frac();   /* freeze it here */
+        g_audio_running   = 0;
+    }
+    SDL_UnlockAudioDevice(g_audio_dev);
 }
 
 void hal_audio_flush(void) {
@@ -380,7 +446,17 @@ void hal_audio_flush(void) {
      * holds, and not reachable from here (SDL_ClearQueuedAudio applies to
      * queued-audio devices, which this is not). The contract is still
      * satisfied: the next callback pulls from the source, which is where the
-     * caller has just put the new position. */
+     * caller has just put the new position. The played count is untouched,
+     * as hal.h promises: what was heard stays counted. */
+}
+
+uint32_t hal_audio_frames_played(void) {
+    if (g_audio_dev == 0) return 0;
+    SDL_LockAudioDevice(g_audio_dev);
+    uint32_t frac   = g_audio_running ? audio_pull_frac() : g_audio_stop_frac;
+    uint32_t played = g_audio_pulled - g_audio_last_pull + frac;
+    SDL_UnlockAudioDevice(g_audio_dev);
+    return played;
 }
 
 void hal_audio_close(void) {
