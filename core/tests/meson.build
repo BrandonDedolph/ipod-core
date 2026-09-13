@@ -826,6 +826,27 @@ if target == 'sim'
   )
   test('player-queue', player_queue_test, suite: 'unit')
 
+  # player-shuffle: the shuffle order as a VALUE — a pure function of the
+  # (seed, keep) pair the player records for every deal, so the resume path
+  # can save 6 bytes and deal the same "what plays next" back after a power
+  # cut. Same fakes as player-queue; the mock USEC timer is the player's only
+  # entropy, so every sequence asserted here is fixed, not a coin toss.
+  player_shuffle_test = executable(
+    'player_shuffle_test',
+    sources: ['player/player_shuffle_test.c',
+              'player/player_test_stubs.c',
+              'hw_mmio/mmio_mock.c',
+              '../player/player.c',
+              '../kernel/pcm_ring.c'],
+    include_directories: include_directories(
+      '../player', '../hal', '../hal/hw', '../fs', '../kernel',
+      '../codecs', '../codecs/dr_flac', '../codecs/dr_mp3',
+      'hw_mmio', 'player', '.'),
+    c_args: ['-DMMIO_MOCK', '-DCORE_FREESTANDING'],
+    override_options: test_opts,
+  )
+  test('player-shuffle', player_shuffle_test, suite: 'unit')
+
   # player-clock: the reported position against what can be heard. The DMA
   # feeder pulls whole ping-pong buffers out of the PCM ring, two of which are
   # in flight inside the HAL at any time, so "consumed from the ring" runs

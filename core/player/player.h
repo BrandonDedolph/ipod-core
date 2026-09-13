@@ -86,6 +86,28 @@ int  player_paused(void);              /* 1 while paused */
 void player_set_shuffle(int on);
 void player_set_repeat(int mode);
 
+/*
+ * The shuffle order is a pure function of (seed, keep) over the queue: the
+ * LCG seed the deal started from, and the queue index that was pinned to the
+ * front of it (the track playing when the deal happened; PLAYER_KEEP_NONE
+ * when nothing was; PLAYER_KEEP_QUEUE when the order simply IS the queue
+ * order — a queue that was enqueued already shuffled). Every deal records
+ * both, so the pair can be saved across a power cut and dealt again with
+ * player_reshuffle_with_seed(): same queue, same pair, same order — the
+ * track after the one you left is still the track after it.
+ *
+ * player_order_seed() is 0 while no order has been dealt (empty queue, or
+ * shuffle never turned on over it). player_reshuffle_with_seed() deals
+ * immediately, whether or not shuffle is on (the order is simply unused
+ * until it is), and is a no-op on an empty queue; a `keep` past the queue
+ * end pins nothing.
+ */
+#define PLAYER_KEEP_NONE   (-1)
+#define PLAYER_KEEP_QUEUE  (-2)
+uint32_t player_order_seed(void);
+int      player_order_keep(void);
+void     player_reshuffle_with_seed(uint32_t seed, int keep);
+
 /* 1 while a track is loaded (playing OR paused). This is the UI's notion:
  * every transport control, the Now Playing entry, the resume-position save
  * and the queue view are gated on it, and "paused" must keep all of those
