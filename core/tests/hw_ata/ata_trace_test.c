@@ -1133,6 +1133,56 @@ static void test_power(xfail_ctx *c)
     rc = ata_read_sectors(0x1000u, 2, g_buf);
     xpect(c, "sleep: a refused sleep leaves the next read reset-free",
           rc == 0 && count_writes(ATA_CONTROL_ADDR) == 0);
+
+    /* --- a PARKED drive is not flushed on the way to SLEEP --------------- *
+     * At suspend entry the drive is almost always already parked (the idle
+     * timer, the player's burst park). STANDBY IMMEDIATE flushed it and
+     * every write path flushes itself, so FLUSH CACHE here would only spin
+     * the platters up to do nothing: STANDBY then SLEEP, no FLUSH. */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY);
+    xpect(c, "sleep-parked: standby parks first", ata_standby() == 0 && ata_is_parked());
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY);
+    rc = ata_sleep();
+    xpect(c, "sleep-parked: returns 0 and is slept", rc == 0 && ata_is_slept());
+    xpect(c, "sleep-parked: STANDBY then SLEEP, no FLUSH",
+          count_writes(ATA_COMMAND_ADDR) == 2 &&
+          nth_write(ATA_COMMAND_ADDR, 0) == CMD_STANDBY_IMM &&
+          nth_write(ATA_COMMAND_ADDR, 1) == CMD_SLEEP);
+
+    /* --- STANDBY while slept issues nothing --------------------------------- */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY);
+    xpect(c, "standby while slept: no-op that returns 0",
+          ata_standby() == 0 && mmio_mock_log_len() == 0 && ata_is_slept());
+
+    /* --- a drive that does not come back from the wake reset fails FAST ---- *
+     * The reset's own 31 s budget is the whole wait: the read must NOT go on
+     * to stack the 10 s ready wait and the 8 s DRQ wait on top of it. Timer:
+     * 0 (baseline), 0, ==31 s, >31 s -> three polls then give up. */
+    {
+        static const uint32_t usec[] = { 0, 0, SRST_READY_US, SRST_READY_US + 1u };
+        mmio_mock_reset();
+        mmio_mock_set_read(ATA_ALT_STATUS_ADDR, BSY);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 4);
+        GUARDED(rc, ata_read_sectors(0x1000u, 2, g_buf));
+        xpect(c, "wake-reset timeout: the read returns -1", rc == -1);
+        xpect(c, "wake-reset timeout: no command was issued",
+              count_writes(ATA_COMMAND_ADDR) == 0);
+        xpect(c, "wake-reset timeout: slept is cleared (no reset loop)",
+              ata_is_slept() == 0);
+        tc = trace_begin("wake-reset-timeout");
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_SRST | ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_CONTROL_ADDR, ATA_CONTROL_NIEN);
+        expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+        expect_timed_timeout(&tc, 3);   /* 0, ==31 s, >31 s */
+        finish(c, &tc);
+    }
+    /* leave the drive awake and unparked for whatever follows */
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    xpect(c, "wake-reset timeout: a later wake succeeds", ata_wakeup() == 0);
 }
 
 /* ======================================================================= */

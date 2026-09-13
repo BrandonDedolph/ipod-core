@@ -1770,7 +1770,11 @@ void player_next(void)
     if (g_queue_n == 0) {
         return;
     }
-    int nxt = successor(g_queue_idx);
+    /* A prefetched hand-over already IS the answer to "what comes next" — and
+     * under Repeat-All + Shuffle the prefetch may have re-dealt the order, so
+     * asking successor() again against the new order with the old index lands
+     * on an arbitrary track. Take the pump's decision. */
+    int nxt = g_pending ? g_pending_idx : successor(g_queue_idx);
     if (nxt < 0) {
         /*
          * Past the last track with Repeat off. This used to return and leave

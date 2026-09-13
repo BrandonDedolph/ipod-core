@@ -18,8 +18,11 @@ keyhold_action_t keyhold_feed(keyhold_t *k, int is_down, uint32_t now_us,
 {
     if (!k->down) {
         if (is_down) {
+            /* no_tap is NOT cleared here: a swallow that arrived before the
+             * sampler showed the press (the tick landed between this feed
+             * and the event drain) must still claim this press's tap. It is
+             * cleared on release, so it can only ever cost one press. */
             k->down    = 1;
-            k->no_tap  = 0;
             k->fired   = 0;
             k->down_us = now_us;
         }
@@ -31,7 +34,8 @@ keyhold_action_t keyhold_feed(keyhold_t *k, int is_down, uint32_t now_us,
          * long one or its tap was claimed by whoever consumed the down-edge. */
         keyhold_action_t a = (k->fired || k->no_tap) ? KEYHOLD_NONE
                                                      : KEYHOLD_TAP;
-        k->down = 0;
+        k->down   = 0;
+        k->no_tap = 0;
         return a;
     }
 
@@ -44,9 +48,9 @@ keyhold_action_t keyhold_feed(keyhold_t *k, int is_down, uint32_t now_us,
 
 void keyhold_swallow_tap(keyhold_t *k)
 {
-    if (k->down) {
-        k->no_tap = 1;
-    }
+    /* Unconditional: the consumer of the down-edge (an event) can run before
+     * the live-state sampler has shown the press to keyhold_feed. */
+    k->no_tap = 1;
 }
 
 uint32_t keyhold_down_us(const keyhold_t *k)

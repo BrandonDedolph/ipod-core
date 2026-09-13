@@ -4389,6 +4389,12 @@ static int enter_standby(void)
  * while on external power: a docked device can sit suspended for as long
  * as it likes. The cost of escalating is a cold boot on the next wake.
  */
+/* How long PLAY must stay held AFTER the screen went dark before the hold
+ * escalates to a PMU power-off (in addition to ~5 s from the down-edge). */
+#ifndef SUSPEND_ESCALATE_DARK_US
+#define SUSPEND_ESCALATE_DARK_US  2500000u                /* 2.5 s */
+#endif
+
 #ifndef SUSPEND_TO_STANDBY_US
 #define SUSPEND_TO_STANDBY_US  (30u * 60u * 1000000u)     /* 30 minutes */
 #endif
@@ -4437,9 +4443,20 @@ static void suspend_to_ram(uint32_t play_down_us)
      * that, enter_standby() has already stopped the player and repainted:
      * skip the idle wait and fall through to the wake path, which finishes
      * the job (release-wait, re-boost, drive spin-up) without resuming. */
+    /* Escalation is timed from BOTH the down-edge (~5 s of hold, the
+     * documented gesture) AND from the moment the screen went dark. The
+     * teardown above is not instant: a pending settings change on a parked
+     * drive is a spin-up (seconds) + write + FLUSH + SLEEP before the
+     * backlight drops. Timed from the down-edge alone, "hold until it goes
+     * dark, then let go" — the natural gesture — arrived here already past
+     * 5 s with PLAY down for one more tick, and turned the sleep the user
+     * asked for into a PMU power-off. */
+    uint32_t dark_us = mmio_read32(USEC_TIMER_ADDR);
     int standby_refused = 0;
     while (clickwheel_buttons() & WHEEL_BTN_PLAY) {
-        if ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - play_down_us) > 5000000u) {
+        uint32_t nowh = mmio_read32(USEC_TIMER_ADDR);
+        if ((uint32_t)(nowh - play_down_us) > 5000000u &&
+            (uint32_t)(nowh - dark_us)      > SUSPEND_ESCALATE_DARK_US) {
             if (enter_standby() != 0) {   /* true off (PMU) — normally no return */
                 standby_refused = 1;
                 was_playing     = 0;      /* stopped, not paused: nothing to resume */
@@ -4510,8 +4527,8 @@ static void suspend_to_ram(uint32_t play_down_us)
                 was_playing     = 0;
                 break;
             }
-            if (!ata_is_parked()) {
-                ata_sleep();
+            if (!ata_is_slept()) {
+                ata_sleep();        /* the handler re-parks with STANDBY only */
             }
         }
 
@@ -4795,11 +4812,8 @@ _Noreturn static void run_ui(fat32_t *fs)
             uint32_t eseq = player_end_seq();
             if (eseq != g_resume_end_seq) {
                 g_resume_end_seq = eseq;
-                if (g_settings.resume_hash != 0) {
-                    g_settings.resume_hash  = 0;
-                    g_settings.resume_secs  = 0;
-                    g_settings.resume_total = 0;
-                    settings_touch();
+                if (resume_ctx_clear(&g_settings)) {
+                    settings_touch();  /* locator AND queue context, together */
                 }
             }
             /* Playback truly ended (stop / queue exhausted / skip past the ends —

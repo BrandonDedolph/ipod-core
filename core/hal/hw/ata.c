@@ -345,6 +345,7 @@ static int g_ata_parked;
 static int g_ata_slept;
 
 int ata_is_parked(void) { return g_ata_parked; }
+int ata_is_slept(void)  { return g_ata_slept; }
 
 /* Defined with the write path below; SLEEP needs the flush first. */
 static int ata_flush_cache(void);
@@ -394,8 +395,10 @@ static int ata_read_raw_locked(uint32_t lba, uint32_t count, void *buf)
     if (!ata_lba28_in_range(lba, count)) {
         return -1;
     }
-    if (g_ata_slept) {
-        (void)ata_leave_sleep();        /* a READ cannot wake a SLEEPing drive */
+    if (g_ata_slept && ata_leave_sleep() != 0) {
+        return -1;                      /* a READ cannot wake a SLEEPing drive, and
+                                         * the reset that can did not bring it back:
+                                         * do not stack the ready + DRQ budgets on top */
     }
     if (ata_wait_ready() != 0) {
         return -1;
@@ -527,7 +530,7 @@ int ata_read_sectors(uint32_t lba, uint32_t count, void *buf)
  * SLEEP + reset-to-wake path has not (2026-09-13). The MK8010GAH lists
  * SLEEP as mandatory (it is, for every ATA-6 drive); what is not known is
  * how long its post-reset spin-up takes, which is why the wake wait is
- * the 4 s timed one rather than a poll count.
+ * the post-reset timed one (ATA_SRST_READY_US) rather than a poll count.
  * ------------------------------------------------------------------------- */
 #define ATA_CMD_STANDBY_IMM   0xE0
 #define ATA_CMD_SLEEP         0xE6
@@ -535,6 +538,9 @@ int ata_read_sectors(uint32_t lba, uint32_t count, void *buf)
 /* STANDBY IMMEDIATE, clock already held. */
 static int ata_standby_locked(void)
 {
+    if (g_ata_slept) {
+        return 0;                       /* already below STANDBY; it would not hear us */
+    }
     if (ata_wait_ready() != 0) {
         return -1;
     }
@@ -576,7 +582,11 @@ int ata_sleep(void)
      * cut, and parked heads matter more than the code, which is still
      * reported.
      */
-    int rc = ata_flush_cache();
+    /* A drive that is already parked was flushed by its STANDBY IMMEDIATE and
+     * every write path flushes itself, so its cache is clean by construction.
+     * FLUSH CACHE would only spin it up to do nothing (04-ata.md's
+     * ata_sleepnow flushes only when the drive is ON, for this reason). */
+    int rc = g_ata_parked ? 0 : ata_flush_cache();
     if (rc == -1) {
         ata_clock_release();
         return -1;
@@ -610,11 +620,14 @@ int ata_sleep(void)
 int ata_wakeup(void)
 {
     ata_clock_hold();
-    if (g_ata_slept) {
-        /* A READ cannot wake a SLEEPing drive — only a reset can (above).
-         * The result is not decisive: the read below has its own ready wait
-         * and reports the failure properly if the drive really is gone. */
-        (void)ata_leave_sleep();
+    if (g_ata_slept && ata_leave_sleep() != 0) {
+        /* A READ cannot wake a SLEEPing drive — only a reset can (above) —
+         * and the reset's own 31 s budget just ran out. Issuing the probe
+         * anyway would stack another ready + DRQ wait on a drive that is
+         * not answering; report it now and let the caller decide. */
+        ata_clock_release();
+        g_ata_parked = 0;
+        return -1;
     }
     /*
      * The drive reports "ready" in standby (BSY clear, RDY set) but is spun
@@ -717,8 +730,8 @@ static int ata_write_raw(uint32_t lba, uint32_t count, const void *buf)
     if (!ata_lba28_in_range(lba, count)) {
         return -1;
     }
-    if (g_ata_slept) {
-        (void)ata_leave_sleep();        /* a WRITE cannot wake a SLEEPing drive */
+    if (g_ata_slept && ata_leave_sleep() != 0) {
+        return -1;                      /* as the read path: a failed reset is final */
     }
     if (ata_wait_ready() != 0) {
         return -1;

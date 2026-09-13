@@ -103,12 +103,26 @@ int main(void)
     xpect(&c, "swallow+hold: and its release is silent",
           keyhold_feed(&k, 0, now += 10000u, HOLD_US) == KEYHOLD_NONE);
 
-    /* --- swallow with nothing down is a no-op ----------------------------- */
+    /* --- swallow before the sampler showed the press ---------------------- *
+     * The event drain (which swallows) can run in the same pass BEFORE the
+     * 100 Hz sample that makes clickwheel_buttons() report the press, so the
+     * swallow lands while keyhold still thinks nothing is down. It must claim
+     * the press that follows — that press IS the wake — and only that one. */
     keyhold_reset(&k);
     keyhold_swallow_tap(&k);
-    keyhold_feed(&k, 1, now += 10000u, HOLD_US);
-    xpect(&c, "swallow while idle: does not poison the next press",
+    xpect(&c, "early swallow: the press it was meant for stays silent",
+          keyhold_feed(&k, 1, now += 10000u, HOLD_US) == KEYHOLD_NONE &&
+          keyhold_feed(&k, 0, now += 10000u, HOLD_US) == KEYHOLD_NONE);
+    xpect(&c, "early swallow: the press after it is a fresh one",
+          keyhold_feed(&k, 1, now += 10000u, HOLD_US) == KEYHOLD_NONE &&
           keyhold_feed(&k, 0, now += 10000u, HOLD_US) == KEYHOLD_TAP);
+    keyhold_reset(&k);
+    keyhold_swallow_tap(&k);
+    now += 10000u;
+    keyhold_feed(&k, 1, now, HOLD_US);
+    now += HOLD_US;
+    xpect(&c, "early swallow + hold: the hold still fires",
+          keyhold_feed(&k, 1, now, HOLD_US) == KEYHOLD_HOLD);
 
     /* --- reset mid-press: the Hold switch went on under the finger -------- */
     keyhold_reset(&k);

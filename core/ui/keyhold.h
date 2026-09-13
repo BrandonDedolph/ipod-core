@@ -66,7 +66,10 @@ keyhold_action_t keyhold_feed(keyhold_t *k, int is_down, uint32_t now_us,
  * The current press's down-edge was consumed elsewhere — it woke the
  * backlight, or dismissed a modal — so it must not ALSO produce the short
  * action on release. The long action survives: holding PLAY from a dark
- * screen is still how you turn the device off. No-op when nothing is down.
+ * screen is still how you turn the device off. Also valid BEFORE the press
+ * has been fed: the event that consumes a down-edge can run before the live
+ * sampler shows it, so a swallow while idle claims the next press's tap (and
+ * only that one — it is cleared on release).
  */
 void keyhold_swallow_tap(keyhold_t *k);
 

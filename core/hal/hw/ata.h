@@ -123,6 +123,11 @@ int ata_wakeup(void);
  */
 int ata_is_parked(void);
 
+/* 1 while the drive is in SLEEP (ata_sleep() issued, no reset since). Slept
+ * implies parked. The suspend loop uses it to know whether a save that woke
+ * the drive left it merely in STANDBY. */
+int ata_is_slept(void);
+
 /*
  * Write `count` 512-byte sectors from `buf` to LBA `lba`, then FLUSH CACHE so
  * the data is on the platters and not just in the drive's write cache (which

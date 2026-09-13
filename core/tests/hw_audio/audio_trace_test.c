@@ -192,6 +192,37 @@ static int test_i2c_reinit_is_idempotent(void)
     return fails;
 }
 
+/* Case 1c: a re-init whose idle wait TIMES OUT is a wedged controller (BUSY
+ * stuck), not a transaction to protect. Nothing good is in flight, and
+ * without a reset every later write would time out for the rest of the
+ * boot — the codec, the PMU standby command, the battery ADC all ride this
+ * bus. So the idempotent path falls through to the full reset sequence. */
+static int test_i2c_reinit_recovers_a_stuck_controller(void)
+{
+    i2c_test_reset();
+    mmio_mock_reset();
+    mmio_mock_set_read(DEV_EN_ADDR,     0);
+    mmio_mock_set_read(DEV_RS_ADDR,     0);
+    mmio_mock_set_read(I2C_STATUS_ADDR, 0);
+    i2c_init();                                    /* first: full sequence */
+
+    mmio_mock_reset();
+    mmio_mock_set_read(DEV_EN_ADDR,     0);
+    mmio_mock_set_read(DEV_RS_ADDR,     0);
+    mmio_mock_set_read(I2C_STATUS_ADDR, I2C_BUSY); /* stuck for good       */
+    i2c_init();
+    /* 65536 BUSY polls saturate the mock's log, so the reset writes are not
+     * recorded — count EVENTS instead: the idempotent early return is exactly
+     * one full wait; falling through to the reset sequence adds its own
+     * end-of-init wait, so a stuck bus costs at least two. */
+    size_t total = mmio_mock_log_len() + mmio_mock_dropped();
+    int fails = 0;
+    fails += check("i2c_init on a stuck bus: falls through to the reset "
+                   "(two full waits, not one)",
+                   total >= 2u * (1u << 16));
+    return fails;
+}
+
 /* Case 2: i2c_send emits the exact controller grammar for a 2-byte
  * write to device 0x1a. CTRL reads 0, STATUS reads idle. */
 static int test_i2c_send_grammar(void)
@@ -448,6 +479,7 @@ int main(void)
     fails += test_i2c_init_grammar();
     fails += test_i2c_init_waits_before_reset();
     fails += test_i2c_reinit_is_idempotent();
+    fails += test_i2c_reinit_recovers_a_stuck_controller();
     fails += test_i2c_send_grammar();
     fails += test_i2c_send_guards();
     fails += test_wm8758_init();

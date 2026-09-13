@@ -60,9 +60,13 @@ static int g_inited;
 void i2c_init(void)
 {
     if (g_inited) {
-        /* Idempotent re-init: let whatever is on the wire finish. */
-        (void)i2c_wait_idle();
-        return;
+        /* Idempotent re-init: let whatever is on the wire finish. If it never
+         * does, the CONTROLLER is wedged (BUSY stuck) — nothing good is in
+         * flight to truncate, and without a reset every later write would
+         * time out for the rest of the boot. Fall through to the reset. */
+        if (i2c_wait_idle() == 0) {
+            return;
+        }
     }
 
     /* Clock-gate the I2C block on, then pulse its reset (09-i2c.md,
