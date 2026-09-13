@@ -3804,6 +3804,23 @@ static void ui_click(void)
  * cross-check and the restore declines an ambiguous match outright. Resuming
  * nothing is a shrug; resuming the WRONG track is a bug.
  *
+ * WHAT ELSE IS STORED: THE QUEUE
+ *
+ * A track alone is not where the user was — it was the 412th of Songs, or
+ * halfway through a Shuffle Songs draw, and coming back in its ALBUM
+ * instead (which is all the record used to allow) is the "the playlist
+ * switches to the album" bug. Every queue this firmware builds is a
+ * function of the library plus a few words, so the record carries those
+ * words (settings.h, RESUME_KIND_*): the kind of queue; for Songs / an
+ * artist / a genre nothing more, because songview_build() over the resumed
+ * song's own artist or genre is that list again; for Shuffle Songs the LCG
+ * seed the library order was dealt from; and the player's own shuffle deal
+ * as its (seed, keep) pair, so Next after the power cut is still the track
+ * that was going to come next. Suspend keeps all of this in RAM; this is
+ * for the cold boot — PMU standby, the battery cutting out, a battery pull.
+ * The album stays the fallback for a record from before the context
+ * existed and for any rebuild that does not land on the track.
+ *
  * WHEN IT IS CAPTURED (the write budget)
  *
  * Never per second, and never per pass. The position is snapshotted only at
