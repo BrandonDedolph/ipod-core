@@ -19,6 +19,15 @@
  *      the clock; nested requests emit zero bus traffic.
  *   5. clock_init is idempotent: a second call re-runs the full sequence
  *      and still ends at CPUFREQ_NORMAL.
+ *   6. clock_suspend emits the exact park grammar (bus to crystal, slow
+ *      timing, PLL disable, PLL unpower — 6 events, both RMWs preserving
+ *      the other bits) and reports CPUFREQ_DEFAULT; a second call is
+ *      silent.
+ *   7. clock_suspend REFUSES (no traffic, -1) while a boost is held or the
+ *      audio DMA is streaming.
+ *   8. clock_resume re-emits the full 30 MHz bring-up and is a no-op when
+ *      the tree is not parked; a cpu_boost issued while parked un-parks
+ *      it, so a later clock_resume then does nothing.
  *
  * NOTE: clock.c uses a smaller PLL_LOCK_SPIN_LIMIT under MMIO_MOCK (see
  * clock.c) purely so the never-locks path fits inside the mock's
@@ -246,6 +255,141 @@ static int test_idempotent(void)
     return fails;
 }
 
+/* Bring the driver to the locked 30 MHz state with a clean log, so the
+ * suspend cases start where suspend_to_ram does (after cpu_unboost). */
+static void settle_at_30mhz(void)
+{
+    mmio_mock_reset();
+    clock_test_reset();
+    mmio_mock_set_read(PLL_STATUS_ADDR, PLL_STATUS_LOCK);
+    clock_init();
+    mmio_mock_reset();
+    mmio_mock_set_read(PLL_STATUS_ADDR, PLL_STATUS_LOCK);
+}
+
+/* Case 6: clock_suspend grammar. PLL_CONTROL reads back the 30 MHz program
+ * word and DEV_INIT2 reads PLL-power + the I2S pad-routing bits, so the two
+ * clears must leave the multiplier field and the pad routing alone. */
+static int test_suspend_grammar(void)
+{
+    int fails = 0;
+    settle_at_30mhz();
+    mmio_mock_set_read(PLL_CONTROL_ADDR, PLL_CONTROL_30MHZ);
+    mmio_mock_set_read(DEV_INIT2_ADDR,
+                       DEV_INIT2_PLL_POWER | DEV_INIT2_I2S_PADS);
+
+    fails += check("suspend: returns 0", clock_suspend() == 0);
+
+    trace_cursor tc = trace_begin("clock_suspend");
+    /* 1. bus off the PLL, onto the crystal */
+    expect_w(&tc, 32, CLOCK_SOURCE_ADDR, CLOCK_SOURCE_XTAL);
+    /* 2. slow timing */
+    expect_w(&tc, 32, DEV_TIMING1_ADDR, DEV_TIMING1_SLOW);
+    /* 3. PLL disable: RMW, enable bits cleared, program word kept */
+    expect_r(&tc, 32, PLL_CONTROL_ADDR);
+    expect_w(&tc, 32, PLL_CONTROL_ADDR,
+             PLL_CONTROL_30MHZ & ~PLL_CONTROL_ENABLE);
+    /* 4. PLL unpower: RMW, power bit cleared, pad routing kept */
+    expect_r(&tc, 32, DEV_INIT2_ADDR);
+    expect_w(&tc, 32, DEV_INIT2_ADDR, DEV_INIT2_I2S_PADS);
+    trace_expect_end(&tc);
+    fails += trace_done(&tc);
+
+    fails += check("suspend: freq == CPUFREQ_DEFAULT (crystal)",
+                   cpu_frequency() == CPUFREQ_DEFAULT);
+
+    /* Already parked: a second call is a silent success. */
+    size_t len = mmio_mock_log_len();
+    fails += check("suspend: second call is silent and returns 0",
+                   clock_suspend() == 0 && mmio_mock_log_len() == len);
+    return fails;
+}
+
+/* Case 7: refusals. A held boost or a streaming DMA means the caller has
+ * not finished quiescing; the park must not happen underneath either. */
+static int test_suspend_refusals(void)
+{
+    int fails = 0;
+
+    settle_at_30mhz();
+    cpu_boost();
+    mmio_mock_reset();
+    fails += check("suspend under boost: refused, no traffic, still 80 MHz",
+                   clock_suspend() == -1 && mmio_mock_log_len() == 0 &&
+                   cpu_frequency() == CPUFREQ_MAX);
+    cpu_unboost();
+
+    settle_at_30mhz();
+    clock_set_audio_dma_active(1);
+    fails += check("suspend under DMA: refused, no traffic, still 30 MHz",
+                   clock_suspend() == -1 && mmio_mock_log_len() == 0 &&
+                   cpu_frequency() == CPUFREQ_NORMAL);
+    clock_set_audio_dma_active(0);
+    return fails;
+}
+
+/* Case 8: clock_resume is the full 30 MHz bring-up (the same 10 events as
+ * clock_init), a no-op when not parked, and a no-op after a cpu_boost has
+ * already un-parked the tree. */
+static int test_resume(void)
+{
+    int fails = 0;
+
+    /* Not parked: silent. */
+    settle_at_30mhz();
+    clock_resume();
+    fails += check("resume when not parked: no traffic",
+                   mmio_mock_log_len() == 0 &&
+                   cpu_frequency() == CPUFREQ_NORMAL);
+
+    /* Parked -> resume: exactly the clock_init grammar. */
+    settle_at_30mhz();
+    (void)clock_suspend();
+    mmio_mock_reset();
+    mmio_mock_set_read(DEV_INIT2_ADDR,   0);
+    mmio_mock_set_read(PLL_CONTROL_ADDR, 0);
+    mmio_mock_set_read(PLL_STATUS_ADDR,  PLL_STATUS_LOCK);
+    clock_resume();
+    trace_cursor tc = trace_begin("clock_resume");
+    expect_r(&tc, 32, DEV_INIT2_ADDR);
+    expect_w(&tc, 32, DEV_INIT2_ADDR, DEV_INIT2_PLL_POWER);
+    expect_r(&tc, 32, PLL_CONTROL_ADDR);
+    expect_w(&tc, 32, PLL_CONTROL_ADDR, PLL_CONTROL_ENABLE);
+    expect_w(&tc, 32, CLOCK_SOURCE_ADDR, CLOCK_SOURCE_XTAL);
+    expect_w(&tc, 32, DEV_TIMING1_ADDR, DEV_TIMING1_SLOW);
+    expect_w(&tc, 32, PLL_CONTROL_ADDR, PLL_CONTROL_30MHZ);
+    expect_r(&tc, 32, PLL_STATUS_ADDR);
+    expect_w(&tc, 32, DEV_TIMING1_ADDR, DEV_TIMING1_SLOW);
+    expect_w(&tc, 32, CLOCK_SOURCE_ADDR, CLOCK_SOURCE_PLL);
+    trace_expect_end(&tc);
+    fails += trace_done(&tc);
+    fails += check("resume: freq == CPUFREQ_NORMAL",
+                   cpu_frequency() == CPUFREQ_NORMAL);
+
+    /* Parked, then a boost (an ATA transfer's clock hold, say): the boost
+     * runs the full 80 MHz switch from the crystal, the unboost drops to
+     * 30 MHz, and the tree is no longer parked — resume must not re-run. */
+    settle_at_30mhz();
+    (void)clock_suspend();
+    mmio_mock_reset();
+    mmio_mock_set_read(PLL_STATUS_ADDR, PLL_STATUS_LOCK);
+    cpu_boost();
+    fails += check("boost while parked: full 80 MHz switch, freq == MAX",
+                   find_write(PLL_CONTROL_ADDR, PLL_CONTROL_80MHZ)
+                       != (size_t)-1 &&
+                   find_write(DEV_INIT2_ADDR, DEV_INIT2_PLL_POWER)
+                       != (size_t)-1 &&
+                   cpu_frequency() == CPUFREQ_MAX);
+    cpu_unboost();
+    fails += check("unboost after that: back at 30 MHz",
+                   cpu_frequency() == CPUFREQ_NORMAL);
+    size_t len = mmio_mock_log_len();
+    clock_resume();
+    fails += check("resume after a boost un-parked it: no traffic",
+                   mmio_mock_log_len() == len);
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
@@ -255,6 +399,9 @@ int main(void)
     fails += test_lock_spin_then_ready();
     fails += test_boost_refcount();
     fails += test_idempotent();
+    fails += test_suspend_grammar();
+    fails += test_suspend_refusals();
+    fails += test_resume();
 
     if (fails == 0) {
         printf("ALL PASS\n");
