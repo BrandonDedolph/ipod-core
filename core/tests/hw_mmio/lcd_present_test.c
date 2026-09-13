@@ -20,6 +20,15 @@
  * calls lcd_present_fb first, so the first case hits the first-frame
  * path, exactly like lcd_trace_test orders its fill cases.
  *
+ * The post-wake case proves the ordering that makes lcd_wake(); present;
+ * backlight_set() safe: while slept, presents emit NOTHING; the first
+ * present after lcd_wake() streams, issues LCD_UPDATE with no wait before
+ * it, and then ABSORBS — polls BCMA_COMMAND, wall-clock bounded and with
+ * no re-kick, until that update (the one carrying the ~500 ms panel init)
+ * has retired — before returning; and the present after that is ordinary.
+ * The absorb used to run BEFORE the command, where it found nothing in
+ * flight and returned at once, so the present returned mid-init.
+ *
  * NOTE (changed): the first frame no longer SKIPS the wait-for-idle. It
  * used to, on the strength of ipodloader2's synchronous final frame
  * (02-lcd.md, "Chainload handoff state"). Booting directly out of the
@@ -394,17 +403,144 @@ static int test_lcd_present_rect_noop(void)
     return fails;
 }
 
+/*
+ * A wall-clock absorb (bcm_wait_idle_wall) that sees `busy` busy status
+ * words before the idle one: the USEC_TIMER baseline, the first status
+ * read, then per busy word a deadline check and the next read.
+ */
+static void expect_absorb(trace_cursor *tc, int busy)
+{
+    expect_r(tc, 32, USEC_TIMER_ADDR);
+    expect_r(tc, 16, BCM_RD_ADDR_ADDR);
+    expect_w(tc, 32, BCM_RD_ADDR_ADDR, BCMA_COMMAND);
+    expect_r(tc, 16, BCM_CONTROL_ADDR);
+    expect_r(tc, 32, BCM_DATA_ADDR);
+    for (int i = 0; i < busy; i++) {
+        expect_r(tc, 32, USEC_TIMER_ADDR);         /* deadline check */
+        expect_r(tc, 16, BCM_RD_ADDR_ADDR);
+        expect_w(tc, 32, BCM_RD_ADDR_ADDR, BCMA_COMMAND);
+        expect_r(tc, 16, BCM_CONTROL_ADDR);
+        expect_r(tc, 32, BCM_DATA_ADDR);
+    }
+}
+
+/*
+ * Sleep, wake, present. See the header: the first post-wake present must
+ * not return until the update it issued has retired, and must not re-kick
+ * while it waits. BCMA_COMMAND answers busy, busy-remnant, then idle to
+ * that absorb — the same three-word sequence the ordinary path is tested
+ * with, so the difference between the two is purely WHERE the wait sits.
+ */
+static int test_lcd_present_post_wake(void)
+{
+    int fails = 0;
+
+    /* Sleep + wake in a scratch window: their grammar is not this case's
+     * subject. USEC_TIMER reads 0, so the settle delays run to the mock's
+     * trip guard and cost a few reads each. */
+    mmio_mock_reset();
+    program_idle_seq();
+    mmio_mock_set_read(BCM_DATA_ADDR, 0);          /* drain: idle at once */
+    lcd_sleep();
+    if (!lcd_is_slept()) {
+        fprintf(stderr, "[lcd_present_post_wake] FAIL: not slept after "
+                        "lcd_sleep()\n");
+        fails++;
+    }
+
+    /* While slept a present must emit NOTHING: streaming pixels at a panel
+     * that is powering down, or into the init on the way back up, is what
+     * wedges the BCM. */
+    mmio_mock_reset();
+    program_idle_seq();
+    fill_pattern();
+    lcd_present_fb(g_fb);
+    lcd_present_rect(g_fb, 0, 8, 320, 16);
+    if (mmio_mock_log_len() != 0) {
+        fprintf(stderr, "[lcd_present_post_wake] FAIL: %zu bus events from "
+                        "a present while slept, expected 0\n",
+                mmio_mock_log_len());
+        fails++;
+    }
+
+    mmio_mock_reset();
+    program_idle_seq();
+    mmio_mock_set_read(BCM_DATA_ADDR, 0);
+    lcd_wake();
+    if (lcd_is_slept()) {
+        fprintf(stderr, "[lcd_present_post_wake] FAIL: still slept after "
+                        "lcd_wake()\n");
+        fails++;
+    }
+
+    /* THE case: the first present after the wake. */
+    mmio_mock_reset();
+    program_idle_seq();                            /* busy, remnant, idle */
+    fill_pattern();
+    lcd_present_fb(g_fb);
+
+    trace_cursor tc = trace_begin("lcd_present_post_wake");
+    expect_write_addr(&tc, BCMA_CMDPARAM);
+    for (unsigned i = 0; i < FRAME_WORDS; i++) {
+        expect_w(&tc, 32, BCM_DATA_ADDR, expected_pair(i));
+    }
+    /* the command FIRST — no wait, nothing is in flight after a wake — */
+    expect_command_strobe(&tc);
+    /* — then the absorb of that very update: two busy words, then idle,
+     * with a deadline check between reads and NO re-kick anywhere. */
+    expect_absorb(&tc, 2);
+    trace_expect_end(&tc);
+    fails += trace_done(&tc);
+
+    /* Exactly one LCD_UPDATE was issued: a re-kick would be a second. */
+    size_t updates = 0;
+    const mmio_event *log = mmio_mock_log();
+    size_t len = mmio_mock_log_len();
+    for (size_t k = 0; k < len; k++) {
+        if (log[k].op == MMIO_OP_WRITE && log[k].width == 32 &&
+            log[k].addr == BCM_DATA_ADDR && log[k].value == BCMCMD_LCD_UPDATE) {
+            updates++;
+        }
+    }
+    if (updates != 1) {
+        fprintf(stderr, "[lcd_present_post_wake] FAIL: %zu LCD_UPDATE "
+                        "commands, expected exactly 1 (no re-kick)\n",
+                updates);
+        fails++;
+    }
+
+    /* The window is one present wide: the next one is the ordinary path
+     * (wait-for-idle after the stream, then the command). */
+    mmio_mock_reset();
+    program_idle_seq();
+    fill_pattern();
+    lcd_present_fb(g_fb);
+    tc = trace_begin("lcd_present_after_post_wake");
+    expect_write_addr(&tc, BCMA_CMDPARAM);
+    for (unsigned i = 0; i < FRAME_WORDS; i++) {
+        expect_w(&tc, 32, BCM_DATA_ADDR, expected_pair(i));
+    }
+    expect_wait_for_idle(&tc);
+    expect_command_strobe(&tc);
+    trace_expect_end(&tc);
+    fails += trace_done(&tc);
+
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
     /* order matters: the first present flips the file-static
      * lcd_first_frame flag, so the first-frame case must run first. All
-     * cases after it are non-first-frame (idle-seq programmed). */
+     * cases after it are non-first-frame (idle-seq programmed); the
+     * post-wake case arms and consumes lcd_post_wake itself and runs last. */
     fails += test_lcd_present_first_frame();
     fails += test_lcd_present_subsequent();
     fails += test_lcd_present_rect_band();
     fails += test_lcd_present_rect_arbitrary();
     fails += test_lcd_present_rect_fullframe();
     fails += test_lcd_present_rect_noop();
+    fails += test_lcd_present_post_wake();
     return fails == 0 ? 0 : 1;
 }
