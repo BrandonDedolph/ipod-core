@@ -824,6 +824,7 @@ typedef struct {
     uint32_t    clus;
     uint32_t    size;
     int         found;
+    fat32_dirent_t *ent;   /* optional: the whole matched entry (resolve_path) */
 } open_ctx_t;
 
 static int open_match_cb(void *ud, const fat32_dirent_t *ent)
@@ -838,6 +839,9 @@ static int open_match_cb(void *ud, const fat32_dirent_t *ent)
         c->clus  = ent->first_clus;
         c->size  = ent->size;
         c->found = 1;
+        if (c->ent) {
+            memcpy(c->ent, ent, sizeof *ent);
+        }
         return 1;          /* stop the walk */
     }
     return 0;
@@ -851,6 +855,7 @@ int fat32_open_in(fat32_t *fs, uint32_t dir_clus, const char *name,
     c.clus  = 0;
     c.size  = 0;
     c.found = 0;
+    c.ent   = 0;
 
     int rc = fat32_readdir(fs, dir_clus, open_match_cb, &c);
     if (rc != 0) {
@@ -869,6 +874,110 @@ int fat32_open(fat32_t *fs, const char *name,
 {
     /* Root-directory lookup: the documented default. */
     return fat32_open_in(fs, fs->root_clus, name, first_clus, size);
+}
+
+/* ---- path resolution (a bounded segment walk over the lookup above) --- */
+
+static int path_sep(char c)
+{
+    return c == '/' || c == '\\';
+}
+
+int fat32_resolve_path(fat32_t *fs, uint32_t dir_clus, const char *path,
+                       fat32_dirent_t *out, uint32_t *parent_clus)
+{
+    if (!fs || !path || !out || !parent_clus) {
+        return FAT32_EINVAL;
+    }
+
+    /*
+     * Pass 1: validate the whole string before touching the disk, so a path
+     * that is malformed at segment nine is refused outright rather than
+     * after eight directory reads. Bounded by FAT32_PATH_MAX; a string with
+     * no NUL inside that is not a path.
+     */
+    uint32_t len = 0;
+    while (len < FAT32_PATH_MAX && path[len] != '\0') {
+        len++;
+    }
+    if (len == FAT32_PATH_MAX) {
+        return FAT32_EINVAL;
+    }
+    uint32_t nseg = 0;
+    for (uint32_t i = 0; i < len; ) {
+        while (i < len && path_sep(path[i])) {
+            i++;
+        }
+        if (i >= len) {
+            break;
+        }
+        uint32_t s = i;
+        while (i < len && !path_sep(path[i])) {
+            i++;
+        }
+        uint32_t n = i - s;
+        if (n >= FAT32_NAME_BYTES) {
+            return FAT32_EINVAL;                       /* no legal name is this long */
+        }
+        if (path[s] == '.' && (n == 1 || (n == 2 && path[s + 1] == '.'))) {
+            return FAT32_EINVAL;                       /* "." / "..": never walked */
+        }
+        if (++nseg > FAT32_PATH_SEGS_MAX) {
+            return FAT32_EINVAL;
+        }
+    }
+    if (nseg == 0) {
+        return FAT32_EINVAL;                           /* "", "/", "\\": no entry */
+    }
+
+    /*
+     * Pass 2: the walk. One NUL-terminated copy of the current segment on
+     * the stack (the matcher wants a C string and `path` is not split), then
+     * the same matcher fat32_open_in uses, over the current directory. Every
+     * intermediate hit must be a directory; the last may be anything.
+     */
+    char     seg[FAT32_NAME_BYTES];
+    uint32_t cur = dir_clus;
+    uint32_t k   = 0;
+    for (uint32_t i = 0; i < len; ) {
+        while (i < len && path_sep(path[i])) {
+            i++;
+        }
+        if (i >= len) {
+            break;
+        }
+        uint32_t s = i;
+        while (i < len && !path_sep(path[i])) {
+            i++;
+        }
+        uint32_t n = i - s;
+        memcpy(seg, path + s, n);
+        seg[n] = '\0';
+
+        open_ctx_t c;
+        c.want  = seg;
+        c.clus  = 0;
+        c.size  = 0;
+        c.found = 0;
+        c.ent   = out;
+        int rc = fat32_readdir(fs, cur, open_match_cb, &c);
+        if (rc != 0) {
+            return rc;                                 /* FAT32_EIO / FAT32_ECORRUPT */
+        }
+        if (!c.found) {
+            return FAT32_ENOENT;
+        }
+        k++;
+        if (k == nseg) {
+            *parent_clus = cur;
+            return 0;
+        }
+        if (!out->is_dir) {
+            return FAT32_ENOENT;                       /* a file used as a folder */
+        }
+        cur = out->first_clus;
+    }
+    return FAT32_ENOENT;                               /* unreachable: nseg > 0 */
 }
 
 int32_t fat32_read_file(fat32_t *fs, uint32_t clus, void *buf, uint32_t maxlen)
