@@ -524,6 +524,14 @@ int fat32_mount(fat32_t *fs, fat_read_fn read, void *ud, uint32_t part_lba)
         return -4;
     }
     fs->fat_start   = rsvd;
+    /* rsvd, num_fats and fatsz are straight off the BPB, and a FATSz32 large
+     * enough to wrap this sum puts data_start INSIDE the FAT region (or at
+     * 0) while every check below still passes — `cap` clamps the same
+     * product for the cluster ceiling, and the region start needs the same
+     * care. A geometry that does not fit in 32 bits is not a volume. */
+    if (fatsz > (0xFFFFFFFFu - rsvd) / num_fats) {
+        return -4;
+    }
     fs->data_start  = rsvd + num_fats * fatsz;
     fs->clus_bytes  = fs->sec_per_clus * byts;
 

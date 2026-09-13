@@ -232,6 +232,9 @@ static int two_ok(const uint8_t *p, int n)
  * caches (they are tagged by fat32_t pointer — see the comment at the tests). */
 static fat32_t g_fs_fatfail, g_fs_datfail, g_fs_persist;
 
+/* And one for the BPB whose geometry does not fit in 32 bits. */
+static fat32_t g_fs_overflow;
+
 static int check(const char *label, int cond)
 {
     printf("[%s] %s\n", label, cond ? "PASS" : "FAIL");
@@ -723,6 +726,30 @@ int main(int argc, char **argv)
         uint32_t c = 0, s = 0;
         fails += check("open_in on an unaddressable directory is ECORRUPT, not ENOENT",
                        fat32_open_in(&sfs, BAD_CLUS, "X.TXT", &c, &s) == FAT32_ECORRUPT);
+    }
+
+    /* ---- a BPB whose data-region start wraps 32 bits ----
+     *
+     * data_start = RsvdSecCnt + NumFATs * FATSz32, every term straight off
+     * the disk. With NumFATs 2 and FATSz32 0x80000000 the product wraps to 0
+     * and data_start lands on FS-sector 1 — INSIDE the FAT — while the root
+     * cluster still validates and the mount used to report success. The
+     * cluster ceiling already clamps the same product; the region start must
+     * refuse. (Same in-RAM stream image, with only the two BPB fields
+     * changed; a fresh fat32_t so no cached boot sector is consulted.) */
+    {
+        build_stream_image();
+        uint8_t *bs = g_mem;
+        bs[16] = 2;                              /* NumFATs */
+        put32(&bs[36], 0x80000000u);             /* FATSz32: 2 * this wraps */
+        fails += check("BPB with an overflowing data_start is refused at mount",
+                       fat32_mount(&g_fs_overflow, mem_read, NULL, 0) != 0);
+        /* And the same fields at the last value that does NOT wrap still
+         * mount — the guard is on the arithmetic, not on big FATs. */
+        put32(&bs[36], 0x7FFFFFFFu);             /* 1 + 2 * 0x7FFFFFFF = 0xFFFFFFFF */
+        fails += check("BPB with a data_start of exactly 0xFFFFFFFF still mounts",
+                       fat32_mount(&g_fs_overflow, mem_read, NULL, 0) == 0 &&
+                       g_fs_overflow.data_start == 0xFFFFFFFFu);
     }
 
     if (fails == 0) {
