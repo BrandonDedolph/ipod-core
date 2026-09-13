@@ -1695,15 +1695,28 @@ static void folder_map_index(void)
 
 /* Resolve an index record's album folder to a cluster. Primary: match the
  * record's precomputed folder_hash (quote/case-folded) against the on-disk
- * folder hashes — one bucket, a chain of ~1. Fallback: the legacy
- * case-insensitive name compare, so a hash mismatch can never regress below
- * the old behaviour; it is linear, but only an orphaned record (or a fold
- * disagreement the parity test exists to prevent) gets that far. */
+ * folder hashes — one bucket, a chain of ~1. Two root folders that differ
+ * only in what the hash folds share it; as in resolve_art_cb the record whose
+ * stored folder name is the on-disk name byte for byte wins, else the first.
+ * (The record's folder[] is the host's display form, which straightens a
+ * curly apostrophe in the tag album, so a "It's" / "It’s" folder pair can
+ * still both read as "It's" — then this is no worse than before.) Fallback:
+ * the legacy case-insensitive name compare, so a hash mismatch can never
+ * regress below the old behaviour; it is linear, but only an orphaned record
+ * (or a fold disagreement the parity test exists to prevent) gets that far. */
 static uint32_t folder_clus_h(uint32_t hash, const char *name)
 {
+    int pick = 0, pick_checked = 0;
     for (int i = g_folder_hh[hash & (FOLDER_HASH_BUCKETS - 1)]; i; i = g_folder_hn[i - 1]) {
-        if (g_folder_map[i - 1].hash == hash) return g_folder_map[i - 1].clus;
+        if (g_folder_map[i - 1].hash != hash) continue;
+        if (!pick) { pick = i; continue; }
+        if (!pick_checked) {
+            pick_checked = 1;
+            if (name_bind_exact(name, g_folder_map[pick - 1].name, 0)) break;
+        }
+        if (name_bind_exact(name, g_folder_map[i - 1].name, 0)) { pick = i; break; }
     }
+    if (pick) return g_folder_map[pick - 1].clus;
     for (int i = 0; i < g_folder_n; i++) {
         if (name_eq_ci(g_folder_map[i].name, name)) return g_folder_map[i].clus;
     }
@@ -1907,19 +1920,36 @@ static int resolve_art_cb(void *ud, const fat32_dirent_t *e)
      * truncation stay invisible for as long as it did. */
     uint32_t fh = name_hash(e->name);
     if (fh == 0) return 0;                        /* 0 is "no locator", never a match */
+    /* Almost always exactly one candidate, and it binds without a byte of
+     * name compared. Two or more is a pair of names in one folder that differ
+     * only in what name_hash folds — "It's" / "It’s", case — and the first in
+     * chain order used to win, so the pair bound in directory order and could
+     * swap titles and durations. The tiebreak is name_bind_exact: the record
+     * whose stored stem IS the on-disk stem, byte for byte. A pair whose stems
+     * both outgrew the 63-byte field can match neither way and keeps the old
+     * order (the index has nothing else the dirent could be checked against:
+     * it carries a duration, the dirent a size). */
+    lib_song_t *pick = 0;
+    int pick_checked = 0;
     for (int i = g_song_hh[fh & (SONG_HASH_BUCKETS - 1)]; i; i = g_song_hn[i - 1]) {
         lib_song_t *s = &g_songs[i - 1];
         if (s->file_clus || s->dir_clus != g_res_album_clus || s->file_hash != fh) continue;
-        s->file_clus = e->first_clus;
-        s->file_size = e->size;
-        /* Bound. From here on the song is shown and located by its ON-DISK name:
-         * the stem, capped exactly as a browse row is (same function, same
-         * NAME_MAX), so the queue entry, the tracklist row and this field are
-         * the same bytes — and its hash is what resume_capture will store. */
-        copy_display_name(s->file, e->name, 1);
-        s->stem_hash = name_hash(s->file);
-        return 0;
+        if (!pick) { pick = s; continue; }
+        if (!pick_checked) {
+            pick_checked = 1;
+            if (name_bind_exact(pick->file, e->name, 1)) break;
+        }
+        if (name_bind_exact(s->file, e->name, 1)) { pick = s; break; }
     }
+    if (!pick) return 0;
+    pick->file_clus = e->first_clus;
+    pick->file_size = e->size;
+    /* Bound. From here on the song is shown and located by its ON-DISK name:
+     * the stem, capped exactly as a browse row is (same function, same
+     * NAME_MAX), so the queue entry, the tracklist row and this field are
+     * the same bytes — and its hash is what resume_capture will store. */
+    copy_display_name(pick->file, e->name, 1);
+    pick->stem_hash = name_hash(pick->file);
     return 0;
 }
 /*

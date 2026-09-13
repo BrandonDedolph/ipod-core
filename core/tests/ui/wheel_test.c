@@ -237,6 +237,22 @@ int main(void)
     xpect(&c, "...and stays up just short of WHEEL_AZ_HOLD_LETTER", wheel_accelerating());
     g_now = last + WHEEL_AZ_HOLD_LETTER;
     xpect(&c, "...and is down at WHEEL_AZ_HOLD_LETTER", !wheel_accelerating());
+    /* The plate follows letter mode and nothing else. Speed falling under
+     * WHEEL_AZ_VEL mid-gesture (five slow detents) does not shorten the
+     * hold: letter mode is latched, and there is no second, shorter hold for
+     * a "fast but not letters" state — no such state exists, because the
+     * step that reaches WHEEL_AZ_VEL is the step that latches letter mode. */
+    fresh(&l, 26 * 4, g_az);
+    ev(&l, 4, IDLE); ev(&l, 4, FAST); ev(&l, 4, FAST);
+    for (int i = 0; i < 5; i++) ev(&l, 4, SLOW);
+    last = wheel_last_us();
+    g_now = last + WHEEL_AZ_HOLD_LETTER - 1;
+    xpect(&c, "speed dropping under WHEEL_AZ_VEL keeps the letter hold",
+          wheel_letter_mode() && wheel_accelerating());
+    fresh(&l, 26 * 4, g_az);
+    ev(&l, 4, IDLE); ev(&l, 4, FAST);     /* vel 2: fast-ish, no letters   */
+    xpect(&c, "under WHEEL_AZ_VEL there is no plate at all, not a shorter hold",
+          !wheel_letter_mode() && !wheel_accelerating());
     ev(&l, 4, IDLE); ev(&l, 4, FAST); ev(&l, 4, FAST);
     wheel_accel_reset();
     xpect(&c, "a reset takes the plate down at once", !wheel_accelerating());

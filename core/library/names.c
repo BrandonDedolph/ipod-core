@@ -66,6 +66,21 @@ void copy_display_name(char *dst, const char *src, int drop_ext)
     dst[i] = '\0';
 }
 
+/* See names.h. The disk name goes through the SAME copy every stored name
+ * was made by (copy_display_name, then NAME_MAX), so the compare is between
+ * two strings produced the same way — not between a raw dirent and a
+ * bounded field. */
+int name_bind_exact(const char *stored, const char *disk, int drop_ext)
+{
+    char tmp[NAME_MAX + 1];
+    copy_display_name(tmp, disk, drop_ext);
+    const char *a = stored, *b = tmp;
+    for (; *a && *b; a++, b++) {
+        if (*a != *b) return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 /* Decode one UTF-8 sequence at *p, advance past it, return the codepoint (-1 at
  * NUL). Malformed bytes yield one byte of progress so a bad name can't stall. */
 int mn_utf8_next(const unsigned char **p)

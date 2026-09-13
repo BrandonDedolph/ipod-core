@@ -49,6 +49,18 @@ int is_junk_dir(const char *name);
  * ".ext". Truncation is byte-bounded. */
 void copy_display_name(char *dst, const char *src, int drop_ext);
 
+/* The record<->disk TIEBREAK. `stored` is the name a record carries (the
+ * index's copy of a filename with its audio extension trimmed, or a folder
+ * name); `disk` is a directory entry it might bind to. 1 when they are the
+ * same bytes once `disk` has been through copy_display_name(drop_ext) — no
+ * case or quote folding, which is the point: name_hash folds, so two names in
+ * one folder that differ only by "It's" / "It\xe2\x80\x99s" (or case) share
+ * a hash bucket, and this is what tells them apart. Only consulted when a
+ * bucket holds more than one candidate; the single-candidate bind never
+ * compares a byte. A stored name that outgrew its 63-byte field can never
+ * match (the disk name was not cut), so such a pair keeps directory order. */
+int name_bind_exact(const char *stored, const char *disk, int drop_ext);
+
 /* Decode one UTF-8 sequence at *p, advance past it, return the codepoint (-1
  * at NUL, U+FFFD for a malformed, overlong or surrogate sequence). Malformed
  * bytes yield one byte of progress so a bad name can't stall. */

@@ -119,6 +119,45 @@ int main(void)
         xpect(&c, "copy: empty in, empty out", g.s[0] == '\0');
     }
 
+    /* ---- name_bind_exact ------------------------------------------------- */
+    {
+        /* The premise: these two hash alike, so they land in one bucket and
+         * only the tiebreak can tell them apart. */
+        xpect(&c, "bind: It's and It\xe2\x80\x99s share a locator hash",
+              name_hash("01. It's Fine.flac") ==
+              name_hash("01. It\xe2\x80\x99s Fine.flac"));
+        xpect(&c, "bind: the record's stem is the on-disk stem",
+              name_bind_exact("01. It's Fine", "01. It's Fine.flac", 1));
+        xpect(&c, "bind: a folded-apostrophe twin is NOT an exact match",
+              !name_bind_exact("01. It's Fine", "01. It\xe2\x80\x99s Fine.flac", 1));
+        xpect(&c, "bind: ...and the other way round",
+              !name_bind_exact("01. It\xe2\x80\x99s Fine", "01. It's Fine.flac", 1) &&
+              name_bind_exact("01. It\xe2\x80\x99s Fine", "01. It\xe2\x80\x99s Fine.flac", 1));
+        xpect(&c, "bind: case is not folded either",
+              !name_bind_exact("01. it's fine", "01. It's Fine.flac", 1));
+        xpect(&c, "bind: a folder compares whole (no extension trimmed)",
+              name_bind_exact("Adele - 25", "Adele - 25", 0) &&
+              !name_bind_exact("Adele - 25", "Adele - 25.1", 0));
+        xpect(&c, "bind: the disk name is copied like the stored one was",
+              name_bind_exact("ab", "a\tb.flac", 1));
+        xpect(&c, "bind: empty stored matches nothing on disk",
+              !name_bind_exact("", "x.flac", 1) && name_bind_exact("", "", 0));
+
+        /* A name past the 63-byte index field: the record holds the cut
+         * (then trim_audio_ext, which finds no extension to trim), the disk
+         * holds the whole thing. Never exact — the caller falls back. */
+        char longname[NAME_MAX + 16];
+        memset(longname, 'x', sizeof longname - 1);
+        longname[sizeof longname - 1] = '\0';
+        memcpy(longname + sizeof longname - 6, ".flac", 6);
+        char stored[NAME_MAX + 1];
+        memcpy(stored, longname, NAME_MAX - 1);
+        stored[NAME_MAX - 1] = '\0';
+        trim_audio_ext(stored);
+        xpect(&c, "bind: a stem that outgrew the field is never exact",
+              !name_bind_exact(stored, longname, 1));
+    }
+
     /* ---- mn_utf8_next ---------------------------------------------------- */
     {
         int n;

@@ -82,17 +82,76 @@ static int skip_bytes(decoder_source_t *src, uint32_t n)
 
 /* -------- string / number helpers --------------------------------------- */
 
-/* Copy printable ASCII (0x20..0x7E) from src[0..len) into a bounded, NUL-
- * terminated dst of `cap` bytes (cap includes the NUL). Drops UTF-8 multibyte
- * and control bytes — matches the atlas font coverage (main.c copy_display_name). */
+/* Length of the well-formed UTF-8 sequence starting at src[0] (1..4), or 0
+ * if it is not one: a bare continuation byte, an overlong form, a surrogate,
+ * a codepoint past U+10FFFF, or a sequence cut short by `len`. The same
+ * rules mn_utf8_next() in library/names.c applies, restated here over a
+ * length-delimited buffer (a Vorbis comment value is not NUL-terminated). */
+static uint32_t utf8_seq_len(const uint8_t *src, uint32_t len)
+{
+    uint8_t c = src[0];
+    uint32_t n;
+    uint8_t lo = 0x80, hi = 0xBF;             /* bounds on the second byte */
+    if (c < 0x80) {
+        return 1;
+    } else if (c >= 0xC2 && c <= 0xDF) {
+        n = 2;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+        n = 3;
+        if (c == 0xE0) lo = 0xA0;             /* overlong */
+        if (c == 0xED) hi = 0x9F;             /* surrogates */
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        n = 4;
+        if (c == 0xF0) lo = 0x90;             /* overlong */
+        if (c == 0xF4) hi = 0x8F;             /* > U+10FFFF */
+    } else {
+        return 0;                             /* C0/C1, F5..FF, or a stray 10xxxxxx */
+    }
+    if (n > len || src[1] < lo || src[1] > hi) {
+        return 0;
+    }
+    for (uint32_t i = 2; i < n; i++) {
+        if ((src[i] & 0xC0) != 0x80) {
+            return 0;
+        }
+    }
+    return n;
+}
+
+/* Copy the displayable text of src[0..len) into a bounded, NUL-terminated
+ * dst of `cap` bytes (cap includes the NUL): printable ASCII and every
+ * well-formed UTF-8 sequence pass through; C0 controls, DEL and bytes that
+ * are not part of a valid sequence are dropped. Truncation happens only on a
+ * sequence boundary — a sequence that does not fit whole is left out, never
+ * cut — so the renderer (which decodes UTF-8, see ui/text) never sees a torn
+ * character. This used to keep 0x20..0x7E only, which is why the per-file
+ * tag scan (the fallback when CORELIB.IDX is absent) showed "Beyonc" where
+ * the index path — whose fields come through the host's utf8_field — showed
+ * "Beyoncé". */
 static void copy_printable(char *dst, uint32_t cap, const uint8_t *src, uint32_t len)
 {
     uint32_t i = 0;
-    for (uint32_t j = 0; j < len && i + 1 < cap; j++) {
+    for (uint32_t j = 0; j < len && i + 1 < cap; ) {
         uint8_t c = src[j];
-        if (c >= 0x20 && c <= 0x7E) {
-            dst[i++] = (char)c;
+        if (c < 0x80) {
+            if (c >= 0x20 && c != 0x7F) {
+                dst[i++] = (char)c;
+            }
+            j++;
+            continue;
         }
+        uint32_t n = utf8_seq_len(src + j, len - j);
+        if (n == 0) {
+            j++;                              /* not UTF-8: drop the byte */
+            continue;
+        }
+        if (i + n + 1 > cap) {
+            break;                            /* would tear it: stop here */
+        }
+        for (uint32_t k = 0; k < n; k++) {
+            dst[i++] = (char)src[j + k];
+        }
+        j += n;
     }
     dst[i] = '\0';
 }
