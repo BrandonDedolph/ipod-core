@@ -18,7 +18,8 @@
  * (run from `meson test` and from `make verify-hw`). Do not reformat, re-indent
  * or rename anything between the BEGIN/END markers; if you change main.c,
  * paste the new text in here. (The locator hash it calls is no longer a copy:
- * name_hash() lives in library/names.c and is linked here for real.)
+ * name_hash() lives in library/names.c and is linked here for real, and so
+ * is the queue-context seam in kernel/resume_ctx.h — test 5 below.)
  *
  * The library it reads is stubbed below with the same field NAMES main.c's
  * lib_song_t uses, so the copied body compiles unchanged.
@@ -29,6 +30,7 @@
 #include <stdint.h>
 
 #include "../../library/names.h"
+#include "../../kernel/resume_ctx.h"   /* the REAL queue-context seam */
 
 static int g_fails;
 
@@ -307,12 +309,117 @@ static void test_long_name(void)
           resume_find_song(H("16"), 251) < 0);
 }
 
+/* ---- 5. the queue context: what a capture stores and a restore rebuilds --- */
+
+/*
+ * kernel/resume_ctx.h is the pure half of the resume QUEUE CONTEXT, linked
+ * here for real (it is header-only and touches no device state). What the
+ * boot path relies on it for:
+ *
+ *   - the kind a Songs view is, from how it was built — the restore builds
+ *     the same view from the resumed song's own fields and needs to agree
+ *     with the capture about which builder that is;
+ *   - the Shuffle Songs library order being a pure function of its seed —
+ *     the record saves 4 bytes and the restore deals the same queue;
+ *   - the settings_t bookkeeping: a capture of what is already stored costs
+ *     no write, any change costs one, and clearing forgets everything.
+ */
+static void test_context(void)
+{
+    /* Which builder a view came from. Nothing builds both a genre and an
+     * artist filter, so genre wins; an empty artist filter is "everyone". */
+    check("Songs (no genre, no artist) is KIND_SONGS",
+          resume_kind_of_view(-1, 0) == RESUME_KIND_SONGS);
+    check("an empty artist filter is still KIND_SONGS",
+          resume_kind_of_view(-1, "") == RESUME_KIND_SONGS);
+    check("an artist's All Songs is KIND_ARTIST",
+          resume_kind_of_view(-1, "Kid Laroi") == RESUME_KIND_ARTIST);
+    check("a genre's songs is KIND_GENRE",
+          resume_kind_of_view(3, 0) == RESUME_KIND_GENRE);
+
+    /* The library order: same seed, same deal; a permutation; safe at the
+     * degenerate sizes. Two fixed seeds, so "differs" is a fixed fact. */
+    {
+        uint16_t a[16], b[16];
+        lib_shuffle_order(a, 16, 0x1234567u);
+        lib_shuffle_order(b, 16, 0x1234567u);
+        check("the same seed deals the same library order",
+              memcmp(a, b, sizeof a) == 0);
+        lib_shuffle_order(b, 16, 0x7654321u);
+        check("a different seed deals a different library order",
+              memcmp(a, b, sizeof a) != 0);
+        int seen[16] = { 0 }, perm = 1;
+        for (int i = 0; i < 16; i++) {
+            if (a[i] >= 16 || seen[a[i]]++) perm = 0;
+        }
+        check("the deal is a permutation of every song index", perm);
+        lib_shuffle_order(a, 1, 99u);
+        check("a one-song library deals itself", a[0] == 0);
+        lib_shuffle_order(a, 0, 99u);      /* must not touch a[] */
+        check("an empty library is not written to", a[0] == 0);
+    }
+
+    /* The record bookkeeping: what one capture writes, and when it counts
+     * as a change. */
+    {
+        settings_t s;
+        memset(&s, 0, sizeof s);
+        resume_ctx_t c = { H("07 Track"), 61, 245, RESUME_KIND_ARTIST, 4,
+                           0, 0xBADC0DE5u, 2 };
+        check("a first capture is a change", resume_ctx_store(&s, &c) == 1);
+        check("...and stores every field",
+              s.resume_hash == H("07 Track") && s.resume_secs == 61 &&
+              s.resume_total == 245 && s.resume_kind == RESUME_KIND_ARTIST &&
+              s.resume_qidx == 4 && s.resume_seed == 0 &&
+              s.resume_order_seed == 0xBADC0DE5u && s.resume_order_keep == 2);
+        check("the same capture again is not a change",
+              resume_ctx_store(&s, &c) == 0);
+        c.secs = 62;
+        check("a second of progress is a change", resume_ctx_store(&s, &c) == 1);
+        c.order_seed = 0x11111111u;         /* shuffle toggled, same track */
+        check("a new shuffle deal is a change even with the position still",
+              resume_ctx_store(&s, &c) == 1 && s.resume_order_seed == 0x11111111u);
+        c.order_keep = -2;                  /* PLAYER_KEEP_QUEUE */
+        check("a negative keep is stored as is",
+              resume_ctx_store(&s, &c) == 1 && s.resume_order_keep == -2);
+        c.qidx = 7;
+        check("a jump inside the queue is a change",
+              resume_ctx_store(&s, &c) == 1 && s.resume_qidx == 7);
+
+        /* A Shuffle Songs capture carries its seed. */
+        resume_ctx_t sh = { H("07 Track"), 0, 245, RESUME_KIND_SHUFFLE, 1500,
+                            0xC0FFEE01u, 0, -2 };
+        check("a Shuffle Songs capture stores the library seed",
+              resume_ctx_store(&s, &sh) == 1 && s.resume_seed == 0xC0FFEE01u &&
+              s.resume_kind == RESUME_KIND_SHUFFLE && s.resume_qidx == 1500);
+
+        /* Out-of-range values never reach the record as such: a kind this
+         * build has no builder for is NONE (the album fallback), an index
+         * outside u16 is pinned. */
+        resume_ctx_t bad = { 1, 0, 0, 200, 70000, 0, 0, 0 };
+        check("an unknown kind is stored as NONE, an oversize index pinned",
+              resume_ctx_store(&s, &bad) == 1 &&
+              s.resume_kind == RESUME_KIND_NONE && s.resume_qidx == 0xFFFF);
+
+        /* Forgetting. */
+        check("clearing a stored locator is a change",
+              resume_ctx_clear(&s) == 1);
+        check("...and leaves nothing behind",
+              s.resume_hash == 0 && s.resume_secs == 0 && s.resume_total == 0 &&
+              s.resume_kind == 0 && s.resume_qidx == 0 && s.resume_seed == 0 &&
+              s.resume_order_seed == 0 && s.resume_order_keep == 0);
+        check("clearing an empty record is not a change",
+              resume_ctx_clear(&s) == 0);
+    }
+}
+
 int main(void)
 {
     test_resolves();
     test_stale();
     test_ambiguous();
     test_long_name();
+    test_context();
 
     printf("resume_test: %s (%d failure%s)\n",
            g_fails == 0 ? "PASS" : "FAIL", g_fails, g_fails == 1 ? "" : "s");

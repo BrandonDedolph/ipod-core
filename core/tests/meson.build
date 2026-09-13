@@ -756,7 +756,9 @@ if target == 'sim'
   # disambiguated by the saved track LENGTH, and decline outright when the
   # length cannot choose. Compiles a verbatim copy of the static function;
   # hw-resume-parity below diffs it against main.c. The locator hash it
-  # calls is the real library/names.c.
+  # calls is the real library/names.c, and the queue-context seam (which
+  # list a view is, the seeded Shuffle Songs order, what a capture stores)
+  # is the real header-only kernel/resume_ctx.h.
   resume_test = executable(
     'resume_test',
     sources: ['kernel/resume_test.c', '../library/names.c'],
