@@ -3744,6 +3744,11 @@ static void ui_stats_emit(void)
     uart_puts(" max_us ");              uart_dec((int)g_ui_art_max_us);
     uart_puts(" held ");                uart_dec((int)g_ui_art_held);
     uart_puts(" parked ");              uart_dec(ata_is_parked());
+    /* BCM health, cumulative: handshakes that ran out of budget (a post-wake
+     * absorb that never retired lands here) and presents refused because the
+     * panel was slept. A healthy device reads 0 0 forever. */
+    uart_puts(" bcm_timeouts ");        uart_dec((int)lcd_bcm_timeouts());
+    uart_puts(" refused ");             uart_dec((int)lcd_presents_refused());
     uart_puts(" decode_us_per_kframe "); uart_dec(ps ? (int)ps->decode_us_per_kframe : -1);
     uart_puts(" ring_low_pct ");        uart_dec((int)player_buf_pct());
     uart_putc('\n');
@@ -4900,36 +4905,61 @@ static void suspend_to_ram(uint32_t play_down_us)
 }
 
 /*
- * Panel sleep at IDLE (backlight timeout) is DISABLED: when it was tried it
- * left the screen solid WHITE until a reboot, which is the worst possible
- * failure on a device whose only debug channel is that screen.
+ * Panel sleep at IDLE: when the backlight times fully off, put the LCD panel
+ * to sleep too (LCD_SLEEP), not just the LED. The panel driver is the second
+ * largest draw on a dark, playing device after the LED itself.
  *
- * Mechanism, from docs/hw/02-lcd.md: on the first LCD_UPDATE after LCD_SLEEP the
- * BCM re-runs its internal LCD panel init and is allowed up to 500 ms for it
- * ("After waking from sleep, the first update can take up to 500 ms ... because
- * the BCM is doing internal LCD panel init"). At the time, our commit handshake
- * budgeted BCM_IDLE_SPIN_LIMIT (~2 ms) and RE-KICKED LCD_UPDATE 16 times inside
- * that window, every later present streamed a fresh 150 KB frame straight into
- * the in-progress init, and the backlight was lit at the input site before any
- * of it — so the init never completed and the BCM latched. The doc names the
- * symptom outright: "If we wake the backlight before the first update
- * completes, the user sees a 500 ms white flash."
+ * HISTORY. The first attempt left the screen solid WHITE until a reboot — the
+ * worst failure on a device whose only debug channel is that screen. The
+ * mechanism (docs/hw/02-lcd.md): the first LCD_UPDATE after LCD_SLEEP makes
+ * the BCM re-run its internal panel init, allowed up to 500 ms. At the time the
+ * commit handshake budgeted ~2 ms and RE-KICKED LCD_UPDATE 16 times inside that
+ * window, every later present streamed a fresh 150 KB frame into the
+ * in-progress init, and the backlight was lit at the input site before any of
+ * it — so the init never completed and the BCM latched. The doc names the
+ * symptom: "If we wake the backlight before the first update completes, the
+ * user sees a 500 ms white flash."
  *
- * The three preconditions for retrying it, and where they stand:
- *   (a) a real bcm_init() bootstrap to recover a failed wake — exists
- *       (lcd_recover), but is compiled out (LCD_RECOVER_ON_WAKE 0) because it
- *       has never run on silicon;
- *   (b) the first post-wake commit waits for ITS update to retire, wall-clock
- *       bounded, with the re-kick suppressed — DONE (hal/hw/lcd.c
- *       bcm_frame_commit, and it is what suspend_to_ram now relies on);
- *   (c) backlight-on deferred until that first present has retired — DONE
- *       here (bl_relight), and inherent in suspend's wake order.
- * The backlight LED is by far the larger draw and is already off in this
- * state, so the win from flipping this is small; suspend_to_ram is where the
- * panel sleep actually earns its keep (SUSPEND_PANEL_SLEEP), and it should
- * prove itself there on the device before this is turned on.
+ * WHAT IS TRUE NOW, and why this is on:
+ *   - hal/hw/lcd.c bcm_frame_commit: the first present after lcd_wake()
+ *     issues its LCD_UPDATE and then WAITS, wall-clock bounded and with NO
+ *     re-kick, until that update has retired. The present returns with the
+ *     panel init done (hw-lcd-present: test_lcd_present_post_wake).
+ *   - While slept, every present is REFUSED and counted (lcd_presents_refused;
+ *     test_lcd_present_refused_reported), so nothing can stream into the
+ *     sleeping BCM or its wake-init. In this loop every painter — the render
+ *     block, the two bar animators, the marquee, the lock plate, the toast —
+ *     is gated on bl_state != BL_OFF anyway, so on the idle path nothing even
+ *     tries; the count is the proof of that on the device.
+ *   - The wake is ONE block (search "Panel wake"), in the only order that is
+ *     safe and the same one suspend_to_ram and enter_standby use: lcd_wake();
+ *     paint the current screen while everything is still dark; present that
+ *     FULL frame (it absorbs the init); THEN backlight_set(). The input sites
+ *     do not light the LED themselves when the panel is slept — they only
+ *     move bl_state, and the wake block does the rest before anything else in
+ *     the pass can present. The wake frame is full by construction, so a
+ *     partial-paint cache (g_lp, np_last) that went stale while dark cannot
+ *     put a two-row partial on top of pixels the BCM no longer has.
+ *   - Two owners compose: a panel slept here and then suspended (hold PLAY
+ *     from dark) is slept once — lcd_sleep is idempotent — and woken once by
+ *     suspend's own wake; the loop clears panel_slept on the way back so it
+ *     does not wake twice. Likewise a refused PMU standby.
+ *   - lcd_recover() (a real bcm_init) exists for a wake that never retires,
+ *     but stays compiled out (LCD_RECOVER_ON_WAKE 0) until it has run on
+ *     silicon; a failed absorb is reported (lcd_bcm_timeouts) and the frame
+ *     goes out anyway, which is what the old code did on every frame.
+ *
+ * UNVERIFIED ON THE DEVICE as of 2026-09-13; suspend's panel sleep
+ * (SUSPEND_PANEL_SLEEP) is the same lcd_sleep/lcd_wake pair and is equally
+ * unflashed. First-flash check: let the backlight time out, wait 10 s, press
+ * a button — the screen must come back with the right content, not white.
+ * ROLLBACK: set this to 0. The LED still times off exactly as before; only the
+ * LCD_SLEEP at the BL_OFF edge and the wake block's lcd_wake go away (the
+ * wake block is then a no-op, since panel_slept never sets).
  */
-#define PANEL_SLEEP_AT_IDLE  0
+#ifndef PANEL_SLEEP_AT_IDLE
+#define PANEL_SLEEP_AT_IDLE  1
+#endif
 
 /*
  * The UI: one event loop that pumps the background player every pass and
@@ -5005,13 +5035,6 @@ _Noreturn static void run_ui(fat32_t *fs)
     scr_push(SCR_MENU);
 
     int      dirty = 1;
-    /* Backlight relight deferred until after the first post-wake present has
-     * retired. Lighting the LED over a panel that is still running its BCM init
-     * is precisely what the user sees as a white screen (02-lcd.md:490), so when
-     * the panel was slept we raise this instead of calling backlight_set() at
-     * the input site. Inert while PANEL_SLEEP_AT_IDLE is 0 (panel_slept never
-     * sets), but it is what makes that flag safe to flip. */
-    int      bl_relight = 0;
     uint32_t np_last = 0xFFFFFFFFu;
     int      np_first = 1;
     int      np_vol_prev = 0;            /* volume overlay was up last NP paint  */
@@ -5037,7 +5060,12 @@ _Noreturn static void run_ui(fat32_t *fs)
     enum { BL_OFF, BL_DIM, BL_FULL };
     int      bl_state   = BL_FULL;
     int      cpu_idled  = 0;              /* core dropped to 30 MHz for deep idle   */
-    int      panel_slept = 0;            /* LCD panel put to sleep at backlight-off */
+    /* LCD panel put to sleep at backlight-off (PANEL_SLEEP_AT_IDLE). While set,
+     * the input sites must NOT light the LED: the "Panel wake" block below
+     * wakes the panel, paints, presents the full frame (which retires the
+     * BCM's panel init) and only then lights it — see the note above run_ui. */
+    int      panel_slept = 0;
+    uint32_t panel_refused_at_sleep = 0;  /* lcd_presents_refused() at the sleep */
     uint32_t last_input = mmio_read32(USEC_TIMER_ADDR);
 
     /* Seeded from the LIVE transport, not from zero: a successful resume_restore
@@ -5239,6 +5267,12 @@ _Noreturn static void run_ui(fat32_t *fs)
                 suspend_to_ram(keyhold_down_us(&play_key));  /* returns on wake */
                 last_input = mmio_read32(USEC_TIMER_ADDR);
                 bl_state   = BL_FULL;           /* backlight restored on resume */
+                panel_slept = 0;                /* suspend woke, presented and
+                                                 * lit the panel itself — even
+                                                 * one this loop had slept at
+                                                 * idle first (lcd_sleep is
+                                                 * idempotent); don't wake it
+                                                 * a second time below */
                 dirty      = 1;                 /* repaint the current screen */
                 break;
             case KEYHOLD_NONE:
@@ -5253,6 +5287,9 @@ _Noreturn static void run_ui(fat32_t *fs)
             g_standby_refused = 0;
             last_input = mmio_read32(USEC_TIMER_ADDR);
             bl_state   = BL_FULL;
+            panel_slept = 0;              /* enter_standby's fallback already
+                                           * did wake -> paint -> present ->
+                                           * backlight; not a second time */
             dirty      = 1;
         }
 
@@ -5272,8 +5309,9 @@ _Noreturn static void run_ui(fat32_t *fs)
             ui_window_arm(&g_lock_flash);
             last_input = mmio_read32(USEC_TIMER_ADDR);   /* wake the backlight    */
             if (bl_state != BL_FULL) {
-                if (panel_slept) bl_relight = 1;         /* after the present     */
-                else             backlight_set(g_settings.backlight_bright);
+                /* A slept panel is lit by the "Panel wake" block, AFTER its
+                 * first full present has retired the BCM's panel init. */
+                if (!panel_slept) backlight_set(g_settings.backlight_bright);
                 bl_state = BL_FULL;
                 wheel_accel_reset();      /* don't resume a pre-sleep gesture */
             }
@@ -5288,8 +5326,9 @@ _Noreturn static void run_ui(fat32_t *fs)
             last_input = mmio_read32(USEC_TIMER_ADDR);
             if (bl_state != BL_FULL) {
                 int was_off = (bl_state == BL_OFF);
-                if (panel_slept) bl_relight = 1;         /* after the present     */
-                else             backlight_set(g_settings.backlight_bright);
+                /* A slept panel is lit by the "Panel wake" block, AFTER its
+                 * first full present has retired the BCM's panel init. */
+                if (!panel_slept) backlight_set(g_settings.backlight_bright);
                 bl_state = BL_FULL;
                 wheel_accel_reset();      /* don't resume a pre-sleep gesture */
                 dirty = 1;                    /* repaint anything drawn while off */
@@ -5798,8 +5837,16 @@ _Noreturn static void run_ui(fat32_t *fs)
             backlight_set(0);
             bl_state = BL_OFF;
             if (PANEL_SLEEP_AT_IDLE) {    /* see the note above run_ui() */
+                /* LED first (above), then the panel: the sleep drains any
+                 * in-flight update, drops the panel-enable bits and issues
+                 * LCD_SLEEP, ~20 ms of which is a settle the loop sits out
+                 * (the pump is not called, but the PCM ring is far deeper
+                 * than that). From here every present is refused until the
+                 * "Panel wake" block — and nothing here tries: every painter
+                 * is gated on bl_state != BL_OFF. */
                 lcd_sleep();              /* blank the panel too, not just the LED */
                 panel_slept = 1;
+                panel_refused_at_sleep = lcd_presents_refused();
             }
         }
 
@@ -5917,15 +5964,46 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
         }
 
-        /* Panel wake: the instant we leave the fully-off state, re-enable the LCD
-         * panel BEFORE any present happens this iteration (the lock-plate flash or
-         * the render block below). One central check covers every wake path, so no
-         * individual input site needs patching. lcd_wake() only restores the
-         * panel-enable bits — the following present re-lights and repaints. */
+        /* Panel wake: the instant we leave the fully-off state, bring the panel
+         * back BEFORE any other present can happen this pass (the lock-plate
+         * flash or the render block below), in the only order that is safe and
+         * the same one suspend_to_ram / enter_standby use:
+         *
+         *   lcd_wake()            panel-enable bits back, absorb armed;
+         *   paint_current_screen  the real screen, rendered while still dark;
+         *   lcd_present_fb        a FULL frame — its LCD_UPDATE carries the
+         *                         BCM's ~500 ms panel init and the call does
+         *                         not return until that has retired;
+         *   backlight_set         only now, so the init is never seen (light
+         *                         over it is the white flash, 02-lcd.md).
+         *
+         * FULL on purpose: every present while slept was refused, so the BCM's
+         * framebuffer holds the last frame from BEFORE the sleep, and a partial
+         * (two list rows, the transport band) on top of that would leave stale
+         * pixels everywhere else. One central block covers every wake path, so
+         * no input site lights the LED itself when panel_slept is set.
+         *
+         * dirty stays set: the render block below repaints once more through
+         * the ordinary path, which is what re-registers the marquee, the
+         * partial-paint caches (g_lp, np_last) and the toast/A-Z edges. That
+         * second frame is invisible (same pixels) and costs one present; it is
+         * exactly what suspend's return does too. */
         if (panel_slept && bl_state != BL_OFF) {
+            uint32_t refused = lcd_presents_refused() - panel_refused_at_sleep;
             lcd_wake();
             panel_slept = 0;
+            paint_current_screen();
+            lcd_present_fb(console_framebuffer());
+            backlight_set(g_settings.backlight_bright);
             dirty = 1;                    /* never resume onto a stale panel */
+            if (refused) {
+                /* Something presented into the slept panel. Not a fault (the
+                 * frame above made up for it), but on the idle path nothing
+                 * should — say so, so the device tells us who. */
+                uart_puts("core: panel wake: ");
+                uart_dec((int)refused);
+                uart_puts(" present(s) refused while slept\n");
+            }
         }
 
         /* Lock/unlock plate takes over the screen for ~1s on a Hold edge. Paint
@@ -6114,14 +6192,6 @@ _Noreturn static void run_ui(fat32_t *fs)
                 dirty = 0;
                 last_present = now;
             }
-        }
-
-        /* Deferred post-wake relight: the panel has now had a real frame pushed
-         * to it (and the hardened commit path blocked for the BCM's panel init),
-         * so it is safe to put light behind it. See bl_relight's declaration. */
-        if (bl_relight && !dirty) {
-            backlight_set(g_settings.backlight_bright);
-            bl_relight = 0;
         }
 
         /* Animate the now-playing 3-bar indicator in the album detail: redraw

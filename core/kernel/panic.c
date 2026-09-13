@@ -24,6 +24,7 @@
 
 #include "hw/uart.h"
 #include "hw/lcd.h"
+#include "hw/backlight.h"
 
 /* Linker-provided supervisor stack bounds (boot/linker.ld). Declared as
  * arrays so the symbol's ADDRESS is the value we want. */
@@ -205,11 +206,19 @@ static void panic_screen(uint32_t cause, const panic_regs_t *regs,
     console_str(0, row + 2, "HALTED. HOLD MENU AND SELECT TO RESET",
                 PAN_DIM, PAN_BG);
 
-    /* Present blind: lcd_present_fb only ever polls the BCM with bounded
-     * spins (hal/hw/lcd.c), so it degrades to wasted cycles — not a second
-     * hang — if the panel was never brought up or the BCM is the thing that
-     * wedged. There is no state left worth protecting at this point. */
+    /* The panel may be ASLEEP when we get here — the main loop sleeps it at
+     * backlight-off (PANEL_SLEEP_AT_IDLE) and suspend sleeps it too — and a
+     * slept panel REFUSES presents (hal/hw/lcd.c), which would make this the
+     * one panic nobody can see. So: wake it (a no-op when it is up), present
+     * (the first frame after a wake does not return until the BCM's panel
+     * init has retired), and only then light it. Both wake and present only
+     * ever poll the BCM with bounded, wall-clock spins on the free-running
+     * USEC_TIMER, so with IRQs masked they degrade to wasted cycles — not a
+     * second hang — if the panel was never brought up or the BCM is the
+     * thing that wedged. There is no state left worth protecting here. */
+    lcd_wake();
     lcd_present_fb(console_framebuffer());
+    backlight_set(BACKLIGHT_MAX);
 }
 
 /* ---- entry point ------------------------------------------------------ */

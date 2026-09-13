@@ -62,10 +62,17 @@ What changed (see `git log 054c722..`):
 4. Battery line still reads sane values (the 2800–4600 mV plausibility band
    must not reject a real cell).
 5. PLAY tap vs hold feel; a tap must never sleep, a hold must never pause.
+6. Panel sleep at idle (`PANEL_SLEEP_AT_IDLE 1`, since 2026-09-13): let the
+   backlight time out, wait 10 s, press a button — the screen must come
+   back with the right content, not white. If white, set
+   `PANEL_SLEEP_AT_IDLE 0` in `kernel/main.c`. Then hold PLAY from dark:
+   the panel must wake once, sleep into suspend, and come back once. The
+   `core: ui` UART line's `bcm_timeouts`/`refused` should read 0/0.
 
 Still open from the audit: `DEV_EN` peripheral gating and PLL-off in
-suspend (moot once escalation lands), the BCM power gate, `PANEL_SLEEP_AT_IDLE`
-(still 0). The reserved playlist queue kind has since been wired — see
+suspend (moot once escalation lands), the BCM power gate. `PANEL_SLEEP_AT_IDLE`
+is now 1 (unflashed; see "What works" and checklist item 6).
+The reserved playlist queue kind has since been wired — see
 **Playlists** under "What works". Closed since: the same-hash
 tiebreak (`name_bind_exact`, exact on-disk name wins when a bucket has two
 candidates), `flac_meta.c` keeping UTF-8 on the scan fallback, and
@@ -263,10 +270,16 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   been flashed: whether the panel comes back from `LCD_SLEEP` (if it wakes
   white, `SUSPEND_PANEL_SLEEP 0`), the drive's post-SLEEP reset wake, the
   suspend draw before/after, and the refused-standby recovery. **LCD panel
-  sleep at idle stays DISABLED** (`PANEL_SLEEP_AT_IDLE 0`) — two of its
-  three preconditions are now genuinely met (the post-wake absorb order,
-  the deferred relight); `bcm_init()` exists but is compiled out. Let the
-  suspend path prove panel sleep on the device first.
+  sleep at idle is ON** (`PANEL_SLEEP_AT_IDLE 1`, 2026-09-13, rollback
+  documented beside it; **equally unflashed**): at backlight-off the loop
+  now issues `LCD_SLEEP`; the wake is one block in the main loop that does
+  `lcd_wake` -> paint -> full present (retires the panel init) -> backlight,
+  the input sites no longer light the LED over a slept panel, and a present
+  refused while slept is counted (`lcd_presents_refused`, host-tested) so
+  the wake frame is full by construction. Idle sleep and suspend compose
+  (sleep twice, wake once — idempotent, host-tested). `panic()` now wakes
+  and lights the panel before it draws. `bcm_init()` exists but is compiled
+  out. The traced idle path is in the commit message of the flip.
 - **Charging** — `charger_set_max_current(500)` asserts HPWR so the LTC4066
   uses the 500 mA input cap instead of the 100 mA one we had been
   inheriting from the boot ROM. **UNVERIFIED ON HARDWARE** — needs an
@@ -344,10 +357,12 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
    one designed for small sizes — not more spacing tuning.
 4. **Flash and measure the power work** — the suspend/standby changes
    above are entirely device-unverified; the first flash should check the
-   panel wakes from `LCD_SLEEP`, the drive wakes from SLEEP, and read the
-   suspend draw. Then **re-enable panel sleep at idle** — see above; the
-   blockers it was disabled for have since been fixed, and the suspend path
-   exercises the same wake sequence.
+   panel wakes from `LCD_SLEEP` (both after a suspend AND after a backlight
+   timeout — panel sleep at idle is now on, checklist item 6), the drive
+   wakes from SLEEP, and read the suspend draw. Panel sleep at idle is the
+   one with the wider exposure: it fires on every backlight timeout, so a
+   white wake there is the first thing to look for; the rollback is
+   `PANEL_SLEEP_AT_IDLE 0`.
 5. **Podcasts / Audiobooks / Composers** — greyed placeholders in the
    menus; no backing implementation.
 6. **More codecs** — AAC / ALAC / Vorbis / Opus / WAV are stubbed in
