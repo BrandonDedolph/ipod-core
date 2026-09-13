@@ -181,12 +181,20 @@ def leadint(s):
 
 
 # A track number at the start of a filename stem: one to three digits, then a
-# separator, then something. Three digits caps it below any year ("1999.flac"
-# is a song called 1999, not track 1999) and the separator rules out an artist
-# whose name starts with digits ("2Pac - ..."). "D-NN" is the flattened
-# multi-disc convention ("2-05 Title") and yields both numbers.
+# REAL separator — ".", "-" or "_", with spaces around it or not — then
+# something. Three digits caps it below any year ("1999.flac" is a song called
+# 1999, not track 1999) and the separator rules out an artist whose name starts
+# with digits ("2Pac - ..."). A bare space is NOT a separator: "7 rings",
+# "99 Luftballons" and "21 Guns" are titles, and reading them as tracks 7, 99
+# and 21 (which this did whenever TRACKNUMBER was empty) put them in the wrong
+# place in every album and gutter. The cost is that "01 Title" — digits, a
+# space, the title — reads as unnumbered too; the caller then substitutes the
+# enumeration position, which for a tree numbered that way IS the number. The
+# device agrees: track_display() in core/library/names.c strips only an "NN."
+# prefix. "D-NN" is the flattened multi-disc convention ("2-05 Title") and
+# yields both numbers.
 _LEAD_DISC_TRACK = re.compile(r"\s*(\d{1,2})-(\d{1,3})(?=[\s._-])")
-_LEAD_TRACK = re.compile(r"\s*(\d{1,3})(?=[\s._-]+\S)")
+_LEAD_TRACK = re.compile(r"\s*(\d{1,3})\s*[._-]\s*(?=\S)")
 
 
 def lead_track(stem, artist=None):

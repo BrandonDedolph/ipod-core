@@ -72,6 +72,8 @@ TAGS = {
     "1999.flac":    ("1999",    0, 0),
     # The flattened multi-disc filename convention, no tags.
     "2-03 Whatever.flac": ("Whatever", 0, 0),
+    # A title that STARTS with a number and a space, no track tag: not 99.
+    "99 Luftballons.flac": ("99 Luftballons", 0, 0),
     # An "Artist - Title" name where the artist starts with digits.
     "50 Cent - In Da Club.flac": ("In Da Club", 0, 0),
     # A flat album whose discs are only in the tags.
@@ -86,7 +88,8 @@ TAGS = {
 # assertions below look records up by the destination form.
 TREE = {
     "Album One - Artist A": ["Alpha.flac", "Bravo.flac", "Charlie.flac"],
-    "Numbers - Prince":     ["1999.flac", "2-03 Whatever.flac"],
+    "Numbers - Prince":     ["1999.flac", "2-03 Whatever.flac",
+                             "99 Luftballons.flac"],
     "Get Rich - 50 Cent":   ["50 Cent - In Da Club.flac"],
     "Double - Band":        ["A.flac", "B.flac", "C.flac", "D.flac"],
     "Boxed - Band/Disc 1":  ["x.flac"],
@@ -137,8 +140,23 @@ def main():
     # ---- 1. the leading-number reader, in isolation ------------------------
     lt = bi.lead_track
     check("lead_track: '01. Title' is track 1", lt("01. Title") == (0, 1))
-    check("lead_track: '12 Title' is track 12", lt("12 Title") == (0, 12))
     check("lead_track: '01 - Title' is track 1", lt("01 - Title") == (0, 1))
+    check("lead_track: '01_Title' is track 1", lt("01_Title") == (0, 1))
+    check("lead_track: '01-Title' is track 1", lt("01-Title") == (0, 1))
+    # A bare space is not a separator. These are titles; with TRACKNUMBER
+    # empty they used to become tracks 7, 99 and 21, and "12 Title" used to
+    # be the assertion that made that so. The device's track_display() only
+    # strips an "NN." prefix, and the tool now draws the line in the same
+    # place: an "NN Title" file is unnumbered and takes its position.
+    check("lead_track: '7 rings' is not a track number", lt("7 rings") == (0, 0))
+    check("lead_track: '99 Luftballons' is not a track number",
+          lt("99 Luftballons") == (0, 0))
+    check("lead_track: '21 Guns' is not a track number", lt("21 Guns") == (0, 0))
+    check("lead_track: '12 Title' is not a track number", lt("12 Title") == (0, 0))
+    check("lead_track: '07. 7 rings' is track 7", lt("07. 7 rings") == (0, 7))
+    check("lead_track: '07 - 7 rings' is track 7", lt("07 - 7 rings") == (0, 7))
+    check("lead_track: '7.' with nothing after it is not a track number",
+          lt("7.") == (0, 0))
     check("lead_track: '1-01 Title' is disc 1 track 1", lt("1-01 Title") == (1, 1))
     check("lead_track: '1999' is not a track number", lt("1999") == (0, 0))
     check("lead_track: '1999 - Title' is not a track number",
@@ -148,8 +166,16 @@ def main():
     check("lead_track: a bare number is not a track number", lt("7") == (0, 0))
     check("lead_track: the album's own artist is not a track number",
           lt("50 Cent - In Da Club", "50 Cent") == (0, 0))
-    check("lead_track: ...but a different leading number still is",
-          lt("50 Cent - In Da Club", "Eminem") == (0, 50))
+    # "50 Cent" has no separator after the digits, so under a different
+    # artist it is STILL not a track number (it used to be track 50, which
+    # was the whole reason the artist rule had to exist). With a real
+    # separator the artist rule is what decides.
+    check("lead_track: ...and neither is it under a different artist",
+          lt("50 Cent - In Da Club", "Eminem") == (0, 0))
+    check("lead_track: '50 - In Da Club' under a different artist is track 50",
+          lt("50 - In Da Club", "Eminem") == (0, 50))
+    check("lead_track: '50 - In Da Club' under the artist '50' is not",
+          lt("50 - In Da Club", "50") == (0, 0))
     check("track_number: the tag beats the filename",
           bi.track_number("03. Foo", 7, 0, 0) == (1, 7))
     check("track_number: a Disc folder beats the disc tag",
@@ -233,6 +259,8 @@ def main():
           nums["1999"]["track"] == 1)
     check("'2-03 Whatever' is disc 2 track 3",
           (nums["Whatever"]["disc"], nums["Whatever"]["track"]) == (2, 3))
+    check("'99 Luftballons' with no track tag is track 3 (its position), not 99",
+          nums["99 Luftballons"]["track"] == 3)
     cent = by_folder(recs, "50 Cent - Get Rich")[0]
     check("'50 Cent - In Da Club' is not track 50", cent["track"] == 1)
 
