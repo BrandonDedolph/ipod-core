@@ -45,6 +45,7 @@
 #include "../library/idx.h"
 #include "../library/sort.h"
 #include "../ui/wheel.h"
+#include "../ui/keyhold.h"
 #include "hw/volume.h"
 
 /*
@@ -589,6 +590,8 @@ static int      g_scrub_dirty;       /* target moved since the last commit     *
 
 /* SELECT press-length arbitration on Now Playing: tap = scrubber, hold = queue. */
 #define SEL_HOLD_US 450000u
+/* PLAY held this long sleeps the device; released sooner, it is play/pause. */
+#define PLAY_HOLD_US 2000000u
 
 static uint32_t g_sel_down_us;
 static int      g_sel_pending;
@@ -4275,8 +4278,8 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      lock_flashing = 0;          /* a lock/unlock plate is on screen     */
     char     az_prev = 0;                /* A-Z locator letter on screen         */
     int      toast_prev = 0;             /* low-battery toast on screen          */
-    int      play_held = 0;              /* PLAY currently down (long-press off)  */
-    uint32_t play_down_us = 0;           /* when PLAY went down                   */
+    keyhold_t play_key;                  /* PLAY: tap = pause, hold = sleep       */
+    keyhold_reset(&play_key);
     g_locked = hold_prev;
 
     /* Backlight inactivity: full -> dim -> off. Any input wakes to full; a press
@@ -4449,25 +4452,42 @@ _Noreturn static void run_ui(fat32_t *fs)
             dirty = 1;
         }
 
-        /* Long-press PLAY (~2s) sleeps the device (suspend: drive spun down,
-         * screen dark, but CPU+RAM alive so wake is INSTANT and skips ipl2).
-         * Holding on to ~5s escalates to a true PMU power-down. LIVE button
-         * state tracks a continuous hold; a short PLAY tap is play/pause.
-         * Locked out while the hold switch is on. */
-        if (!g_locked && (clickwheel_buttons() & WHEEL_BTN_PLAY)) {
+        /*
+         * PLAY press-length arbitration: a tap toggles pause, a hold of
+         * PLAY_HOLD_US sleeps the device (suspend: drive spun down, screen
+         * dark, but CPU+RAM alive so wake is INSTANT). Holding on to ~5 s
+         * escalates to a true PMU power-down. Decided from LIVE button state
+         * once per pass, by the same rule SELECT uses on Now Playing: the
+         * down-edge decides nothing, the release before the threshold is the
+         * tap, the first pass at the threshold is the hold. The pause toggle
+         * used to fire on the down-edge EVENT regardless, so hold-to-sleep
+         * paused first (and wake did not resume) and hold-while-paused played
+         * for two seconds before sleeping. Locked out while the hold switch is
+         * on; a press that woke the backlight or dismissed a modal has its tap
+         * swallowed below (keyhold_swallow_tap) but can still hold.
+         */
+        {
             uint32_t nowp = mmio_read32(USEC_TIMER_ADDR);
-            if (!play_held) {
-                play_held = 1;
-                play_down_us = nowp;
-            } else if ((uint32_t)(nowp - play_down_us) > 2000000u) {
-                suspend_to_ram(play_down_us);   /* returns on wake */
-                play_held  = 0;
+            int      down = !g_locked &&
+                            (clickwheel_buttons() & WHEEL_BTN_PLAY) != 0;
+            switch (keyhold_feed(&play_key, down, nowp, PLAY_HOLD_US)) {
+            case KEYHOLD_TAP:
+                /* Transport: PLAY toggles pause from any screen, like a real
+                 * iPod (RIGHT/LEFT skip in the event block below). */
+                if (player_active()) {
+                    player_toggle_pause();
+                    dirty = 1;
+                }
+                break;
+            case KEYHOLD_HOLD:
+                suspend_to_ram(keyhold_down_us(&play_key));  /* returns on wake */
                 last_input = mmio_read32(USEC_TIMER_ADDR);
                 bl_state   = BL_FULL;           /* backlight restored on resume */
                 dirty      = 1;                 /* repaint the current screen */
+                break;
+            case KEYHOLD_NONE:
+                break;
             }
-        } else {
-            play_held = 0;
         }
 
         /* Hold-switch edge (a cheap GPIO read, independent of the wheel block
@@ -4477,6 +4497,7 @@ _Noreturn static void run_ui(fat32_t *fs)
         if (held != hold_prev) {
             hold_prev = held;
             g_locked  = held;
+            keyhold_reset(&play_key);     /* a press under the switch is void */
             /* Force the plate to REPAINT for the new state. Without this, a second
              * edge (e.g. on->off within the 1 s window) leaves lock_flashing set
              * from the first edge, so the render guard (!lock_flashing) suppresses
@@ -4509,6 +4530,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                 if (was_off) {                /* swallow the wake press */
                     ev.buttons = 0;
                     ev.wheel_delta = 0;
+                    keyhold_swallow_tap(&play_key);   /* ...its release too */
                 }
             }
             /* Menu click on a button press (one per down-edge; not on the
@@ -4524,21 +4546,23 @@ _Noreturn static void run_ui(fat32_t *fs)
              * trying to get the modal off the screen for. Same swallow pattern as
              * the backlight wake above. */
             /* Any input dismisses a live toast (not consumed — the press was
-             * meant for whatever is underneath) and marks the modal seen. */
-            battwarn_input(mmio_read32(USEC_TIMER_ADDR));
+             * meant for whatever is underneath) and marks the modal seen.
+             * Not for a swallowed wake press: that one only lit the screen,
+             * and it must not also count as "the user has seen the warning". */
+            if (ev.buttons || ev.wheel_delta) {
+                battwarn_input(mmio_read32(USEC_TIMER_ADDR));
+            }
             if ((scr_cur() == SCR_CHARGING || scr_cur() == SCR_BATTERY) &&
                 ev.buttons) {
                 scr_pop();
                 dirty = 1;
                 ev.buttons     = 0;
                 ev.wheel_delta = 0;
+                keyhold_swallow_tap(&play_key);   /* PLAY's release too */
             }
             /* Transport buttons are global (work from any screen while playing),
-             * like a real iPod: PLAY toggles pause, RIGHT/LEFT skip track. */
-            if ((ev.buttons & WHEEL_BTN_PLAY) && player_active()) {
-                player_toggle_pause();
-                dirty = 1;
-            }
+             * like a real iPod: RIGHT/LEFT skip track. PLAY is decided by press
+             * length in the keyhold block above, not here at the down-edge. */
             if ((ev.buttons & WHEEL_BTN_RIGHT) && player_active()) {
                 player_next();
                 hal_volume_set(g_volume);         /* re-apply over codec re-init */

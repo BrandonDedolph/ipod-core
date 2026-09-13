@@ -234,6 +234,16 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Tap-vs-hold press-length arbitration (ours): the machine that decides
+  # whether PLAY was tapped (pause) or held (sleep), fed live button state
+  # once per main-loop pass. Extracted from kernel/main.c so the host can
+  # test it; same keyhold.c the host keyhold_test compiles.
+  keyhold_hw_lib = static_library(
+    'core_keyhold_hw',
+    sources: ['ui/keyhold.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Music-library model (ours; library/, not to be confused with lib/, the
   # freestanding libc). names.c is the name handling the library is built on:
   # the folded locator hash that binds a CORELIB.IDX record to its file, the
@@ -320,7 +330,7 @@ if target == 'hw'
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, keyhold_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),
