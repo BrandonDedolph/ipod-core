@@ -1861,24 +1861,50 @@ int player_seek_to(uint32_t sec)
 
     uint32_t rate   = g_dec.sample_rate ? g_dec.sample_rate : 44100u;
     uint64_t target = (uint64_t)sec * rate;
-    if (g_dec.total_frames > 0 && target >= g_dec.total_frames) {
-        target = g_dec.total_frames - 1;
+    uint64_t limit  = g_dec.total_frames;
+    if (limit == 0 && g_queue[g_queue_idx].fmt == 1) {
+        /*
+         * An MP3 of unknown length (no Xing/Info tag and the open-time frame
+         * count failed) had no clamp at all: a scrub past the end sent
+         * dr_mp3 brute-forcing through the whole file, only to fail at EOF.
+         * The file size still bounds it — MPEG audio is never below 8 kbps,
+         * so a file of N bytes cannot hold more than N/1000 seconds. Coarse,
+         * but it is a true upper bound, and a seek clamped to it that still
+         * overshoots is caught by the restart below instead of running wild.
+         */
+        limit = (uint64_t)(g_queue[g_queue_idx].size / 1000u) * rate;
+    }
+    if (limit > 0 && target >= limit) {
+        target = limit - 1;
         sec    = (uint32_t)(target / rate);
     }
 
     if (g_dec.ops->seek(&g_dec, target) != DECODER_OK) {
-        if (reopened) {
-            /* We already tore the stream down to reopen it; the buffered PCM
-             * is from a decoder that no longer exists. Restart from the top of
-             * the track rather than resuming into it. */
-            hal_audio_flush();
-            pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
-            g_written  = 0;
-            g_boundary = 0;
-            g_eos      = 0;
-            decode_pump_upto(SEEK_PRIME_FRAMES);
-            clock_anchor(0);
+        /*
+         * A failed seek is not a no-op. dr_flac's binary search and dr_mp3's
+         * brute-force scan both move the byte cursor as they go, so on
+         * failure the decoder is sitting at some unrelated point in the
+         * stream — and the old resume-as-we-were path simply restarted the
+         * DAC into it: the ring's tail of the OLD position, then whatever the
+         * decoder produced from wherever it had got to. The only position
+         * we can vouch for is the top of the track: put the decoder there
+         * (re-seek to 0, or reopen when even that fails), and restart from
+         * it as the reopened branch already did.
+         */
+        if (g_dec.ops->seek(&g_dec, 0) != DECODER_OK &&
+            seek_reopen_current() != 0) {
+            hal_audio_flush();           /* nothing left to resume into */
+            return -1;
         }
+        hal_audio_flush();
+        pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
+        g_written        = 0;
+        g_boundary       = 0;
+        g_eos            = 0;
+        g_prefetch_tried = 0;
+        decode_pump_upto(SEEK_PRIME_FRAMES);
+        clock_anchor(0);
+        g_pl_low_fill = RING_FRAMES;
         if (!was_paused) {
             hal_audio_start();
         }

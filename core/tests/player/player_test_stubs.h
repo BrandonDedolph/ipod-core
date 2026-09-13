@@ -33,6 +33,18 @@ int stub_drain(int frames);
 uint32_t stub_last_open_clus(void);
 
 /*
+ * Seek control. stub_set_seek_ok(0) makes every seek fail (a codec that
+ * cannot seek at all); stub_set_seek_max(n) fails only targets past frame n
+ * (a seek that overshoots the stream — the top of the track is still
+ * reachable). stub_last_seek_frame is the target the decoder last received,
+ * so a clamp applied by the player is visible. stub_set_total_unknown(1)
+ * makes the next open report total_frames == 0, the "length unknown" case.
+ */
+void stub_set_seek_max(uint64_t max_frame);
+void stub_set_total_unknown(int unknown);
+extern uint64_t stub_last_seek_frame;
+
+/*
  * The drive's read path. player_disk_read() retries a failed sector read six
  * times — unless the pump has armed its one-shot spin-up probe, in which case
  * it tries once. That flag is private to player.c, but it is observable here:

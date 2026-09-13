@@ -1000,16 +1000,79 @@ int main(void)
     xpect(&c, "seek moves the elapsed clock to the target",
           player_elapsed_s() == 3u);
 
-    /* A seek the decoder refuses must leave playback exactly as it was, not
-     * stopped and not silently repositioned. */
+    /* A seek the decoder refuses must not stop playback — but it cannot
+     * "leave it as it was" either: the codec's seek moves the byte cursor as
+     * it searches, so after a failure the decoder is somewhere unknown. The
+     * old path restarted the DAC into that: the ring's tail of the old spot,
+     * then whatever the decoder found. The one position that can be vouched
+     * for is the top of the track, so a failed seek restarts there, with the
+     * stale PCM flushed, and reports the failure. */
     stub_reset();
     player_play_queue(ents, 4, 0, 0, 0);
-    set_usec(0);
-    stub_set_seek_ok(0);
+    set_usec(10000000u);
+    stub_set_seek_ok(0);                   /* every seek fails, even to 0 */
+    int opens_before_refusal = stub_opens;
     xpect(&c, "a refused seek reports failure", player_seek_to(3u) == -1);
     xpect(&c, "a refused seek leaves the DAC running", stub_audio_running == 1);
     xpect(&c, "a refused seek leaves the track playing", player_active() == 1);
+    xpect(&c, "a codec that cannot even reach frame 0 is reopened",
+          stub_opens == opens_before_refusal + 1);
+    xpect(&c, "a refused seek flushes the PCM of the position it left",
+          stub_audio_flushes >= 1 && stub_audio_primed == 0);
+    xpect(&c, "a refused seek restarts the clock at 0:00, not somewhere unknown",
+          player_elapsed_s() == 0u);
+    xpect(&c, "a refused seek leaves audio in the ring to play",
+          stub_drain(1024) == 1024);
     stub_set_seek_ok(1);
+
+    /* The same, for a seek that overshoots while the top of the track is
+     * still reachable: no reopen, a re-seek to 0. The fake decoder models the
+     * cursor motion by ending the stream on a failed seek, so resuming into
+     * it (the old behaviour) would leave nothing to play. */
+    stub_reset();
+    stub_set_track_frames(44100u * 10u);
+    player_play_queue(ents, 4, 0, 0, 0);
+    set_usec(10000000u);
+    stub_set_seek_max(44100u * 5u);        /* targets past 5 s fail */
+    int opens_before_overshoot = stub_opens;
+    xpect(&c, "an overshooting seek reports failure", player_seek_to(8u) == -1);
+    xpect(&c, "an overshooting seek re-seeks the live decoder to 0 rather "
+              "than reopening", stub_opens == opens_before_overshoot &&
+          stub_last_seek_frame == 0u);
+    xpect(&c, "an overshooting seek restarts from the top: DAC running, "
+              "clock at 0:00", stub_audio_running == 1 &&
+          player_elapsed_s() == 0u);
+    xpect(&c, "an overshooting seek leaves audio in the ring to play",
+          stub_drain(1024) == 1024);
+    /* ...and a subsequent good seek still works on the same decoder. */
+    xpect(&c, "a later in-range seek on the same track succeeds",
+          player_seek_to(4u) == 0 && player_elapsed_s() == 4u);
+    stub_set_seek_max(~(uint64_t)0);
+
+    /* An MP3 whose length is unknown had no clamp at all: a scrub past the
+     * end sent the decoder scanning to EOF. The file size still bounds it —
+     * MPEG audio is never below 8 kbps — so the target is clamped to what
+     * the file could possibly hold. */
+    stub_reset();
+    stub_set_track_frames(44100u * 7200u);
+    stub_set_total_unknown(1);
+    make_entries(ents, 1, 0);
+    ents[0].fmt  = 1;                      /* MP3 */
+    ents[0].size = 1024u * 1024u;          /* 1 MiB: at most 1048 s */
+    player_play_queue(ents, 1, 0, 0, 0);
+    set_usec(0);
+    xpect(&c, "unknown length: the player reports no total",
+          player_total_s() == 0u);
+    xpect(&c, "unknown-length MP3: a seek far past what the file could hold "
+              "succeeds, clamped", player_seek_to(5000u) == 0);
+    xpect(&c, "unknown-length MP3: the decoder was asked for the last frame "
+              "the file could possibly hold",
+          stub_last_seek_frame == (uint64_t)(1048576u / 1000u) * 44100u - 1u);
+    xpect(&c, "unknown-length MP3: the clock reads the clamped position",
+          player_elapsed_s() == 1047u);
+    stub_set_total_unknown(0);
+    stub_set_track_frames(44100u * 10u);   /* back to this section's 10 s track */
+    make_entries(ents, 4, 0);
 
     /* Seeking while PAUSED must not start the DAC — and must not corrupt the
      * resume position, which is what hal_audio_stop's unguarded recompute did
