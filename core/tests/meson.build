@@ -747,6 +747,22 @@ if target == 'sim'
   )
   test('names', names_test, suite: 'unit')
 
+  # playlist: the Playlists read path (core/library/playlist.c) — the SAME
+  # source the ARM build links. Lists <library root>/Playlists/*.m3u8 and
+  # resolves one into playable rows over the real fs/m3u.c + fs/fat32.c, on
+  # a hand-built in-RAM volume with VFAT long names: every entry shape a
+  # desktop tool writes, every way an entry fails (missing, a folder, not
+  # audio, a read error) as a COUNT, the row and playlist caps reported, and
+  # an unreadable playlist file as the one hard error.
+  playlist_test = executable(
+    'playlist_test',
+    sources: ['library/playlist_test.c', '../library/playlist.c',
+              '../library/names.c', '../fs/m3u.c', '../fs/fat32.c'],
+    include_directories: include_directories('.'),
+    override_options: test_opts,
+  )
+  test('playlist', playlist_test, suite: 'unit')
+
   # name-hash: the library locator hash. It exists twice — in
   # library/names.c (device) and in tools/build_index.py (host) — and it is
   # the ONLY thing binding a CORELIB.IDX record to its file on disk. If the
