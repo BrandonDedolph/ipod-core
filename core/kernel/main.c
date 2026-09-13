@@ -409,8 +409,11 @@ static int         g_lib_truncated;
  *                     to retry; the fix is re-running the host importer. UI:
  *                     "index out of date, N tracks skipped".
  *   g_lib_load_err    nonzero (a FAT32_* code) when the library ROOT itself
- *                     could not be enumerated, so there is no library at all
- *                     this session. The counts above are then meaningless
+ *                     could not be enumerated, or CORELIB.IDX could not be
+ *                     READ (a disk error mid-stream, after the retries — as
+ *                     opposed to an index that is corrupt, which falls back
+ *                     to the scan), so there is no library at all this
+ *                     session. The counts above are then meaningless
  *                     (0 songs). UI: a "could not read the disk" screen in
  *                     place of an empty Music menu; to retry, clear
  *                     g_lib_scanned and call library_ensure again.
@@ -2095,9 +2098,38 @@ static int library_load_index(fat32_t *fs)
         uint32_t batch = count - n;
         if (batch > 64) batch = 64;
         int32_t got = fat32_stream_read(&st, idxbuf, batch * 256u);
-        if (got <= 0) break;
-        uint32_t recs = (uint32_t)got / 256u;
-        if (recs == 0) break;
+        /*
+         * A failed read is NOT the end of the index. `if (got <= 0) break;`
+         * used to stand here, so an EIO or ECORRUPT mid-file ended the loop
+         * quietly: n < count then flagged the library "too large", the CRC
+         * was skipped (it only runs when every record streamed past), and
+         * library_finish ran on the partial set — half the library missing,
+         * no scan fallback, no retry, and About blaming the caps for it.
+         *
+         * EIO is the drive, not the file: retried on the load's budget
+         * (fat32_stream_read leaves the cursor untouched on an error, so the
+         * same call is simply repeated), and if it still fails the load is
+         * refused with g_lib_load_err set — "could not read the disk", no
+         * scan fallback against a disk that just failed, and a deliberate
+         * retry clears g_lib_scanned. Anything else — ECORRUPT, or a read
+         * that came up short of the batch the header's size promised — is
+         * the FILE: rejected like a CRC mismatch, so the tag scan takes over.
+         */
+        for (int attempt = 0;
+             got == FAT32_EIO && attempt < LIB_READDIR_RETRIES && g_lib_retry_budget > 0;
+             attempt++) {
+            g_lib_retry_budget--;
+            sleep_ms(LIB_READDIR_RETRY_MS);
+            got = fat32_stream_read(&st, idxbuf, batch * 256u);
+        }
+        if (got == FAT32_EIO) {
+            g_lib_load_err = FAT32_EIO;
+            return idx_reject(IDX_EREAD);
+        }
+        if (got < 0 || (uint32_t)got < batch * 256u) {
+            return idx_reject(IDX_EREAD);
+        }
+        uint32_t recs = batch;
         if (h.has_crc) crc = crc32_update(crc, idxbuf, recs * 256u);
         for (uint32_t k = 0; k < recs && g_songs_n < LIB_MAX_SONGS; k++) {
             const uint8_t *r = idxbuf + k * 256u;
@@ -2146,7 +2178,8 @@ static int library_load_index(fat32_t *fs)
         load_bar("Loading Library",            /* first ~75% = reading the index */
                  count ? (int)(n * 75u / count) : 0);
     }
-    if (n < count) g_lib_truncated = 1;    /* ran out of song slots (or of index) */
+    if (n < count) g_lib_truncated = 1;    /* ran out of song slots: the only
+                                            * way out of the loop early now  */
     /* The CRC is over ALL the records, so it can only be checked when all of
      * them streamed past. A load cut short by LIB_MAX_SONGS has not read them
      * all — it is already flagged truncated, and the host refuses to write an
