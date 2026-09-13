@@ -19,8 +19,8 @@ core/
 │   ├── hw/      ARM drivers: lcd, ata, i2c, i2s, wm8758, dma, audio,
 │   │            clickwheel, backlight, battery, power, volume, piezo, uart
 │   └── sim/     host backend (SDL2)
-├── fs/          from-scratch read-only FAT32 reader (LFN → UTF-8), plus an
-│                M3U8 playlist reader (parse-only — see "Playlists")
+├── fs/          from-scratch read-only FAT32 reader (LFN → UTF-8) with a
+│                bounded path walk, plus an M3U8 playlist reader
 ├── lib/         freestanding mem.c (memcpy/memset)
 ├── codecs/      dr_flac + dr_mp3 (freestanding), static arena, read-ahead
 │                disk source, FLAC metadata reader, unified decoder ABI
@@ -160,13 +160,27 @@ fields plus a normalized-name hash that binds each record to its file on
 disk independent of quote/case style. If the index is absent the firmware
 falls back to a per-file tag scan.
 
-## Playlists — parser only
+## Playlists — read only
 
-`fs/m3u.c` reads M3U8 playlists and is unit-tested against the malformed
-files real libraries contain. It is **wired to nothing**: no menu reaches
-it, so playlists are not a user-visible feature yet. Playlist *writing* does
-not exist and cannot until the FAT driver can allocate clusters, which it
-cannot — it is read-only by design today.
+Put `.m3u8` (or `.m3u`) files in `Music/Playlists/` — `Playlists/` at the
+volume root on a disk with no `Music/` folder. Entries may be absolute from
+the volume root (`/Music/Artist - Album/01 Song.flac`) or relative to that
+folder (`../Artist - Album/01 Song.flac`); `\` separators and a drive
+letter are tolerated. Music → Playlists lists them by filename (extension
+trimmed), A–Z, re-read on every entry; open one for its tracklist, SELECT
+plays the whole playlist from that row; a playlist queue resumes at boot.
+
+`fs/m3u.c` parses (unit-tested against the malformed files real libraries
+contain), `fat32_resolve_path()` walks each entry to its directory entry,
+and `library/playlist.c` turns the result into rows named and located
+exactly as an album's tracklist rows are, so they bind to the same index
+records. Entries that are missing, not audio, or unreadable are skipped and
+counted, never fatal. Caps: 64 playlists, 128 tracks per playlist — the
+first that many, with the overflow reported. Host-tested end to end on an
+in-RAM volume (`tests/library/playlist_test.c`); **not yet flashed**.
+
+Playlist *writing* does not exist and cannot until the FAT driver can
+allocate clusters, which it cannot — it is read-only by design today.
 
 ## Status
 

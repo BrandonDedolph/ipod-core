@@ -82,8 +82,8 @@ See the [**Screens**](#screens) gallery below for a full tour.
   the six faces ships its own kerning table (1,700–3,700 pairs) and its own
   tracking value, solved from measured ink-to-ink spacing rather than
   guessed.
-- **A real library UI.** Browse by Artists / Albums / Songs / Genres —
-  plus an artist's whole discography as one **All Songs** list — off a
+- **A real library UI.** Browse by Playlists / Artists / Albums / Songs /
+  Genres — plus an artist's whole discography as one **All Songs** list — off a
   host-built index (`CORELIB.IDX`) that loads in one read and holds up to
   6000 songs / 1024 albums / 512 artists / 128 genres in full UTF-8. Album-
   art chips, a 120×120 now-playing cover, a scrolling marquee for long
@@ -290,13 +290,15 @@ browser and Now Playing screens render on device via the freestanding text
 renderer. There is no serial cable in the loop — on-device state is
 confirmed through an on-screen framebuffer console and the Boot Details page.
 
-Not there yet, and honestly labelled: **Playlists** — the M3U8 reader is
-merged and unit-tested but wired to nothing, and writing playlists needs
-FAT32 cluster allocation, which doesn't exist. **Search**, **Podcasts /
-Audiobooks / Composers**, and codecs beyond FLAC are all unimplemented.
-Panel sleep at idle is written but switched off (it wedged the LCD white).
-Library sync is manual: build the index and convert art on the host, then
-copy.
+**Playlists** read from disk: drop `.m3u8` files into `Music/Playlists/`
+(paths absolute from the volume root or relative to that folder) and they
+appear under Music → Playlists — written on the host, merged, host-tested
+end to end, **not yet flashed**. Not there yet, and honestly labelled:
+**writing** playlists needs FAT32 cluster allocation, which doesn't exist.
+**Search**, **Podcasts / Audiobooks / Composers**, and codecs beyond FLAC
+are all unimplemented. Panel sleep at idle is written but switched off (it
+wedged the LCD white). Library sync is manual: build the index and convert
+art on the host, then copy.
 
 Not yet verified on the device: gapless hand-over, the 500 mA charge-current
 change (needs an inline USB current meter), and seek performance outside the
@@ -418,7 +420,7 @@ core/                     bare-metal firmware + host test build
 │   │                     click-wheel, backlight, battery, power, piezo, UART
 │   └── sim/              host HAL backend (SDL2)
 ├── fs/                   from-scratch read-only FAT32 reader (LFN → UTF-8)
-│                         + an M3U8 playlist reader (parse-only, not yet wired)
+│                         + an M3U8 playlist reader and a bounded path walk
 ├── lib/                  freestanding mem.c (memcpy/memset)
 ├── codecs/               dr_flac + dr_mp3 (freestanding), static arena,
 │                         read-ahead disk source, FLAC metadata reader
