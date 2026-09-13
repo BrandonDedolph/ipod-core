@@ -595,8 +595,25 @@ static int            g_pl_paused;         /* DMA suspended, position held      
  * every pass, and so resume knows whether a wake is owed.
  */
 static int            g_pl_codec_cold;
-static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start    */
-static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (freezes clock) */
+/*
+ * The elapsed clock. USEC_TIMER is a free-running 32-bit 1 MHz counter, so it
+ * wraps every 4294.97 s (71:35) — shorter than a podcast or a DJ mix. The
+ * clock used to be (now - track_start) in 32-bit microseconds, which snapped
+ * a two-hour track back to 0:00 at 1:11:35, saved a wrong resume position
+ * from then on, and made a scrub to 1:30:00 land at 18:25 because the seek
+ * anchor computed now - sec*1000000 in the same width.
+ *
+ * Instead: running time is FOLDED into a 64-bit accumulator, once per pump
+ * pass, as the 32-bit difference since the last fold. No single difference
+ * ever spans more than one pass (the pump runs hundreds of times a second
+ * while playing), so the wrap is never crossed inside one. A read between
+ * passes adds the same difference without storing it. Pause stops the
+ * folding (after one last fold), resume restarts the stamp, and a seek or a
+ * hand-over sets the accumulator outright.
+ */
+static uint64_t       g_pl_elapsed_us;    /* running time folded so far           */
+static uint32_t       g_pl_last_us;       /* USEC_TIMER at the last fold          */
+static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (codec timer)  */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
 static int            g_shuffle;          /* walk g_order instead of the queue     */
@@ -936,6 +953,23 @@ static uint32_t track_total_s(const decoder_t *d)
     return (d->total_frames > 0) ? (uint32_t)(d->total_frames / rate) : 0;
 }
 
+/* Fold the running time since the last fold into the elapsed clock. Only
+ * meaningful while playing: paused time must not be counted, and the caller
+ * gates on that. See g_pl_elapsed_us. */
+static void clock_fold(void)
+{
+    uint32_t now = mmio_read32(USEC_TIMER_ADDR);
+    g_pl_elapsed_us += (uint32_t)(now - g_pl_last_us);
+    g_pl_last_us     = now;
+}
+
+/* Set the elapsed clock to `us` as of NOW: track start, hand-over, seek. */
+static void clock_set_us(uint64_t us)
+{
+    g_pl_elapsed_us = us;
+    g_pl_last_us    = mmio_read32(USEC_TIMER_ADDR);
+}
+
 /*
  * Bring the DAC up at `rate` and start pulling from the ring.
  *
@@ -1027,7 +1061,7 @@ static int player_open_current(void)
         g_last_err = PLAYER_ERR_RATE;
         return -1;
     }
-    g_pl_start_us = mmio_read32(USEC_TIMER_ADDR);
+    clock_set_us(0);
     g_pl_low_fill = RING_FRAMES;
     g_pl_active   = 1;
     g_pl_paused   = 0;
@@ -1070,25 +1104,25 @@ void player_pause(void)
         return;
     }
     hal_audio_stop();
+    clock_fold();                        /* count up to this instant, no further */
     g_pl_pause_us = mmio_read32(USEC_TIMER_ADDR);
     g_pl_paused   = 1;
 }
 
-/* Resume from pause: shift the track start forward by the paused duration so the
- * elapsed clock is continuous, then restart the DAC (re-primes from the ring).
+/* Resume from pause: restart the elapsed clock's fold stamp at NOW, so the
+ * paused stretch is never counted, then restart the DAC (re-primes from the
+ * ring).
  *
  * If the pause lasted long enough for the pump to power the codec down, wake
  * it first — the HAL's buffers and offset are intact underneath, so the
- * hal_audio_start that follows is the same seamless resume either way. The
- * clock shift is unaffected: it is computed from the pause timestamp, which
- * the power-down never touches. */
+ * hal_audio_start that follows is the same seamless resume either way. */
 void player_resume(void)
 {
     if (!g_pl_active || !g_pl_paused) {
         return;
     }
-    g_pl_start_us += mmio_read32(USEC_TIMER_ADDR) - g_pl_pause_us;
-    g_pl_paused    = 0;
+    g_pl_last_us = mmio_read32(USEC_TIMER_ADDR);
+    g_pl_paused  = 0;
     if (g_pl_codec_cold) {
         codec_wake();
     }
@@ -1257,7 +1291,7 @@ static void pending_commit(void)
             return;
         }
     }
-    g_pl_start_us = mmio_read32(USEC_TIMER_ADDR) - over_us;
+    clock_set_us(over_us);
     g_pl_low_fill = RING_FRAMES;
     g_last_err    = PLAYER_OK;
     g_open_seq++;
@@ -1416,6 +1450,10 @@ void player_pump(void)
         }
         return;
     }
+
+    /* Once per pass, while playing: this is what keeps every 32-bit timer
+     * difference in the elapsed clock shorter than the timer's wrap. */
+    clock_fold();
 
     uint32_t fill = pcm_ring_fill(&g_ring);
 
@@ -1578,8 +1616,13 @@ uint32_t player_elapsed_s(void)
     if (!g_pl_active) {
         return 0;
     }
-    uint32_t nowu = g_pl_paused ? g_pl_pause_us : mmio_read32(USEC_TIMER_ADDR);
-    return (nowu - g_pl_start_us) / 1000000u;
+    uint64_t us = g_pl_elapsed_us;
+    if (!g_pl_paused) {
+        /* Time since the last fold — under one pump pass, so far below the
+         * timer's wrap. Not stored: reads are free to happen at any rate. */
+        us += (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - g_pl_last_us);
+    }
+    return (uint32_t)(us / 1000000u);
 }
 
 uint32_t player_total_s(void) { return g_pl_active ? g_pl_total_s : 0u; }
@@ -1731,23 +1774,18 @@ void player_prev(void)
 /*
  * Re-anchor the elapsed clock so it reads `sec` NOW.
  *
- * While paused the clock is (g_pl_pause_us - g_pl_start_us), and resume adds
- * (now - g_pl_pause_us) onto the start. A paused seek used to move only the
- * start, leaving the pause stamp where the pause began — so the frozen clock
- * read `sec` minus however long the listener had already been paused, and
- * resuming then added that same paused stretch back on top, landing the
- * clock short of the target by the length of the pause. Invisible when the
- * seek lands in the same instant as the pause (which is all the earlier test
- * exercised); a scrub a minute into a pause was wrong by a minute. Moving the
- * pause stamp with the start keeps both identities true.
+ * The accumulator is set outright, in 64 bits: `sec * 1000000` overflowed
+ * the old 32-bit `now - sec*1000000u` anchor for any target past 71:35, so a
+ * scrub to 1:30:00 came back reading 18:25. Paused or not makes no
+ * difference here — the fold stamp restarts at NOW either way, and while
+ * paused nothing folds, so the frozen clock reads exactly `sec` and resume
+ * carries on from it. (An older shape of this clock also had to move the
+ * pause stamp to keep a paused seek honest; the stamp now only times the
+ * codec power-down, which a seek has no reason to restart.)
  */
 static void clock_anchor(uint32_t sec)
 {
-    uint32_t now = mmio_read32(USEC_TIMER_ADDR);
-    g_pl_start_us = now - sec * 1000000u;
-    if (g_pl_paused) {
-        g_pl_pause_us = now;
-    }
+    clock_set_us((uint64_t)sec * 1000000u);
 }
 
 /*

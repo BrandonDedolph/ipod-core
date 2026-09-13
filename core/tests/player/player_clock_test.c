@@ -230,5 +230,73 @@ int main(void)
     xpect(&c, "ration: one pass restores the line, not one step",
           drain_all() == HAL_INFLIGHT_FRAMES);
 
+    /* ---- 5. the clock survives the microsecond timer wrapping ------------ *
+     * USEC_TIMER is a free-running 32-bit 1 MHz counter: it wraps every
+     * 4294.97 s (71:35). The elapsed clock used to be (now - start) in 32-bit
+     * microseconds, so a two-hour podcast snapped back to 0:00 at 1:11:35 —
+     * and the seek anchor computed now - sec*1e6 in the same width, so a
+     * scrub to 1:30:00 (5400e6 us, itself past 2^32) landed at 18:25. The
+     * scenario below crosses BOTH: the timer wraps 295 s into the track, and
+     * the elapsed time passes 2^32 us at 4295 s. Every step is 50 s of wall
+     * time with one pump, far under the wrap, as on the device. */
+    stub_reset();
+    stub_set_track_frames(44100u * 7200u);         /* a 2 h track */
+    make_entries(ents, 1);
+    uint32_t t = 4000000000u;                      /* 295 s before the wrap */
+    set_usec(t);
+    player_play_queue(ents, 1, 0, 0, 0);
+    xpect(&c, "wrap: a track started near the wrap reads 0:00",
+          player_elapsed_s() == 0u);
+    int clock_ok = 1;
+    for (uint32_t sec = 50; sec <= 5000; sec += 50) {
+        t = 4000000000u + sec * 1000000u;          /* modular: wraps naturally */
+        set_usec(t);
+        player_pump();
+        if (player_elapsed_s() != sec) {
+            clock_ok = 0;
+        }
+    }
+    xpect(&c, "wrap: the clock reads true elapsed time across the timer wrap "
+              "and past 2^32 us of it", clock_ok);
+    xpect(&c, "wrap: 1:23:20 in, the clock says so", player_elapsed_s() == 5000u);
+    set_usec(t + 30000000u);                       /* no pump in between */
+    xpect(&c, "wrap: a read between pumps still runs",
+          player_elapsed_s() == 5030u);
+    t += 30000000u;
+    set_usec(t);
+    player_pump();
+
+    /* The seek anchor, past 71:35. */
+    xpect(&c, "wrap: a scrub to 1:30:00 succeeds", player_seek_to(5400u) == 0);
+    xpect(&c, "wrap: ...and the clock reads 1:30:00, not 18:25",
+          player_elapsed_s() == 5400u);
+    t += 10000000u;
+    set_usec(t);
+    player_pump();
+    xpect(&c, "wrap: and runs on from the target", player_elapsed_s() == 5410u);
+
+    /* A pause that itself outlives the timer's period: nothing of it counts,
+     * and the codec power-down inside it (timed from the pause stamp) is
+     * unaffected. */
+    player_pause();
+    for (int k = 0; k < 10; k++) {
+        t += 500000000u;                           /* 5000 s of pause, in 500 s steps */
+        set_usec(t);
+        player_pump();
+    }
+    xpect(&c, "wrap: a 5000 s pause counts nothing", player_elapsed_s() == 5410u);
+    xpect(&c, "wrap: the pause powered the codec down once, as usual",
+          stub_audio_suspends == 1);
+    player_resume();
+    t += 7000000u;
+    set_usec(t);
+    player_pump();
+    xpect(&c, "wrap: resume after the long pause carries on, +7 s",
+          player_elapsed_s() == 5417u);
+    /* And relative seeks compute against the true position. */
+    xpect(&c, "wrap: a relative seek from 1:30:17", player_seek_seconds(-17) == 0);
+    xpect(&c, "wrap: ...lands on 1:30:00", player_elapsed_s() == 5400u);
+    stub_set_track_frames(8192u);
+
     return xfail_done(&c);
 }
