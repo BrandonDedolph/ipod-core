@@ -308,7 +308,16 @@ int ata_identify(void *buf)
     for (int w = 0; w < 256; w++) {
         *out++ = mmio_read16(ATA_DATA_ADDR);
     }
-    uint8_t st = mmio_read8(ATA_ALT_STATUS_ADDR);
+    /* Same rule as the sector paths: the drive raises BSY after the last
+     * word while it completes the command, and every other status bit is
+     * undefined while BSY is set. Testing ERR/DF on the first read after the
+     * data could fail a good IDENTIFY on a transient byte (and this runs
+     * once, at boot, with no retry behind it) or pass a bad one. Wait for
+     * BSY to clear and test the status that cleared it. */
+    int st = ata_wait_not_busy_us(ATA_SPINUP_US);
+    if (st < 0) {
+        return -2;
+    }
     if (st & (ATA_STATUS_ERR | ATA_STATUS_DF)) {
         return -3;
     }

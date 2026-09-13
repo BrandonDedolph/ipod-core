@@ -471,6 +471,109 @@ static void test_init(xfail_ctx *c)
 }
 
 /* ======================================================================= */
+/*  identify                                                               */
+/* ======================================================================= */
+
+/* The IDENTIFY DEVICE grammar: two ready waits around the master select,
+ * the command, one DRQ block of 256 words, then the post-data status waited
+ * for !BSY (`post_busy` BSY polls) before ERR/DF is read off it. */
+static void expect_identify(trace_cursor *tc, size_t post_busy)
+{
+    expect_wait_ready(tc);
+    expect_w(tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+    expect_wait_ready(tc);
+    expect_w(tc, 8, ATA_COMMAND_ADDR, ATA_CMD_IDENTIFY);
+    expect_drq_wait(tc, 0);
+    expect_r(tc, 8, ATA_COMMAND_ADDR);
+    for (int w = 0; w < 256; w++) {
+        expect_r(tc, 16, ATA_DATA_ADDR);
+    }
+    expect_timed_wait(tc, post_busy);
+}
+
+static void test_identify(xfail_ctx *c)
+{
+    int rc;
+    trace_cursor tc;
+
+    /* --- the clean case: all 256 words land, status clean after them --- */
+    {
+        static const uint32_t seq[] = { RDY, RDY, RDY | DRQ, RDY };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 4);
+        mmio_mock_set_read(ATA_DATA_ADDR, 0x4B1Du);
+        memset(g_buf, 0, sizeof g_buf);
+        GUARDED(rc, ata_identify(g_buf));
+        xpect(c, "identify: returns 0 on a clean drive", rc == 0);
+        xpect(c, "identify: all 256 words land in the buffer",
+              all_halfwords(g_buf, 256, 0x4B1Du) && g_buf[256] == 0);
+        tc = trace_begin("identify-clean");
+        expect_identify(&tc, 0);
+        finish(c, &tc);
+    }
+
+    /* --- ERR under BSY after the data is NOT an error ------------------ *
+     * After the last word the drive raises BSY while it completes the
+     * command; every other status bit is undefined until BSY clears. The
+     * first status read after the data shows BSY|ERR, then BSY, then a
+     * clean RDY: the driver must poll through it. Under the old code the
+     * first read was taken at face value and a good IDENTIFY failed with
+     * -3 — at boot, where nothing retries it. */
+    {
+        static const uint32_t seq[] = { RDY, RDY, RDY | DRQ,
+                                        BSY | ERR, BSY, RDY };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 6);
+        GUARDED(rc, ata_identify(g_buf));
+        xpect(c, "identify: ERR under BSY after the data is not an error",
+              rc == 0);
+        tc = trace_begin("identify-post-data-busy");
+        expect_identify(&tc, 2);
+        finish(c, &tc);
+    }
+
+    /* --- a real ERR (BSY clear) after the data IS reported ------------- */
+    {
+        static const uint32_t seq[] = { RDY, RDY, RDY | DRQ, RDY | ERR };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 4);
+        GUARDED(rc, ata_identify(g_buf));
+        xpect(c, "identify: ERR with BSY clear after the data is -3", rc == -3);
+        tc = trace_begin("identify-post-data-err");
+        expect_identify(&tc, 0);
+        finish(c, &tc);
+    }
+
+    /* --- BSY that never clears after the data times out (-2) ----------- *
+     * Timer: 0 for the three satisfied waits' start reads and the post-data
+     * wait's start, then past the DRQ ceiling on its first unsatisfied
+     * poll. The old code would have reported the stale byte instead. */
+    {
+        static const uint32_t seq[]  = { RDY, RDY, RDY | DRQ, BSY | ERR };
+        static const uint32_t usec[] = { 0, 0, 0, 0, SPINUP_US + 1u };
+        mmio_mock_reset();
+        mmio_mock_queue_read(ATA_ALT_STATUS_ADDR, seq, 4);
+        mmio_mock_queue_read(USEC_TIMER_ADDR, usec, 5);
+        GUARDED(rc, ata_identify(g_buf));
+        xpect(c, "identify: BSY forever after the data does not hang", rc != 999);
+        xpect(c, "identify: ...and is a timeout (-2), not the stale ERR (-3)",
+              rc == -2);
+        tc = trace_begin("identify-post-data-busy-forever");
+        expect_wait_ready(&tc);
+        expect_w(&tc, 8, ATA_SELECT_ADDR, ATA_SELECT_OBS);
+        expect_wait_ready(&tc);
+        expect_w(&tc, 8, ATA_COMMAND_ADDR, ATA_CMD_IDENTIFY);
+        expect_drq_wait(&tc, 0);
+        expect_r(&tc, 8, ATA_COMMAND_ADDR);
+        for (int w = 0; w < 256; w++) {
+            expect_r(&tc, 16, ATA_DATA_ADDR);
+        }
+        expect_timed_timeout(&tc, 1);
+        finish(c, &tc);
+    }
+}
+
+/* ======================================================================= */
 /*  read                                                                   */
 /* ======================================================================= */
 
@@ -1324,6 +1427,7 @@ int main(void)
 {
     xfail_ctx c = { "hw-ata", 0, 0, 0 };
     test_init(&c);
+    test_identify(&c);
     test_read(&c);
     test_power(&c);
     test_write(&c);
