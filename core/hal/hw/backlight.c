@@ -218,9 +218,19 @@ static void bl_step_to(int target)
  * ------------------------------------------------------------------------- */
 #define BL_OFF_GRACE_TICKS  300u    /* ~3 s at HZ = 100 */
 
-static int      bl_powered;         /* GPIOB circuit power currently asserted */
-static int      bl_led_off;         /* backlight_set(0) was the last request  */
-static uint32_t bl_off_ticks;       /* ticks spent in the off state           */
+/*
+ * bl_powered and bl_led_off are SHARED between backlight_service(), which runs
+ * from the 100 Hz tick ISR, and backlight_set(), which runs from the main
+ * thread. Each side reads a flag the other side writes, so both are volatile:
+ * without it the compiler may legally keep a stale copy in a register across
+ * the ISR (backlight_set's `if (!bl_powered)` after a power-down it never saw)
+ * or hoist the ISR's read out of its own path. Every write to either flag is
+ * a single aligned word store, so volatile is sufficient — no IRQ masking is
+ * needed around the checks. bl_off_ticks is touched by the ISR only.
+ */
+static volatile int bl_powered;     /* GPIOB circuit power currently asserted */
+static volatile int bl_led_off;     /* backlight_set(0) was the last request  */
+static uint32_t     bl_off_ticks;   /* ticks spent in the off state           */
 
 /* Assert circuit power and re-seed the tracked level from the chip's power-up
  * reference. Mirrors the power-up half of backlight_init. */

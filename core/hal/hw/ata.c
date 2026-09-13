@@ -20,6 +20,8 @@
 #include "pp5022.h"
 #include "mmio.h"
 #include "ata.h"
+#include "uart.h"                 /* uart_puts: the refused-boost report     */
+#include "../../kernel/clock.h"   /* CPUFREQ_MAX: the clock the strobes want */
 
 /*
  * Poll ceilings, in microseconds on the free-running USEC_TIMER (04-ata.md,
@@ -133,16 +135,36 @@ static int ata_wait_ready(void)
  * read issued from deep idle pays a frequency switch, and that path is already
  * dominated by the multi-second platter spin-up.
  *
+ * THE BOOST CAN BE REFUSED. kernel/clock.c will not run the frequency
+ * switch while the audio DMA is streaming out of SDRAM (it reprograms the
+ * SDRAM timing the DMA master is reading through); the request is deferred
+ * until the stream stops and cpu_boost() returns having changed nothing. So
+ * a transfer issued from a 30 MHz core under live audio — the player's own
+ * refill, unless something else already holds the boost — goes out at
+ * 30 MHz against strobes programmed for 80. That refusal policy is right
+ * and is NOT changed here; what was wrong is that it was silent. After
+ * boosting, the bracket now checks the clock actually in effect and reports
+ * a mismatch on the UART, so a marginal-timing read error seen on device
+ * can be correlated with the clock it happened at instead of being a
+ * mystery.
+ *
  * Declared weak so this driver still links in the host golden-trace test,
- * which compiles ata.c alone with no kernel clock driver.
+ * which compiles ata.c alone with no kernel clock driver or UART; a test
+ * that defines them becomes the kernel's stand-in and can observe the
+ * bracket.
  */
 __attribute__((weak)) void cpu_boost(void);
 __attribute__((weak)) void cpu_unboost(void);
+__attribute__((weak)) uint32_t cpu_frequency(void);
+__attribute__((weak)) void uart_puts(const char *s);
 
 static void ata_clock_hold(void)
 {
     if (cpu_boost) {
         cpu_boost();
+    }
+    if (cpu_frequency && uart_puts && cpu_frequency() != CPUFREQ_MAX) {
+        uart_puts("core: ata: boost refused, transfer at slow clock\n");
     }
 }
 

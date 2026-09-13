@@ -72,6 +72,12 @@ static int g_boost;
  * not in the callers. Refusing is the right answer rather than quiescing: the
  * DMA cannot be paused without a gap in the audio, and a frequency change is
  * always optional.
+ *
+ * The refusal is silent from here — g_freq keeps reporting the true clock and
+ * that is the whole interface. A caller that NEEDS the boosted clock rather
+ * than merely preferring it must check cpu_frequency() after cpu_boost():
+ * hal/hw/ata.c's ata_clock_hold does, and reports on the UART when a transfer
+ * is about to run at 30 MHz against the ROM's 80 MHz PIO strobes.
  */
 static volatile int g_dma_active;
 

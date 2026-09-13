@@ -41,6 +41,10 @@
  *   lba28    — an LBA range past 2^28 is rejected before a single register
  *              write, instead of having its top bits masked off and quietly
  *              aliasing a lower sector (and, on a write, overwriting it).
+ *   clock    — every command is bracketed in a balanced cpu_boost/unboost,
+ *              and a boost the clock driver REFUSED (frequency still below
+ *              CPUFREQ_MAX) is reported on the UART, once per command, while
+ *              the command still goes out (the refusal policy is unchanged).
  *
  * Values are hand-derived from core/docs/hw/04-ata.md via pp5022.h, never
  * from Rockbox source. Private ata.c constants are MIRRORED here rather than
@@ -59,6 +63,63 @@
 #include "mmio_mock.h"
 #include "trace_expect.h"
 #include "../xfail.h"
+#include "../../kernel/clock.h"   /* CPUFREQ_MAX / CPUFREQ_NORMAL */
+
+/* ---- the kernel's stand-in: clock bracket + UART ----------------------- *
+ * ata.c declares cpu_boost / cpu_unboost / cpu_frequency / uart_puts WEAK so
+ * it links alone; defining them here makes them observable. cpu_boost raises
+ * the reported frequency unless the test has marked the boost REFUSED — the
+ * shape kernel/clock.c has while the audio DMA streams: the counter bumps,
+ * nothing else happens, cpu_frequency() keeps telling the truth. */
+static int      g_boosts, g_unboosts;
+static int      g_boost_refused;
+static uint32_t g_freq = CPUFREQ_MAX;
+static char     g_uart[512];
+static size_t   g_uart_len;
+
+void cpu_boost(void)
+{
+    g_boosts++;
+    if (!g_boost_refused) {
+        g_freq = CPUFREQ_MAX;
+    }
+}
+
+void cpu_unboost(void)
+{
+    g_unboosts++;
+}
+
+uint32_t cpu_frequency(void)
+{
+    return g_freq;
+}
+
+void uart_puts(const char *str)
+{
+    size_t n = strlen(str);
+    if (g_uart_len + n + 1 > sizeof g_uart) {
+        n = sizeof g_uart - g_uart_len - 1;
+    }
+    memcpy(g_uart + g_uart_len, str, n);
+    g_uart_len += n;
+    g_uart[g_uart_len] = '\0';
+}
+
+static void uart_clear(void)
+{
+    g_uart_len = 0;
+    g_uart[0]  = '\0';
+}
+
+static size_t uart_lines(void)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < g_uart_len; i++) {
+        n += (g_uart[i] == '\n');
+    }
+    return n;
+}
 
 /* ---- mirrors of ata.c's private constants ---------------------------- */
 
@@ -1027,6 +1088,77 @@ static void test_lba28(xfail_ctx *c)
     xpect(c, "lba28: the last physical sector writes", rc == 0);
 }
 
+/* ======================================================================= */
+/*  clock: the boost bracket, and the refused-boost report                 */
+/* ======================================================================= */
+
+static void test_clock(xfail_ctx *c)
+{
+    fill_pattern();
+
+    /* --- honoured boost: balanced bracket, silent -------------------------- */
+    g_boost_refused = 0;
+    g_freq = CPUFREQ_NORMAL;
+    g_boosts = g_unboosts = 0;
+    uart_clear();
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    int rc = ata_read_sectors(0x1000u, 2, g_buf);
+    xpect(c, "clock: read under an honoured boost returns 0", rc == 0);
+    xpect(c, "clock: one boost, one unboost per command",
+          g_boosts == 1 && g_unboosts == 1);
+    xpect(c, "clock: nothing on the UART when the boost took",
+          g_uart_len == 0);
+
+    /* Split read: two commands, two brackets, still silent. */
+    g_boosts = g_unboosts = 0;
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_read_sectors(0x2000u, 258, g_buf);
+    xpect(c, "clock: a split read brackets each command",
+          rc == 0 && g_boosts == 2 && g_unboosts == 2);
+    xpect(c, "clock: and stays silent", g_uart_len == 0);
+
+    /* --- REFUSED boost (audio DMA live in clock.c): report, still issue --- *
+     * The frequency stays at 30 MHz after cpu_boost(). The transfer must
+     * still go out — the refusal policy is clock.c's and is not second-
+     * guessed here — but the UART must hear exactly one line about it, per
+     * command, naming the ATA driver and the boost. */
+    g_boost_refused = 1;
+    g_freq = CPUFREQ_NORMAL;
+    g_boosts = g_unboosts = 0;
+    uart_clear();
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_read_sectors(0x1000u, 2, g_buf);
+    xpect(c, "clock: a read under a refused boost still goes out", rc == 0);
+    xpect(c, "clock: READ SECTORS was issued",
+          count_writes(ATA_COMMAND_ADDR) == 1);
+    xpect(c, "clock: the bracket is still balanced",
+          g_boosts == 1 && g_unboosts == 1);
+    xpect(c, "clock: the refused boost is reported on the UART",
+          strstr(g_uart, "ata") != NULL && strstr(g_uart, "boost") != NULL);
+    xpect(c, "clock: exactly one line for one command", uart_lines() == 1);
+
+    /* A write too: the settings save is the case that matters most. */
+    uart_clear();
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_write_sectors(0x1000u, 2, g_pattern);
+    xpect(c, "clock: a write under a refused boost still goes out", rc == 0);
+    xpect(c, "clock: and is reported once", uart_lines() == 1 &&
+          strstr(g_uart, "boost") != NULL);
+
+    /* Honoured again: quiet again (the check is per call, not latched). */
+    g_boost_refused = 0;
+    uart_clear();
+    mmio_mock_reset();
+    mmio_mock_set_read(ATA_ALT_STATUS_ADDR, RDY | DRQ);
+    rc = ata_read_sectors(0x1000u, 2, g_buf);
+    xpect(c, "clock: quiet again once the boost is honoured",
+          rc == 0 && g_uart_len == 0);
+}
+
 int main(void)
 {
     xfail_ctx c = { "hw-ata", 0, 0, 0 };
@@ -1035,5 +1167,6 @@ int main(void)
     test_power(&c);
     test_write(&c);
     test_lba28(&c);
+    test_clock(&c);
     return xfail_done(&c);
 }
