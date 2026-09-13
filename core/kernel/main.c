@@ -5109,11 +5109,18 @@ _Noreturn static void run_ui(fat32_t *fs)
                 dirty = 0;
             }
             lock_flashing = 1;
-            /* Only throttle when idle; keep audio paced while playing. Halt the
-             * core (self-waking ~10 ms, one tick) instead of a busy-spin. Same
-             * gate as the main halt below: a PAUSED player has no DMA to pace. */
+            /* The plate skips the render below — and with it the loop's two
+             * halts, so it halts here itself. Idle (which includes paused: no
+             * DMA to pace) parks the core for a tick, as the main 10 ms halt
+             * does. PLAYING takes the same 200 us halt as the bottom of the
+             * loop, under the same "the pump did nothing" gate: without it a
+             * Hold flip mid-track free-spun the core at 80 MHz for the whole
+             * second the plate is up, re-polling the wheel through masked IRQs
+             * — the exact spin the bottom halt exists to prevent. */
             if (!player_playing()) {
                 cpu_wait_ms(10);
+            } else if (pump_us < 200u) {
+                cpu_wait_us(200);
             }
             continue;                     /* skip the normal render this pass      */
         }
