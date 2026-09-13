@@ -12,7 +12,14 @@
 
 #include <stdint.h>
 
-/* One-time controller bring-up: clock-gate, reset pulse, clock poke. */
+/*
+ * Controller bring-up: clock-gate, wait for the bus to be idle, reset pulse,
+ * clock poke. The reset is ONE-SHOT: the first call does the full sequence,
+ * every later call (hal_audio_init runs one per track and per seek, right
+ * behind a codec write that may still be on the wire) only waits for the
+ * bus to go idle. Resetting the controller mid-transaction can leave the
+ * slave holding SDA with no bit-bang path to free it.
+ */
 void i2c_init(void);
 
 /*
