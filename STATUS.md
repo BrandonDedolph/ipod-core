@@ -69,8 +69,13 @@ suspend (moot once escalation lands), the BCM power gate, `PANEL_SLEEP_AT_IDLE`
 **Playlists** under "What works". Closed since: the same-hash
 tiebreak (`name_bind_exact`, exact on-disk name wins when a bucket has two
 candidates), `flac_meta.c` keeping UTF-8 on the scan fallback, and
-`ata_identify()` waiting for !BSY before it reads ERR/DF. Nothing has been
-pushed.
+`ata_identify()` waiting for !BSY before it reads ERR/DF. Also closed: a
+skip while paused ran the full codec bring-up (WM_RESET + VMID charge) only
+for the 5 s pause timer to power it down again — the bring-up is now owed to
+the resume (`g_pl_bringup_pending` in `player.c`, with the player/HAL state
+table; `player-queue` 13e'', `player-clock` 11), so ten paused Nexts cost
+zero I²C. Add to the first-flash checklist: Next ×N while paused, then Play —
+no pop, sound at the last track's rate. Nothing has been pushed.
 
 ### 2026-09-13, later — cross-branch review, two rounds
 
