@@ -595,8 +595,25 @@ static int            g_pl_paused;         /* DMA suspended, position held      
  * every pass, and so resume knows whether a wake is owed.
  */
 static int            g_pl_codec_cold;
-static uint32_t       g_pl_start_us;      /* USEC_TIMER at current track start    */
-static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (freezes clock) */
+/*
+ * The elapsed clock. USEC_TIMER is a free-running 32-bit 1 MHz counter, so it
+ * wraps every 4294.97 s (71:35) — shorter than a podcast or a DJ mix. The
+ * clock used to be (now - track_start) in 32-bit microseconds, which snapped
+ * a two-hour track back to 0:00 at 1:11:35, saved a wrong resume position
+ * from then on, and made a scrub to 1:30:00 land at 18:25 because the seek
+ * anchor computed now - sec*1000000 in the same width.
+ *
+ * Instead: running time is FOLDED into a 64-bit accumulator, once per pump
+ * pass, as the 32-bit difference since the last fold. No single difference
+ * ever spans more than one pass (the pump runs hundreds of times a second
+ * while playing), so the wrap is never crossed inside one. A read between
+ * passes adds the same difference without storing it. Pause stops the
+ * folding (after one last fold), resume restarts the stamp, and a seek or a
+ * hand-over sets the accumulator outright.
+ */
+static uint64_t       g_pl_elapsed_us;    /* running time folded so far           */
+static uint32_t       g_pl_last_us;       /* USEC_TIMER at the last fold          */
+static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (codec timer)  */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
 static int            g_shuffle;          /* walk g_order instead of the queue     */
@@ -936,8 +953,25 @@ static uint32_t track_total_s(const decoder_t *d)
     return (d->total_frames > 0) ? (uint32_t)(d->total_frames / rate) : 0;
 }
 
+/* Fold the running time since the last fold into the elapsed clock. Only
+ * meaningful while playing: paused time must not be counted, and the caller
+ * gates on that. See g_pl_elapsed_us. */
+static void clock_fold(void)
+{
+    uint32_t now = mmio_read32(USEC_TIMER_ADDR);
+    g_pl_elapsed_us += (uint32_t)(now - g_pl_last_us);
+    g_pl_last_us     = now;
+}
+
+/* Set the elapsed clock to `us` as of NOW: track start, hand-over, seek. */
+static void clock_set_us(uint64_t us)
+{
+    g_pl_elapsed_us = us;
+    g_pl_last_us    = mmio_read32(USEC_TIMER_ADDR);
+}
+
 /*
- * Bring the DAC up at `rate` and start pulling from the ring.
+ * Bring the DAC up at `rate` and, if `start`, begin pulling from the ring.
  *
  * hal_audio_init RESETS the WM8758 and writes 0 dB headphone gain, so the
  * user's volume and balance have to be re-applied — and re-applied BEFORE the
@@ -949,9 +983,18 @@ static uint32_t track_total_s(const decoder_t *d)
  * for the WHOLE track — full-scale into someone's headphones at a "20%"
  * setting. Doing it here covers every path into playback by construction.
  *
+ * `start` is 0 when the transport is being opened PAUSED (a skip while
+ * paused). The codec is brought up and the source is registered, but the DMA
+ * is not kicked: hal_audio_init leaves the HAL with no buffered PCM, so the
+ * hal_audio_start() that the eventual resume issues cold-primes both buffers
+ * from the ring — the same first sound a normal open produces, just later.
+ * Kicking here and pausing straight after, which is what a paused skip used
+ * to do, played the first ~1-30 ms of the new track at the user's gain and
+ * then muted it over I2C: an audible click on every Next/Prev while paused.
+ *
  * Returns 0, or -1 if the HAL can't clock this format.
  */
-static int audio_bringup(uint32_t rate)
+static int audio_bringup(uint32_t rate, int start)
 {
     if (hal_audio_init(rate, 2u) != 0) {
         return -1;
@@ -959,7 +1002,9 @@ static int audio_bringup(uint32_t rate)
     hal_volume_set(hal_volume_get());
     hal_balance_set(hal_balance_get());
     hal_audio_set_source(ring_source, 0);
-    hal_audio_start();
+    if (start) {
+        hal_audio_start();
+    }
     g_out_rate      = rate;
     g_pl_codec_cold = 0;                 /* init is a full bring-up */
     return 0;
@@ -996,10 +1041,12 @@ static void codec_wake(void)
     g_pl_codec_cold = 0;
 }
 
-/* Open g_queue[g_queue_idx] and start the DAC. Returns 0, or -1 on failure;
- * player_last_error() then says whether the file was unreadable or simply a
- * format the DAC can't clock, so the UI can eventually explain the skip. */
-static int player_open_current(void)
+/* Open g_queue[g_queue_idx] and start the DAC — or, with `paused`, bring
+ * the codec up and leave the transport paused at 0:00 with the DMA never
+ * kicked (see audio_bringup). Returns 0, or -1 on failure; player_last_error()
+ * then says whether the file was unreadable or simply a format the DAC can't
+ * clock, so the UI can eventually explain the skip. */
+static int player_open_current(int paused)
 {
     load_track_art(&g_queue[g_queue_idx]);
 
@@ -1023,38 +1070,39 @@ static int player_open_current(void)
      * scrolled past unplayed and unexplained. Mono is up-mixed to stereo in
      * the decode step, so the DAC only ever sees 2 channels and we depend on
      * the HAL for nothing but the rate. */
-    if (audio_bringup(g_dec.sample_rate) != 0) {
+    if (audio_bringup(g_dec.sample_rate, !paused) != 0) {
         g_last_err = PLAYER_ERR_RATE;
         return -1;
     }
-    g_pl_start_us = mmio_read32(USEC_TIMER_ADDR);
+    clock_set_us(0);
     g_pl_low_fill = RING_FRAMES;
     g_pl_active   = 1;
-    g_pl_paused   = 0;
+    g_pl_paused   = paused;
+    if (paused) {
+        /* A fresh pause on the new track: the codec power-down in the pump
+         * is timed from here, exactly as if the listener had just pressed
+         * pause. The clock is frozen at 0:00 (nothing folds while paused). */
+        g_pl_pause_us = mmio_read32(USEC_TIMER_ADDR);
+    }
     g_last_err    = PLAYER_OK;
     g_open_seq++;
     return 0;
 }
 
 /*
- * Open the current entry, restoring a paused transport if we were paused.
+ * Open the current entry, keeping a paused transport paused.
  *
  * Every manual skip (Next / Prev / queue jump) funnels through here. Without
- * it, skipping while paused silently RESUMED playback: player_open_current
- * unconditionally clears g_pl_paused and calls hal_audio_start(). The codec
- * still comes up at the user's gain either way — audio_bringup re-latches
- * volume before the DMA is kicked, and the pause below only suspends the DMA
- * again, it doesn't touch the gain.
+ * it, skipping while paused silently RESUMED playback. It used to open
+ * normally and then call player_pause(), which was silent on paper and not
+ * in the ear: the open kicked the DMA at the user's gain and the pause then
+ * muted it over I2C, so every skip while paused clicked. The pause is now
+ * part of the open itself — the DMA is never started (audio_bringup), so
+ * there is nothing to cut.
  */
 static int open_current_keep_pause(int was_paused)
 {
-    if (player_open_current() != 0) {
-        return -1;
-    }
-    if (was_paused) {
-        player_pause();
-    }
-    return 0;
+    return player_open_current(was_paused);
 }
 
 /* Pause: suspend the DMA but keep the decoder, ring, and position — resume
@@ -1070,25 +1118,25 @@ void player_pause(void)
         return;
     }
     hal_audio_stop();
+    clock_fold();                        /* count up to this instant, no further */
     g_pl_pause_us = mmio_read32(USEC_TIMER_ADDR);
     g_pl_paused   = 1;
 }
 
-/* Resume from pause: shift the track start forward by the paused duration so the
- * elapsed clock is continuous, then restart the DAC (re-primes from the ring).
+/* Resume from pause: restart the elapsed clock's fold stamp at NOW, so the
+ * paused stretch is never counted, then restart the DAC (re-primes from the
+ * ring).
  *
  * If the pause lasted long enough for the pump to power the codec down, wake
  * it first — the HAL's buffers and offset are intact underneath, so the
- * hal_audio_start that follows is the same seamless resume either way. The
- * clock shift is unaffected: it is computed from the pause timestamp, which
- * the power-down never touches. */
+ * hal_audio_start that follows is the same seamless resume either way. */
 void player_resume(void)
 {
     if (!g_pl_active || !g_pl_paused) {
         return;
     }
-    g_pl_start_us += mmio_read32(USEC_TIMER_ADDR) - g_pl_pause_us;
-    g_pl_paused    = 0;
+    g_pl_last_us = mmio_read32(USEC_TIMER_ADDR);
+    g_pl_paused  = 0;
     if (g_pl_codec_cold) {
         codec_wake();
     }
@@ -1248,7 +1296,7 @@ static void pending_commit(void)
         hal_audio_drain(500u);
         hal_audio_stop();
         decode_pump();
-        if (audio_bringup(g_dec.sample_rate) != 0) {
+        if (audio_bringup(g_dec.sample_rate, 1) != 0) {
             /* The DAC can't clock this file. Don't let one odd-rate track end
              * the album — skip it the way a corrupt file is skipped. */
             g_last_err  = PLAYER_ERR_RATE;
@@ -1257,7 +1305,7 @@ static void pending_commit(void)
             return;
         }
     }
-    g_pl_start_us = mmio_read32(USEC_TIMER_ADDR) - over_us;
+    clock_set_us(over_us);
     g_pl_low_fill = RING_FRAMES;
     g_last_err    = PLAYER_OK;
     g_open_seq++;
@@ -1290,7 +1338,7 @@ static void player_advance(void)
     }
     /* Repeat One: replay the same track (single attempt — falling into the skip
      * loop below with Repeat-One set would retry a lone broken track forever). */
-    if (g_repeat == 2 && player_open_current() == 0) {
+    if (g_repeat == 2 && player_open_current(0) == 0) {
         return;
     }
     for (int tries = 0; tries <= g_queue_n; tries++) {
@@ -1305,7 +1353,7 @@ static void player_advance(void)
             return;
         }
         g_queue_idx = nxt;
-        if (player_open_current() == 0) {
+        if (player_open_current(0) == 0) {
             return;                      /* next track playing */
         }
         /* else: broken track, loop to skip it (bounded by `tries`) */
@@ -1330,7 +1378,7 @@ void player_play_queue(const browse_entry_t *src, int n, int start,
      * suppressed for the life of this queue. */
     g_queue_art_shared = (art_clus != 0);
     load_folder_art(g_pl_fs, art_clus, art_size);  /* queue-level art */
-    if (player_open_current() != 0) {
+    if (player_open_current(0) != 0) {
         player_advance();                /* skip a broken first track */
     }
 }
@@ -1365,9 +1413,26 @@ void player_queue_commit(int start)
      * previous track's artwork. */
     g_queue_art_shared = 0;
     load_folder_art(g_pl_fs, 0, 0);      /* mixed queue: per-track art loads on open */
-    if (player_open_current() != 0) {
+    if (player_open_current(0) != 0) {
         player_advance();                /* skip a broken first track */
     }
+}
+
+/*
+ * Will diskbuf_pump() read from the backing source on its next call? Mirrors
+ * the pump's own decision (codecs/diskbuf.c): while bursting it reads until
+ * the high watermark, EOF or a latched error; idle, it wakes only once the
+ * decoder has drained the buffer below the low watermark. The player needs
+ * this BEFORE the call, because waking a parked drive is bookkeeping that
+ * must happen exactly when a read is about to hit it — see player_pump.
+ */
+static int diskbuf_will_fetch(const diskbuf_t *db)
+{
+    if (db->eos || db->err) {
+        return 0;
+    }
+    uint32_t ahead = diskbuf_fill_ahead(db);
+    return db->filling ? (ahead < db->high) : (ahead < db->low);
 }
 
 /* Decode one chunk per call and auto-advance at end of track. Called every
@@ -1399,6 +1464,10 @@ void player_pump(void)
         }
         return;
     }
+
+    /* Once per pass, while playing: this is what keeps every 32-bit timer
+     * difference in the elapsed clock shorter than the timer's wrap. */
+    clock_fold();
 
     uint32_t fill = pcm_ring_fill(&g_ring);
 
@@ -1451,13 +1520,32 @@ void player_pump(void)
         }
     }
     if (pcm_ring_fill(&g_ring) >= gate) {
-        if (g_drive_parked || g_dbuf.err_streak > 0) {
+        /*
+         * Only treat this pass as a disk access if diskbuf_pump is actually
+         * going to read. Most passes it is not: the buffer is topped up and
+         * idle, and the pump returns without touching the drive. Clearing
+         * g_drive_parked on those passes too — which this used to do — meant
+         * the park branch below saw "not parked, topped up, idle" and issued
+         * STANDBY IMMEDIATE again, every pass, hundreds of times a second for
+         * the whole of quiet playback: each one a cpu_boost, a ready wait and
+         * a command the drive had already executed. Worse, the one-shot probe
+         * was armed on every one of those passes and never consumed, so the
+         * next read from ANYWHERE — the prefetch's track_open, album art, a
+         * library probe — went out as a single non-retrying attempt, which is
+         * the intermittent "OPEN FAILED" the six-try loop exists to ride over.
+         */
+        if (diskbuf_will_fetch(&g_dbuf) &&
+            (g_drive_parked || g_dbuf.err_streak > 0)) {
             /* Waking a parked platter, or retrying a read that already failed
              * once: one attempt, no backoff loop. */
             g_drive_parked = 0;
             g_spinup_probe = 1;
         }
         diskbuf_pump(&g_dbuf, DISK_CHUNK);
+        /* The probe is for the read that just happened, never for the next
+         * one. If the pump did not consume it (the fetch was served without a
+         * block read, or did not happen at all), it must not lie in wait. */
+        g_spinup_probe = 0;
     }
     /* Apple-quiet playback: physically PARK the drive between refill bursts.
      * The diskbuf already goes idle (filling==0) once it's topped up; when it
@@ -1542,11 +1630,16 @@ uint32_t player_elapsed_s(void)
     if (!g_pl_active) {
         return 0;
     }
-    uint32_t nowu = g_pl_paused ? g_pl_pause_us : mmio_read32(USEC_TIMER_ADDR);
-    return (nowu - g_pl_start_us) / 1000000u;
+    uint64_t us = g_pl_elapsed_us;
+    if (!g_pl_paused) {
+        /* Time since the last fold — under one pump pass, so far below the
+         * timer's wrap. Not stored: reads are free to happen at any rate. */
+        us += (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - g_pl_last_us);
+    }
+    return (uint32_t)(us / 1000000u);
 }
 
-uint32_t player_total_s(void) { return g_pl_total_s; }
+uint32_t player_total_s(void) { return g_pl_active ? g_pl_total_s : 0u; }
 
 uint32_t player_buf_pct(void) { return (g_pl_low_fill * 100u) / RING_FRAMES; }
 
@@ -1695,23 +1788,18 @@ void player_prev(void)
 /*
  * Re-anchor the elapsed clock so it reads `sec` NOW.
  *
- * While paused the clock is (g_pl_pause_us - g_pl_start_us), and resume adds
- * (now - g_pl_pause_us) onto the start. A paused seek used to move only the
- * start, leaving the pause stamp where the pause began — so the frozen clock
- * read `sec` minus however long the listener had already been paused, and
- * resuming then added that same paused stretch back on top, landing the
- * clock short of the target by the length of the pause. Invisible when the
- * seek lands in the same instant as the pause (which is all the earlier test
- * exercised); a scrub a minute into a pause was wrong by a minute. Moving the
- * pause stamp with the start keeps both identities true.
+ * The accumulator is set outright, in 64 bits: `sec * 1000000` overflowed
+ * the old 32-bit `now - sec*1000000u` anchor for any target past 71:35, so a
+ * scrub to 1:30:00 came back reading 18:25. Paused or not makes no
+ * difference here — the fold stamp restarts at NOW either way, and while
+ * paused nothing folds, so the frozen clock reads exactly `sec` and resume
+ * carries on from it. (An older shape of this clock also had to move the
+ * pause stamp to keep a paused seek honest; the stamp now only times the
+ * codec power-down, which a seek has no reason to restart.)
  */
 static void clock_anchor(uint32_t sec)
 {
-    uint32_t now = mmio_read32(USEC_TIMER_ADDR);
-    g_pl_start_us = now - sec * 1000000u;
-    if (g_pl_paused) {
-        g_pl_pause_us = now;
-    }
+    clock_set_us((uint64_t)sec * 1000000u);
 }
 
 /*
@@ -1787,24 +1875,50 @@ int player_seek_to(uint32_t sec)
 
     uint32_t rate   = g_dec.sample_rate ? g_dec.sample_rate : 44100u;
     uint64_t target = (uint64_t)sec * rate;
-    if (g_dec.total_frames > 0 && target >= g_dec.total_frames) {
-        target = g_dec.total_frames - 1;
+    uint64_t limit  = g_dec.total_frames;
+    if (limit == 0 && g_queue[g_queue_idx].fmt == 1) {
+        /*
+         * An MP3 of unknown length (no Xing/Info tag and the open-time frame
+         * count failed) had no clamp at all: a scrub past the end sent
+         * dr_mp3 brute-forcing through the whole file, only to fail at EOF.
+         * The file size still bounds it — MPEG audio is never below 8 kbps,
+         * so a file of N bytes cannot hold more than N/1000 seconds. Coarse,
+         * but it is a true upper bound, and a seek clamped to it that still
+         * overshoots is caught by the restart below instead of running wild.
+         */
+        limit = (uint64_t)(g_queue[g_queue_idx].size / 1000u) * rate;
+    }
+    if (limit > 0 && target >= limit) {
+        target = limit - 1;
         sec    = (uint32_t)(target / rate);
     }
 
     if (g_dec.ops->seek(&g_dec, target) != DECODER_OK) {
-        if (reopened) {
-            /* We already tore the stream down to reopen it; the buffered PCM
-             * is from a decoder that no longer exists. Restart from the top of
-             * the track rather than resuming into it. */
-            hal_audio_flush();
-            pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
-            g_written  = 0;
-            g_boundary = 0;
-            g_eos      = 0;
-            decode_pump_upto(SEEK_PRIME_FRAMES);
-            clock_anchor(0);
+        /*
+         * A failed seek is not a no-op. dr_flac's binary search and dr_mp3's
+         * brute-force scan both move the byte cursor as they go, so on
+         * failure the decoder is sitting at some unrelated point in the
+         * stream — and the old resume-as-we-were path simply restarted the
+         * DAC into it: the ring's tail of the OLD position, then whatever the
+         * decoder produced from wherever it had got to. The only position
+         * we can vouch for is the top of the track: put the decoder there
+         * (re-seek to 0, or reopen when even that fails), and restart from
+         * it as the reopened branch already did.
+         */
+        if (g_dec.ops->seek(&g_dec, 0) != DECODER_OK &&
+            seek_reopen_current() != 0) {
+            hal_audio_flush();           /* nothing left to resume into */
+            return -1;
         }
+        hal_audio_flush();
+        pcm_ring_init(&g_ring, ring_storage, RING_FRAMES);
+        g_written        = 0;
+        g_boundary       = 0;
+        g_eos            = 0;
+        g_prefetch_tried = 0;
+        decode_pump_upto(SEEK_PRIME_FRAMES);
+        clock_anchor(0);
+        g_pl_low_fill = RING_FRAMES;
         if (!was_paused) {
             hal_audio_start();
         }

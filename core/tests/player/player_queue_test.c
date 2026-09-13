@@ -1000,16 +1000,79 @@ int main(void)
     xpect(&c, "seek moves the elapsed clock to the target",
           player_elapsed_s() == 3u);
 
-    /* A seek the decoder refuses must leave playback exactly as it was, not
-     * stopped and not silently repositioned. */
+    /* A seek the decoder refuses must not stop playback — but it cannot
+     * "leave it as it was" either: the codec's seek moves the byte cursor as
+     * it searches, so after a failure the decoder is somewhere unknown. The
+     * old path restarted the DAC into that: the ring's tail of the old spot,
+     * then whatever the decoder found. The one position that can be vouched
+     * for is the top of the track, so a failed seek restarts there, with the
+     * stale PCM flushed, and reports the failure. */
     stub_reset();
     player_play_queue(ents, 4, 0, 0, 0);
-    set_usec(0);
-    stub_set_seek_ok(0);
+    set_usec(10000000u);
+    stub_set_seek_ok(0);                   /* every seek fails, even to 0 */
+    int opens_before_refusal = stub_opens;
     xpect(&c, "a refused seek reports failure", player_seek_to(3u) == -1);
     xpect(&c, "a refused seek leaves the DAC running", stub_audio_running == 1);
     xpect(&c, "a refused seek leaves the track playing", player_active() == 1);
+    xpect(&c, "a codec that cannot even reach frame 0 is reopened",
+          stub_opens == opens_before_refusal + 1);
+    xpect(&c, "a refused seek flushes the PCM of the position it left",
+          stub_audio_flushes >= 1 && stub_audio_primed == 0);
+    xpect(&c, "a refused seek restarts the clock at 0:00, not somewhere unknown",
+          player_elapsed_s() == 0u);
+    xpect(&c, "a refused seek leaves audio in the ring to play",
+          stub_drain(1024) == 1024);
     stub_set_seek_ok(1);
+
+    /* The same, for a seek that overshoots while the top of the track is
+     * still reachable: no reopen, a re-seek to 0. The fake decoder models the
+     * cursor motion by ending the stream on a failed seek, so resuming into
+     * it (the old behaviour) would leave nothing to play. */
+    stub_reset();
+    stub_set_track_frames(44100u * 10u);
+    player_play_queue(ents, 4, 0, 0, 0);
+    set_usec(10000000u);
+    stub_set_seek_max(44100u * 5u);        /* targets past 5 s fail */
+    int opens_before_overshoot = stub_opens;
+    xpect(&c, "an overshooting seek reports failure", player_seek_to(8u) == -1);
+    xpect(&c, "an overshooting seek re-seeks the live decoder to 0 rather "
+              "than reopening", stub_opens == opens_before_overshoot &&
+          stub_last_seek_frame == 0u);
+    xpect(&c, "an overshooting seek restarts from the top: DAC running, "
+              "clock at 0:00", stub_audio_running == 1 &&
+          player_elapsed_s() == 0u);
+    xpect(&c, "an overshooting seek leaves audio in the ring to play",
+          stub_drain(1024) == 1024);
+    /* ...and a subsequent good seek still works on the same decoder. */
+    xpect(&c, "a later in-range seek on the same track succeeds",
+          player_seek_to(4u) == 0 && player_elapsed_s() == 4u);
+    stub_set_seek_max(~(uint64_t)0);
+
+    /* An MP3 whose length is unknown had no clamp at all: a scrub past the
+     * end sent the decoder scanning to EOF. The file size still bounds it —
+     * MPEG audio is never below 8 kbps — so the target is clamped to what
+     * the file could possibly hold. */
+    stub_reset();
+    stub_set_track_frames(44100u * 7200u);
+    stub_set_total_unknown(1);
+    make_entries(ents, 1, 0);
+    ents[0].fmt  = 1;                      /* MP3 */
+    ents[0].size = 1024u * 1024u;          /* 1 MiB: at most 1048 s */
+    player_play_queue(ents, 1, 0, 0, 0);
+    set_usec(0);
+    xpect(&c, "unknown length: the player reports no total",
+          player_total_s() == 0u);
+    xpect(&c, "unknown-length MP3: a seek far past what the file could hold "
+              "succeeds, clamped", player_seek_to(5000u) == 0);
+    xpect(&c, "unknown-length MP3: the decoder was asked for the last frame "
+              "the file could possibly hold",
+          stub_last_seek_frame == (uint64_t)(1048576u / 1000u) * 44100u - 1u);
+    xpect(&c, "unknown-length MP3: the clock reads the clamped position",
+          player_elapsed_s() == 1047u);
+    stub_set_total_unknown(0);
+    stub_set_track_frames(44100u * 10u);   /* back to this section's 10 s track */
+    make_entries(ents, 4, 0);
 
     /* Seeking while PAUSED must not start the DAC — and must not corrupt the
      * resume position, which is what hal_audio_stop's unguarded recompute did
@@ -1088,6 +1151,125 @@ int main(void)
     xpect(&c, "Next past the last track ends playback", player_active() == 0);
     xpect(&c, "a button press does NOT wait for the buffers to drain",
           stub_audio_drains == 0);
+
+    /* ---- 13e'. a skip while paused never runs the DMA ------------------ *
+     *
+     * Next / Prev / a queue jump while paused stayed paused, but only after
+     * the fact: the open brought the codec up, kicked the DMA at the user's
+     * gain, and THEN player_pause() muted it over I2C — a click on every
+     * paused skip. The open must now bring the transport up already paused,
+     * with hal_audio_start() never called, and the resume that follows is
+     * the first time the DAC runs on the new track. */
+    stub_reset();
+    stub_set_track_frames(44100u * 10u);
+    make_entries(ents, 4, 0);
+    player_play_queue(ents, 4, 1, 0, 0);
+    set_usec(0);
+    player_pause();
+    {
+        int starts_before = stub_audio_starts;
+        int stops_before  = stub_audio_stops;
+        player_next();                           /* -> 2 */
+        xpect(&c, "Next while paused moves to the next track, still paused",
+              player_queue_current() == 2 && player_paused() == 1 &&
+              player_active() == 1);
+        xpect(&c, "Next while paused never starts the DAC",
+              stub_audio_starts == starts_before && stub_audio_running == 0);
+        player_prev();                           /* -> 1 (clock at 0:00) */
+        xpect(&c, "Prev while paused goes back, still paused",
+              player_queue_current() == 1 && player_paused() == 1);
+        xpect(&c, "Prev while paused never starts the DAC",
+              stub_audio_starts == starts_before && stub_audio_running == 0);
+        player_jump(3);
+        xpect(&c, "a queue jump while paused lands paused",
+              player_queue_current() == 3 && player_paused() == 1);
+        xpect(&c, "a queue jump while paused never starts the DAC",
+              stub_audio_starts == starts_before && stub_audio_running == 0);
+        xpect(&c, "a paused open holds the clock at 0:00",
+              player_elapsed_s() == 0u);
+        (void)stops_before;
+        /* The eventual resume is the new track's first sound: the DAC comes
+         * up and pulls the PCM the open primed. */
+        set_usec(3000000u);
+        player_resume();
+        xpect(&c, "resume after a paused skip starts the DAC once",
+              stub_audio_starts == starts_before + 1 && stub_audio_running == 1);
+        xpect(&c, "resume after a paused skip plays from the primed ring",
+              stub_drain(1024) == 1024);
+        xpect(&c, "resume after a paused skip runs the clock from 0:00",
+              player_elapsed_s() == 0u);
+        set_usec(4000000u);
+        xpect(&c, "...and a second later it reads 1", player_elapsed_s() == 1u);
+        /* A paused skip must still time the codec power-down from the skip,
+         * as a normal pause would from the button press. */
+        player_pause();
+        set_usec(4000000u + 1000000u);
+        player_prev();                           /* 1 s in: a real skip, -> 2 */
+        xpect(&c, "the paused skip under test happened",
+              player_queue_current() == 2 && player_paused() == 1);
+        int suspends_before = stub_audio_suspends;
+        set_usec(4000000u + 1000000u + PLAYER_PAUSE_CODEC_OFF_US - 1u);
+        player_pump();
+        xpect(&c, "a paused skip's power-down is timed from the skip: not yet",
+              stub_audio_suspends == suspends_before);
+        set_usec(4000000u + 1000000u + PLAYER_PAUSE_CODEC_OFF_US);
+        player_pump();
+        xpect(&c, "a paused skip's power-down is timed from the skip: now",
+              stub_audio_suspends == suspends_before + 1);
+    }
+    stub_set_track_frames(8192u);
+
+    /* ---- 13e. quiet playback parks the drive ONCE ---------------------- *
+     *
+     * Between refill bursts the anti-skip buffer is topped up and idle, and
+     * the pump parks the platters. That state persists for tens of seconds
+     * per burst, i.e. thousands of pump passes. Each pass used to un-park
+     * the drive in software (without any read to justify it) and then, seeing
+     * an un-parked idle drive, park it again: a STANDBY IMMEDIATE — cpu_boost,
+     * ready wait, command, wait — hundreds of times a second for the whole of
+     * quiet playback. The fakes model the idle state exactly: diskbuf_pump()
+     * has nothing to do and fill_ahead sits far above the low watermark. */
+    stub_reset();
+    stub_set_track_frames(44100u * 60u);   /* long enough never to hit EOS */
+    make_entries(ents, 1, 0);
+    player_play_queue(ents, 1, 0, 0, 0);
+    set_usec(0);
+    for (int i = 0; i < 300; i++) {
+        player_pump();                     /* fills the ring past the parked gate */
+    }
+    /* Model one refill burst starting and ending: a pass with the buffer
+     * drained below the watermark (the pump would read here), then topped up
+     * again. Whatever state the drive was left in by the sections above, it
+     * is now unparked-and-idle, and the pass after must park it. */
+    stub_set_disk_ahead(0);
+    player_pump();
+    stub_set_disk_ahead(64u * 1024u * 1024u);
+    int standbys_before = stub_ata_standbys;
+    for (int i = 0; i < 400; i++) {
+        player_pump();
+    }
+    xpect(&c, "quiet playback parks the drive exactly once, not once per pass",
+          stub_ata_standbys == standbys_before + 1);
+    /*
+     * The same passes used to arm the pump's one-shot spin-up probe and never
+     * consume it, so the next block read from ANYWHERE went out with the
+     * retry loop disabled — the intermittent "OPEN FAILED" the six tries were
+     * written to ride over, back again for every prefetch, art load and
+     * library probe that followed a quiet stretch. With reads failing, a
+     * latched probe shows up as one attempt instead of six.
+     */
+    {
+        uint8_t sector[512];
+        stub_set_ata_read_ok(0);
+        int reads_before = stub_ata_reads;
+        xpect(&c, "a failing read still fails",
+              player_disk_read(0, 0, 1, sector) == -1);
+        xpect(&c, "the spin-up probe is not left armed by an idle pump pass: "
+                  "the next read gets its full retry loop",
+              stub_ata_reads - reads_before == 6);
+        stub_set_ata_read_ok(1);
+    }
+    stub_set_track_frames(8192u);
 
     /* ---- 14. calls with nothing loaded are safe ------------------------ */
     stub_reset();
