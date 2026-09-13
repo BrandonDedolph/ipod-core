@@ -641,7 +641,12 @@ static int      g_bat_mv_filt = -1;          /* median of recent samples (policy
  * which sits with the status-strip state it feeds. */
 static void settings_commit(int force);
 static void resume_capture(void);
-_Noreturn static void enter_standby(void);
+static int  enter_standby(void);
+
+/* Set by enter_standby() when the PMU refused the power-down and the device
+ * was brought back instead: run_ui reads and clears it to resync its
+ * backlight/idle state with the screen enter_standby already relit. */
+static int g_standby_refused;
 
 /*
  * settings_commit() modes.
@@ -848,8 +853,12 @@ static int battery_refresh(int force)
         /* The documented power-off path: stop the player, blank the panel,
          * PMU deep-sleep with wake sources set. Its own settings_commit(1)
          * is the reason the DISKSAFE flush above exists: by now the write
-         * gate should refuse it (see battery_disk_writes_allowed). */
-        enter_standby();                  /* does not return */
+         * gate should refuse it (see battery_disk_writes_allowed). It comes
+         * back only if the PMU refused, already repainted; nothing more to do
+         * here — the policy stays latched at SHUTOFF, so this edge does not
+         * repeat, and the device runs on until the cell gives out. */
+        (void)enter_standby();
+        break;
 
     case BATTERY_EVENT_RECOVERED:
         uart_puts("core: batt RECOVERED: writes allowed again\n");
@@ -4023,24 +4032,64 @@ static void paint_current_screen(void)
     }
 }
 
-/* Quiesce and enter PMU deep-sleep standby (triggered by holding PLAY). Stops
- * audio + the decode/disk feed, blanks the panel + backlight, then hands off to
- * the PMU. Never returns — a button press wakes the device by re-running the
- * boot path (a cold boot of the firmware, not a resume). */
-_Noreturn static void enter_standby(void)
+/*
+ * Quiesce and enter PMU deep-sleep standby — the true "off" (holding PLAY
+ * past ~5 s, the suspend timeout, or the battery policy's SHUTOFF edge).
+ * A button press wakes the device by re-running the boot path (a cold boot
+ * of the firmware, not a resume).
+ *
+ * Everything that draws is put away BEFORE the rail cut, in the order the
+ * hardware wants: the transport and the codec (hal_audio_close powers the
+ * WM8758 down and gates the audio clocks), then the settings write while the
+ * drive is still spinning, then the drive itself (cache flushed, heads
+ * parked, spun down — 04-ata.md: "safe to cut power after this returns"),
+ * then the panel (black frame, backlight off, LCD_SLEEP). The PMU write is
+ * last. The settings write goes through the normal battery gate: below the
+ * disk-safe line it is refused, and the DISKSAFE-edge flush that already
+ * happened is what persists (see CFG_COMMIT_LAST).
+ *
+ * RETURNS -1 IF THE PMU REFUSED. power_standby() gives up after a bounded
+ * number of I2C retries rather than hang, and this used to fall into a
+ * for(;;) regardless — a dark, dead device, reached by the user asking to
+ * turn it off. Now the refusal is recovered here: panel woken, the current
+ * screen repainted (the present absorbs the panel init), backlight restored,
+ * and the caller carries on. The player has been STOPPED by then, not paused
+ * — that is the price of the refusal, and the caller must not resume it.
+ * On the device this path has never been seen to fire; it is the I2C-wedged
+ * case, and the recovery sequence is UNVERIFIED on hardware.
+ */
+static int enter_standby(void)
 {
     /* BEFORE player_stop(): once the transport is torn down there is no track
      * name and no elapsed clock left to record. */
     resume_capture();
     player_stop();
-    settings_commit(1);                   /* persist before the PMU cuts power */
+    hal_audio_close();                    /* codec rails off, audio clocks gated */
+    settings_commit(1);                   /* persist while the drive still spins */
+    if (!ata_is_parked()) {
+        ata_standby();                    /* flush + park + spin down            */
+    }
     console_clear(0x0000);                /* blank BEFORE the power cut so no */
     lcd_present_fb(console_framebuffer()); /* stale colour lingers on the panel */
     cpu_wait_ms(80);                      /* let the BCM push the black frame  */
     backlight_set(0);
-    power_standby();                      /* PMU cuts power — does not return */
-    for (;;) {
-    }
+    lcd_sleep();                          /* panel off; the BCM stays alive   */
+    (void)power_standby();                /* PMU cuts power — normally no return */
+
+    /*
+     * Still here: the PMU never took the command. Bring the device back to a
+     * usable state rather than leave it dark. Wake the panel and push ONE
+     * frame BEFORE the backlight: that first present is the one the BCM
+     * answers with its ~500 ms panel init, and lighting the LED over it is
+     * the white flash (02-lcd.md).
+     */
+    uart_puts("core: standby REFUSED by the PMU; staying up\n");
+    lcd_wake();
+    paint_current_screen();
+    lcd_present_fb(console_framebuffer());
+    backlight_set(g_settings.backlight_bright);
+    g_standby_refused = 1;
+    return -1;
 }
 
 /*
@@ -4084,10 +4133,18 @@ static void suspend_to_ram(uint32_t play_down_us)
     backlight_set(0);
 
     /* Wait for the trigger PLAY hold to release (so it can't instantly wake us).
-     * Held past ~5s total => a real power-down instead. */
+     * Held past ~5s total => a real power-down instead. If the PMU refuses
+     * that, enter_standby() has already stopped the player and repainted:
+     * skip the idle wait and fall through to the wake path, which finishes
+     * the job (release-wait, re-boost, drive spin-up) without resuming. */
+    int standby_refused = 0;
     while (clickwheel_buttons() & WHEEL_BTN_PLAY) {
         if ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - play_down_us) > 5000000u) {
-            enter_standby();              /* true off (PMU) — does not return */
+            if (enter_standby() != 0) {   /* true off (PMU) — normally no return */
+                standby_refused = 1;
+                was_playing     = 0;      /* stopped, not paused: nothing to resume */
+                break;
+            }
         }
         /* See the wake loop below for why this drain is load-bearing. */
         while (clickwheel_get_event(&drain)) { }
@@ -4097,7 +4154,7 @@ static void suspend_to_ram(uint32_t play_down_us)
 
     /* Low-power idle until any button is pressed. The 100 Hz tick keeps sampling
      * the wheel into the latch through each cpu_wait, so a press is seen fast. */
-    while (clickwheel_buttons() == 0) {
+    while (!standby_refused && clickwheel_buttons() == 0) {
         /*
          * DRAINING HERE IS WHAT MAKES THE DEVICE WAKE AT ALL.
          *
@@ -4488,6 +4545,16 @@ _Noreturn static void run_ui(fat32_t *fs)
             case KEYHOLD_NONE:
                 break;
             }
+        }
+
+        /* A refused PMU standby (see enter_standby) has already relit and
+         * repainted the screen from outside this loop; resync the backlight
+         * and idle bookkeeping so the next press is not treated as a wake. */
+        if (g_standby_refused) {
+            g_standby_refused = 0;
+            last_input = mmio_read32(USEC_TIMER_ADDR);
+            bl_state   = BL_FULL;
+            dirty      = 1;
         }
 
         /* Hold-switch edge (a cheap GPIO read, independent of the wheel block

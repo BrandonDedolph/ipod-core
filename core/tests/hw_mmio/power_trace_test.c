@@ -15,12 +15,13 @@
  * The values are hand-derived from core/docs/hw/06-power.md and 09-i2c.md (via
  * power.c's own register defines), never from Rockbox source.
  *
- * ESCAPING THE POINT OF NO RETURN. power_standby() ends in a deliberate
- * `for (;;)` — on the device the PMU cuts power a few milliseconds later, so
- * returning would mean running on with a half-torn-down system. That makes it
- * uncallable from a plain host test. The mock bus's post-access hook (added
- * for exactly this) fires on each recorded access; once the transaction's
- * final strobe lands we longjmp back out, leaving the recorded trace intact.
+ * ESCAPING THE POINT OF NO RETURN. Once the PMU accepts the write,
+ * power_standby() holds for 500 ms waiting for the power to drop — on the
+ * device it does; on the host the function would eventually return -1 as if
+ * refused. The mock bus's post-access hook (added for exactly this) fires on
+ * each recorded access; once the transaction's final strobe lands we longjmp
+ * back out, leaving the recorded trace intact, so the accepted case is
+ * observed as STROBED and never as a spurious refusal.
  *
  * This asserts the TRANSACTION CONTENT, not how many times a retry loop runs:
  * a bounded retry is being added to this function, and the number of attempts
@@ -122,9 +123,12 @@ typedef enum {
     STANDBY_SPUN,      /* it never returned and never strobed: a dead hang */
 } standby_outcome;
 
+static int g_last_rc;                 /* power_standby's return, when it returned */
+
 static standby_outcome run_standby(void)
 {
     g_timed_out    = 0;
+    g_last_rc      = 0;
     g_escape_armed = 1;
     mmio_mock_set_hook(escape_on_strobe);
     arm_watchdog();
@@ -132,7 +136,7 @@ static standby_outcome run_standby(void)
     standby_outcome out;
     int jumped = sigsetjmp(g_escape, 1);
     if (jumped == 0) {
-        power_standby();
+        g_last_rc = power_standby();
         out = STANDBY_RETURNED;        /* returned on its own */
     } else if (jumped == 1) {
         out = STANDBY_STROBED;
@@ -286,22 +290,18 @@ int main(void)
     mmio_mock_set_read(I2C_STATUS_ADDR, I2C_BUSY);  /* permanently busy */
     mmio_mock_set_read(I2C_CTRL_ADDR,   0x00);
     out = run_standby();
+    int rc = g_last_rc;
     xpect(&c, "a permanently-BUSY bus issues no GOSTDBY strobe",
           out != STANDBY_STROBED);
     xpect(&c, "a permanently-BUSY bus writes no payload",
           count_writes(I2C_DATA_ADDR(1)) == 0);
     xpect(&c, "a failed standby write does not wedge the core",
           out != STANDBY_SPUN);
+    /* The refusal is REPORTED, not hidden: the caller (kernel/main.c
+     * enter_standby) is what brings the device back — panel wake, one
+     * present, then backlight — and it can only do that on a -1. */
+    xpect(&c, "a refused standby returns -1 to the caller",
+          out == STANDBY_RETURNED && rc == -1);
 
     return xfail_done(&c);
-}
-
-/*
- * power_standby() relights the backlight when it gives up on a wedged bus,
- * rather than leaving the user with a dark unresponsive device. No panel here.
- */
-void backlight_set(int level);
-void backlight_set(int level)
-{
-    (void)level;
 }

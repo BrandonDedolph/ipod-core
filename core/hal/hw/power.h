@@ -24,10 +24,11 @@
  *
  * NORMALLY DOES NOT RETURN: the PMU cuts SoC power. It returns only when
  * standby could not be entered at all — a wedged I2C control bus that did not
- * accept the command after a bounded number of retries. In that case it
- * returns -1 and has relit the backlight so the failure is visible, and the
- * caller should carry on rather than assume it is powering down. (Previously
- * this case was an unkillable for(;;) on a dark screen.)
+ * accept the command after a bounded number of retries — and then returns -1.
+ * The caller owns making that visible: wake the panel, present a frame, and
+ * only then relight the backlight (lighting a slept panel first is the
+ * white-screen failure), and carry on rather than assume it is powering
+ * down. (Previously this case was an unkillable for(;;) on a dark screen.)
  */
 int power_standby(void);
 
