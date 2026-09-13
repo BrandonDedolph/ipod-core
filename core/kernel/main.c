@@ -4105,6 +4105,26 @@ static int enter_standby(void)
  * is dark, not electrically off), so it draws more than deep-sleep — fine for
  * short off/on, which is what this is for.
  */
+/*
+ * Put the LCD PANEL to sleep for the suspend, not just the backlight.
+ *
+ * lcd_sleep() issues the BCM's LCD_SLEEP (panel driver off; the BCM itself
+ * stays powered and bootstrapped, so no firmware re-upload is needed). The
+ * hazard is on the way back: the first LCD_UPDATE after a wake carries a
+ * ~500 ms panel init, and light behind the panel before that update has
+ * retired is the solid-white screen (02-lcd.md). The wake path below does
+ * lcd_wake(); paint; present; backlight in that order, and the present does
+ * not return until the init has retired (hal/hw/lcd.c bcm_frame_commit) —
+ * which is what makes this safe to ship at 1.
+ *
+ * UNVERIFIED ON THE DEVICE as of 2026-09-13. If the screen comes back WHITE
+ * after a suspend, set this to 0: the panel then stays driven-black for the
+ * suspend exactly as before (backlight off only), and nothing else changes.
+ */
+#ifndef SUSPEND_PANEL_SLEEP
+#define SUSPEND_PANEL_SLEEP 1
+#endif
+
 static void suspend_to_ram(uint32_t play_down_us)
 {
     wheel_event_t drain;
@@ -4123,7 +4143,7 @@ static void suspend_to_ram(uint32_t play_down_us)
                                            * entered from BL_FULL), so without this
                                            * the "sleeping" device holds the 80 MHz
                                            * operating point for the whole suspend */
-    ata_standby();                        /* spin the platters down (quiet, low-power) */
+    ata_sleep();                          /* flush, park, spin down, interface off */
     /* Clear to black BEFORE cutting the backlight, so the transflective panel
      * doesn't faintly ghost the last UI in ambient light while asleep. Wake
      * repaints the real screen while the backlight is still off (below), so the
@@ -4131,6 +4151,10 @@ static void suspend_to_ram(uint32_t play_down_us)
     console_clear(0x0000);
     lcd_present_fb(console_framebuffer());
     backlight_set(0);
+#if SUSPEND_PANEL_SLEEP
+    lcd_sleep();                          /* panel driver off; drains the black
+                                           * frame first, then LCD_SLEEP     */
+#endif
 
     /* Wait for the trigger PLAY hold to release (so it can't instantly wake us).
      * Held past ~5s total => a real power-down instead. If the PMU refuses
@@ -4205,9 +4229,20 @@ static void suspend_to_ram(uint32_t play_down_us)
      * time the idle path unboosts). It also puts the ATA read and the render
      * back at 80 MHz, which is where their timing was calibrated. */
     cpu_boost();
-    ata_wakeup();                         /* spin the drive back up before any read */
+    ata_wakeup();                         /* reset + spin the drive back up before any read */
+    /*
+     * Panel back, in the only order that is safe: wake the panel driver,
+     * render the real screen while everything is still dark, present it —
+     * this present carries the BCM's ~500 ms panel init and does not return
+     * until that has retired — and ONLY THEN light the backlight. Light any
+     * earlier and the init shows as a white flash; on the old absorb
+     * ordering it could latch white for good. lcd_wake() is a no-op when
+     * the panel was not slept (SUSPEND_PANEL_SLEEP 0, or a refused standby
+     * that already woke it), and the present is then the ordinary one.
+     */
+    lcd_wake();
     paint_current_screen();               /* render the real screen while dark... */
-    lcd_present_fb(console_framebuffer());
+    lcd_present_fb(console_framebuffer()); /* ...retire the panel init...     */
     backlight_set(g_settings.backlight_bright);  /* ...then light up straight to it */
     if (was_playing) {
         player_resume();
@@ -4215,29 +4250,34 @@ static void suspend_to_ram(uint32_t play_down_us)
 }
 
 /*
- * Panel sleep at idle is DISABLED: it leaves the screen solid WHITE until a
- * reboot, which is the worst possible failure on a device whose only debug
- * channel is that screen.
+ * Panel sleep at IDLE (backlight timeout) is DISABLED: when it was tried it
+ * left the screen solid WHITE until a reboot, which is the worst possible
+ * failure on a device whose only debug channel is that screen.
  *
  * Mechanism, from docs/hw/02-lcd.md: on the first LCD_UPDATE after LCD_SLEEP the
  * BCM re-runs its internal LCD panel init and is allowed up to 500 ms for it
  * ("After waking from sleep, the first update can take up to 500 ms ... because
- * the BCM is doing internal LCD panel init"). Our commit handshake budgets
- * BCM_IDLE_SPIN_LIMIT (~2 ms) and RE-KICKS LCD_UPDATE 16 times inside that
- * window, while every later present streams a fresh 150 KB frame straight into
- * the in-progress init — so the init never completes and the BCM latches. The
- * doc names the symptom outright: "If we wake the backlight before the first
- * update completes, the user sees a 500 ms white flash." We light the backlight
- * at the input site, ~400 lines before lcd_wake() runs, so it is white, and
- * there is no bcm_init() anywhere in the tree to recover with — hence the
- * reboot.
+ * the BCM is doing internal LCD panel init"). At the time, our commit handshake
+ * budgeted BCM_IDLE_SPIN_LIMIT (~2 ms) and RE-KICKED LCD_UPDATE 16 times inside
+ * that window, every later present streamed a fresh 150 KB frame straight into
+ * the in-progress init, and the backlight was lit at the input site before any
+ * of it — so the init never completed and the BCM latched. The doc names the
+ * symptom outright: "If we wake the backlight before the first update
+ * completes, the user sees a 500 ms white flash."
  *
- * The backlight LED is by far the larger draw and is already off in this state;
- * suspend_to_ram() makes the same trade deliberately ("the panel is dark, not
- * electrically off"). Do NOT re-enable this without (a) a real bcm_init()
- * bootstrap to recover a failed wake, (b) a wall-clock absorb window on the
- * first post-wake commit with the re-kick SUPPRESSED, and (c) deferring
- * backlight-on until that first present has retired.
+ * The three preconditions for retrying it, and where they stand:
+ *   (a) a real bcm_init() bootstrap to recover a failed wake — exists
+ *       (lcd_recover), but is compiled out (LCD_RECOVER_ON_WAKE 0) because it
+ *       has never run on silicon;
+ *   (b) the first post-wake commit waits for ITS update to retire, wall-clock
+ *       bounded, with the re-kick suppressed — DONE (hal/hw/lcd.c
+ *       bcm_frame_commit, and it is what suspend_to_ram now relies on);
+ *   (c) backlight-on deferred until that first present has retired — DONE
+ *       here (bl_relight), and inherent in suspend's wake order.
+ * The backlight LED is by far the larger draw and is already off in this
+ * state, so the win from flipping this is small; suspend_to_ram is where the
+ * panel sleep actually earns its keep (SUSPEND_PANEL_SLEEP), and it should
+ * prove itself there on the device before this is turned on.
  */
 #define PANEL_SLEEP_AT_IDLE  0
 
