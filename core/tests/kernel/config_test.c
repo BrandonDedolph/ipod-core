@@ -191,7 +191,14 @@ static int settings_eq(const settings_t *a, const settings_t *b)
            a->theme == b->theme && a->clicker == b->clicker &&
            a->resume_hash == b->resume_hash &&
            a->resume_secs == b->resume_secs &&
-           a->resume_total == b->resume_total;
+           a->resume_total == b->resume_total &&
+           a->resume_kind == b->resume_kind &&
+           a->resume_flags == b->resume_flags &&
+           a->resume_qidx == b->resume_qidx &&
+           a->resume_seed == b->resume_seed &&
+           a->resume_order_seed == b->resume_order_seed &&
+           a->resume_order_keep == b->resume_order_keep &&
+           a->resume_ctx_hash == b->resume_ctx_hash;
 }
 
 /* A settings_t with every field distinct from the defaults and at an extreme
@@ -204,6 +211,13 @@ static void spicy(settings_t *s)
     s->backlight_secs = 60; s->backlight_bright = 1;
     s->theme = 3;    s->clicker = 2;
     s->resume_hash = 0xDEADBEEFu; s->resume_secs = 1234; s->resume_total = 5678;
+    /* The queue context: the largest kind, a queue index past any album, a
+     * negative keep (PLAYER_KEEP_QUEUE), and seeds with every byte distinct.
+     * The reserved words stay 0 — the codec writes them as 0 whatever the
+     * struct holds, which test_resume_context pins separately. */
+    s->resume_kind = 6;  s->resume_flags = 0; s->resume_qidx = 5999;
+    s->resume_seed = 0xC0FFEE01u; s->resume_order_seed = 0xBADC0DE5u;
+    s->resume_order_keep = -2; s->resume_ctx_hash = 0;
 }
 
 /* ---- mock-bus programming ---------------------------------------------- */
@@ -417,7 +431,9 @@ static void recrc(uint8_t *rec)
 #define T_OFF_PAYLOAD 12u
 #define T_LEN_V1      12u          /* settings only                        */
 #define T_LEN_V2      24u          /* + resume hash/secs/total, 4 bytes ea. */
+#define T_LEN_V2Q     44u          /* + the resume queue context (same ver) */
 #define T_OFF_RES     (T_OFF_PAYLOAD + T_LEN_V1)   /* 24: resume_hash      */
+#define T_OFF_CTX     (T_OFF_PAYLOAD + T_LEN_V2)   /* 36: resume_kind      */
 #define T_RESUME_MAX  86400u       /* the decoder's ceiling on both counts  */
 
 static void put32le(uint8_t *p, uint32_t v)
@@ -458,8 +474,8 @@ static void test_resume_record(void)
     config_encode(rec, &in, 7);
     check("record is version 2", rec[T_OFF_VERSION] == 2 &&
                                  rec[T_OFF_VERSION + 1] == 0);
-    check("record declares the v2 payload length",
-          rec[T_OFF_LENGTH] == T_LEN_V2 && rec[T_OFF_LENGTH + 1] == 0);
+    check("record declares the v2 payload length, context included",
+          rec[T_OFF_LENGTH] == T_LEN_V2Q && rec[T_OFF_LENGTH + 1] == 0);
     check("resume fields land at the documented offsets",
           get32le(&rec[T_OFF_RES])     == 0xDEADBEEFu &&
           get32le(&rec[T_OFF_RES + 4]) == 1234u &&
@@ -568,6 +584,126 @@ static void test_resume_record(void)
     rec[T_OFF_RES + 2] ^= 0x01;
     check("a flipped resume byte fails the CRC",
           config_decode(rec, &out, &seq) == 0);
+}
+
+/*
+ * The resume QUEUE CONTEXT: appended after the locator under the SAME record
+ * version, with `length` 24 -> 44. What it must get right:
+ *
+ *   - the 24-byte record every device in the field holds right now (written
+ *     by the build before this one) still decodes, and decodes to kind NONE
+ *     — the album fallback, which is exactly what that build did;
+ *   - `length` gates the context on its own, independently of the locator:
+ *     a record one byte short of 44 keeps its locator and drops its context;
+ *   - no track, no context — on both sides, like the position;
+ *   - a kind from a future build is declined (NONE), never acted on;
+ *   - the reserved words are written as 0 whatever the struct held;
+ *   - the negative keep values the player uses survive the round trip.
+ */
+static void test_resume_context(void)
+{
+    uint8_t rec[CONFIG_SLOT_BYTES];
+    settings_t in, out;
+    uint32_t seq = 0;
+
+    defaults(&in);
+    spicy(&in);
+    config_encode(rec, &in, 11);
+    check("context fields land at the documented offsets",
+          rec[T_OFF_CTX] == 6 && rec[T_OFF_CTX + 1] == 0 &&
+          rec[T_OFF_CTX + 2] == (5999 & 0xFF) && rec[T_OFF_CTX + 3] == (5999 >> 8) &&
+          get32le(&rec[T_OFF_CTX + 4])  == 0xC0FFEE01u &&
+          get32le(&rec[T_OFF_CTX + 8])  == 0xBADC0DE5u &&
+          get32le(&rec[T_OFF_CTX + 12]) == 0 &&
+          rec[T_OFF_CTX + 16] == 0xFE && rec[T_OFF_CTX + 17] == 0xFF &&
+          rec[T_OFF_CTX + 18] == 0 && rec[T_OFF_CTX + 19] == 0);
+    memset(&out, 0xA5, sizeof out);
+    check("context round-trips (negative keep included)",
+          config_decode(rec, &out, &seq) == 1 && settings_eq(&in, &out) &&
+          out.resume_order_keep == -2);
+
+    /* The record the PREVIOUS build wrote: version 2, length 24, zero
+     * padding where the context now lives. Built exactly as that encoder
+     * did, and it is the record on every deployed device. */
+    config_encode(rec, &in, 12);
+    rec[T_OFF_LENGTH] = (uint8_t)T_LEN_V2;
+    memset(&rec[T_OFF_CTX], 0, T_LEN_V2Q - T_LEN_V2);
+    recrc(rec);
+    memset(&out, 0x5A, sizeof out);
+    check("a 24-byte v2 record still decodes under this build",
+          config_decode(rec, &out, &seq) == 1 && seq == 12u &&
+          out.resume_hash == 0xDEADBEEFu && out.resume_secs == 1234u);
+    check("...with kind NONE and an empty context, not the padding",
+          out.resume_kind == 0 && out.resume_flags == 0 &&
+          out.resume_qidx == 0 && out.resume_seed == 0 &&
+          out.resume_order_seed == 0 && out.resume_order_keep == 0 &&
+          out.resume_ctx_hash == 0);
+
+    /* One byte short of the context: real context bytes are present in the
+     * record but `length` says they are padding, and padding they are. */
+    config_encode(rec, &in, 13);
+    rec[T_OFF_LENGTH] = (uint8_t)(T_LEN_V2Q - 1u);
+    recrc(rec);
+    memset(&out, 0x5A, sizeof out);
+    check("a length one byte short of the context keeps the locator",
+          config_decode(rec, &out, &seq) == 1 &&
+          out.resume_hash == 0xDEADBEEFu && out.resume_total == 5678u);
+    check("...and drops the context",
+          out.resume_kind == 0 && out.resume_seed == 0 &&
+          out.resume_order_seed == 0 && out.resume_qidx == 0);
+
+    /* No track => no context, on encode... */
+    defaults(&in);
+    spicy(&in);
+    in.resume_hash = 0;
+    config_encode(rec, &in, 14);
+    check("encode drops the context with the locator",
+          rec[T_OFF_CTX] == 0 && get32le(&rec[T_OFF_CTX + 4]) == 0 &&
+          get32le(&rec[T_OFF_CTX + 8]) == 0 &&
+          rec[T_OFF_CTX + 16] == 0 && rec[T_OFF_CTX + 17] == 0);
+
+    /* ...and on decode, against a hand-edited record. */
+    defaults(&in);
+    spicy(&in);
+    config_encode(rec, &in, 15);
+    put32le(&rec[T_OFF_RES], 0);
+    recrc(rec);
+    memset(&out, 0x5A, sizeof out);
+    check("decode drops the context with the locator",
+          config_decode(rec, &out, &seq) == 1 && out.resume_hash == 0 &&
+          out.resume_kind == 0 && out.resume_qidx == 0 &&
+          out.resume_seed == 0 && out.resume_order_seed == 0 &&
+          out.resume_order_keep == 0);
+
+    /* A kind this build has no builder for: read as NONE (album fallback),
+     * with the rest of the context still there for a build that does. */
+    config_encode(rec, &in, 16);
+    rec[T_OFF_CTX] = 200;
+    recrc(rec);
+    check("an unknown kind decodes as NONE",
+          config_decode(rec, &out, &seq) == 1 && out.resume_kind == 0 &&
+          out.resume_seed == 0xC0FFEE01u);
+
+    /* Encode clamps an out-of-range kind the same way, so a stray value in
+     * RAM never reaches the disk as a number a future reader might act on. */
+    in.resume_kind = 200;
+    config_encode(rec, &in, 17);
+    check("encode writes an out-of-range kind as NONE", rec[T_OFF_CTX] == 0);
+
+    /* Reserved words: always 0 on disk, always 0 in RAM after a decode. */
+    defaults(&in);
+    spicy(&in);
+    in.resume_flags = 0xAB; in.resume_ctx_hash = 0x12345678u;
+    config_encode(rec, &in, 18);
+    check("reserved context words are written as 0",
+          rec[T_OFF_CTX + 1] == 0 && get32le(&rec[T_OFF_CTX + 12]) == 0 &&
+          rec[T_OFF_CTX + 18] == 0 && rec[T_OFF_CTX + 19] == 0);
+    rec[T_OFF_CTX + 1] = 0xCD;
+    put32le(&rec[T_OFF_CTX + 12], 0xFEEDFACEu);
+    recrc(rec);
+    check("reserved context words read back as 0",
+          config_decode(rec, &out, &seq) == 1 &&
+          out.resume_flags == 0 && out.resume_ctx_hash == 0);
 }
 
 /* ---- seq ordering ------------------------------------------------------ */
@@ -924,8 +1060,10 @@ static void test_host_fixture(const char *path)
      * device would still boot, but a freshly imported iPod would silently be
      * unable to remember a position until its first save. */
     check("host record is v2 with an empty resume locator",
-          blob[4] == 2 && blob[5] == 0 && blob[6] == 24 && blob[7] == 0 &&
-          s.resume_hash == 0 && s.resume_secs == 0 && s.resume_total == 0);
+          blob[4] == 2 && blob[5] == 0 && blob[6] == 44 && blob[7] == 0 &&
+          s.resume_hash == 0 && s.resume_secs == 0 && s.resume_total == 0 &&
+          s.resume_kind == 0 && s.resume_qidx == 0 && s.resume_seed == 0 &&
+          s.resume_order_seed == 0 && s.resume_order_keep == 0);
     check("host tool leaves slot 1 empty for the first device write",
           config_decode(&blob[CONFIG_SLOT_BYTES], &s, &seq) == 0);
 }
@@ -935,6 +1073,7 @@ int main(int argc, char **argv)
     test_file_lba();
     test_codec();
     test_resume_record();
+    test_resume_context();
     test_seq_order();
     test_two_slot();
     test_write_trace();

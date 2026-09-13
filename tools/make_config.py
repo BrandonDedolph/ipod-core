@@ -112,7 +112,24 @@ PAYLOAD_V1_LEN = len(PAYLOAD_FIELDS)  # 12
 #   resume_total  its length, kept as a cross-check against a same-named track
 # A fresh file has nothing to resume, so all three are written as 0.
 RESUME_FIELDS = ["resume_hash", "resume_secs", "resume_total"]
-PAYLOAD_LEN = PAYLOAD_V1_LEN + 4 * len(RESUME_FIELDS)   # 24
+PAYLOAD_V2_LEN = PAYLOAD_V1_LEN + 4 * len(RESUME_FIELDS)   # 24
+
+# After the locator, under the SAME version, the resume QUEUE CONTEXT: which
+# list the track was playing in and the seeds that rebuild it. Mirrors
+# P_RES_KIND.. in config.c — (name, struct format, offset within the payload).
+# length 24 -> 44; a 24-byte record still decodes (context unknown).
+# resume_order_keep is signed: -1 / -2 are the player's KEEP_NONE / KEEP_QUEUE.
+CTX_FIELDS = [
+    ("resume_kind",       "<B", 24),   # RESUME_KIND_* (0 = none/unknown)
+    ("resume_flags",      "<B", 25),   # reserved, 0
+    ("resume_qidx",       "<H", 26),   # queue index of the track
+    ("resume_seed",       "<I", 28),   # Shuffle Songs' library-order LCG seed
+    ("resume_order_seed", "<I", 32),   # the player's shuffle-deal seed
+    ("resume_ctx_hash",   "<I", 36),   # reserved, 0
+    ("resume_order_keep", "<h", 40),   # the player's shuffle-deal pin
+    ("resume_pad",        "<H", 42),   # reserved, 0
+]
+PAYLOAD_LEN = PAYLOAD_V2_LEN + 20                          # 44
 
 SIGNED = {"bass", "treble", "balance"}
 
@@ -141,6 +158,8 @@ def encode(values: dict, seq: int) -> bytes:
     for j, name in enumerate(RESUME_FIELDS):
         v = int(values.get(name, 0)) & 0xFFFFFFFF
         struct.pack_into("<I", rec, OFF_PAYLOAD + PAYLOAD_V1_LEN + 4 * j, v)
+    for name, fmt, off in CTX_FIELDS:
+        struct.pack_into(fmt, rec, OFF_PAYLOAD + off, int(values.get(name, 0)))
     struct.pack_into("<I", rec, OFF_CRC, crc32(bytes(rec[:OFF_CRC])))
     return bytes(rec)
 
@@ -167,10 +186,13 @@ def decode(rec: bytes):
     # The v2 tail is gated on the record's own `length`, exactly as
     # config_decode() gates it — so a v1 record (length 12) still verifies
     # here instead of being read out of the zero padding.
-    if length >= PAYLOAD_LEN:
+    if length >= PAYLOAD_V2_LEN:
         for j, name in enumerate(RESUME_FIELDS):
             out[name] = struct.unpack_from(
                 "<I", rec, OFF_PAYLOAD + PAYLOAD_V1_LEN + 4 * j)[0]
+    if length >= PAYLOAD_LEN:
+        for name, fmt, off in CTX_FIELDS:
+            out[name] = struct.unpack_from(fmt, rec, OFF_PAYLOAD + off)[0]
     return seq, out
 
 

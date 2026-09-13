@@ -80,7 +80,41 @@ typedef struct {
     uint32_t resume_hash;    /* name_hash of the track filename; 0 = none     */
     uint32_t resume_secs;    /* elapsed seconds within that track             */
     uint32_t resume_total;   /* that track's length, as a sanity cross-check  */
+
+    /*
+     * RESUME QUEUE CONTEXT — what the track was playing IN, so the boot path
+     * can rebuild that queue instead of the track's album. Every queue this
+     * firmware builds is a deterministic function of the library plus a few
+     * words: which list (resume_kind — the song's own artist/genre name the
+     * list), the LCG seed Shuffle Songs drew the library order from
+     * (resume_seed), and the player's shuffle deal (resume_order_seed +
+     * resume_order_keep, see player_order_seed). resume_qidx is where in that
+     * queue the track sat, a hint for the rebuild and the "N of M" the user
+     * remembers. All meaningless while resume_kind is RESUME_KIND_NONE, and
+     * zeroed with the locator (hash 0) on both sides of the codec.
+     * resume_flags and resume_ctx_hash are reserved (written 0, ignored).
+     */
+    uint8_t  resume_kind;    /* RESUME_KIND_*                                 */
+    uint8_t  resume_flags;   /* reserved                                      */
+    uint16_t resume_qidx;    /* queue index of the track when captured        */
+    uint32_t resume_seed;    /* Shuffle Songs' library-order LCG seed         */
+    uint32_t resume_order_seed;  /* player_order_seed() — 0 = no deal         */
+    int      resume_order_keep;  /* player_order_keep(); PLAYER_KEEP_*        */
+    uint32_t resume_ctx_hash;/* reserved                                      */
 } settings_t;
+
+/* What kind of queue the resume locator's track was playing in. On disk as
+ * one byte; unknown values read back as NONE (the album fallback). */
+enum {
+    RESUME_KIND_NONE     = 0,  /* unknown — rebuild the track's album         */
+    RESUME_KIND_ALBUM    = 1,  /* the album folder, entered from the browser  */
+    RESUME_KIND_SONGS    = 2,  /* Songs: every song, title order              */
+    RESUME_KIND_ARTIST   = 3,  /* an artist's All Songs                       */
+    RESUME_KIND_GENRE    = 4,  /* a genre's songs                             */
+    RESUME_KIND_SHUFFLE  = 5,  /* Shuffle Songs: the library in seed order    */
+    RESUME_KIND_PLAYLIST = 6,  /* reserved for M3U playlists (not wired yet)  */
+    RESUME_KIND_MAX      = RESUME_KIND_PLAYLIST
+};
 
 /* Populate `s` with sensible defaults (shuffle off, repeat off, volume 70,
  * backlight 15 s at full brightness, Linen theme). */

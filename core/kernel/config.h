@@ -64,6 +64,10 @@
  *
  *   v1  the settings fields (12 payload bytes).
  *   v2  + the resume locator (hash / elapsed / length, 12 more bytes).
+ *       + the resume queue context (kind / queue index / seeds, 20 more
+ *         bytes) — appended under the SAME version, length 24 -> 44, so
+ *         a 24-byte v2 record still reads (context unknown) and a build
+ *         that only knows 24 bytes still reads a 44-byte one.
  *
  * The v2 payload is v1's with fields APPENDED — no existing offset moved, so
  * the header and the first 12 payload bytes of a v1 record on a user's disk
