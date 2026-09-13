@@ -712,7 +712,7 @@ static int battery_refresh(int force)
          * battery_policy_feed(-1) touches neither the filter nor the level, so
          * a flaky bus can neither power the device off nor clear a genuine
          * DISKSAFE. */
-        (void)battery_policy_feed(-1);
+        (void)battery_policy_feed(-1, power_is_external());
         uart_puts("core: batt read failed\n");
         return 1;
     }
@@ -728,7 +728,7 @@ static int battery_refresh(int force)
      * the FILTERED millivolts too — same curve, same mapping, just not
      * re-evaluated on a single spin-up-sagged sample every 5 s.
      */
-    battery_event_t ev = battery_policy_feed(bs.mv);
+    battery_event_t ev = battery_policy_feed(bs.mv, g_bat_ext);
     g_bat_mv_filt = battery_filtered_mv();
     g_bat_pct     = battery_percent_from_mv(g_bat_mv_filt);
 

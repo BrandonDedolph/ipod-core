@@ -171,23 +171,122 @@ static int test_battery_sample(void)
     return trace_done(&tc);
 }
 
-/* A raw code BELOW the cell's operating band: the clamp must move mv but must
- * NOT touch mv_raw, or "bad read" and "flat battery" stay indistinguishable. */
+/* A SMALL excursion outside the cell's operating band — inside the reject band
+ * but under the 3300 mV floor, or over the 4200 mV ceiling — is clamped: mv
+ * moves, mv_raw does not, so "flat cell under load" and "at the floor" stay
+ * distinguishable to a caller that looks. */
 static int test_battery_sample_clamp(void)
 {
-    mmio_mock_reset();
-    /* raw = (0x20<<2)|0 = 128 -> 128*6000>>10 = 750 mV, far below PMU_MV_MIN. */
-    mmio_mock_set_read(I2C_DATA0_ADDR, 0x20);
-    mmio_mock_set_read(I2C_DATA1_ADDR, 0x00);
-
-    battery_sample_t bs;
-    int rc = battery_sample(&bs);
     trace_cursor tc = trace_begin("battery_sample_clamp");
-    if (rc != 0 || bs.raw != 128 || bs.mv_raw != 750 || bs.mv != 3300) {
-        fprintf(stderr, "[battery_sample_clamp] rc %d raw %d mv_raw %d mv %d; "
-                        "expected 0/128/750/3300\n",
-                rc, bs.raw, bs.mv_raw, bs.mv);
+    battery_sample_t bs;
+    int rc;
+
+    /* raw = (0x87<<2)|0 = 540 -> 540*6000>>10 = 3164 mV: under the floor,
+     * inside the reject band. */
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_DATA0_ADDR, 0x87);
+    mmio_mock_set_read(I2C_DATA1_ADDR, 0x00);
+    rc = battery_sample(&bs);
+    if (rc != 0 || bs.raw != 540 || bs.mv_raw != 3164 || bs.mv != 3300) {
+        fprintf(stderr, "[%s] low: rc %d raw %d mv_raw %d mv %d; "
+                        "expected 0/540/3164/3300\n",
+                tc.name, rc, bs.raw, bs.mv_raw, bs.mv);
         tc.fails++;
+    }
+
+    /* raw = (0xB9<<2)|0 = 740 -> 4335 mV: over the ceiling (a cell being
+     * driven by the charger), inside the reject band. */
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_DATA0_ADDR, 0xB9);
+    mmio_mock_set_read(I2C_DATA1_ADDR, 0x00);
+    rc = battery_sample(&bs);
+    if (rc != 0 || bs.raw != 740 || bs.mv_raw != 4335 || bs.mv != 4200) {
+        fprintf(stderr, "[%s] high: rc %d raw %d mv_raw %d mv %d; "
+                        "expected 0/740/4335/4200\n",
+                tc.name, rc, bs.raw, bs.mv_raw, bs.mv);
+        tc.fails++;
+    }
+    return trace_done(&tc);
+}
+
+/*
+ * THE NACK SHAPES. i2c_read() cannot see a missing ack: it waits for the
+ * controller to go idle and latches whatever I2C_DATA0/1 hold. When the PMU
+ * does not answer the result read those registers still hold the bytes the
+ * driver itself last WROTE through them — DATA0 = 0x30 (the ADCS1 register
+ * pointer) and DATA1 = 0x05 (the ADCC1 start byte from the select write) —
+ * which assembles to raw 0xC1 = 1130 mV. Before this fix that clamped to the
+ * 3300 mV floor, i.e. the shutoff line, and three such reads inside 15 s
+ * carried the policy through DISKSAFE to a power-off on a healthy cell. The
+ * inverse (a floating bus, 0xFF/0xFF -> 0x3FF = 5994 mV) clamped to 4200 and
+ * hid a flat battery behind a full one. Both must be FAILED reads: -1
+ * everywhere, so they enter nothing anywhere.
+ *
+ * The mock is seeded with exactly the register-file residue a NACKed read
+ * leaves — the value it returns for DATA0/DATA1 is the value the driver wrote
+ * there one transaction earlier.
+ */
+static int test_battery_sample_nack_residue_is_failure(void)
+{
+    trace_cursor tc = trace_begin("battery_sample_nack_residue_is_failure");
+    battery_sample_t bs;
+    int rc;
+
+    /* What the register file holds after the pointer write: 0x30 / 0x05. */
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_DATA0_ADDR, 0x30);
+    mmio_mock_set_read(I2C_DATA1_ADDR, 0x05);
+    rc = battery_sample(&bs);
+    if (rc == 0 || bs.raw != -1 || bs.mv_raw != -1 || bs.mv != -1) {
+        fprintf(stderr, "[%s] residue 0x30/0x05 (1130 mV): rc %d raw %d "
+                        "mv_raw %d mv %d; expected -1 everywhere\n",
+                tc.name, rc, bs.raw, bs.mv_raw, bs.mv);
+        tc.fails++;
+    }
+    if (battery_millivolts() != -1 || battery_percent() != -1) {
+        fprintf(stderr, "[%s] wrappers returned a value for the residue\n",
+                tc.name);
+        tc.fails++;
+    }
+
+    /* A bus floating high: 0x3FF -> 5994 mV. */
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_DATA0_ADDR, 0xFF);
+    mmio_mock_set_read(I2C_DATA1_ADDR, 0xFF);
+    rc = battery_sample(&bs);
+    if (rc == 0 || bs.raw != -1 || bs.mv_raw != -1 || bs.mv != -1) {
+        fprintf(stderr, "[%s] floating 0x3FF (5994 mV): rc %d raw %d "
+                        "mv_raw %d mv %d; expected -1 everywhere\n",
+                tc.name, rc, bs.raw, bs.mv_raw, bs.mv);
+        tc.fails++;
+    }
+    if (battery_millivolts() != -1 || battery_percent() != -1) {
+        fprintf(stderr, "[%s] wrappers returned a value for a floating bus\n",
+                tc.name);
+        tc.fails++;
+    }
+
+    /* The band edges themselves, so the reject thresholds are pinned:
+     * raw 478 -> 2800 mV is the lowest accepted (clamps to 3300),
+     * raw 477 -> 2794 mV is rejected;
+     * raw 785 -> 4599 mV is the highest accepted (clamps to 4200),
+     * raw 786 -> 4605 mV is rejected. */
+    struct { int d0, d1, want_rc, want_mv; const char *what; } edges[] = {
+        { 0x77, 0x02,  0, 3300, "2800 mV accepted"  },   /* 478 */
+        { 0x77, 0x01, -1,   -1, "2794 mV rejected"  },   /* 477 */
+        { 0xC4, 0x01,  0, 4200, "4599 mV accepted"  },   /* 785 */
+        { 0xC4, 0x02, -1,   -1, "4605 mV rejected"  },   /* 786 */
+    };
+    for (unsigned i = 0; i < sizeof edges / sizeof edges[0]; i++) {
+        mmio_mock_reset();
+        mmio_mock_set_read(I2C_DATA0_ADDR, (uint32_t)edges[i].d0);
+        mmio_mock_set_read(I2C_DATA1_ADDR, (uint32_t)edges[i].d1);
+        rc = battery_sample(&bs);
+        if (rc != edges[i].want_rc || bs.mv != edges[i].want_mv) {
+            fprintf(stderr, "[%s] %s: rc %d mv %d (mv_raw %d)\n",
+                    tc.name, edges[i].what, rc, bs.mv, bs.mv_raw);
+            tc.fails++;
+        }
     }
     return trace_done(&tc);
 }
@@ -195,7 +294,7 @@ static int test_battery_sample_clamp(void)
 /*
  * An all-zero ADC result is a failed read. i2c_read() only waits for the
  * controller to go idle — it never checks that the PMU acked — so a transfer
- * the PMU did not answer can return zeros and report success. Raw 0 would
+ * the PMU did not answer can return zeros and report success. Raw 0 used to
  * clamp to the 3300 mV floor, i.e. the shutoff line, so three of them in a
  * row would walk the policy from OK to power-off on a healthy cell. The
  * driver must reject it, and the policy must then see -1 and hold still.
@@ -310,13 +409,17 @@ static int expect_charging(uint32_t gpiob, int want, const char *label)
  * deliberately broken policy — see the commit message for the list.
  * ===================================================================== */
 
+/* power_is_external() as seen by the policy for every feed below. Cases run on
+ * battery (0) unless they are testing the charger gate. */
+static int g_ext;
+
 /* Feed `mv` `n` times, asserting NONE from every feed except the last, which
  * must return `last`. Returns the number of mismatches. */
 static int feed_expect(trace_cursor *tc, int mv, int n, battery_event_t last)
 {
     for (int i = 0; i < n; i++) {
         battery_event_t want = (i == n - 1) ? last : BATTERY_EVENT_NONE;
-        battery_event_t got  = battery_policy_feed(mv);
+        battery_event_t got  = battery_policy_feed(mv, g_ext);
         if (got != want) {
             fprintf(stderr, "[%s] feed #%d of %d mV: expected event %d, got %d "
                             "(filtered %d)\n",
@@ -349,6 +452,7 @@ static void expect_level(trace_cursor *tc, battery_level_t want,
 static int prime(trace_cursor *tc, int mv)
 {
     battery_policy_reset();
+    g_ext = 0;
     if (feed_expect(tc, mv, BATTERY_FILTER_N, BATTERY_EVENT_NONE)) {
         return 1;
     }
@@ -469,6 +573,7 @@ static int test_policy_disksafe_once_first(void)
     mmio_mock_reset();
 
     battery_policy_reset();
+    g_ext = 0;
     /* Not armed: four floor samples, no event, writes still allowed. */
     feed_expect(&tc, 3300, 4, BATTERY_EVENT_NONE);
     expect_level(&tc, BATTERY_LEVEL_OK, 1, "unarmed");
@@ -485,7 +590,7 @@ static int test_policy_disksafe_once_first(void)
     feed_expect(&tc, 3450, 3, BATTERY_EVENT_DISKSAFE);
     int disksafe_events = 0, other_events = 0;
     for (int i = 0; i < 24; i++) {
-        battery_event_t ev = battery_policy_feed((i & 1) ? 3450 : 3520);
+        battery_event_t ev = battery_policy_feed((i & 1) ? 3450 : 3520, 0);
         if (ev == BATTERY_EVENT_DISKSAFE) {
             disksafe_events++;
         } else if (ev != BATTERY_EVENT_NONE) {
@@ -560,7 +665,7 @@ static int test_policy_i2c_failure_inert(void)
     for (int i = 0; i < 3; i++) {
         battery_sample_t zb;
         int zrc = battery_sample(&zb);
-        battery_event_t zev = battery_policy_feed(zrc == 0 ? zb.mv : -1);
+        battery_event_t zev = battery_policy_feed(zrc == 0 ? zb.mv : -1, 0);
         if (zrc == 0 || zev != BATTERY_EVENT_NONE) {
             fprintf(stderr, "[%s] zero read %d: rc %d event %d\n",
                     tc.name, i, zrc, (int)zev);
@@ -583,7 +688,7 @@ static int test_policy_i2c_failure_inert(void)
                 tc.name);
         tc.fails++;
     }
-    battery_event_t ev = battery_policy_feed(rc == 0 ? bs.mv : -1);
+    battery_event_t ev = battery_policy_feed(rc == 0 ? bs.mv : -1, 0);
     if (ev != BATTERY_EVENT_NONE || battery_filtered_mv() != 3700) {
         fprintf(stderr, "[%s] wedged-bus sample: event %d filtered %d\n",
                 tc.name, (int)ev, battery_filtered_mv());
@@ -625,6 +730,72 @@ static int test_policy_recovers(void)
     return trace_done(&tc);
 }
 
+/*
+ * ON A CHARGER THE DESCENT IS OFF. Every downward edge exists to stop a
+ * running-down cell browning the system out; with external power the charger
+ * holds the rails and drives the cell UP, so neither hazard exists — and a
+ * cell so flat it reads under the lines while charging is exactly the one that
+ * must be left on the charger, not powered off the moment the filter fills.
+ *
+ * Pinned: a floor-level ring on a charger arms without DISKSAFE and never
+ * reaches SHUTOFF; the confirm run does not accumulate while plugged in, so an
+ * unplug starts the 15 s confirm from zero; the ring still fills (gauge);
+ * RECOVERED still fires off the median with the charger attached; and the
+ * gate is read per sample — unplug, and the descent resumes on the same ring.
+ */
+static int test_policy_external_gates_descent(void)
+{
+    trace_cursor tc = trace_begin("policy_external_gates_descent");
+    mmio_mock_reset();
+
+    /* Boot on a charger with a flat cell: arms, no DISKSAFE, no SHUTOFF, for
+     * as long as it stays plugged in. */
+    battery_policy_reset();
+    g_ext = 1;
+    feed_expect(&tc, 3300, 5, BATTERY_EVENT_NONE);       /* arms here      */
+    feed_expect(&tc, 3300, 20, BATTERY_EVENT_NONE);      /* 100 s at floor */
+    expect_level(&tc, BATTERY_LEVEL_OK, 1, "flat on charger");
+    if (!battery_filter_ready() || battery_filtered_mv() != 3300) {
+        fprintf(stderr, "[%s] charger stopped the ring: ready %d filtered %d\n",
+                tc.name, battery_filter_ready(), battery_filtered_mv());
+        tc.fails++;
+    }
+
+    /* Unplug on the same floor-level ring: DISKSAFE on the very next sample
+     * (median already at the floor), then SHUTOFF only after a FULL confirm
+     * window counted from the unplug — two more, because the unplug sample
+     * itself was the first evaluation at the floor. Had the run accumulated
+     * while plugged in, SHUTOFF would fire on the unplug sample. */
+    g_ext = 0;
+    feed_expect(&tc, 3300, 1, BATTERY_EVENT_DISKSAFE);
+    feed_expect(&tc, 3300, 2, BATTERY_EVENT_SHUTOFF);
+    expect_level(&tc, BATTERY_LEVEL_SHUTOFF, 0, "after unplug");
+
+    /* A healthy ring, plugged in, then a genuine decline: nothing fires while
+     * the charger is attached, however deep or long. */
+    if (prime(&tc, 3700)) {
+        return trace_done(&tc);
+    }
+    g_ext = 1;
+    feed_expect(&tc, 3450, 10, BATTERY_EVENT_NONE);
+    feed_expect(&tc, 3300, 10, BATTERY_EVENT_NONE);
+    expect_level(&tc, BATTERY_LEVEL_OK, 1, "declining on charger");
+
+    /* Plugged in while already in DISKSAFE: no SHUTOFF, and the charger
+     * pushing the median over the recovery line clears it as usual. */
+    if (prime(&tc, 3700)) {
+        return trace_done(&tc);
+    }
+    feed_expect(&tc, 3450, 3, BATTERY_EVENT_DISKSAFE);
+    g_ext = 1;
+    feed_expect(&tc, 3300, 10, BATTERY_EVENT_NONE);
+    expect_level(&tc, BATTERY_LEVEL_DISKSAFE, 0, "floor in disksafe, charger");
+    feed_expect(&tc, 3900, 3, BATTERY_EVENT_RECOVERED);
+    expect_level(&tc, BATTERY_LEVEL_OK, 1, "recovered on charger");
+    g_ext = 0;
+    return trace_done(&tc);
+}
+
 int main(void)
 {
     int fails = 0;
@@ -633,6 +804,7 @@ int main(void)
     fails += test_battery_sample();
     fails += test_battery_sample_clamp();
     fails += test_battery_sample_zero_is_failure();
+    fails += test_battery_sample_nack_residue_is_failure();
     fails += test_battery_percent_from_mv();
 
     /* Low-battery policy: filter, thresholds, debounce, bus failure, recovery. */
@@ -641,6 +813,7 @@ int main(void)
     fails += test_policy_disksafe_once_first();
     fails += test_policy_i2c_failure_inert();
     fails += test_policy_recovers();
+    fails += test_policy_external_gates_descent();
 
     /* power_is_external polarity matrix:
      *   main charger bit 0x08 is ACTIVE-LOW (clear = present),
