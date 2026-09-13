@@ -69,11 +69,17 @@ int  stub_audio_suspends_while_running;
 int  stub_audio_drains;
 int  stub_audio_drained_while_running;  /* drains issued BEFORE the stop      */
 int  stub_ata_standbys;
+int  stub_ata_reads;
+static int g_ata_read_ok = 1;  /* stub_set_ata_read_ok(): make reads fail */
 int  stub_meta_reads;
 int  stub_seeks;
 static int g_seek_ok = 1;   /* stub_set_seek_ok(): force the decoder to refuse */
 
-void stub_set_seek_ok(int ok) { g_seek_ok = ok ? 1 : 0; }
+static uint32_t g_disk_ahead = 64u * 1024u * 1024u;
+
+void stub_set_seek_ok(int ok)          { g_seek_ok = ok ? 1 : 0; }
+void stub_set_ata_read_ok(int ok)      { g_ata_read_ok = ok ? 1 : 0; }
+void stub_set_disk_ahead(uint32_t b)   { g_disk_ahead = b; }
 
 /* Frames the fake decoder produces before reporting end-of-stream. Small, so a
  * track ends after a bounded number of player_pump() calls. */
@@ -90,9 +96,11 @@ void stub_reset(void)
     stub_audio_drained_while_running = 0;
     stub_audio_cold = stub_audio_suspends = stub_audio_wakes = 0;
     stub_audio_suspends_while_running = 0;
-    stub_ata_standbys = stub_meta_reads = 0;
+    stub_ata_standbys = stub_ata_reads = stub_meta_reads = 0;
     stub_seeks = 0;
     g_seek_ok  = 1;
+    g_ata_read_ok = 1;
+    g_disk_ahead  = 64u * 1024u * 1024u;
     g_frames_left = 0;
 }
 
@@ -184,10 +192,13 @@ void diskbuf_init(diskbuf_t *db, decoder_source_t *inner, uint8_t *buf,
 {
     (void)buf;
     (void)cap;
-    (void)low;
-    (void)high;
     memset(db, 0, sizeof *db);
     db->inner = inner;
+    /* The watermarks are kept: the player reads them back to predict whether
+     * a pump pass will touch the drive, and a zeroed pair would make every
+     * pass look idle. */
+    db->low   = low;
+    db->high  = high;
 }
 
 void diskbuf_as_source(diskbuf_t *db, decoder_source_t *out)
@@ -205,9 +216,9 @@ uint32_t diskbuf_pump(diskbuf_t *db, uint32_t chunk)
 uint32_t diskbuf_fill_ahead(const diskbuf_t *db)
 {
     (void)db;
-    /* Comfortably above the player's DISK_LOW watermark, so the "topped up and
-     * idle -> park the drive" branch is the one that runs. */
-    return 64u * 1024u * 1024u;
+    /* By default comfortably above the player's DISK_LOW watermark, so the
+     * "topped up and idle -> park the drive" branch is the one that runs. */
+    return g_disk_ahead;
 }
 
 /* No disk error: the player distinguishes a persistent read failure from a
@@ -471,6 +482,10 @@ void hal_audio_close(void)
 int ata_read_sectors(uint32_t lba, uint32_t count, void *buf)
 {
     (void)lba;
+    stub_ata_reads++;
+    if (!g_ata_read_ok) {
+        return -1;
+    }
     memset(buf, 0, (size_t)count * 512u);
     return 0;
 }

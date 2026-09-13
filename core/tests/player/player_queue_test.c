@@ -1089,6 +1089,58 @@ int main(void)
     xpect(&c, "a button press does NOT wait for the buffers to drain",
           stub_audio_drains == 0);
 
+    /* ---- 13e. quiet playback parks the drive ONCE ---------------------- *
+     *
+     * Between refill bursts the anti-skip buffer is topped up and idle, and
+     * the pump parks the platters. That state persists for tens of seconds
+     * per burst, i.e. thousands of pump passes. Each pass used to un-park
+     * the drive in software (without any read to justify it) and then, seeing
+     * an un-parked idle drive, park it again: a STANDBY IMMEDIATE — cpu_boost,
+     * ready wait, command, wait — hundreds of times a second for the whole of
+     * quiet playback. The fakes model the idle state exactly: diskbuf_pump()
+     * has nothing to do and fill_ahead sits far above the low watermark. */
+    stub_reset();
+    stub_set_track_frames(44100u * 60u);   /* long enough never to hit EOS */
+    make_entries(ents, 1, 0);
+    player_play_queue(ents, 1, 0, 0, 0);
+    set_usec(0);
+    for (int i = 0; i < 300; i++) {
+        player_pump();                     /* fills the ring past the parked gate */
+    }
+    /* Model one refill burst starting and ending: a pass with the buffer
+     * drained below the watermark (the pump would read here), then topped up
+     * again. Whatever state the drive was left in by the sections above, it
+     * is now unparked-and-idle, and the pass after must park it. */
+    stub_set_disk_ahead(0);
+    player_pump();
+    stub_set_disk_ahead(64u * 1024u * 1024u);
+    int standbys_before = stub_ata_standbys;
+    for (int i = 0; i < 400; i++) {
+        player_pump();
+    }
+    xpect(&c, "quiet playback parks the drive exactly once, not once per pass",
+          stub_ata_standbys == standbys_before + 1);
+    /*
+     * The same passes used to arm the pump's one-shot spin-up probe and never
+     * consume it, so the next block read from ANYWHERE went out with the
+     * retry loop disabled — the intermittent "OPEN FAILED" the six tries were
+     * written to ride over, back again for every prefetch, art load and
+     * library probe that followed a quiet stretch. With reads failing, a
+     * latched probe shows up as one attempt instead of six.
+     */
+    {
+        uint8_t sector[512];
+        stub_set_ata_read_ok(0);
+        int reads_before = stub_ata_reads;
+        xpect(&c, "a failing read still fails",
+              player_disk_read(0, 0, 1, sector) == -1);
+        xpect(&c, "the spin-up probe is not left armed by an idle pump pass: "
+                  "the next read gets its full retry loop",
+              stub_ata_reads - reads_before == 6);
+        stub_set_ata_read_ok(1);
+    }
+    stub_set_track_frames(8192u);
+
     /* ---- 14. calls with nothing loaded are safe ------------------------ */
     stub_reset();
     player_queue_begin();          /* stops playback, empties the queue */

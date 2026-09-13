@@ -32,6 +32,21 @@ int stub_drain(int frames);
  * actually chose, independent of what its index says. */
 uint32_t stub_last_open_clus(void);
 
+/*
+ * The drive's read path. player_disk_read() retries a failed sector read six
+ * times — unless the pump has armed its one-shot spin-up probe, in which case
+ * it tries once. That flag is private to player.c, but it is observable here:
+ * make the reads fail and count how many attempts one player_disk_read() costs.
+ */
+void stub_set_ata_read_ok(int ok);
+extern int stub_ata_reads;      /* ata_read_sectors calls, success or not   */
+
+/* Bytes the fake anti-skip buffer reports as buffered ahead of the decoder.
+ * Defaults to far above the player's low watermark ("topped up and idle");
+ * dropping it below the watermark for a pass models the start of a refill
+ * burst, which is what lets a test steer the drive park/unpark bookkeeping. */
+void stub_set_disk_ahead(uint32_t bytes);
+
 extern int stub_opens;          /* decoder opens that succeeded             */
 extern int stub_open_attempts;  /* opens attempted, incl. the failures      */
 extern int stub_closes;         /* decoder closes                           */

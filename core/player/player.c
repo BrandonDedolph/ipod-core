@@ -1370,6 +1370,23 @@ void player_queue_commit(int start)
     }
 }
 
+/*
+ * Will diskbuf_pump() read from the backing source on its next call? Mirrors
+ * the pump's own decision (codecs/diskbuf.c): while bursting it reads until
+ * the high watermark, EOF or a latched error; idle, it wakes only once the
+ * decoder has drained the buffer below the low watermark. The player needs
+ * this BEFORE the call, because waking a parked drive is bookkeeping that
+ * must happen exactly when a read is about to hit it — see player_pump.
+ */
+static int diskbuf_will_fetch(const diskbuf_t *db)
+{
+    if (db->eos || db->err) {
+        return 0;
+    }
+    uint32_t ahead = diskbuf_fill_ahead(db);
+    return db->filling ? (ahead < db->high) : (ahead < db->low);
+}
+
 /* Decode one chunk per call and auto-advance at end of track. Called every
  * main-loop pass, so audio runs in the background while the UI is elsewhere. */
 void player_pump(void)
@@ -1451,13 +1468,32 @@ void player_pump(void)
         }
     }
     if (pcm_ring_fill(&g_ring) >= gate) {
-        if (g_drive_parked || g_dbuf.err_streak > 0) {
+        /*
+         * Only treat this pass as a disk access if diskbuf_pump is actually
+         * going to read. Most passes it is not: the buffer is topped up and
+         * idle, and the pump returns without touching the drive. Clearing
+         * g_drive_parked on those passes too — which this used to do — meant
+         * the park branch below saw "not parked, topped up, idle" and issued
+         * STANDBY IMMEDIATE again, every pass, hundreds of times a second for
+         * the whole of quiet playback: each one a cpu_boost, a ready wait and
+         * a command the drive had already executed. Worse, the one-shot probe
+         * was armed on every one of those passes and never consumed, so the
+         * next read from ANYWHERE — the prefetch's track_open, album art, a
+         * library probe — went out as a single non-retrying attempt, which is
+         * the intermittent "OPEN FAILED" the six-try loop exists to ride over.
+         */
+        if (diskbuf_will_fetch(&g_dbuf) &&
+            (g_drive_parked || g_dbuf.err_streak > 0)) {
             /* Waking a parked platter, or retrying a read that already failed
              * once: one attempt, no backoff loop. */
             g_drive_parked = 0;
             g_spinup_probe = 1;
         }
         diskbuf_pump(&g_dbuf, DISK_CHUNK);
+        /* The probe is for the read that just happened, never for the next
+         * one. If the pump did not consume it (the fetch was served without a
+         * block read, or did not happen at all), it must not lie in wait. */
+        g_spinup_probe = 0;
     }
     /* Apple-quiet playback: physically PARK the drive between refill bursts.
      * The diskbuf already goes idle (filling==0) once it's topped up; when it
@@ -1546,7 +1582,7 @@ uint32_t player_elapsed_s(void)
     return (nowu - g_pl_start_us) / 1000000u;
 }
 
-uint32_t player_total_s(void) { return g_pl_total_s; }
+uint32_t player_total_s(void) { return g_pl_active ? g_pl_total_s : 0u; }
 
 uint32_t player_buf_pct(void) { return (g_pl_low_fill * 100u) / RING_FRAMES; }
 
