@@ -62,9 +62,11 @@ What changed (see `git log 054c722..`):
 
 Still open from the audit: `DEV_EN` peripheral gating and PLL-off in
 suspend (moot once escalation lands), the BCM power gate, `PANEL_SLEEP_AT_IDLE`
-(still 0), a tiebreak for same-hash files in one folder, `flac_meta.c`
-stripping non-ASCII on the scan fallback, `ata_identify()`'s ERR check, and
-the reserved playlist queue kind. Nothing has been pushed.
+(still 0), and the reserved playlist queue kind. Closed since: the same-hash
+tiebreak (`name_bind_exact`, exact on-disk name wins when a bucket has two
+candidates), `flac_meta.c` keeping UTF-8 on the scan fallback, and
+`ata_identify()` waiting for !BSY before it reads ERR/DF. Nothing has been
+pushed.
 
 ## Where we are right now (2026-07-28)
 
