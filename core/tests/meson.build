@@ -783,6 +783,22 @@ if target == 'sim'
   )
   test('idx', idx_test, suite: 'unit')
 
+  # cfg-commit: the settings-save commit gate (core/kernel/cfg_commit.c) —
+  # the SAME source the ARM build links. It decides when a pending settings
+  # change becomes the firmware's one disk write: the debounce, the "don't
+  # spin the platters up for 1 KB under a live player" refusal, the battery
+  # gate and its DISKSAFE exemption, and — the two it got wrong while it was
+  # a static in main.c — that a write into a PARKED drive is preceded by a
+  # wake, and that a write that FAILS leaves the change pending for a retry
+  # (one debounce later, bounded) instead of discarding it.
+  cfg_commit_test = executable(
+    'cfg_commit_test',
+    sources: ['kernel/cfg_commit_test.c', '../kernel/cfg_commit.c'],
+    include_directories: include_directories('.'),
+    override_options: test_opts,
+  )
+  test('cfg-commit', cfg_commit_test, suite: 'unit')
+
   # sort: the stable index-array merge sort (core/library/sort.c) every
   # alphabetised list is built with — the SAME source the ARM build links.
   # main.c's only evidence for it was a comment saying it had been checked

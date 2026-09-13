@@ -33,6 +33,7 @@
 #include "console.h"
 #include "panic.h"
 #include "config.h"
+#include "cfg_commit.h"
 #include "../ui/text.h"
 #include "../ui/thumb.h"
 #include "../ui/artcache.h"
@@ -639,35 +640,13 @@ static int      g_bat_mv_filt = -1;          /* median of recent samples (policy
 /* Defined further down; the low-battery policy in battery_refresh() acts
  * through them. Forward-declared here rather than moving battery_refresh(),
  * which sits with the status-strip state it feeds. */
-static void settings_commit(int force);
+static void settings_commit(int mode);
 static void resume_capture(void);
 _Noreturn static void enter_standby(void);
 
-/*
- * settings_commit() modes.
- *
- *   CFG_COMMIT_IDLE   the main loop: debounced, deferred while the drive is
- *                     parked under a live player, refused below the
- *                     disk-safe battery line.
- *   CFG_COMMIT_FORCE  now (suspend, power-off): no debounce, no parked
- *                     check — still refused below the disk-safe line.
- *   CFG_COMMIT_LAST   the ONE write the low-battery policy makes at the
- *                     DISKSAFE edge, exempt from the battery gate.
- *
- * The exemption is not optional. battery_policy_feed() latches DISKSAFE
- * BEFORE it returns the edge, so by the time battery_refresh() acts on that
- * edge battery_disk_writes_allowed() is already 0 — and a gated commit there
- * refuses the very flush the policy exists to make while the cell still has
- * the energy for it. That is exactly what happened when the flush and the
- * gate landed as two separate changes, each written without the other: the
- * DISKSAFE handler called settings_commit(1), the gate turned it away, and a
- * low-battery shutdown persisted nothing at all — no resume position, no
- * pending setting — while both commit messages described a flush that
- * never ran.
- */
-#define CFG_COMMIT_IDLE   0
-#define CFG_COMMIT_FORCE  1
-#define CFG_COMMIT_LAST   2
+/* settings_commit() modes — CFG_COMMIT_IDLE / _FORCE / _LAST — and the
+ * policy behind them (the DISKSAFE exemption in particular, which is not
+ * optional) live in cfg_commit.h with the gate that implements them. */
 
 /* Measured cost of the last full-frame present; defined with the present
  * throttle further down. Reported on the stats line below so the number the
@@ -2666,87 +2645,70 @@ static void settings_apply(void)
  * add another, call it there too — a missed call means the change is simply
  * not persisted, which is the safe direction to fail.
  * ------------------------------------------------------------------------- */
-#define CFG_SAVE_DEBOUNCE_US  3000000u    /* 3 s after the last change */
-
-static int      g_cfg_dirty;              /* a change is pending a write   */
-static int      g_cfg_save_deferred;      /* gate refusal already logged   */
-static uint32_t g_cfg_dirty_us;           /* when the last change happened */
+/* The pending-change state and the gate itself are kernel/cfg_commit.c —
+ * pure, and tested on the host — so this file only gathers what the gate
+ * needs to know and carries out its verdict. */
+static cfg_commit_t g_cfg_commit;
 
 static void settings_touch(void)
 {
-    g_cfg_dirty    = 1;
-    g_cfg_dirty_us = mmio_read32(USEC_TIMER_ADDR);
+    cfg_commit_touch(&g_cfg_commit, mmio_read32(USEC_TIMER_ADDR));
 }
 
 /*
- * Commit a pending save. `force` skips the debounce (used when leaving the
- * Settings screen and before suspend). A failure is logged and the dirty flag
- * is cleared anyway: config_save() leaves the previous good slot intact, so the
- * only cost is that this session's change does not persist — and retrying every
- * pass would just hammer a drive that is already unhappy.
+ * Commit a pending save. `mode` is CFG_COMMIT_IDLE (the main loop: debounced,
+ * deferred while the drive is parked under a live player), CFG_COMMIT_FORCE
+ * (suspend, power-off: now) or CFG_COMMIT_LAST (the DISKSAFE flush, exempt
+ * from the battery gate). config_save() is the ONLY thing in the firmware
+ * that writes to the user's disk, and this is its only caller, so the gate's
+ * verdict is the whole write policy — see cfg_commit.h.
+ *
+ * Two things the gate is there to get right, because the code that stood
+ * here got both wrong: a write into a PARKED drive is preceded by
+ * ata_wakeup() (the forced commits at suspend/power-off went straight in,
+ * and the spin-up then ran inside ata_write_raw's DRQ budget — on overrun
+ * ata_recover soft-reset the channel mid-spin-up and the save returned -2);
+ * and a write that fails leaves the change PENDING, for a retry one debounce
+ * later, bounded (the pending flag was cleared before the write, so that -2
+ * silently discarded the change — the resume position captured a line
+ * earlier included). The previous good record is intact either way.
  */
-static void settings_commit(int force)
+static void settings_commit(int mode)
 {
-    if (!g_cfg_dirty) {
+    cfg_commit_env_t env;
+    env.now_us        = mmio_read32(USEC_TIMER_ADDR);
+    env.parked        = ata_is_parked();
+    env.player_active = player_active();
+    env.battery_ok    = battery_disk_writes_allowed();
+    env.writable      = config_writable();
+    int gate = cfg_commit_gate(&g_cfg_commit, mode, &env);
+    if (gate == CFG_GATE_DEFER_LOG) {
+        /* Once per refusal episode, never once per pass: a UART line is
+         * milliseconds of blocking TX, and this runs thousands of times a
+         * second while playing. */
+        uart_puts("core: cfg save deferred — battery below disk-safe\n");
         return;
     }
-    if (!force) {
-        if ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - g_cfg_dirty_us)
-                < CFG_SAVE_DEBOUNCE_US) {
-            return;
-        }
-        /* Don't spin the platters up just to save 1 KB. If the drive is parked
-         * while audio plays out of the anti-skip buffer, the write would cost
-         * a multi-second, audible spin-up for something with no deadline —
-         * so keep the change pending and let it ride out on the next refill,
-         * on playback stopping, or on the forced commit at suspend/power-off.
-         * The record stays in RAM either way; the only thing at risk is a
-         * battery pull, and the forced paths cover every graceful exit. */
-        if (ata_is_parked() && player_active()) {
-            return;
-        }
-    }
-    /*
-     * Refuse the write when the cell is too low to guarantee finishing it.
-     *
-     * config_save() is the ONLY thing in the firmware that writes to the
-     * user's disk, and settings_commit is its only caller, so this one check
-     * is the whole write gate. Below the disk-safe threshold the policy in
-     * battery.c has already flushed pending changes and parked the drive; a
-     * write starting after that would spin the platters back up on a cell that
-     * may not have the energy to see it through, and a cut mid-sector is how a
-     * config record gets torn.
-     *
-     * Deliberately BEFORE clearing g_cfg_dirty: the change stays pending, so
-     * it lands on the next commit if the charger goes in and the policy
-     * recovers. Refusing to write is not the same as discarding the edit.
-     *
-     * This also covers the forced commit inside enter_standby(): at the
-     * shutoff threshold that path would otherwise attempt a write at 3300 mV,
-     * which is exactly the moment there is least energy to complete one.
-     */
-    if (force != CFG_COMMIT_LAST && !battery_disk_writes_allowed()) {
-        /* Logged ONCE per refusal, not once per pass. This runs from the main
-         * loop — 100 Hz idle, thousands of passes a second while playing —
-         * and a UART line is milliseconds of blocking TX at 115200 baud;
-         * printed on every pass it would have dragged the whole UI for as
-         * long as the cell stayed below the line with a change pending. */
-        if (!g_cfg_save_deferred) {
-            uart_puts("core: cfg save deferred — battery below disk-safe\n");
-            g_cfg_save_deferred = 1;
-        }
+    if (gate != CFG_GATE_WRITE && gate != CFG_GATE_WRITE_WAKE) {
         return;
     }
-    g_cfg_save_deferred = 0;
-    g_cfg_dirty = 0;
-    if (!config_writable()) {
-        return;                            /* no CORECFG.DAT — nothing to do */
+    if (gate == CFG_GATE_WRITE_WAKE) {
+        /* Pre-pay the spin-up on the read path, which is built to wait out
+         * the multi-second wake, rather than inside the write's DRQ budget.
+         * A failed wake is not fatal here: the write below reports its own
+         * result, and a failure keeps the change pending. */
+        (void)ata_wakeup();
     }
-    int rc = config_save(&g_settings);
+    int rc      = config_save(&g_settings);
+    int pending = cfg_commit_result(&g_cfg_commit, rc,
+                                    mmio_read32(USEC_TIMER_ADDR));
     uart_puts("core: cfg save rc ");
     uart_put_hex32((uint32_t)rc);
     uart_puts(" seq ");
     uart_put_hex32(config_seq());
+    if (pending) {
+        uart_puts(" (retry pending)");
+    }
     uart_putc('\n');
 }
 
@@ -4283,7 +4245,7 @@ _Noreturn static void run_ui(fat32_t *fs)
      * the first UI paint. Stamped here rather than after the present so the
      * number means "time until the device was ready", not "+1 frame". */
     g_boot_total_ms    = boot_ms_now();
-    g_cfg_dirty = 0;                      /* loading is not a change to save back */
+    cfg_commit_clear(&g_cfg_commit);      /* loading is not a change to save back */
     g_scr_n = 0;
     scr_push(SCR_MENU);
 
