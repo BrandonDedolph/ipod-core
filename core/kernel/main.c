@@ -4677,9 +4677,15 @@ static int enter_standby(void)
                                            * path; a suspend has already slept
                                            * it (parked) by the time it gets here */
     }
-    console_clear(0x0000);                /* blank BEFORE the power cut so no */
-    lcd_present_fb(console_framebuffer()); /* stale colour lingers on the panel */
-    cpu_wait_ms(80);                      /* let the BCM push the black frame  */
+    console_clear(0xFFFF);                /* blank BEFORE the power cut so no */
+    lcd_present_fb(console_framebuffer()); /* stale colour lingers on the panel.
+                                           * WHITE, not black: with the LED off a
+                                           * black frame on this transflective
+                                           * panel is a dark field with the pixel
+                                           * grid showing in ambient light; white
+                                           * is what "off" looks like (device,
+                                           * 2026-09-13)                        */
+    cpu_wait_ms(80);                      /* let the BCM push the frame        */
     backlight_set(0);
 #if SUSPEND_PANEL_SLEEP
     lcd_sleep();                          /* panel off; the BCM stays alive   */
@@ -4826,7 +4832,7 @@ static int g_suspend_lp;
 #define SUSPEND_PARK_PLL     0
 #endif
 #ifndef SUSPEND_SLOW_TICK
-#define SUSPEND_SLOW_TICK    1
+#define SUSPEND_SLOW_TICK    0
 #endif
 #ifndef SUSPEND_GATE_CLOCKS
 #define SUSPEND_GATE_CLOCKS  1
@@ -4892,8 +4898,11 @@ static void suspend_to_ram(uint32_t play_down_us)
     /* Clear to black BEFORE cutting the backlight, so the transflective panel
      * doesn't faintly ghost the last UI in ambient light while asleep. Wake
      * repaints the real screen while the backlight is still off (below), so the
-     * black is never seen as a flash. */
-    console_clear(0x0000);
+     * blank is never seen as a flash. WHITE, not black: with the LED off a
+     * black frame shows as a dark field with the pixel grid visible in
+     * ambient light — "random black pixels" (device, 2026-09-13); a white
+     * frame is what an iPod looks like when it is off. */
+    console_clear(0xFFFF);
     lcd_present_fb(console_framebuffer());
     backlight_set(0);
 #if SUSPEND_PANEL_SLEEP
