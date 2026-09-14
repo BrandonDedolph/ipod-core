@@ -12,6 +12,7 @@ index that get built into or copied alongside the firmware.
 | `daylight.py` | The **one** definition of the daylight between two glyphs on a row, shared by the generator, the solver and the judge so the value solved for is the value judged: the coverage-integrated white between the two glyphs' >=50%-alpha cores, antialiasing fringe counted by what it leaves white. The first optical solve measured from the outermost pixel with *any* alpha, and a 9 px `e` whose curve ends in a 17-alpha pixel got its neighbour placed a full column further out than the eye could see — the artist sub-line's "Je remih". The no-touch floor stays a threshold (alpha >= 64 clears 1 px), on purpose; the module docstring says why. |
 | `optical_solve.py` | Solve `OPTICAL_SOLVED` in `atlas_gen.py` — the per-atlas daylight target and word gap — from a stated objective over `ui_strings.txt`, instead of sweeping numbers by eye: target within a quarter pixel of the face's own `n` counter at that size (Tracy's rule), minimum rhythm sd among those; word gap at the midpoint between the closest-approach word-split guard and half an em. `--verbose` prints the whole trade-off curve. Re-run after changing the face, the sizes, the tracking, the floor, the measure or the strings, and paste the block it prints. |
 | `make_config.py` | Create (`--create`) the pre-allocated `CORECFG.DAT` settings file in the volume root, and verify (`--verify`, read-only) the absolute LBA the firmware will overwrite. The firmware cannot create files, so this must run once before settings can persist — and `--verify` is the mandatory pre-flight before the device's first write. The record is now **v2**: v1 was settings only, v2 appends the resume locator (`resume_hash` / `resume_secs` / `resume_total`), gated on the record's own `length` exactly as `config_decode()` gates it, so a v1 record still verifies. Its defaults must match `settings_defaults()` in the firmware. See `core/docs/design/settings-persistence.md`. |
+| `make_log.py` | Create (`--create`) the pre-allocated `CORELOG.BIN` event-log ring in the volume root (4 MiB, a header block + 2047 ring blocks of 2048 B), verify (`--verify`, read-only) the block LBAs the firmware will overwrite — following the cluster chain, since this file spans many clusters — and read it back (`--dump`: the firmware's UART narration in sequence order, boot boundaries and torn/overwritten blocks marked; `--blocks` for the per-block headers). The firmware fills it from an 8 KiB RAM tap on the UART, one block per flush, through the same write gate as the settings save. Windows note: copy Windows-natively + `Write-VolumeCache`, as for `CORECFG.DAT`. `--selftest` runs under `meson test`. |
 | `build_index.py` | Read a source music tree with `ffprobe` and emit `CORELIB.IDX` — the single-read library index the firmware loads at boot (duration, track/disc, UTF-8 title/artist/album/genre, and a normalized-name hash locator per track). Paths are `--src` / `--out`; ffprobe failures are counted and listed at the end (a non-zero exit), and the record count is checked against the firmware's `LIB_MAX_SONGS`. |
 | `artist_genres.json` | The artist → primary genre map `build_index.py` applies when a file's own genre tag is empty or a comma-list. Data, not code — add artists here, not in the script. |
 | `coreart.py` | Extract a FLAC's embedded cover into the CoreArt RGB565 sidecars the firmware blits directly — `folder.art` (120×120, now-playing hero) and `folder.thm` (28×28, list chip). No JPEG decoding on the device. |
@@ -38,6 +39,13 @@ python3 tools/make_config.py --create /mnt/d          # → CORECFG.DAT
 # Pre-flight before the device's FIRST write: the LBA this prints must equal
 # the one the firmware logs over UART ("core: cfg ... lba XXXXXXXX/YYYYYYYY").
 sudo python3 tools/make_config.py --verify /dev/sdX
+
+# Event log — ONCE per device, into the volume root; same pre-flight, against
+# "core: evlog on seq .. boot .. lba XXXXXXXX/YYYYYYYY"
+python3 tools/make_log.py --create /mnt/d                # → CORELOG.BIN
+sudo python3 tools/make_log.py --verify /dev/sdX
+# ...and to read it after a session (disk mode; copy Windows-natively on WSL):
+python3 tools/make_log.py --dump CORELOG.BIN
 ```
 
 The Python tools need `Pillow` (atlas/art) and `ffmpeg`/`ffprobe` (art/index);

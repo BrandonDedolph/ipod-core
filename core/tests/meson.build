@@ -1013,5 +1013,17 @@ if target == 'sim'
          args: [meson.current_source_dir() / 'scripts' /
                 'check_build_index.py'],
          suite: 'unit')
+
+    # make-log: the host half of the on-disk event log (tools/make_log.py).
+    # Round-trips a synthesized ring through --dump: blocks come back in
+    # sequence order regardless of the slot the ring put them in, an
+    # overwritten or torn block is reported as a gap, boot boundaries and
+    # the FINAL flag show, a bad header is refused. The device side of the
+    # same format is tests/kernel/evlog_test.c, which decodes this tool's
+    # --emit fixture with the firmware's decoder.
+    test('make-log', py,
+         args: [meson.current_source_dir() / '..' / '..' / 'tools' /
+                'make_log.py', '--selftest'],
+         suite: 'unit')
   endif
 endif
