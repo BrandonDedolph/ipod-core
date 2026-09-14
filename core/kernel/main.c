@@ -4902,7 +4902,22 @@ static void suspend_to_ram(uint32_t play_down_us)
                                            * entered from BL_FULL), so without this
                                            * the "sleeping" device holds the 80 MHz
                                            * operating point for the whole suspend */
+    /* DEVICE 2026-09-13: STANDBY, not SLEEP. Every short-hold suspend today
+     * went dark and "never woke" while the 5 s power-off (which never
+     * touches the drive) came back fine. SLEEP needs a bus reset to recover
+     * and the wake path issues one BEFORE repainting; if this drive does
+     * not answer it, the wake sits in the 31 s reset budget with the screen
+     * dark. STANDBY is the device-proven park; a plain read spins it up. */
+#ifndef SUSPEND_ATA_SLEEP
+#define SUSPEND_ATA_SLEEP 0
+#endif
+#if SUSPEND_ATA_SLEEP
     ata_sleep();                          /* flush, park, spin down, interface off */
+#else
+    if (!ata_is_parked()) {
+        ata_standby();                    /* park + spin down, interface stays up */
+    }
+#endif
     /* Clear to black BEFORE cutting the backlight, so the transflective panel
      * doesn't faintly ghost the last UI in ambient light while asleep. Wake
      * repaints the real screen while the backlight is still off (below), so the
@@ -5039,9 +5054,15 @@ static void suspend_to_ram(uint32_t play_down_us)
                 was_playing     = 0;
                 break;
             }
+#if SUSPEND_ATA_SLEEP
             if (!ata_is_slept()) {
                 ata_sleep();        /* the handler re-parks with STANDBY only */
             }
+#else
+            if (!ata_is_parked()) {
+                ata_standby();
+            }
+#endif
             suspend_lowpower_enter();
         }
 
