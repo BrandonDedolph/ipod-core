@@ -3025,9 +3025,10 @@ static void settings_touch(void)
  * Commit a pending save. `mode` is CFG_COMMIT_IDLE (the main loop: debounced,
  * deferred while the drive is parked under a live player), CFG_COMMIT_FORCE
  * (suspend, power-off: now) or CFG_COMMIT_LAST (the DISKSAFE flush, exempt
- * from the battery gate). config_save() is the ONLY thing in the firmware
- * that writes to the user's disk, and this is its only caller, so the gate's
- * verdict is the whole write policy — see cfg_commit.h.
+ * from the battery gate). config_save() and evlog_flush() (evlog_commit,
+ * below) are the only two things in the firmware that write to the user's
+ * disk, and both go through this gate, so its verdict is the whole write
+ * policy — see cfg_commit.h.
  *
  * Two things the gate is there to get right, because the code that stood
  * here got both wrong: a write into a PARKED drive is preceded by

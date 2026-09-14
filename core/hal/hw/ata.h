@@ -3,7 +3,8 @@
  * core/hal/hw/ata.h — minimal PIO-polled ATA sector driver (PP5022).
  *
  * 512-byte LBA28 sectors: a read path used by everything, and a write path
- * with exactly one caller (the settings save in kernel/config.c). We boot
+ * with exactly two callers (the settings save in kernel/config.c and the
+ * event log in kernel/evlog.c, both under the same commit gate). We boot
  * directly as the OSOS image, so the drive state we inherit is the Apple
  * boot ROM's (powered, spun, PIO-timed) and init is just a soft reset plus
  * "select master, wait ready" — see core/docs/hw/04-ata.md. The 80 GB 5.5G
@@ -134,11 +135,13 @@ int ata_is_slept(void);
  * is enabled by default — without the flush, a battery pull between the write
  * and the drive's own writeback loses it silently).
  *
- * PROVEN ON HARDWARE (2026-07-27) and wired to ONE caller: config_save() in
+ * PROVEN ON HARDWARE (2026-07-27) with ONE caller: config_save() in
  * kernel/config.c, whose banner records the qualification procedure (resolve
  * the LBA three ways, write, read back raw, fsck). That procedure is owed by
- * anyone adding a second caller, because unlike a bad read, a bad write
- * destroys data. The fs layer (fs/fat32.c) is still read-only and keeps no
+ * anyone adding a caller, because unlike a bad read, a bad write destroys
+ * data. The SECOND caller, evlog_flush() in kernel/evlog.c (bound in by
+ * main.c), owes it and has not yet paid: STATUS.md first-flash item 9.
+ * The fs layer (fs/fat32.c) is still read-only and keeps no
  * write-invalidation for its sector caches — a caller that writes a sector
  * the fs may have cached must deal with that itself, as config.c does by
  * reading its slots back through the volume's raw block callback rather than

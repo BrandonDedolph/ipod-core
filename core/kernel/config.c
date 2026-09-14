@@ -39,6 +39,13 @@
  *
  * If any step fails, the correct response is to make config_writable() return
  * 0 unconditionally, not to "fix it quickly".
+ *
+ * THE SECOND CALLER. kernel/evlog.c (the on-disk event log, 2026-09-13)
+ * writes 2048-byte blocks into CORELOG.BIN under every rule above, and owes
+ * this same procedure with its own tool: tools/make_log.py --verify against
+ * the "core: evlog ... lba <hdr>/<next>" line, a forced flush, a raw
+ * read-back, chkdsk read-only. STATUS.md's first-flash checklist item 9
+ * spells it out. It is unflashed until that has been done.
  * =========================================================================
  *
  * WHY THIS IS SAFE (when the LBA is right)
@@ -734,7 +741,8 @@ int config_probe_lba(uint32_t slot, uint32_t *lba)
 /* ---- save -------------------------------------------------------------- */
 
 /*
- * THE ONLY CALL TO ata_write_sectors() IN THE FIRMWARE.
+ * ONE OF THE TWO CALLS TO ata_write_sectors() IN THE FIRMWARE (the other is
+ * evlog_flush in kernel/evlog.c, which main.c binds in as the log's writer).
  *
  * Order matters: resolve and validate the address FIRST, build the record
  * SECOND, write THIRD, and only update the in-RAM bookkeeping if the write

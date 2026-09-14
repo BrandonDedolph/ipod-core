@@ -12,9 +12,9 @@
 
 # config.c is the ONLY code in the firmware that writes to the user's disk
 # (settings persistence into a pre-allocated CORECFG.DAT, overwritten in place
-# so no filesystem metadata is ever mutated). It is also the only caller of
-# ata_write_sectors. Its record codec + the write path's register grammar are
-# covered host-side by tests/kernel/config_test.c.
+# so no filesystem metadata is ever mutated). It was the only caller of
+# ata_write_sectors until evlog.c (below). Its record codec + the write
+# path's register grammar are covered host-side by tests/kernel/config_test.c.
 #
 # cfg_commit.c is the commit GATE in front of config_save: the debounce, the
 # parked-drive and battery refusals, the wake-before-write, and what becomes

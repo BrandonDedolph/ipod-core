@@ -2,7 +2,9 @@
 /*
  * core/kernel/config.h — persistent settings, stored in a PRE-ALLOCATED file.
  *
- * *** THIS IS THE ONLY CODE IN THE FIRMWARE THAT WRITES TO THE USER'S DISK. ***
+ * *** THIS IS ONE OF TWO PLACES IN THE FIRMWARE THAT WRITE TO THE USER'S DISK ***
+ * (the other is kernel/evlog.c, the event log, which follows every rule
+ * below and owes the same qualification).
  *
  * The whole design exists to make that sentence survivable. See config.c for
  * the full rationale; the short version:
@@ -127,7 +129,8 @@ int config_writable(void);
  * Persist `s` to the slot that was NOT most recently read, with a bumped
  * sequence number, then FLUSH CACHE.
  *
- * THE ONLY CALLER OF ata_write_sectors() IN THE FIRMWARE. Re-resolves and
+ * One of the two callers of ata_write_sectors() (the other: evlog_flush,
+ * kernel/evlog.c, under the same gate). Re-resolves and
  * re-validates the target LBA from the file's cluster on every call — nothing
  * is cached. Refuses (returns negative, writes nothing) if config_load() never
  * succeeded in finding the file.

@@ -79,6 +79,19 @@ What changed (see `git log 054c722..`):
 8. Paused skips: press Next ×5 while paused, then Play — one bring-up,
    no pops on the skips; a 44.1 → 48 kHz skip while paused then Play
    must come up at 48 kHz.
+9. **Event log — the write path's second caller; qualify it before it
+   flushes.** `python3 tools/make_log.py --create` (Windows-native copy +
+   `Write-VolumeCache`), then `sudo python3 tools/make_log.py --verify
+   /dev/sdX`: note the header LBA and the next-write LBA. Boot; the UART
+   line `core: evlog on seq .. boot .. lba <hdr>/<next>` MUST show the same
+   two numbers. If not, power off before a flush. Then hold PLAY (suspend
+   → forced flush, `core: evlog blk 00000000 final`), wake, disk mode,
+   `--verify` again: block 1 valid, seq 0, FINAL, and `--dump` prints the
+   boot narration; `chkdsk D:` (read-only, no `/f`) clean. Then let it run
+   with the log ON until a `core: evlog blk` idle write lands (a full block
+   is ~40 battery lines, ~4 min) and `chkdsk` once more. About must read
+   `LOG <n> on`; `LOG off` means the file was not found or did not
+   validate, and nothing is written.
 
 Still open from the audit: the BCM power gate, the ROM's undocumented
 `DEV_EN` bits (USB/FireWire/IDE) and a 32 kHz suspend point — `DEV_EN`
@@ -190,6 +203,39 @@ device, listen for the title and clock flipping exactly as the next track
 starts, and watch `audio_late_kicks()` — a late completion is now also a
 late position, capped at the buffer.
 
+### 2026-09-13, later — an on-disk event log (unflashed, device-gated)
+
+Every `core:` line the UART carries is now also captured into an 8 KiB RAM
+ring (`kernel/evlog.c`, a weak-symbol tap in `hal/hw/uart.c`; the wire bytes
+are unchanged, the clicky golden still matches) and flushed one 2048 B block
+at a time into `CORELOG.BIN`, a 4 MiB ring `tools/make_log.py --create`
+pre-allocates next to `CORECFG.DAT`. Same rules as the settings file: the
+device never creates or grows it, block 0 (header: magic/version/block
+size/count/id/CRC) is validated at mount and never written, every block's
+LBA is re-resolved through the cluster chain (`fat32_file_lba_at`, new)
+before every write, whole physical sectors only, and the write goes
+through `cfg_commit_gate` — idle: one full block, debounced, never wakes a
+parked drive; forced at suspend entry and standby (FINAL block, wakes the
+drive first); the DISKSAFE last write is exempt; nothing below it. The
+cursor is found at boot by a binary search over the ring's seq numbers
+(~11 reads for 2047 slots), not a sweep. Boot line:
+`core: evlog on|off seq .. boot .. prev none|final|unflushed lba <hdr>/<next>`
+— `prev` is the boot reason as far as the log knows it. About shows
+`LOG <seq> on` / `LOG off` / `LOG <seq> err`. New narration: suspend
+entering / idle loop / wake, standby entering, each flush's result.
+Host: `evlog` (150 cases: format, the host tool's fixture decoded by the
+firmware, every mount refusal, the whole flush policy, ring wrap, torn
+blocks, the O(log n) scan on 64 slots) and `make-log` (the `--dump` round
+trip), plus `fat32_file_lba_at` cases in `fat32`. 57 suites green, ARM
+`-Werror` + `verify-hw` clean, image +14 KB. **Not flashed**: checklist
+item 9 is the qualification `kernel/config.c`'s banner demands of a second
+caller of `ata_write_sectors()` — this is that caller.
+
+**To pull the log:** disk mode → `powershell.exe Copy-Item D:\CORELOG.BIN
+C:\Users\<you>\CORELOG.BIN` (Windows-native; a drvfs read can serve a stale
+copy) → `python3 tools/make_log.py --dump /mnt/c/Users/<you>/CORELOG.BIN`
+(`--blocks` for the per-block headers).
+
 ## Where we are right now (2026-07-28)
 
 **A full music player on real hardware, and it is now the device's own
@@ -283,10 +329,23 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   device never creates, grows, moves or deletes the file — it overwrites
   the bytes of the file's own first cluster, so zero FS metadata changes.
   The target LBA is re-resolved and re-validated through `fat32_file_lba()`
-  before *every* write. `config_save()` is the only call to
-  `ata_write_sectors()` in the firmware. **Proven on hardware 2026-07-27**;
-  slot alternation confirmed from a raw disk dump, and `chkdsk` found no
-  problems afterwards.
+  before *every* write. `config_save()` was the only call to
+  `ata_write_sectors()` in the firmware until the event log below became
+  the second. **Proven on hardware 2026-07-27**; slot alternation
+  confirmed from a raw disk dump, and `chkdsk` found no problems
+  afterwards.
+- **Event log** (unflashed, device-gated — checklist item 9) —
+  `CORELOG.BIN`, pre-allocated by `tools/make_log.py` (4 MiB: a header
+  block + 2047 ring blocks of 2048 B = two physical sectors each). The
+  firmware taps every UART byte into an 8 KiB RAM ring and flushes it one
+  block at a time (16 B header: magic, seq, boot id, length + FINAL bit,
+  CRC-32; 2032 B of text) at block `1 + seq % 2047`, LBA re-resolved
+  through the file's cluster chain before every write, through the same
+  commit gate as the settings save (idle: full block, debounced, drive
+  already up; forced at suspend/standby; the DISKSAFE last write; never
+  below it). Block 0 is never written; if it does not validate the log is
+  off and About says `LOG off`. Pull it: disk mode → `powershell.exe
+  Copy-Item D:\CORELOG.BIN C:\...` → `python3 tools/make_log.py --dump`.
 - **Resume on boot** — comes back on the track you left, **paused**, at the
   saved position, **in the queue you were playing it in**: Songs, an
   artist's songs, a genre, the same Shuffle Songs draw, or a playlist (the
@@ -444,14 +503,15 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
    can drift from the device silently. A device capture path would end that.
 8. **Library sync is manual** — build the index on the host
    (`tools/build_index.py`), convert art (`tools/coreart.py`), pre-create
-   `CORECFG.DAT` (`tools/make_config.py`), and copy to the device.
+   `CORECFG.DAT` (`tools/make_config.py`) and `CORELOG.BIN`
+   (`tools/make_log.py`), and copy to the device.
 9. **Host CLI install/flash/recover are stubs** —
     `core/cli/internal/cli/install.go` says so outright; flashing is
     `ipodpatcher` by hand today.
 
 ## Testing
 
-`meson test -C build-sim` from `core/` (**54/54** green):
+`meson test -C build-sim` from `core/` (**57/57** green):
 
 - **Codec KAT** — FLAC + MP3 decoders bit-exact against reference PCM.
 - **MMIO golden traces** — each freestanding hw driver is host-compiled against a
@@ -472,6 +532,13 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   check against the host side.
 - **Settings persistence** — the config record layout, CRC, slot alternation,
   LBA resolution and the ATA write bus grammar.
+- **Event log** — `kernel/evlog.c` on a RAM disk with a deliberately
+  fragmented `CORELOG.BIN`: the block format and every rejection, the host
+  tool's `--emit` fixture decoded by the firmware, every mount refusal, the
+  flush policy through the real `cfg_commit` gate, ring wrap and remount,
+  torn blocks at and off the cursor, an unreadable slot, the O(log n) boot
+  scan; a recorder refuses any write outside the file's own clusters.
+  `make-log` round-trips a synthesized ring through `--dump`.
 - **FAT32** — the happy path, path resolution (`fat32_resolve_path`: every
   separator/case form, every refusal, EIO vs ENOENT), plus corrupt images:
   cyclic FAT chains, out-of-range clusters, a FAT16 boot sector, orphaned
