@@ -51,6 +51,13 @@ What changed (see `git log 054c722..`):
   modals replace rather than overflow the screen stack; rail-pinned sliders
   don't write; lock plate no longer busy-spins; stale strip gauge repaints.
 
+**Device verdicts so far (2026-09-13 evening):** audio noise fixed
+(VMID); panel sleep white on wake (off); suspend wakes with the PLL park
+off; PMU power-off + wake OK; gauge, scrollbar, seven themes, white blank
+flashed. Next bench items: pull CORELOG.BIN after a suspend and `--dump` it,
+`chkdsk`, then re-try the 10 Hz tick and the gates ONE AT A TIME with the
+log capturing the loop.
+
 **First-flash checklist (all of the above is unverified on the device):**
 1. Suspend → wake: panel comes back from `LCD_SLEEP` (white → set
    `SUSPEND_PANEL_SLEEP 0`); drive comes back from SLEEP via SRST (watch the
@@ -151,9 +158,22 @@ by leaving `clock_suspend` out of `suspend_lowpower_enter`.
   the panel slept, and the first press came back solid white. Both
   `PANEL_SLEEP_AT_IDLE` and `SUSPEND_PANEL_SLEEP` are back to 0; the
   `lcd_sleep` before the PMU standby command is gated on the same flag.
-- **5 s PLAY hold: dark and unwakeable.** No button and not the charger
-  woke it; only Menu+Select did. Not yet attributed (hang before GOSTDBY vs
-  a standby that does not wake). The 20 s suspend test discriminates.
+- **Suspend: SOLVED, late.** Every short-hold suspend went dark and never
+  woke; the 5 s hold (PMU power-off) came back from the third image on.
+  Three bisect flashes of the low-power switches all "failed" because the
+  review-round re-park guard in the idle loop ran UNCONDITIONALLY — the
+  PLL park (CLOCK_SOURCE → crystal, PLL off) executed on every image,
+  "all off" included, and the wake side never un-parked it. With the guard
+  gated, the short-hold suspend wakes and resumes. So: **the PLL park
+  breaks the wake** (wheel or tick does not survive the crystal source as
+  written); the 10 Hz tick and the SER0/PWM/I2C gates were never actually
+  tested alone. All three stay 0 (`SUSPEND_PARK_PLL/SLOW_TICK/GATE_CLOCKS`);
+  the drive parks with STANDBY (`SUSPEND_ATA_SLEEP 0`) — SLEEP was swapped
+  out mid-bisect and is untested on its own too.
+- **Event log** (`CORELOG.BIN`, 4 MiB, on the device since the evening):
+  Boot Details reports header/next LBAs 49238456 / 49238464 — header ~1 MB
+  past CORECFG.DAT's slot, next block inside the header's cluster. Raw-disk
+  `make_log.py --verify` still owed for the record.
 - **Audio: FIXED and CONFIRMED.** Hiss with nothing playing, the wheel click
   on the jack and the drive's spin-up on the jack were all one thing: the
   codec played through VMIDSEL 0x2, the datasheet's low-power STANDBY
