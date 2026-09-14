@@ -634,6 +634,14 @@ static void draw_lock_glyph(int x, int y, uint16_t c)
 /* Cached battery/power readout. The gauge read is an I2C transaction (slow, and
  * shares the codec bus), so sample it a few seconds apart — NOT every present —
  * and hold the last value. mv/pct < 0 means the read failed / not yet sampled. */
+/* Charger input budget asked of the LTC4066 (HPWR). 100 mA for now: on USB
+ * the jack carried the drive and the piezo (a cable ground loop) plus a whine,
+ * and the owner found 100 mA better (device, 2026-09-13). Also the charge
+ * current the gauge corrects for while on external power. */
+#ifndef CHARGER_MAX_MA
+#define CHARGER_MAX_MA 100
+#endif
+
 static int      g_bat_mv  = -1;
 static int      g_bat_pct = -1;
 static int      g_bat_ext = 0;               /* external power present            */
@@ -732,7 +740,23 @@ static int battery_refresh(int force)
      */
     battery_event_t ev = battery_policy_feed(bs.mv, g_bat_ext);
     g_bat_mv_filt = battery_filtered_mv();
-    g_bat_pct     = battery_percent_from_mv(g_bat_mv_filt);
+    /*
+     * The gauge: charge-corrected while on external power (the terminal
+     * voltage is lifted by the charge current; see battery_percent_charging),
+     * then SLEWED. A voltage-derived percent steps when the cable goes in or
+     * out and when the drive spins up; the user reads "the battery", not the
+     * terminal voltage, so the shown number moves at most one point per
+     * sample (5 s) toward the estimate. Seeded on the first good sample.
+     */
+    int est = g_bat_ext ? battery_percent_charging(g_bat_mv_filt, CHARGER_MAX_MA)
+                        : battery_percent_from_mv(g_bat_mv_filt);
+    if (g_bat_pct < 0 || est < 0) {
+        g_bat_pct = est;                        /* first sample, or none */
+    } else if (est > g_bat_pct) {
+        g_bat_pct++;
+    } else if (est < g_bat_pct) {
+        g_bat_pct--;
+    }
 
     /* Same sample, same cadence, feeds what the USER is told. Everything the
      * warning UI does about flapping keys off the FILTERED millivolts and the
@@ -5150,9 +5174,6 @@ _Noreturn static void run_ui(fat32_t *fs)
      * A shared-ground loop over the cable explains the first two; the whine
      * may be an unenumerated port current-limiting under a 500 mA pull. This
      * flash asks for 100 mA so the owner can compare. */
-#ifndef CHARGER_MAX_MA
-#define CHARGER_MAX_MA 100
-#endif
     charger_set_max_current(CHARGER_MAX_MA); /* LTC4066 HPWR: 100 mA cap until asserted */
     chip_placeholder_init();
     artcache_init();                  /* ways must start at key -1; .bss gives 0,

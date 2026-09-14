@@ -181,6 +181,43 @@ int battery_percent_from_mv(int mv)
     return 100;
 }
 
+/*
+ * Percent while ON THE CHARGER. The discharge curve maps RESTING voltage;
+ * a cell being charged sits above its resting voltage by the charge current
+ * times its internal resistance (plus the charger's own constant-voltage
+ * hold near the top), so the same lookup reads it 20-30 points fuller the
+ * instant the cable goes in, and drops back the instant it comes out — the
+ * "jumps to the top when plugged in" the owner reported (device, 2026-09-13).
+ *
+ * Model: an offset proportional to the requested charge current (~0.3 mV
+ * per mA: ~150 mV at the 500 mA HPWR budget, ~30 mV at the 100 mA cap —
+ * a 2005-era cell's ~0.3 Ω), tapering linearly to zero over the last
+ * BATTERY_CHG_TAPER_MV below the 4200 mV charge ceiling, where the charger
+ * is in its constant-voltage phase and the terminal voltage IS the resting
+ * voltage. Approximate — the point is to remove the jump, not to be a
+ * coulomb counter — and clamped so the estimate can never exceed what the
+ * raw voltage says.
+ */
+#define BATTERY_CHG_CEIL_MV   4200
+#define BATTERY_CHG_TAPER_MV   150
+
+int battery_percent_charging(int mv, int charge_ma)
+{
+    if (mv < 0) {
+        return -1;
+    }
+    int off = (charge_ma * 3 + 5) / 10;                 /* 0.3 mV per mA */
+    int head = BATTERY_CHG_CEIL_MV - mv;                /* room below the ceiling */
+    if (head <= 0) {
+        off = 0;
+    } else if (head < BATTERY_CHG_TAPER_MV) {
+        off = (off * head + BATTERY_CHG_TAPER_MV / 2) / BATTERY_CHG_TAPER_MV;
+    }
+    int pct = battery_percent_from_mv(mv - off);
+    int cap = battery_percent_from_mv(mv);
+    return pct > cap ? cap : pct;
+}
+
 /* ---------- Public API ---------------------------------------------- */
 
 void battery_init(void)

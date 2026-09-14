@@ -82,6 +82,11 @@ int battery_sample(battery_sample_t *out);
  */
 int battery_percent_from_mv(int mv);
 
+/* Percent for a cell ON the charger: the same curve after removing the
+ * charge-current lift (0.3 mV/mA of `charge_ma`, tapering to zero at the
+ * 4200 mV ceiling). -1 in, -1 out. Never above battery_percent_from_mv(mv). */
+int battery_percent_charging(int mv, int charge_ma);
+
 /* ---------------------------------------------------------------------------
  * Low-battery policy: filtered millivolts, two thresholds, one state machine.
  *

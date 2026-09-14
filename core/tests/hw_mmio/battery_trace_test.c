@@ -325,6 +325,53 @@ static int test_battery_sample_zero_is_failure(void)
 /* The curve as a pure function: same answer as battery_percent(), with no bus
  * traffic at all — which is what lets a caller filter several samples and
  * convert once. */
+/* battery_percent_charging(): removes the charge lift, tapers it out at the
+ * ceiling, never exceeds the resting-curve answer, passes -1 through. */
+static int test_battery_percent_charging(void)
+{
+    int fails = 0;
+    mmio_mock_reset();
+    /* 500 mA -> 150 mV lift: 3990 on the charger reads like 3840 resting (50%),
+     * where the plain curve would have said ~74%. */
+    int p500 = battery_percent_charging(3990, 500);
+    int plain = battery_percent_from_mv(3990);
+    if (!(p500 == battery_percent_from_mv(3840) && p500 < plain)) {
+        fprintf(stderr, "[battery_percent_charging] 3990@500mA: got %d, plain %d\n", p500, plain);
+        fails++;
+    }
+    /* 100 mA -> 30 mV: a much smaller correction. */
+    int p100 = battery_percent_charging(3990, 100);
+    if (!(p100 == battery_percent_from_mv(3960) && p100 > p500)) {
+        fprintf(stderr, "[battery_percent_charging] 3990@100mA: got %d\n", p100);
+        fails++;
+    }
+    /* At the ceiling the lift is gone: 4200 is 100% either way. */
+    if (battery_percent_charging(4200, 500) != 100) {
+        fprintf(stderr, "[battery_percent_charging] 4200 should be 100\n");
+        fails++;
+    }
+    /* Half-way into the taper the lift is halved: 4125 @500 -> 75 mV off. */
+    if (battery_percent_charging(4125, 500) != battery_percent_from_mv(4050)) {
+        fprintf(stderr, "[battery_percent_charging] taper at 4125: got %d\n",
+                battery_percent_charging(4125, 500));
+        fails++;
+    }
+    /* Never above the resting answer; -1 passes through; no bus traffic. */
+    for (int mv = 3300; mv <= 4200; mv += 25) {
+        if (battery_percent_charging(mv, 500) > battery_percent_from_mv(mv)) {
+            fprintf(stderr, "[battery_percent_charging] %d exceeds resting\n", mv);
+            fails++;
+            break;
+        }
+    }
+    if (battery_percent_charging(-1, 500) != -1 || mmio_mock_log_len() != 0) {
+        fprintf(stderr, "[battery_percent_charging] -1 or bus traffic\n");
+        fails++;
+    }
+    if (!fails) printf("[battery_percent_charging] PASS\n");
+    return fails;
+}
+
 static int test_battery_percent_from_mv(void)
 {
     mmio_mock_reset();
@@ -806,6 +853,7 @@ int main(void)
     fails += test_battery_sample_zero_is_failure();
     fails += test_battery_sample_nack_residue_is_failure();
     fails += test_battery_percent_from_mv();
+    fails += test_battery_percent_charging();
 
     /* Low-battery policy: filter, thresholds, debounce, bus failure, recovery. */
     fails += test_policy_sag_ignored();
