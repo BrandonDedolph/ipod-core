@@ -263,13 +263,14 @@ void settings_render(int screen, const settings_t *s, int sel);
 /*
  * Render the About screen from live values (main.c owns these — do not
  * fabricate). free/total are whole megabytes; pct<0 or mv<=0 render as "--".
- * log_seq / log_state describe the event log (kernel/evlog.c): the line
- * reads "LOG <seq> on", "LOG off" or "LOG <seq> err".
+ * log_seq / log_state describe the event log (kernel/evlog.c): the footer
+ * reads "LOG <seq> on", "LOG off" or "LOG <seq> err". lib_truncated != 0
+ * draws the "library too large" warning (the counts hit a LIB_MAX_* cap).
  */
 void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
                            int n_songs, int n_albums, int n_artists,
-                           uint32_t log_seq, int log_state);
+                           uint32_t log_seq, int log_state, int lib_truncated);
 
 /*
  * Render the Boot Details screen (SETTINGS_DIAG). All times are milliseconds

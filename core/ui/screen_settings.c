@@ -288,7 +288,7 @@ void settings_render(int screen, const settings_t *s, int sel)
     if (screen == SETTINGS_ABOUT) {
         /* main.c should call settings_about_render() with live values; this
          * placeholder path keeps settings_render total over every screen. */
-        settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, ABOUT_LOG_OFF);
+        settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, ABOUT_LOG_OFF, 0);
         return;
     }
 
@@ -355,119 +355,161 @@ static void su_append(char *d, const char *w)
     su_copy(d + i, w);
 }
 
-/* About — a little device dashboard: three big library stats, a storage bar
- * (used vs free), and a device footer, instead of a plain key/value list. */
+/*
+ * About — a small device dashboard.
+ *
+ *   ‹ About
+ *   iPod 5.5G                                  [Core]
+ *      4127          318           142
+ *      SONGS        ALBUMS        ARTISTS
+ *   ┌ STORAGE ──────────┐  ┌ BATTERY ──────────┐
+ *   │ 21.0 GB free       │  │ 73%                │
+ *   │ ▓▓▓▓▓▓▓▓▓░░░       │  │ [▓▓▓▓▓▓▓░░]▏       │
+ *   │ 55.3 of 76.3 GB    │  │ 3912 mV            │
+ *   └────────────────────┘  └────────────────────┘
+ *              ADC 2731 · LOG 6 on
+ *
+ * The first cut stacked STORAGE and BATTERY as two identical full-width
+ * accent bars with their diagnostics jammed against the labels, and the
+ * device name floated alone in the middle of the page. Now the name and the
+ * firmware chip share one row, the two gauges sit side by side on raised
+ * plates so each has room for its own caption, and every raw diagnostic
+ * (ADC code, event log) lives on ONE muted footer line where it cannot be
+ * mistaken for a design element — but stays on this screen, because "LOG
+ * off" here is how the owner knows a night's crash will come with no log.
+ */
+#define AB_CARD_Y   142          /* both plates: top edge                     */
+#define AB_CARD_H   80           /* ...and height (ends at 222)               */
+#define AB_CARD_W   140          /* 16 | 140 | 8 | 140 | 16 = 320             */
+#define AB_CARD_PAD 10           /* inset for the plate's text and bars       */
+
+/* One raised plate with its small-caps label; returns the inner x. */
+static int about_card(int x, const char *label)
+{
+    ui_round_rect(x, AB_CARD_Y, AB_CARD_W, AB_CARD_H, 6, g_pal[PAL_PLATE]);
+    st_text(x + AB_CARD_PAD, AB_CARD_Y + 18, label, F_SMALL, S_MUTED);
+    return x + AB_CARD_PAD;
+}
+
 void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
                            int n_songs, int n_albums, int n_artists,
-                           uint32_t log_seq, int log_state)
+                           uint32_t log_seq, int log_state, int lib_truncated)
 {
     console_clear(S_SURFACE);
     ui_header("About", "", 1);
 
-    char v[48];
+    char v[48], w[24];
 
-    /* --- device name hero, centred at the top --- */
-    st_text((LCD_WIDTH - text_width("iPod 5.5G", F_BIG)) / 2, 62,
-            "iPod 5.5G", F_BIG, S_INK);
+    /* --- device row: name left, firmware chip right, one baseline --- */
+    st_text(16, 66, "iPod 5.5G", F_BIG, S_INK);
+    {
+        int cw = text_width("Core", F_SUB);
+        int chw = cw + 16, chx = LCD_WIDTH - 16 - chw, chy = 52;
+        ui_round_rect(chx, chy, chw, 16, 8, S_ACCENT);
+        st_text(chx + 8, chy + 12, "Core", F_SUB, S_SURFACE);
+    }
+    /* A capped load is the one thing the stat columns below cannot show on
+     * their own: a library that hit LIB_MAX_* just looks smaller. Warning
+     * red, deliberately outside the palette, in the slot under the name. */
+    if (lib_truncated) {
+        ui_text_centered(84, "Library too large " UI_GLYPH_MIDDOT
+                             " some items not shown", F_SMALL, S_WARN);
+    }
 
-    /* --- three big stat columns: Songs / Albums / Artists --- */
+    /* --- three stat columns: Songs / Albums / Artists --- */
     const char *lbl[3] = { "SONGS", "ALBUMS", "ARTISTS" };
     int         val[3] = { n_songs, n_albums, n_artists };
     int colw = LCD_WIDTH / 3;
     for (int i = 0; i < 3; i++) {
         int cx = colw * i + colw / 2;
         su_to_str(v, (unsigned)(val[i] < 0 ? 0 : val[i]));
-        st_text(cx - text_width(v, F_BIG) / 2, 100, v, F_BIG, S_INK);
-        st_text(cx - text_width(lbl[i], F_SMALL) / 2, 116, lbl[i], F_SMALL, S_MUTED);
-        if (i) console_fill_rect(colw * i, 86, 1, 36, S_BORDER);   /* column rule */
+        st_text(cx - text_width(v, F_BIG) / 2, 108, v, F_BIG, S_INK);
+        st_text(cx - text_width(lbl[i], F_SMALL) / 2, 124, lbl[i], F_SMALL, S_MUTED);
+        if (i) console_fill_rect(colw * i, 94, 1, 36, S_BORDER);   /* column rule */
     }
-    console_fill_rect(16, 130, LCD_WIDTH - 32, 1, S_BORDER);
 
-    /* --- firmware row: label left, "Core" chip on the right --- */
-    st_text(16, 150, "FIRMWARE", F_SMALL, S_MUTED);
+    /* --- STORAGE plate: free space big, used-fraction bar, capacity caption --- */
     {
-        int cw = text_width("Core", F_SUB);
-        int chw = cw + 16, chx = LCD_WIDTH - 16 - chw, chy = 140;
-        ui_round_rect(chx, chy, chw, 15, 7, S_ACCENT);
-        st_text(chx + 8, 151, "Core", F_SUB, S_SURFACE);
-    }
-    /*
-     * The event log, next to the firmware label the way the millivolts sit
-     * next to the battery: a diagnostic sharing a row, not a design element.
-     * "LOG off" is the one that matters — it says CORELOG.BIN is missing or
-     * did not validate, so a report of "it died in the night" will come
-     * with no log. The number is the next block's sequence: it climbing
-     * across sessions is how you know flushes are landing.
-     */
-    {
-        if (log_state == ABOUT_LOG_OFF) {
-            su_copy(v, "LOG off");
+        int ix = about_card(16, "STORAGE");
+        int bw = AB_CARD_W - 2 * AB_CARD_PAD;
+        if (free_mb != 0xFFFFFFFFu) {
+            fmt_gb(v, free_mb);
+            int pen = st_text(ix, AB_CARD_Y + 44, v, F_BIG, S_INK);
+            st_text(pen + 5, AB_CARD_Y + 44, "free", F_SUB, S_MUTED_D);
         } else {
-            su_copy(v, "LOG ");
-            su_to_str(v + 4, (unsigned)log_seq);
-            su_append(v, log_state == ABOUT_LOG_ERR ? " err" : " on");
+            st_text(ix, AB_CARD_Y + 44, "--", F_BIG, S_MUTED);
         }
-        st_text(16 + text_width("FIRMWARE", F_SMALL) + 8, 150, v,
-                F_SMALL, S_MUTED_D);
+        int by = AB_CARD_Y + 52, bh = 6;
+        ui_round_rect(ix, by, bw, bh, 3, S_TRK);
+        if (total_mb > 0 && free_mb != 0xFFFFFFFFu) {
+            uint32_t used = (total_mb > free_mb) ? total_mb - free_mb : 0;
+            int fw = (int)(((unsigned long long)used * bw) / total_mb);
+            if (fw < bh && used > 0) fw = bh;
+            if (fw > bw) fw = bw;
+            ui_round_rect(ix, by, fw, bh, 3, S_ACCENT);
+            fmt_gb(v, used);                 /* "55.3 GB" ...                */
+            { int i = 0; while (v[i] && v[i] != ' ') i++; v[i] = '\0'; }   /* ..."55.3" */
+            su_append(v, " of ");
+            fmt_gb(w, total_mb);
+            su_append(v, w);
+            st_text(ix, AB_CARD_Y + 72, v, F_SMALL, S_MUTED_D);
+        }
     }
 
-    /* --- storage bar (used = accent fill on a faint track) --- */
-    st_text(16, 176, "STORAGE", F_SMALL, S_MUTED);
-    if (free_mb != 0xFFFFFFFFu) {
-        fmt_gb(v, free_mb); su_append(v, " free");
-        st_text_right(16, 176, v, F_SUB, S_MUTED_D);
-    }
-    int bx = 16, by = 182, bw = LCD_WIDTH - 32, bh = 8;
-    ui_round_rect(bx, by, bw, bh, 4, S_TRK);
-    if (total_mb > 0 && free_mb != 0xFFFFFFFFu) {
-        uint32_t used = (total_mb > free_mb) ? total_mb - free_mb : 0;
-        int fw = (int)(((unsigned long long)used * bw) / total_mb);
-        if (fw < bh && used > 0) fw = bh;
-        if (fw > bw) fw = bw;
-        ui_round_rect(bx, by, fw, bh, 4, S_ACCENT);
-    }
-
-    /* --- battery: a little battery pictogram with proportional fill --- */
-    st_text(16, 212, "BATTERY", F_SMALL, S_MUTED);
-    if (battery_pct >= 0) {
-        su_to_str(v, (unsigned)battery_pct); su_append(v, "%");
-        st_text_right(16, 212, v, F_SUB, S_INK);
-    }
-    /*
-     * Millivolts and the raw ADC code, next to the percentage.
-     *
-     * battery.h's own instruction is to "display raw millivolts and sanity-
-     * check the ~3300..4200 mV range before trusting battery_percent() or any
-     * shutdown threshold" — and this function was RECEIVING battery_mv and
-     * discarding it with a (void) cast, so that step was not performable from
-     * a shipped build. The percent above is interpolated off a curve
-     * transcribed from a 2005 cell; on a replacement cell it is a guess until
-     * these two numbers are checked against a meter. Muted and small: this is
-     * a diagnostic sharing a row with the real readout, not a design element.
-     */
-    if (battery_mv > 0) {
-        char rb[16];
-        su_to_str(v, (unsigned)battery_mv);
-        su_append(v, "mV");
-        if (battery_raw >= 0) {
-            su_to_str(rb, (unsigned)battery_raw);
-            su_append(v, " / ");
-            su_append(v, rb);
-        }
-        st_text(16 + text_width("BATTERY", F_SMALL) + 8, 212, v,
-                F_SMALL, S_MUTED_D);
-    }
+    /* --- BATTERY plate: percent big, a battery pictogram, millivolts caption --- */
     {
-        int gx = 16, gy = 218, gw = LCD_WIDTH - 32 - 5, gh = 12;   /* body */
-        ui_round_rect(gx, gy, gw, gh, 3, S_TRK);                   /* shell */
-        console_fill_rect(gx + gw, gy + 3, 4, gh - 6, S_TRK);      /* + nub */
+        int ix = about_card(164, "BATTERY");
+        if (battery_pct >= 0) {
+            su_to_str(v, (unsigned)battery_pct); su_append(v, "%");
+            st_text(ix, AB_CARD_Y + 44, v, F_BIG, S_INK);
+        } else {
+            st_text(ix, AB_CARD_Y + 44, "--", F_BIG, S_MUTED);
+        }
+        int gx = ix, gy = AB_CARD_Y + 50, gw = AB_CARD_W - 2 * AB_CARD_PAD - 4, gh = 10;
+        ui_round_rect(gx, gy, gw, gh, 3, S_TRK);                   /* shell   */
+        console_fill_rect(gx + gw, gy + 3, 3, gh - 6, S_TRK);      /* + nub   */
         if (battery_pct >= 0) {
             int pct = battery_pct > 100 ? 100 : battery_pct;
             int fw  = (gw - 4) * pct / 100;
             if (fw < 2 && pct > 0) fw = 2;
             ui_round_rect(gx + 2, gy + 2, fw, gh - 4, 2, S_ACCENT);
         }
+        /*
+         * Millivolts, per battery.h's own instruction to "display raw
+         * millivolts and sanity-check the ~3300..4200 mV range before
+         * trusting battery_percent()". The percent above is interpolated off
+         * a curve transcribed from a 2005 cell; on a replacement cell it is
+         * a guess until this number is checked against a meter.
+         */
+        if (battery_mv > 0) {
+            su_to_str(v, (unsigned)battery_mv); su_append(v, " mV");
+            st_text(ix, AB_CARD_Y + 72, v, F_SMALL, S_MUTED_D);
+        }
+    }
+
+    /*
+     * Diagnostics footer: the raw ADC code behind the millivolts, and the
+     * event log. "LOG off" is the one that matters — CORELOG.BIN is missing
+     * or did not validate. The number is the next block's sequence: it
+     * climbing across sessions is how you know flushes are landing.
+     */
+    {
+        v[0] = '\0';
+        if (battery_raw >= 0) {
+            su_copy(v, "ADC ");
+            su_to_str(v + 4, (unsigned)battery_raw);
+            su_append(v, " " UI_GLYPH_MIDDOT " ");
+        }
+        if (log_state == ABOUT_LOG_OFF) {
+            su_append(v, "LOG off");
+        } else {
+            su_append(v, "LOG ");
+            su_to_str(w, (unsigned)log_seq);
+            su_append(v, w);
+            su_append(v, log_state == ABOUT_LOG_ERR ? " err" : " on");
+        }
+        ui_text_centered(236, v, F_SMALL, S_MUTED);
     }
 }
 

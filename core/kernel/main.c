@@ -3122,24 +3122,17 @@ static void evlog_commit(int mode)
 static void settings_render_cur(void)
 {
     if (g_set_screen == SETTINGS_ABOUT) {
+        /* The counts are capped (LIB_MAX_SONGS/ALBUMS, ARTISTS_MAX,
+         * LIB_MAX_GENRES). When a load actually hit one of those caps the
+         * screen says so — otherwise a library that's too big just looks
+         * like it lost tracks. The warning and the load time are
+         * INDEPENDENT (the warning used to hide the number entirely). */
         settings_about_render(g_bat_pct, g_bat_mv, g_bat_raw, g_total_mb, g_free_mb,
                               g_songs_n, g_albums_n, g_artists_n,
                               evlog_seq(),
                               evlog_enabled()  ? ABOUT_LOG_ON :
-                              evlog_failures() ? ABOUT_LOG_ERR : ABOUT_LOG_OFF);
-        /* The counts above are capped (LIB_MAX_SONGS/ALBUMS, ARTISTS_MAX,
-         * LIB_MAX_GENRES). When a load actually hit one of those caps, say so —
-         * otherwise a library that's too big just looks like it lost tracks.
-         * Drawn here, over the shared About panel, in the gap between the device
-         * hero (baseline 62) and the stat columns (baseline 100). */
-        /* These are INDEPENDENT: the truncation warning used to be an else-if
-         * in front of the load time, so a library that hit a cap hid the number
-         * entirely — which is exactly the library you most want the number for. */
-        if (g_lib_truncated) {
-            ui_text_centered(78, "Library too large " UI_GLYPH_MIDDOT
-                                 " some items not shown",
-                             FONT_SMALL, BATT_LOW_RED);
-        }
+                              evlog_failures() ? ABOUT_LOG_ERR : ABOUT_LOG_OFF,
+                              g_lib_truncated);
     } else if (g_set_screen == SETTINGS_DIAG) {
         /* Boot Details owns the diagnostics now: the cold-boot phase
          * breakdown and the settings-file locator. They used to be squeezed
