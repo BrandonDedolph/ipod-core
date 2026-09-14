@@ -650,26 +650,28 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
      * somebody's music library". That procedure assumes a serial cable, and
      * there is none here, so the number has to reach the panel. Read-only.
      */
-    st_text(16, 214, "CONFIG", F_SMALL, S_MUTED);
+    /* Two rows, label left, "a / b" right: CONFIG's slot LBAs (with the seq
+     * folded into the label), then the event log's header / next-flush LBAs.
+     * A pair the host tool prints in the same order. */
     if (!cfg_writable) {
+        st_text(16, 214, "CONFIG", F_SMALL, S_MUTED);
         st_text_right(16, 214, "not writable", F_SUB, S_MUTED_D);
     } else {
-        su_copy(v, "seq ");
-        su_to_str(v + 4, cfg_seq);
-        st_text_right(16, 214, v, F_SUB, S_INK);
+        su_copy(v, "CONFIG seq ");
+        su_to_str(v + 11, cfg_seq);
+        st_text(16, 214, v, F_SMALL, S_MUTED);
         int i = su_to_str(v, lba0);
         su_copy(v + i, " / ");
         su_to_str(v + i + 3, lba1);
-        st_text_right(16, 230, v, F_SMALL, S_MUTED_D);
+        st_text_right(16, 214, v, F_SMALL, S_MUTED_D);
     }
-    /* --- event-log locator: header block / next flush's block --- *
-     * Same procedure as CONFIG (tools/make_log.py --verify prints both);
-     * sits on the left of the same two rows. 0/0 = log off. */
+    st_text(16, 230, "LOG", F_SMALL, S_MUTED);
     if (log_hdr_lba || log_next_lba) {
-        st_text(16 + 60, 214, "LOG", F_SMALL, S_MUTED);
         int i = su_to_str(v, log_hdr_lba);
         su_copy(v + i, " / ");
         su_to_str(v + i + 3, log_next_lba);
-        st_text(16 + 60, 230, v, F_SMALL, S_MUTED_D);
+        st_text_right(16, 230, v, F_SMALL, S_MUTED_D);
+    } else {
+        st_text_right(16, 230, "off", F_SUB, S_MUTED_D);
     }
 }
