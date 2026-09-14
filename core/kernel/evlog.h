@@ -94,7 +94,9 @@
 #define EVLOG_BLOCK_SECTORS (EVLOG_BLOCK_BYTES / ATA_SECTOR_SZ)      /* 4      */
 #define EVLOG_HDR_BYTES     16u
 #define EVLOG_TEXT_BYTES    (EVLOG_BLOCK_BYTES - EVLOG_HDR_BYTES)    /* 2032   */
-#define EVLOG_RING_BYTES    8192u   /* RAM capture ring; a power of two       */
+#define EVLOG_RING_BYTES    16384u  /* RAM capture ring; a power of two. 8 KiB
+                                     * dropped bytes on the device during a
+                                     * paused/parked stretch (no flush) */
 #define EVLOG_MIN_BLOCKS    2u      /* header + one ring slot                 */
 #define EVLOG_MAX_BLOCKS    65536u  /* ceiling on a header's count (128 MiB) */
 #define EVLOG_VERSION       1u

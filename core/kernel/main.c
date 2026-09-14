@@ -3855,12 +3855,22 @@ static void ui_present_damage(void)
     int x, y, w, h;
     if (console_damage_get(&x, &y, &w, &h)) {
         uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
-        if (x <= 0 && y <= 0 && w >= LCD_WIDTH && h >= LCD_HEIGHT) {
+        int full = (x <= 0 && y <= 0 && w >= LCD_WIDTH && h >= LCD_HEIGHT);
+        if (full) {
             lcd_present_fb(console_framebuffer());
         } else {
             lcd_present_rect(console_framebuffer(), x, y, w, h);
         }
-        g_present_cost_us = mmio_read32(USEC_TIMER_ADDR) - t0;
+        /* Only a FULL present sets the pace. The gap exists so the BCM can
+         * retire the last frame to the panel before the next command lands
+         * in its short idle budget; a 2.5 ms partial after a 10.8 ms full
+         * frame said "10 ms is enough", and the transport band arriving 20 ms
+         * after a full Now Playing repaint met a BCM still busy — "idle-wait
+         * timed out", re-kicks, a stalled loop and 12 audio underruns (device
+         * log, 2026-09-13). */
+        if (full) {
+            g_present_cost_us = mmio_read32(USEC_TIMER_ADDR) - t0;
+        }
     }
     console_damage_reset();
 }
@@ -5619,7 +5629,12 @@ _Noreturn static void run_ui(fat32_t *fs)
                 break;
             case KEYHOLD_HOLD:
                 suspend_to_ram(keyhold_down_us(&play_key));  /* returns on wake */
-                last_input = mmio_read32(USEC_TIMER_ADDR);
+                last_input   = mmio_read32(USEC_TIMER_ADDR);
+                last_present = last_input;      /* suspend just presented the wake
+                                                 * frame: pace the loop's own
+                                                 * repaint behind it, or the two
+                                                 * back-to-back full frames meet
+                                                 * a busy BCM (device log) */
                 bl_state   = BL_FULL;           /* backlight restored on resume */
                 panel_slept = 0;                /* suspend woke, presented and
                                                  * lit the panel itself — even
@@ -6481,13 +6496,16 @@ _Noreturn static void run_ui(fat32_t *fs)
                  * on every detent (it forces np_last), so THAT case is paced by
                  * the last present's cost like every other wheel-driven paint —
                  * np_last stays forced until the band actually goes out. */
-                if (!np_scrubbing() ||
-                    (uint32_t)(nowv - last_present) >= present_gap_us()) {
+                /* Paced against the last present of ANY kind, scrubbing or
+                 * not: the clock's band a few ms behind a full frame found the
+                 * BCM still retiring it (see ui_present_damage). np_last stays
+                 * unchanged when throttled, so the band goes out next pass. */
+                if ((uint32_t)(nowv - last_present) >= present_gap_us()) {
                     console_damage_reset();
                     nowplaying_transport_render(elapsed, player_total_s());
                     ui_present_damage();
-                    np_last = elapsed;
-                    if (np_scrubbing()) last_present = nowv;
+                    np_last      = elapsed;
+                    last_present = nowv;
                     player_note_presented();
                 }
             }
