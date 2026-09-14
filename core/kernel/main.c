@@ -4824,9 +4824,17 @@ static int g_suspend_lp;
  * that cannot see the wheel never escalates either. Panel sleep was already
  * off for that flash. Each piece is switchable so a flash can turn one on
  * at a time; all OFF is the known-good shape (the 2026-09-10 suspend, plus
- * ATA SLEEP). Order of suspicion: the PLL park (does the wheel's OPTO block
- * or the tick survive the crystal source?), the 10 Hz tick (the wake IS the
- * tick sampling the wheel), then the gates.
+ * ATA SLEEP).
+ *
+ * RESULT (three flashes, same evening): all off — wakes. Tick + gates on,
+ * PLL off — dark. Gates ONLY — dark. So the CLOCK GATES are what break the
+ * wake: the wheel was still alive when the PLAY release was seen (gates
+ * already applied), so the kill is later — the 5 s battery cycle un-gates
+ * and re-gates SER0/PWM/I2C (the I2C re-gate is a full reset-pulse
+ * bring-up), and something in that round trip stops the wheel or the tick.
+ * Not yet split per block. The 10 Hz tick was never tested ALONE; the PLL
+ * park never tested at all. Both stay off until the on-disk event log can
+ * show what the loop did last. Ship: all three 0.
  */
 #ifndef SUSPEND_PARK_PLL
 #define SUSPEND_PARK_PLL     0
@@ -4835,7 +4843,7 @@ static int g_suspend_lp;
 #define SUSPEND_SLOW_TICK    0
 #endif
 #ifndef SUSPEND_GATE_CLOCKS
-#define SUSPEND_GATE_CLOCKS  1
+#define SUSPEND_GATE_CLOCKS  0
 #endif
 
 static void suspend_lowpower_enter(void)
