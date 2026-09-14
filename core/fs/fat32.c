@@ -99,11 +99,14 @@ static int       fat_cache_valid = 0;
  * write path was "not wired to anything yet", which stopped being true and is
  * exactly the kind of stale reassurance that gets a stale-cache bug written.
  *
- * It is not live today, and the reason is narrow: config.c does its own reads
- * through the raw block callback (config.c:516-521), deliberately bypassing
- * these caches, and it is the only writer. Any SECOND writer, or any attempt
- * to route config's reads back through fat32, must invalidate both this cache
- * and fat_cache first. */
+ * It is not live today, and the reason is narrow: BOTH writers — config.c
+ * (CORECFG.DAT) and kernel/evlog.c (CORELOG.BIN) — do their own reads
+ * through the raw block callback, deliberately bypassing these caches, and
+ * nothing else on the device reads either file through the fs paths. Any
+ * writer whose file IS read through fat32_read_file / the stream, or any
+ * attempt to route those two modules' reads back through fat32, must
+ * invalidate both this cache and fat_cache first. (fat_cache holds FAT
+ * sectors only, which neither writer ever changes.) */
 static uint8_t   dat_cache[4096];
 static fat32_t  *dat_cache_fs    = 0;
 static uint32_t  dat_cache_sec   = 0;

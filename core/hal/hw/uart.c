@@ -100,6 +100,21 @@ void uart_clock_resume(void)
     g_gated = 0;
 }
 
+/*
+ * Event-log tap. Every byte this driver is asked to send is also handed to
+ * kernel/evlog.c's RAM ring — how the disk ends up holding a copy of the
+ * UART narration. It only OBSERVES: the bytes on the wire are unchanged
+ * (the clicky boot smoke compares them). Weak no-op here so the driver
+ * still links on its own — the hw-uart trace test, and any build without
+ * the log — and the strong definition in evlog.c takes over in the
+ * firmware. Fed the character BEFORE the '\n' -> "\r\n" expansion and
+ * each hex digit of uart_put_hex32, so the log carries plain text.
+ */
+__attribute__((weak)) void evlog_capture(uint8_t b)
+{
+    (void)b;
+}
+
 static void uart_tx_byte(uint8_t b)
 {
     if (g_gated) {
@@ -179,6 +194,7 @@ void uart_init(void)
 
 void uart_putc(char c)
 {
+    evlog_capture((uint8_t)c);
     if (c == '\n') {
         uart_tx_byte('\r');
     }
@@ -197,6 +213,7 @@ void uart_put_hex32(uint32_t v)
     static const char hex[] = "0123456789ABCDEF";   /* 17 B incl NUL; idx 0..15 */
 
     for (int shift = 28; shift >= 0; shift -= 4) {
+        evlog_capture((uint8_t)hex[(v >> shift) & 0xF]);
         uart_tx_byte((uint8_t)hex[(v >> shift) & 0xF]);
     }
 }

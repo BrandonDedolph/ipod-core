@@ -22,4 +22,12 @@
 # so the host can test it (tests/kernel/cfg_commit_test.c); pure, no
 # hardware — main.c hands it the clock, the drive, the player and the battery.
 
-kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c')
+#
+# evlog.c is the SECOND writer: the on-disk event log (a RAM tap on the UART,
+# flushed one 2048 B block at a time into the pre-allocated CORELOG.BIN
+# through the same gate as config_save, every block's LBA re-resolved
+# through the file's cluster chain). Hardware-free like cfg_commit.c — the
+# write and wake are injected from main.c — so tests/kernel/evlog_test.c
+# drives the whole ring, the boot scan and the flush policy on the host.
+
+kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c')
