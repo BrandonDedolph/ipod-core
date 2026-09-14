@@ -6133,6 +6133,17 @@ _Noreturn static void run_ui(fat32_t *fs)
                              * screen; power_enter_disk_mode never returns. */
                             player_stop();
                             hal_audio_close();
+                            /* Disk mode is where the log gets READ, so
+                             * what is still in RAM has to land first —
+                             * the reboot below is a ROM entry, nothing
+                             * of ours runs again. Same for a settings
+                             * change made a second ago. Both forced;
+                             * the drive is up (the ROM needs it anyway).
+                             * DEVICE 2026-09-13: a whole test session
+                             * arrived at the host as "prev unflushed". */
+                            settings_commit(1);
+                            uart_puts("core: disk mode: entering\n");
+                            evlog_commit(CFG_COMMIT_FORCE);
                             console_clear(LINEN_SURFACE);
                             ui_text_centered(LCD_HEIGHT / 2 - 8, "Disk Mode",
                                              FONT_TITLE, LINEN_INK);
