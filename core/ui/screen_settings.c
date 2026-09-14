@@ -63,7 +63,7 @@
  * These were duplicated here as a "matched copy", and the copy had already
  * fallen behind: the taller two-line row work (ROW_H2/LIST_ROWS2) landed only
  * in main.c, so Settings kept scrolling with the old feel. */
-#define TH_ROW_H   40                          /* taller theme-picker rows    */
+#define TH_ROW_H   39                          /* five rows fill the page: (240-42)/39 = 5 */
 
 /* ---------------------------------------------------------------------------
  * Tiny draw helpers (matched copies of main.c's, kept local on purpose)
@@ -233,7 +233,7 @@ static const char *const TH_SUB[THEME_COUNT] = {
     [THEME_MUSHROOM] = "Warm greige - muted rust",
 };
 
-/* Seven 40 px rows no longer fit under the header ((240-42)/40 = 4), so the
+/* Seven 39 px rows do not fit under the header ((240-42)/39 = 5), so the
  * picker scrolls through the same window + scrollbar as every other list. */
 #define TH_ROWS    ((LCD_HEIGHT - LIST_Y0) / TH_ROW_H)
 
