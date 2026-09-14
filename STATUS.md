@@ -206,7 +206,8 @@ a real player: **streaming FLAC off the iPod's own disk** (read-ahead over
 an 8 MB anti-skip buffer, not preload, so full-length tracks play), a
 host-built library index (`CORELIB.IDX`) for instant Songs / Albums /
 Artists / Genres, **settings that persist to disk**, **resume-on-boot**,
-and the full Linen/Onyx UI. On-screen framebuffer console plus the new
+and the full themed UI (Linen/Onyx plus five more palettes, see Settings
+below). On-screen framebuffer console plus the new
 Settings → Boot Details page are the cable-free debug channel; there is NO
 serial cable (confirm hw state on screen instead).
 
@@ -404,8 +405,10 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   lock/unlock padlock modals, charging screen ("CHARGED" when done), boot
   splash. Anti-aliased modal/progress corners.
 - **Settings** — nine rows: Playback (shuffle / repeat / **resume**), Sound
-  (volume / bass / treble / balance via the WM8758 EQ), Theme (Linen ↔ Onyx
-  live palette swap), Display (backlight timeout + brightness), Clicker
+  (volume / bass / treble / balance via the WM8758 EQ), Theme (seven live
+  palette swaps — Linen, Onyx, Sage, Plaster, Olive, Umber, Mushroom; the
+  picker scrolls, an unknown stored id lands on Linen), Display (backlight
+  timeout + brightness), Clicker
   (7 piezo profiles + Off), About (dashboard: song/album/artist counts,
   storage, battery), Boot Details, Disk Mode, Reset. The list scrolls and
   has a scrollbar. Placeholder rows that did nothing were removed.

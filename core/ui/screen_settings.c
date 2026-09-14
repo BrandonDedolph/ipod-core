@@ -219,32 +219,53 @@ static void list_render(int screen, const settings_t *s, int sel)
  * Theme picker (system-screens.jsx ThemePicker): swatch + name + sub, with a
  * "CURRENT" tag on the active theme.
  * ------------------------------------------------------------------------- */
-/* Preview tones are each theme's OWN colours (fixed literals, NOT the live
- * palette) so a row previews the theme it would switch to. Order matches the
- * theme ids: 0 = Linen (light), 1 = Onyx (dark). */
-static const uint16_t TH_SWATCH[2] = { 0xF79Du, 0x18C2u };  /* surface tone   */
-static const uint16_t TH_INK[2]    = { 0x18A2u, 0xEF3Cu };  /* ink hint bar   */
-static const char *const TH_SUB[2] = {
-    "Warm light - text-forward",
-    "Warm dark - terracotta",
+/* Preview tones are each theme's OWN colours — read from that theme's source
+ * table (palette.h theme_table), NOT the live g_pal[] — so a row previews the
+ * theme it would switch to and can never drift from what theme_set() loads.
+ * Only the one-line blurbs live here, indexed by the THEME_* id. */
+static const char *const TH_SUB[THEME_COUNT] = {
+    [THEME_LINEN]    = "Warm light - text-forward",
+    [THEME_ONYX]     = "Warm dark - terracotta",
+    [THEME_SAGE]     = "Dark green-grey - clay",
+    [THEME_PLASTER]  = "Pink-beige limewash - oxblood",
+    [THEME_OLIVE]    = "Greige-olive - burnt ochre",
+    [THEME_UMBER]    = "Espresso - caramel",
+    [THEME_MUSHROOM] = "Warm greige - muted rust",
 };
+
+/* Seven 40 px rows no longer fit under the header ((240-42)/40 = 4), so the
+ * picker scrolls through the same window + scrollbar as every other list. */
+#define TH_ROWS    ((LCD_HEIGHT - LIST_Y0) / TH_ROW_H)
+
+/* The header's right-hand count. A literal (no snprintf here), pinned to the
+ * id list so adding a theme without updating it fails to build. */
+#define TH_COUNT_STR "7 themes"
+_Static_assert(THEME_COUNT == 7, "update TH_COUNT_STR and TH_SUB[]");
 
 static void theme_render(const settings_t *s, int sel)
 {
-    int n = settings_count(SETTINGS_THEME);
-    for (int r = 0; r < n; r++) {
-        int ry = LIST_Y0 + r * TH_ROW_H;
+    int n   = settings_count(SETTINGS_THEME);
+    int top = st_scroll_window(sel, n, TH_ROWS);
+    st_scrollbar(LIST_Y0, top, TH_ROWS, n);
+    for (int vr = 0; vr < TH_ROWS; vr++) {
+        int r = top + vr;
+        if (r >= n) {
+            break;
+        }
+        int ry = LIST_Y0 + vr * TH_ROW_H;
         int is_sel = (r == sel);
         if (is_sel) {
-            sel_bar(LIST_Y0, TH_ROW_H, r);
+            sel_bar(LIST_Y0, TH_ROW_H, vr);
         }
 
         /* Swatch tile with a border + a small "text" hint bar. */
         int sw = 26, sx = 14, sy = ry + (TH_ROW_H - sw) / 2;
         console_fill_rect(sx - 1, sy - 1, sw + 2, sw + 2,
                           is_sel ? S_SEL_SUB : S_BORDER);
-        console_fill_rect(sx, sy, sw, sw, TH_SWATCH[r]);
-        console_fill_rect(sx + 6, sy + 10, 14, 3, TH_INK[r]);
+        const uint16_t *tp = theme_table(r);   /* r < THEME_COUNT: never NULL */
+        console_fill_rect(sx, sy, sw, sw, tp[PAL_SURFACE]);
+        console_fill_rect(sx + 6, sy + 10, 14, 3, tp[PAL_INK]);
+        console_fill_rect(sx + 6, sy + 16, 4, 4, tp[PAL_ACCENT]);
 
         int tx = sx + sw + 10;
         uint16_t fg   = is_sel ? S_SEL_FG  : S_INK;
@@ -279,7 +300,7 @@ void settings_render(int screen, const settings_t *s, int sel)
     case SETTINGS_PLAYBACK: title = "Playback"; break;
     case SETTINGS_SOUND:    title = "Sound";    break;
     case SETTINGS_DISPLAY:  title = "Display";  break;
-    case SETTINGS_THEME:    title = "Theme"; right = "2 themes"; break;
+    case SETTINGS_THEME:    title = "Theme"; right = TH_COUNT_STR; break;
     case SETTINGS_CLICKER:  title = "Clicker"; break;
     default:                title = "Settings"; break;
     }

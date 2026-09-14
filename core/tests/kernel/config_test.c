@@ -412,7 +412,7 @@ static void test_codec(void)
     rec[12 + 4] = 200;    /* volume            */
     rec[12 + 9] = 255;    /* backlight_bright  */
     rec[12 + 5] = 0x80;   /* bass = -128       */
-    rec[12 + 10] = 99;    /* theme             */
+    rec[12 + 10] = 99;    /* theme — no such id: must land on Linen (0) */
     rec[12 + 8] = 7;      /* backlight_secs — not a legal step */
     {
         /* Recompute the CRC the same way config.c does, so this record is
@@ -434,7 +434,7 @@ static void test_codec(void)
     check("codec clamps an in-range-CRC but out-of-range record",
           config_decode(rec, &out, &seq) == 1 &&
           out.volume == 100 && out.backlight_bright == 32 &&
-          out.bass == -12 && out.theme == 3 &&
+          out.bass == -12 && out.theme == 0 &&
           out.backlight_secs == 5);
 }
 

@@ -13,6 +13,7 @@
  */
 
 #include "settings.h"
+#include "palette.h"                   /* THEME_* ids + THEME_COUNT (header only) */
 
 /* ---------------------------------------------------------------------------
  * Small freestanding helpers
@@ -133,7 +134,16 @@ static const char *const ROOT_L[9] = {
 static const char *const PLAY_L[3] = { "Shuffle", "Repeat", "Resume" };
 static const char *const SOUND_L[4] = { "Volume", "Bass", "Treble", "Balance" };
 static const char *const DISP_L[2] = { "Backlight", "Brightness" };
-static const char *const THEME_L[2] = { "Linen", "Onyx" };
+/* Theme picker rows, in THEME_* id order (ui/palette.h) — the id IS the row. */
+static const char *const THEME_L[THEME_COUNT] = {
+    [THEME_LINEN]    = "Linen",
+    [THEME_ONYX]     = "Onyx",
+    [THEME_SAGE]     = "Sage",
+    [THEME_PLASTER]  = "Plaster",
+    [THEME_OLIVE]    = "Olive",
+    [THEME_UMBER]    = "Umber",
+    [THEME_MUSHROOM] = "Mushroom",
+};
 /* Clicker: index 0 = Off, 1..N = sound profiles (main.c maps to piezo tones). */
 static const char *const CLICK_L[8] = {
     "Off", "Tick", "Click", "Pop", "Blip", "Tock", "Double", "Chirp",
@@ -181,7 +191,7 @@ int settings_count(int screen)
     case SETTINGS_DISPLAY:  return 2;
     case SETTINGS_ABOUT:    return 1;   /* non-interactive info page */
     case SETTINGS_DIAG:     return 1;   /* non-interactive info page */
-    case SETTINGS_THEME:    return 2;
+    case SETTINGS_THEME:    return THEME_COUNT;
     case SETTINGS_CLICKER:  return CLICK_N;   /* Off + sound profiles */
     default:                return 0;
     }
@@ -205,8 +215,8 @@ const char *settings_label(int screen, int idx)
 
 const char *settings_theme_name(int theme)
 {
-    if (theme < 0 || theme > 1) {
-        return "Linen";
+    if (theme < 0 || theme >= THEME_COUNT) {
+        return THEME_L[THEME_LINEN];   /* what palette.c renders for it too */
     }
     return THEME_L[theme];
 }
@@ -363,7 +373,7 @@ int settings_activate(int screen, settings_t *s, int idx)
         return SETTINGS_ACTION_NOOP;       /* Brightness is wheel-adjusted */
 
     case SETTINGS_THEME:
-        if (idx >= 0 && idx < 2 && idx != s->theme) {
+        if (idx >= 0 && idx < THEME_COUNT && idx != s->theme) {
             s->theme = idx;
             return SETTINGS_ACTION_NONE;
         }

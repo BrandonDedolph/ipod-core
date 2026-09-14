@@ -87,7 +87,8 @@ See the [**Screens**](#screens) gallery below for a full tour.
   host-built index (`CORELIB.IDX`) that loads in one read and holds up to
   6000 songs / 1024 albums / 512 artists / 128 genres in full UTF-8. Album-
   art chips, a 120×120 now-playing cover, a scrolling marquee for long
-  titles, a warm-light **Linen** theme and a warm-dark **Onyx** one, plus
+  titles, seven themes (warm-light **Linen**, warm-dark **Onyx**, and Sage,
+  Plaster, Olive, Umber, Mushroom), plus
   settings (tone/balance, backlight, click profiles), volume and lock
   overlays, and a battery gauge that warns red when low.
 - **It remembers.** Settings persist across reboots to a pre-allocated
@@ -147,10 +148,15 @@ grows its sound waves as you turn it up.
   </tr>
 </table>
 
-### Two themes — Linen &amp; Onyx
+### Seven themes — Linen, Onyx, and five more
 
-The same UI in a warm-light and a warm-dark palette, swapped live from
-Settings.
+The same UI in a warm-light (Linen) and a warm-dark (Onyx) palette, shown
+below, swapped live from Settings. Five more ship alongside them: **Sage**
+(dark green-grey, clay accent), **Plaster** (pink-beige limewash, oxblood),
+**Olive** (greige-olive, burnt ochre), **Umber** (espresso, caramel) and
+**Mushroom** (warm greige, muted rust). Every theme keeps the same design
+language — the selection bar is always the ink colour behind surface-coloured
+text, so it inverts with the theme.
 
 <p align="center"><img src="docs/screens/themes.gif" alt="Linen and Onyx themes" width="360"></p>
 

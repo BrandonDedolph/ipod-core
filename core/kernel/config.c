@@ -89,6 +89,7 @@
 #include "hw/ata.h"
 #include "../fs/fat32.h"
 #include "../ui/settings.h"
+#include "../ui/palette.h"             /* THEME_COUNT: the stored theme's range */
 
 /* ---- module state ------------------------------------------------------ */
 
@@ -307,7 +308,7 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
     p[P_BALANCE]   = (uint8_t)(int8_t)clampi(s->balance, -100, 100);
     p[P_BL_SECS]   = (uint8_t)clamp_bl_secs(s->backlight_secs);
     p[P_BL_BRIGHT] = (uint8_t)clampi(s->backlight_bright, 1, 32);
-    p[P_THEME]     = (uint8_t)clampi(s->theme,   0, 3);
+    p[P_THEME]     = (uint8_t)clampi(s->theme,   0, THEME_COUNT - 1);
     p[P_CLICKER]   = (uint8_t)clampi(s->clicker, 0, 3);
 
     /* v2: the resume locator. Hash 0 means "nothing to resume", so the two
@@ -384,7 +385,12 @@ int config_decode(const uint8_t *rec, settings_t *s, uint32_t *seq)
     s->balance           = clampi((int8_t)p[P_BALANCE], -100, 100);
     s->backlight_secs    = clamp_bl_secs(p[P_BL_SECS]);
     s->backlight_bright  = clampi(p[P_BL_BRIGHT], 1, 32);
-    s->theme             = clampi(p[P_THEME],   0, 3);
+    /* A theme id this build does not know (a record from a newer build with
+     * more themes, or a stray byte) means Linen — NOT the nearest theme: the
+     * picker and palette.c both treat an unknown id as Linen, and clamping
+     * would silently hand the user the last theme in the list instead. */
+    s->theme             = (p[P_THEME] < THEME_COUNT) ? (int)p[P_THEME]
+                                                      : THEME_LINEN;
     s->clicker           = clampi(p[P_CLICKER], 0, 3);
 
     /*

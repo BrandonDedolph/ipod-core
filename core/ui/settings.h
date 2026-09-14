@@ -23,8 +23,7 @@
  * (player), volume (mirrors hal_volume), backlight_secs + backlight_bright
  * (backlight HAL), resume_on_startup (kernel/main.c re-opens the saved track at
  * boot). COSMETIC fields render + store but nothing consumes them yet
- * (crossfade, bass, treble, balance, theme>0) — flagged at their declarations
- * below.
+ * (crossfade, bass, treble, balance) — flagged at their declarations below.
  *
  * Freestanding: integer-only, no libc/libm/malloc, no allocation. The model
  * half (settings.c) has no hardware or framebuffer dependency at all, so it
@@ -54,8 +53,9 @@ typedef struct {
     int  balance;            /* -100..100 — COSMETIC                          */
     int  backlight_secs;     /* 0=never / 5/10/15/30/60 — FUNCTIONAL          */
     int  backlight_bright;   /* 1..32 — FUNCTIONAL                            */
-    int  theme;              /* 0 = Linen, 1 = Onyx; BOTH render (palette.c   */
-                             /* theme_set). 2..3 are unused.                  */
+    int  theme;              /* THEME_* id (ui/palette.h): 0 Linen, 1 Onyx,   */
+                             /* 2 Sage, 3 Plaster, 4 Olive, 5 Umber,          */
+                             /* 6 Mushroom — FUNCTIONAL (palette.c theme_set) */
     int  clicker;            /* 0/1 — FUNCTIONAL (piezo click on navigation)  */
 
     /*
@@ -208,7 +208,9 @@ int settings_count(int screen);
 /* The row label for (screen, idx), or "" if out of range. Stable .rodata. */
 const char *settings_label(int screen, int idx);
 
-/* The display name of theme index `theme` ("Linen"/"Onyx"). */
+/* The display name of theme id `theme` ("Linen", "Onyx", "Sage", "Plaster",
+ * "Olive", "Umber", "Mushroom" — ui/palette.h THEME_* order). An id outside
+ * that range names "Linen", which is also what palette.c renders for it. */
 const char *settings_theme_name(int theme);
 
 /* The display name of clicker profile `profile` ("Off"/"Tick"/"Click"/"Pop"). */
