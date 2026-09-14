@@ -1365,3 +1365,87 @@ int fat32_file_lba(const fat32_t *fs, uint32_t first_clus,
     *max_sectors = run;
     return 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * The same resolution at a BYTE OFFSET inside the file, for a pre-allocated
+ * file bigger than one cluster (kernel/evlog.c's ring). Everything
+ * fat32_file_lba() refuses, this refuses; on top of it:
+ *
+ *   - the chain walk is BOUNDED (FAT_LBA_AT_MAX_CLUS steps, each through
+ *     next_cluster(), so every hop is validated against max_clus before it is
+ *     followed) and STOPS at the first end-of-chain: an offset past the end
+ *     of the chain is FAT32_ECORRUPT, never "the cluster after the last one";
+ *   - a FAT sector that will not read is FAT32_EIO, not a guess;
+ *   - the in-cluster remainder must be a whole number of 512-byte sectors
+ *     (FAT32_EINVAL otherwise) — the caller deals in sectors, and there is
+ *     no such thing as "the LBA of byte 100";
+ *   - *max_sectors is what remains of THIS cluster from that sector, so a
+ *     caller whose record straddles a cluster boundary gets told, rather
+ *     than being pointed at the next cluster of a chain it never checked.
+ *
+ * It does NOT know the file's size: the caller has the directory entry and
+ * bounds its own offsets against it; what this guarantees is that the
+ * address returned lies inside a cluster the chain actually links from
+ * `first_clus`, in order, `byte_offset / clus_bytes` hops down.
+ * ------------------------------------------------------------------------- */
+#define FAT_LBA_AT_MAX_CLUS 4096u
+
+int fat32_file_lba_at(fat32_t *fs, uint32_t first_clus, uint32_t byte_offset,
+                      uint32_t *lba, uint32_t *max_sectors)
+{
+    if (fs == 0 || lba == 0 || max_sectors == 0) {
+        return FAT32_EINVAL;
+    }
+    *lba         = 0;
+    *max_sectors = 0;
+
+    if (fs->sec_ratio == 0 || fs->sec_per_clus == 0 || fs->clus_bytes == 0) {
+        return FAT32_ECORRUPT;      /* unmounted / impossible geometry */
+    }
+    if ((byte_offset % 512u) != 0) {
+        return FAT32_EINVAL;
+    }
+
+    uint32_t hops   = byte_offset / fs->clus_bytes;
+    uint32_t in_off = byte_offset % fs->clus_bytes;
+    if (hops > FAT_LBA_AT_MAX_CLUS) {
+        return FAT32_ECORRUPT;      /* no file we pre-allocate is this long */
+    }
+
+    /* Walk exactly `hops` links. next_cluster() validates each target
+     * against max_clus and returns FAT_EOC for free/reserved/out-of-range
+     * entries, so an unlinked or damaged chain ends here, not at an
+     * address. */
+    uint32_t clus = first_clus;
+    if (!cluster_valid(fs, clus)) {
+        return FAT32_ECORRUPT;
+    }
+    for (uint32_t i = 0; i < hops; i++) {
+        uint32_t nx = next_cluster(fs, clus);
+        if (nx == 0) {
+            return FAT32_EIO;
+        }
+        if (nx >= FAT_EOC) {
+            return FAT32_ECORRUPT;  /* offset lies past the end of the chain */
+        }
+        clus = nx;
+    }
+
+    /* The cluster we landed on goes through the SAME resolver the settings
+     * file uses — one formula, one set of bounds checks. */
+    uint32_t base = 0, run = 0;
+    int rc = fat32_file_lba(fs, clus, &base, &run);
+    if (rc != 0) {
+        return rc;
+    }
+    uint32_t skip = in_off / 512u;
+    if (skip >= run) {
+        return FAT32_ECORRUPT;      /* cannot happen for a sane clus_bytes; refuse anyway */
+    }
+    if (base > 0xFFFFFFFFu - skip) {
+        return FAT32_ECORRUPT;
+    }
+    *lba         = base + skip;
+    *max_sectors = run - skip;
+    return 0;
+}

@@ -455,6 +455,81 @@ int main(int argc, char **argv)
     fails += check("partial read (maxlen=100) returns 100 correct bytes",
                    partial_ok);
 
+    /* ---- fat32_file_lba_at: a byte offset inside a multi-cluster chain ----
+     * The image has no MBR (part_lba 0), BytesPerSec 2048 (sec_ratio 4),
+     * RSVD 2 + two one-sector FATs => data_start = FS-sector 4, so cluster N
+     * is FS-sector N+2 and its first LBA is (N+2)*4. HELLO.TXT is the chain
+     * 3 -> 4 (LBAs 20 and 24); Intentions.flac is the single cluster 5.
+     * This is the resolver kernel/evlog.c writes through, so the cases are
+     * the ones that matter for a WRITE: the first cluster, a later cluster
+     * reached by walking the chain, and every way to ask for an address the
+     * chain does not own. */
+    {
+        uint32_t la = 1, ms = 1;
+        fails += check("lba_at offset 0 = cluster 3's first LBA (20), run 4",
+                       fat32_file_lba_at(&fs, clus, 0, &la, &ms) == 0 &&
+                       la == 20 && ms == 4);
+        uint32_t l0 = 0, r0 = 0;
+        fails += check("lba_at offset 0 agrees with fat32_file_lba",
+                       fat32_file_lba(&fs, clus, &l0, &r0) == 0 &&
+                       l0 == la && r0 == ms);
+        fails += check("lba_at offset 512 = LBA 21, 3 sectors left in cluster",
+                       fat32_file_lba_at(&fs, clus, 512, &la, &ms) == 0 &&
+                       la == 21 && ms == 3);
+        fails += check("lba_at offset 1536 = LBA 23, 1 sector left",
+                       fat32_file_lba_at(&fs, clus, 1536, &la, &ms) == 0 &&
+                       la == 23 && ms == 1);
+        fails += check("lba_at offset 2048 follows the chain to cluster 4 (LBA 24)",
+                       fat32_file_lba_at(&fs, clus, 2048, &la, &ms) == 0 &&
+                       la == 24 && ms == 4);
+        fails += check("lba_at offset 2560 = cluster 4 + 1 sector (LBA 25)",
+                       fat32_file_lba_at(&fs, clus, 2560, &la, &ms) == 0 &&
+                       la == 25 && ms == 3);
+
+        /* Past the end of the chain: cluster 4 is EOC, so the third cluster
+         * does not exist. Refused, and the out-params are 0, not "the
+         * cluster after 4" — which on a real volume is somebody's file. */
+        la = 1; ms = 1;
+        fails += check("lba_at offset 4096 (past the 2-cluster chain) refuses",
+                       fat32_file_lba_at(&fs, clus, 4096, &la, &ms) == FAT32_ECORRUPT &&
+                       la == 0 && ms == 0);
+        la = 1; ms = 1;
+        fails += check("lba_at far past the end refuses",
+                       fat32_file_lba_at(&fs, clus, 0x00400000u, &la, &ms) == FAT32_ECORRUPT &&
+                       la == 0 && ms == 0);
+        la = 1; ms = 1;
+        fails += check("lba_at absurd offset (bounded walk) refuses",
+                       fat32_file_lba_at(&fs, clus, 0x80000000u, &la, &ms) == FAT32_ECORRUPT &&
+                       la == 0 && ms == 0);
+
+        /* A single-cluster file has no second cluster. */
+        la = 1; ms = 1;
+        fails += check("lba_at offset 2048 into a 1-cluster file refuses",
+                       fat32_file_lba_at(&fs, lc, 2048, &la, &ms) == FAT32_ECORRUPT &&
+                       la == 0 && ms == 0);
+        fails += check("lba_at offset 0 of Intentions.flac = cluster 5 (LBA 28)",
+                       fat32_file_lba_at(&fs, lc, 0, &la, &ms) == 0 &&
+                       la == 28 && ms == 4);
+
+        /* Not a sector boundary, a bad cluster, null args. */
+        la = 1; ms = 1;
+        fails += check("lba_at unaligned byte offset is EINVAL",
+                       fat32_file_lba_at(&fs, clus, 100, &la, &ms) == FAT32_EINVAL &&
+                       la == 0 && ms == 0);
+        la = 1; ms = 1;
+        fails += check("lba_at from cluster 0 refuses",
+                       fat32_file_lba_at(&fs, 0, 0, &la, &ms) == FAT32_ECORRUPT &&
+                       la == 0 && ms == 0);
+        la = 1; ms = 1;
+        fails += check("lba_at from an out-of-range cluster refuses",
+                       fat32_file_lba_at(&fs, 0x0FFFFFF0u, 0, &la, &ms) == FAT32_ECORRUPT &&
+                       la == 0 && ms == 0);
+        fails += check("lba_at null out-params is EINVAL",
+                       fat32_file_lba_at(&fs, clus, 0, NULL, &ms) == FAT32_EINVAL &&
+                       fat32_file_lba_at(&fs, clus, 0, &la, NULL) == FAT32_EINVAL &&
+                       fat32_file_lba_at(NULL, clus, 0, &la, &ms) == FAT32_EINVAL);
+    }
+
     /* ---- streaming reader (forward cursor) ----
      * HELLO.TXT is 3000 bytes of i&0xFF spanning clusters 3->4 at the
      * 2048-byte (one-cluster) boundary. Read it forward in small 7-byte
