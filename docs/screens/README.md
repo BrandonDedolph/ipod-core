@@ -122,7 +122,7 @@ A screenshot here is a claim about what the device draws. So:
 | `playlists.png` | Music → Playlists list | `screen_playlists` |
 | `detail.png` | album detail (tracklist) | `screen_detail` |
 | `nowplaying.png` `volume.png` | Now Playing, volume plate | `screen_nowplaying`, `screen_volume` |
-| `lock.png` `locked.png` `locked_list.png` | Hold-switch banners (Now Playing row / list chrome) | `screen_lock`, `screen_locked`, `screen_locked_list` |
+| `hold_unlocked.png` `hold_locked.png` `hold_locked_list.png` | Hold-switch banners (Now Playing row / list chrome) | `screen_lock`, `screen_locked`, `screen_locked_list` |
 | `settings.png` `sound.png` `clicker.png` `theme.png` | Settings | `screen_settings`, `screen_sound`, `screen_clicker`, `screen_theme` |
 | `about.png` `bootdetails.png` | About dashboard, Boot Details | `screen_about`, `screen_diag` |
 | `nowplaying_onyx.png` `albums_onyx.png` | the Onyx theme | `with_palette(ONYX, …)` |
@@ -132,11 +132,11 @@ A screenshot here is a claim about what the device draws. So:
 | `demo.gif` | the walkthrough alone: browse → play | `build_walkthrough_gif` (`walkthrough_spec`) |
 | `boot.gif` | power-on: splash, library bar, main menu | `gif_boot` (`_boot_spec`) |
 | `jump.gif` | Right jumps to Now Playing, Menu returns to the row | `gif_jump` |
-| `browse.gif` `volume.gif` `themes.gif` `lock.gif` `settings.gif` | one feature each | `gif_*` |
+| `browse.gif` `volume.gif` `themes.gif` `hold.gif` `settings.gif` | one feature each | `gif_*` |
 
-Indexed here, not referenced by the top-level README: `demo.gif`, `lock.gif`,
+Indexed here, not referenced by the top-level README: `demo.gif`, `hold.gif`,
 `volume.gif`, `music.png`, `songs.png`, `genres.png`, `sound.png`,
-`clicker.png`, `theme.png`, `lock.png`, `locked_list.png`, `loading_onyx.png`,
+`clicker.png`, `theme.png`, `hold_unlocked.png`, `hold_locked_list.png`, `loading_onyx.png`,
 `albums_onyx.png`. They stay in the gallery; the README shows a smaller set.
 
 ## Keeping it honest

@@ -428,7 +428,7 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
         }
         int cw = text_width(chip, F_SUB);
         int chw = cw + 16, chx = LCD_WIDTH - 16 - chw, chy = 52;
-        ui_round_rect(chx, chy, chw, 16, 8, S_ACCENT);
+        ui_round_rect(chx, chy, chw, 16, 8, S_INK);
         st_text(chx + 8, chy + 12, chip, F_SUB, S_SURFACE);
     }
     /* A capped load is the one thing the stat columns below cannot show on
@@ -469,7 +469,7 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
             int fw = (int)(((unsigned long long)used * bw) / total_mb);
             if (fw < bh && used > 0) fw = bh;
             if (fw > bw) fw = bw;
-            ui_round_rect(ix, by, fw, bh, 3, S_ACCENT);
+            ui_round_rect(ix, by, fw, bh, 3, S_INK);
             fmt_gb(v, used);                 /* "55.3 GB" ...                */
             { int i = 0; while (v[i] && v[i] != ' ') i++; v[i] = '\0'; }   /* ..."55.3" */
             su_append(v, " of ");
@@ -495,7 +495,7 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
             int pct = battery_pct > 100 ? 100 : battery_pct;
             int fw  = (gw - 4) * pct / 100;
             if (fw < 2 && pct > 0) fw = 2;
-            ui_round_rect(gx + 2, gy + 2, fw, gh - 4, 2, S_ACCENT);
+            ui_round_rect(gx + 2, gy + 2, fw, gh - 4, 2, S_INK);
         }
         /*
          * Millivolts, per battery.h's own instruction to "display raw

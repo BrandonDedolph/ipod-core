@@ -1115,7 +1115,7 @@ def screen_about(lib_truncated=AB_LIB_TRUNCATED):
     chip = "Core " + VERSION if VERSION else "Core"
     cw = text_width(chip, FONT_SUB)
     chw, chx, chy = cw + 16, W - 16 - (cw + 16), 52
-    sc.fill_round_rect(chx, chy, chw, 16, 8, ACCENT)
+    sc.fill_round_rect(chx, chy, chw, 16, 8, INK)
     sc.text(chx + 8, chy + 12, chip, FONT_SUB, SURFACE)
     if lib_truncated:
         sc.text_centered(84, "Library too large " + MIDDOT + " some items not shown",
@@ -1146,7 +1146,7 @@ def screen_about(lib_truncated=AB_LIB_TRUNCATED):
     if fw < bh and used > 0:
         fw = bh
     fw = min(fw, bw)
-    sc.fill_round_rect(ix, by, fw, bh, 3, ACCENT)
+    sc.fill_round_rect(ix, by, fw, bh, 3, INK)
     used_str = fmt_gb(used).split(" ")[0]          # "53.5 GB" -> "53.5"
     sc.text(ix, AB_CARD_Y + 72, used_str + " of " + fmt_gb(AB_TOTAL_MB), FONT_SMALL, MUTED_D)
 
@@ -1160,7 +1160,7 @@ def screen_about(lib_truncated=AB_LIB_TRUNCATED):
     fw2 = (gw - 4) * pct // 100
     if fw2 < 2 and pct > 0:
         fw2 = 2
-    sc.fill_round_rect(gx + 2, gy + 2, fw2, gh - 4, 2, ACCENT)
+    sc.fill_round_rect(gx + 2, gy + 2, fw2, gh - 4, 2, INK)
     sc.text(ix, AB_CARD_Y + 72, str(AB_BATT_MV) + " mV", FONT_SMALL, MUTED_D)
 
     # --- diagnostics footer: raw ADC code + the event log sequence ---
@@ -1383,7 +1383,7 @@ def gif_lock():
     # Hold disengaged: the UNLOCKED banner, and the strip padlock is gone.
     spec.append((_lock_screen(False, elapsed=e, glyph=False), 5, 170)); e += 1
     spec.append((_np(e), 3, 160))
-    return _save_gif("lock.gif", spec)
+    return _save_gif("hold.gif", spec)
 
 
 def gif_settings():
@@ -2013,9 +2013,9 @@ def main():
     outputs.append(save_png(screen_genres(), "genres.png"))
     outputs.append(save_png(screen_about(), "about.png"))
     outputs.append(save_png(screen_volume(), "volume.png"))
-    outputs.append(save_png(screen_lock(), "lock.png"))
-    outputs.append(save_png(screen_locked(), "locked.png"))
-    outputs.append(save_png(screen_locked_list(), "locked_list.png"))
+    outputs.append(save_png(screen_lock(), "hold_unlocked.png"))
+    outputs.append(save_png(screen_locked(), "hold_locked.png"))
+    outputs.append(save_png(screen_locked_list(), "hold_locked_list.png"))
     # --- new: library / browsing ---
     outputs.append(save_png(screen_mainmenu(), "mainmenu.png"))
     outputs.append(save_png(screen_music(), "music.png"))

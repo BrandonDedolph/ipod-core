@@ -125,8 +125,8 @@ longer drops the battery and the track off the top of the screen.
 > announces a Hold edge by inverting the TOP CHROME for ~1 s instead — an ink
 > band with a closed padlock and "Locked", a surface band with the popped-open
 > padlock and "Unlocked" — so the title and the art stay uncovered. The
-> persistent strip padlock is unchanged. See `docs/screens/locked.png`,
-> `docs/screens/lock.png` and `docs/screens/locked_list.png`.
+> persistent strip padlock is unchanged. See `docs/screens/hold_locked.png`,
+> `docs/screens/hold_unlocked.png` and `docs/screens/hold_locked_list.png`.
 
 ---
 
@@ -145,7 +145,7 @@ The interactive prototype treats navigation as a stack of frames:
 - **Wheel rotation:**
   - On Now Playing → volume (briefly shows overlay)
   - On lists → moves selection
-- **Hold switch (top of device):** toggles a global lock. While locked, all wheel input is blocked and shows a 1s "LOCKED" plate (the firmware ships this as a top-chrome banner rather than a centred plate — `docs/screens/locked.png`). Status bars across all screens render a small lock glyph next to the battery.
+- **Hold switch (top of device):** toggles a global lock. While locked, all wheel input is blocked and shows a 1s "LOCKED" plate (the firmware ships this as a top-chrome banner rather than a centred plate — `docs/screens/hold_locked.png`). Status bars across all screens render a small lock glyph next to the battery.
 
 Lists scroll automatically so the selection stays visible (~1/3 from the top of the viewport).
 

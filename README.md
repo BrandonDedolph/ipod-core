@@ -72,7 +72,7 @@ left.
   <tr>
     <td><img src="docs/screens/nowplaying.png" width="260" alt="Now Playing"></td>
     <td><img src="docs/screens/volume.png" width="260" alt="Volume overlay"></td>
-    <td><img src="docs/screens/locked.png" width="260" alt="Hold banner"></td>
+    <td><img src="docs/screens/hold_locked.png" width="260" alt="Hold banner"></td>
   </tr>
 </table>
 

@@ -40,7 +40,7 @@ and the wheel do nothing while it is on; a press shows the banner again. A small
 the status strip. Slide it off for the Unlocked banner. Touch the wheel or a button and the banner
 goes away at once.
 
-<p align="center"><img src="screens/lock.gif" alt="the Hold banner" width="360"></p>
+<p align="center"><img src="screens/hold.gif" alt="the Hold banner" width="360"></p>
 
 ## The status strip
 
