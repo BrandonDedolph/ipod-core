@@ -132,6 +132,23 @@ needs a reset pulse after a gate, and the wheel/UART at the crystal
 rate. If a suspend misbehaves, the three parks are independent — start
 by leaving `clock_suspend` out of `suspend_lowpower_enter`.
 
+### 2026-09-13, evening — first flash: what the device said
+
+- **Panel sleep: WHITE on wake.** The backlight timed out during playback,
+  the panel slept, and the first press came back solid white. Both
+  `PANEL_SLEEP_AT_IDLE` and `SUSPEND_PANEL_SLEEP` are back to 0; the
+  `lcd_sleep` before the PMU standby command is gated on the same flag.
+- **5 s PLAY hold: dark and unwakeable.** No button and not the charger
+  woke it; only Menu+Select did. Not yet attributed (hang before GOSTDBY vs
+  a standby that does not wake). The 20 s suspend test discriminates.
+- **Audio: FIXED and CONFIRMED.** Hiss with nothing playing, the wheel click
+  on the jack and the drive's spin-up on the jack were all one thing: the
+  codec played through VMIDSEL 0x2, the datasheet's low-power STANDBY
+  divider (worst supply rejection). Playback now uses the normal 0x1
+  divider, and the codec is forced cold at boot (a Menu+Select reset keeps
+  its rails up). Second flash: jack silent idle, silent paused, no click
+  bleed, no drive noise — owner confirmed all four.
+
 ### 2026-09-13, later — cross-branch review, two rounds
 
 Five reviewers went over the merged result looking for what each parallel
