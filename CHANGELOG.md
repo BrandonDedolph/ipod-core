@@ -3,6 +3,12 @@
 Each release lists what changed on the device since the previous one. Versions are git tags;
 the boot screen and Settings → About show the one the device runs.
 
+## Unreleased
+
+- The user guide's opening line names the running version again (it still said v0.1.0 in the
+  v0.1.1 release). `tools/release.py <version>` now sets the version everywhere it is shown,
+  regenerates the stamped stills and GIFs, and lists anything that still disagrees.
+
 ## v0.1.1 — 2026-09-14
 
 Since v0.1.0.

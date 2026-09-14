@@ -34,7 +34,7 @@ fallbacks: `git describe --tags --always --dirty --abbrev=7` → `BUILD_ID`
 (fallback `unknown`, the firmware's `CORE_BUILD_ID`) and `git describe --tags
 --abbrev=0` → `VERSION` (fallback `v0.0.0`, the firmware's `CORE_VERSION`).
 `BUILD_ID` is the boot/loading stills' bottom-right stamp and the Boot Details
-header; `VERSION` is the About chip's "Core v0.1.0". This used to be a
+header; `VERSION` is the About chip's "Core vX.Y.Z". This used to be a
 hard-coded hash, which meant `boot.png` claimed a commit that had not been the
 tip for weeks. Consequence worth knowing: **those five stills change whenever
 the working tree's describe output changes** — a fresh commit, or a dirty tree
@@ -47,7 +47,7 @@ environment variables and `render.py` uses them verbatim instead of calling
 git:
 
 ```bash
-CORE_STAMP_BUILD_ID=v0.1.0 CORE_STAMP_VERSION=v0.1.0 \
+CORE_STAMP_BUILD_ID=<version> CORE_STAMP_VERSION=<version> \
   tools/.venv/bin/python3 docs/screens/render.py
 ```
 
