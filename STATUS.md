@@ -303,6 +303,14 @@ forces a settings commit and a FINAL log block first (narrated
 "core: disk mode: entering"). The ROM Select+Play route still loses RAM
 — unavoidable.
 
+**Pushed 2026-09-14 (054c722..353f2de, 108 commits), CI green on every
+job.** README and core/README rewritten for the device as it is; the
+docs/screens gallery re-rendered against the firmware (render.py repaired —
+it had not run since the atlas set changed; docs/screens/README.md holds
+the rules; Settings-side screens checked against host renders of the real
+C, library-side against main.c). Next bench: the three suspend switches
+one at a time with the log capturing; playlists with real .m3u8 files.
+
 **End of night, device image = 1879fa0.** Confirmed on the device today:
 silent jack (VMID), steady charge gauge, scrollbar under fast scroll,
 white blank at sleep, seven themes on a five-row picker, short-hold
