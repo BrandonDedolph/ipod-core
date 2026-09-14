@@ -3147,9 +3147,13 @@ static void settings_render_cur(void)
          * of the stat columns. main.c resolves the LBAs here because
          * config_probe_lba() must resolve FRESH, exactly as a save would,
          * rather than reporting something cached. Read-only. */
-        uint32_t lba0 = 0, lba1 = 0;
+        uint32_t lba0 = 0, lba1 = 0, log_hdr = 0, log_next = 0;
         (void)config_probe_lba(0, &lba0);
         (void)config_probe_lba(1, &lba1);
+        if (evlog_enabled()) {
+            (void)evlog_probe_header_lba(&log_hdr);
+            (void)evlog_probe_lba(evlog_seq(), &log_next);
+        }
         const player_stats_t *ps = player_stats();
         settings_diag_render(g_boot_total_ms, g_boot_lcd_ms, g_boot_disk_ms,
                              g_lib_load_ms, g_boot_resume_ms,
@@ -3157,7 +3161,8 @@ static void settings_render_cur(void)
                              g_boot_res_seek_ms,
                              ps ? ps->decode_us_per_kframe : 0,
                              ps ? ps->underruns : 0,
-                             config_writable(), config_seq(), lba0, lba1);
+                             config_writable(), config_seq(), lba0, lba1,
+                             log_hdr, log_next);
     } else {
         settings_render(g_set_screen, &g_settings, g_set_sel);
     }

@@ -277,6 +277,9 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
  * derives "OTHER" as total minus the named phases so unmeasured time is
  * visible instead of lost. lba0/lba1 are the absolute sectors config_save()
  * would write; cfg_writable 0 renders the locator as "not writable".
+ * log_hdr_lba/log_next_lba are the event log's header block and the block
+ * its next flush would write (both 0 when the log is off) — the same
+ * cross-check against tools/make_log.py --verify.
  */
 void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                           uint32_t lib_ms, uint32_t resume_ms,
@@ -284,6 +287,7 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                           uint32_t res_seek_ms,
                           uint32_t decode_us_kframe, uint32_t underruns,
                           int cfg_writable, uint32_t cfg_seq,
-                          uint32_t lba0, uint32_t lba1);
+                          uint32_t lba0, uint32_t lba1,
+                          uint32_t log_hdr_lba, uint32_t log_next_lba);
 
 #endif /* CORE_UI_SETTINGS_H */

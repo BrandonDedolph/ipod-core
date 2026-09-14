@@ -529,7 +529,8 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                           uint32_t res_seek_ms,
                           uint32_t decode_us_kframe, uint32_t underruns,
                           int cfg_writable, uint32_t cfg_seq,
-                          uint32_t lba0, uint32_t lba1)
+                          uint32_t lba0, uint32_t lba1,
+                          uint32_t log_hdr_lba, uint32_t log_next_lba)
 {
     char v[48];
     console_clear(S_SURFACE);
@@ -660,5 +661,15 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
         su_copy(v + i, " / ");
         su_to_str(v + i + 3, lba1);
         st_text_right(16, 230, v, F_SMALL, S_MUTED_D);
+    }
+    /* --- event-log locator: header block / next flush's block --- *
+     * Same procedure as CONFIG (tools/make_log.py --verify prints both);
+     * sits on the left of the same two rows. 0/0 = log off. */
+    if (log_hdr_lba || log_next_lba) {
+        st_text(16 + 60, 214, "LOG", F_SMALL, S_MUTED);
+        int i = su_to_str(v, log_hdr_lba);
+        su_copy(v + i, " / ");
+        su_to_str(v + i + 3, log_next_lba);
+        st_text(16 + 60, 230, v, F_SMALL, S_MUTED_D);
     }
 }
