@@ -58,20 +58,67 @@ def rgb565(v):
 
 BATT_RED = rgb565(0xE125)   # low-battery warning, theme-independent
 
-# Two themes, both RGB565. SEL_BG/SEL_FG derive from INK/SURFACE so the inverted
-# selection bar reads right in both (Linen: dark bar/light text; Onyx: the
-# reverse). apply_palette() rebinds the module globals the screen builders read.
+# Seven themes, all RGB565, values transcribed verbatim from core/ui/palette.c
+# (PAL_LINEN ... PAL_MUSHROOM). SEL_BG/SEL_FG derive from INK/SURFACE so the
+# inverted selection bar reads right in every one (light themes: dark bar/
+# light text; dark themes: the reverse). apply_palette() rebinds the module
+# globals the screen builders read.
 LINEN = dict(
     SURFACE=0xF79D, INK=0x18A2, MUTED=0x7B8D, MUTED2=0x9C70, MUTED_D=0x5A89,
     ACCENT=0xC348, BORDER=0xE71B, PLATE=0xF7BE, TRK=0xDEDA, SB_TRK=0xE73C,
-    SB_THMB=0xAD34, SEL_SUB=0xB595, CHEVRON=0xC638, SEL_TRK=0x4A69,
+    SB_THMB=0xAD34, SEL_SUB=0xB595, CHEVRON=0xB575, SEL_TRK=0x41E7,
+    PILL_OFF=0xCE58,
 )
 ONYX = dict(
     SURFACE=0x18C2, INK=0xEF3C, MUTED=0xACF2, MUTED2=0xB533, MUTED_D=0x8C0E,
     ACCENT=0xC348, BORDER=0x3185, PLATE=0x2944, TRK=0x39A5, SB_TRK=0x2924,
-    SB_THMB=0x6B0B, SEL_SUB=0x5A89, CHEVRON=0x4A27, SEL_TRK=0x8410,
+    SB_THMB=0x6B0B, SEL_SUB=0x5A89, CHEVRON=0x4A27, SEL_TRK=0xCE16,
+    PILL_OFF=0x39A5,
+)
+SAGE = dict(
+    SURFACE=0x31A6, INK=0xEF3B, MUTED=0xAD74, MUTED2=0x7C2F, MUTED_D=0xC657,
+    ACCENT=0xC3CA, BORDER=0x3A28, PLATE=0x3A07, TRK=0x4248, SB_TRK=0x3A07,
+    SB_THMB=0x6BCD, SEL_SUB=0x6B4C, CHEVRON=0x5B2B, SEL_TRK=0xCE58,
+    PILL_OFF=0x4248,
+)
+PLASTER = dict(
+    SURFACE=0xE6DA, INK=0x3965, MUTED=0x8B8D, MUTED2=0xA491, MUTED_D=0x5A48,
+    ACCENT=0x8A06, BORDER=0xDE57, PLATE=0xEF3B, TRK=0xD657, SB_TRK=0xDE98,
+    SB_THMB=0xB4F2, SEL_SUB=0xB553, CHEVRON=0xB533, SEL_TRK=0x5248,
+    PILL_OFF=0xCDF6,
+)
+OLIVE = dict(
+    SURFACE=0xE71A, INK=0x2964, MUTED=0x6B8C, MUTED2=0x8C90, MUTED_D=0x4A67,
+    ACCENT=0xABA6, BORDER=0xD6B8, PLATE=0xEF5B, TRK=0xCE77, SB_TRK=0xDED9,
+    SB_THMB=0xA511, SEL_SUB=0xAD53, CHEVRON=0xA532, SEL_TRK=0x4A48,
+    PILL_OFF=0xC616,
+)
+UMBER = dict(
+    SURFACE=0x2903, INK=0xEF1A, MUTED=0xB512, MUTED2=0x8BCE, MUTED_D=0xCDF6,
+    ACCENT=0xCC49, BORDER=0x3985, PLATE=0x3165, TRK=0x39A6, SB_TRK=0x3144,
+    SB_THMB=0x7B2B, SEL_SUB=0x62CA, CHEVRON=0x5A68, SEL_TRK=0xCE16,
+    PILL_OFF=0x39A6,
+)
+MUSHROOM = dict(
+    SURFACE=0xE6FA, INK=0x3144, MUTED=0x7BAD, MUTED2=0x9C91, MUTED_D=0x5289,
+    ACCENT=0xA2C8, BORDER=0xD678, PLATE=0xEF5C, TRK=0xD678, SB_TRK=0xDEB9,
+    SB_THMB=0xAD12, SEL_SUB=0xAD54, CHEVRON=0xB553, SEL_TRK=0x4A28,
+    PILL_OFF=0xC617,
 )
 _PAL_KEYS = list(LINEN.keys()) + ["SEL_BG", "SEL_FG"]
+
+# THEME_* id order (core/ui/palette.h / settings.c THEME_L) — the id IS the
+# row in the picker. Name + one-line subtitle come from screen_settings.c's
+# TH_SUB[]; the palette dict is that theme's own PAL_* table.
+THEMES = [
+    ("Linen",    "Warm light - text-forward",      LINEN),
+    ("Onyx",     "Warm dark - terracotta",          ONYX),
+    ("Sage",     "Dark green-grey - clay",          SAGE),
+    ("Plaster",  "Pink-beige limewash - oxblood",   PLASTER),
+    ("Olive",    "Greige-olive - burnt ochre",       OLIVE),
+    ("Umber",    "Espresso - caramel",               UMBER),
+    ("Mushroom", "Warm greige - muted rust",         MUSHROOM),
+]
 
 def apply_palette(spec):
     g = globals()
@@ -466,7 +513,9 @@ def draw_lock_glyph(sc, x, y, c):
     sc.fill_rect(x + 1, y, 6, 2, c)
 
 def status_strip(sc, left="CORE", pct=78, locked=False):
-    sc.text(12, STATUS_H - 4, left, FONT_SMALL, MUTED2)
+    # main.c status_strip_render: left text clipped before the right cluster
+    # (12, LCD_WIDTH-70), not drawn full width and painted over.
+    sc.text(12, STATUS_H - 4, left, FONT_SMALL, MUTED2, clip=(12, W - 70))
     bx = W - 12 - 24
     draw_battery(sc, bx, 1, pct)
     if locked:
@@ -576,8 +625,10 @@ def screen_albums(sel=ALBUMS_SEL, title_offset=0):
     header(sc, "Albums", "%d / %d" % (sel + 1, len(ALBUMS)), back=True)
     for r, (t, a, art) in enumerate(ALBUMS):
         s = (r == sel)
-        list_row(sc, LIST_Y0, r, t, sub=a, selected=s, chip=art, rh=ROW_H2,
-                 title_offset=title_offset if s else 0)
+        # main.c albumlist_row_draw: list_row_tall(..., chevron=1, right=0) —
+        # a disclosure chevron, no per-row right value.
+        list_row(sc, LIST_Y0, r, t, sub=a, chevron=True, selected=s, chip=art,
+                 rh=ROW_H2, title_offset=title_offset if s else 0)
     scrollbar(sc, LIST_Y0, 0, LIST_ROWS2, len(ALBUMS))
     return sc.img
 
@@ -784,51 +835,96 @@ def screen_locked():
 
 
 # -- about -------------------------------------------------------------------
-def screen_about():
+def fmt_gb(mb):
+    """settings_about_render's fmt_gb: whole megabytes as 'W.F GB'."""
+    whole = mb // 1024
+    frac = (mb % 1024) * 10 // 1024
+    return "%d.%d GB" % (whole, frac)
+
+# Device dashboard values (core/ui/screen_settings.c settings_about_render):
+#   ‹ About
+#   iPod 5.5G                                  [Core]
+#      4127          318           142
+#      SONGS        ALBUMS        ARTISTS
+#   ┌ STORAGE ──────────┐  ┌ BATTERY ──────────┐
+#   │ 21.0 GB free       │  │ 73%                │
+#   │ ▓▓▓▓▓▓▓▓▓░░░       │  │ [▓▓▓▓▓▓▓░░]▏       │
+#   │ 53.5 of 74.5 GB    │  │ 3912 mV            │
+#   └────────────────────┘  └────────────────────┘
+#              ADC 2731 · LOG 6 on
+AB_SONGS, AB_ALBUMS, AB_ARTISTS = 4127, 318, 142
+AB_TOTAL_MB, AB_FREE_MB = 76288, 21504          # -> "74.5 GB" total, "21.0 GB" free
+AB_BATT_PCT, AB_BATT_MV, AB_BATT_RAW = 73, 3912, 2731
+AB_LOG_SEQ, AB_LOG_ON = 6, True
+AB_LIB_TRUNCATED = False
+
+AB_CARD_Y, AB_CARD_H, AB_CARD_W, AB_CARD_PAD = 142, 80, 140, 10   # 16|140|8|140|16=320
+
+def _about_card(sc, x, label):
+    sc.fill_round_rect(x, AB_CARD_Y, AB_CARD_W, AB_CARD_H, 6, PLATE)
+    sc.text(x + AB_CARD_PAD, AB_CARD_Y + 18, label, FONT_SMALL, MUTED)
+    return x + AB_CARD_PAD
+
+def screen_about(lib_truncated=AB_LIB_TRUNCATED):
     sc = Screen()
     header(sc, "About", back=True)
-    sc.text_centered(62, "iPod 5.5G", FONT_TITLE, INK)
+
+    # --- device row: name left, firmware chip right, one baseline ---
+    sc.text(16, 66, "iPod 5.5G", FONT_TITLE, INK)
+    cw = text_width("Core", FONT_SUB)
+    chw, chx, chy = cw + 16, W - 16 - (cw + 16), 52
+    sc.fill_round_rect(chx, chy, chw, 16, 8, ACCENT)
+    sc.text(chx + 8, chy + 12, "Core", FONT_SUB, SURFACE)
+    if lib_truncated:
+        sc.text_centered(84, "Library too large " + MIDDOT + " some items not shown",
+                          FONT_SMALL, BATT_RED)
+
+    # --- three stat columns: Songs / Albums / Artists ---
     lbl = ["SONGS", "ALBUMS", "ARTISTS"]
-    val = [911, 94, 32]
+    val = [AB_SONGS, AB_ALBUMS, AB_ARTISTS]
     colw = W // 3
     for i in range(3):
         cx = colw * i + colw // 2
         v = str(val[i])
-        sc.text(cx - text_width(v, FONT_TITLE) // 2, 100, v, FONT_TITLE, INK)
-        sc.text(cx - text_width(lbl[i], FONT_SMALL) // 2, 116, lbl[i], FONT_SMALL, MUTED)
+        sc.text(cx - text_width(v, FONT_TITLE) // 2, 108, v, FONT_TITLE, INK)
+        sc.text(cx - text_width(lbl[i], FONT_SMALL) // 2, 124, lbl[i], FONT_SMALL, MUTED)
         if i:
-            sc.fill_rect(colw * i, 86, 1, 36, BORDER)
-    sc.fill_rect(16, 130, W - 32, 1, BORDER)
-    # firmware row + Core chip
-    sc.text(16, 150, "FIRMWARE", FONT_SMALL, MUTED)
-    cw = text_width("Core", FONT_SUB)
-    chw = cw + 16
-    chx = W - 16 - chw
-    sc.fill_round_rect(chx, 140, chw, 15, 7, ACCENT)
-    sc.text(chx + 8, 151, "Core", FONT_SUB, SURFACE)
-    # storage
-    sc.text(16, 176, "STORAGE", FONT_SMALL, MUTED)
-    total_mb = 76319
-    free_mb = 41988
-    def fmt_gb(mb):
-        whole = mb // 1024
-        frac = (mb % 1024) * 10 // 1024
-        return "%d.%d GB" % (whole, frac)
-    sc.text_right(W - 16, 176, fmt_gb(free_mb) + " free", FONT_SUB, MUTED_D)
-    bx, by, bw, bh = 16, 182, W - 32, 8
-    sc.fill_round_rect(bx, by, bw, bh, 4, TRK)
-    used = total_mb - free_mb
-    fw = int(used * bw / total_mb)
-    sc.fill_round_rect(bx, by, fw, bh, 4, ACCENT)
-    # battery
-    pct = 78
-    sc.text(16, 212, "BATTERY", FONT_SMALL, MUTED)
-    sc.text_right(W - 16, 212, str(pct) + "%", FONT_SUB, INK)
-    gx, gy, gw, gh = 16, 218, W - 32 - 5, 12
+            sc.fill_rect(colw * i, 94, 1, 36, BORDER)
+
+    # --- STORAGE plate: free space big, used-fraction bar, capacity caption ---
+    ix = _about_card(sc, 16, "STORAGE")
+    bw = AB_CARD_W - 2 * AB_CARD_PAD
+    v = fmt_gb(AB_FREE_MB)
+    pen = sc.text(ix, AB_CARD_Y + 44, v, FONT_TITLE, INK)
+    sc.text(pen + 5, AB_CARD_Y + 44, "free", FONT_SUB, MUTED_D)
+    by, bh = AB_CARD_Y + 52, 6
+    sc.fill_round_rect(ix, by, bw, bh, 3, TRK)
+    used = AB_TOTAL_MB - AB_FREE_MB
+    fw = int(used * bw / AB_TOTAL_MB)
+    if fw < bh and used > 0:
+        fw = bh
+    fw = min(fw, bw)
+    sc.fill_round_rect(ix, by, fw, bh, 3, ACCENT)
+    used_str = fmt_gb(used).split(" ")[0]          # "53.5 GB" -> "53.5"
+    sc.text(ix, AB_CARD_Y + 72, used_str + " of " + fmt_gb(AB_TOTAL_MB), FONT_SMALL, MUTED_D)
+
+    # --- BATTERY plate: percent big, a battery pictogram, millivolts caption ---
+    ix = _about_card(sc, 164, "BATTERY")
+    sc.text(ix, AB_CARD_Y + 44, str(AB_BATT_PCT) + "%", FONT_TITLE, INK)
+    gx, gy, gw, gh = ix, AB_CARD_Y + 50, AB_CARD_W - 2 * AB_CARD_PAD - 4, 10
     sc.fill_round_rect(gx, gy, gw, gh, 3, TRK)
-    sc.fill_rect(gx + gw, gy + 3, 4, gh - 6, TRK)
+    sc.fill_rect(gx + gw, gy + 3, 3, gh - 6, TRK)
+    pct = min(AB_BATT_PCT, 100)
     fw2 = (gw - 4) * pct // 100
+    if fw2 < 2 and pct > 0:
+        fw2 = 2
     sc.fill_round_rect(gx + 2, gy + 2, fw2, gh - 4, 2, ACCENT)
+    sc.text(ix, AB_CARD_Y + 72, str(AB_BATT_MV) + " mV", FONT_SMALL, MUTED_D)
+
+    # --- diagnostics footer: raw ADC code + the event log sequence ---
+    v = "ADC " + str(AB_BATT_RAW) + " " + MIDDOT + " "
+    v += ("LOG " + str(AB_LOG_SEQ) + " on") if AB_LOG_ON else "LOG off"
+    sc.text_centered(236, v, FONT_SMALL, MUTED)
     return sc.img
 
 
@@ -848,11 +944,11 @@ def save_png(im, name):
 # Menu screens (main + Music submenu) — real rows from core/kernel/main.c
 # ---------------------------------------------------------------------------
 MAIN_MENU = [   # (label, active) — idle: "Now Playing" row is hidden
-    ("Music", True), ("Playlists", False), ("Podcasts", False),
+    ("Music", True), ("Playlists", True), ("Podcasts", False),
     ("Audiobooks", False), ("Settings", True),
 ]
 MUSIC_MENU = [
-    ("Playlists", False), ("Artists", True), ("Albums", True), ("Songs", True),
+    ("Playlists", True), ("Artists", True), ("Albums", True), ("Songs", True),
     ("Shuffle Songs", True), ("Genres", True), ("Composers", False),
     ("Audiobooks", False),
 ]
@@ -882,10 +978,11 @@ def build_walkthrough_gif():
             frames.append(p)
             durations.append(ms)
 
-    # 1) MAIN MENU — dwell only on ACTIVE rows; greyed rows (Playlists/Podcasts/
-    #    Audiobooks) are passed over quickly (1 frame), never selected.
+    # 1) MAIN MENU — dwell on ACTIVE rows; greyed rows (Podcasts/Audiobooks) are
+    #    passed over quickly (1 frame), never selected.
     add(screen_menu("Core", MAIN_MENU, 0, False), hold=4)   # Music (active)
-    for i in (1, 2, 3):                                      # pass greyed rows
+    add(screen_menu("Core", MAIN_MENU, 1, False), hold=2)   # Playlists (active)
+    for i in (2, 3):                                         # pass greyed rows
         add(screen_menu("Core", MAIN_MENU, i, False), hold=1)
     add(screen_menu("Core", MAIN_MENU, 4, False), hold=3)   # Settings (active) — pause
     for i in (3, 2, 1):                                      # pass back up
@@ -1011,14 +1108,17 @@ def gif_volume():
 
 
 def gif_themes():
-    """DUAL THEME: cross-cut the SAME playing track between Linen and Onyx. The
-    track keeps playing across the cuts, so the clock ticks up at each flip."""
+    """SEVEN THEMES: cross-cut the SAME playing track through every theme in
+    picker order (THEMES). The track keeps playing across the cuts, so the
+    clock ticks up at each flip. ~900ms per theme, longer on the first."""
     spec = []
     e = 73
-    for theme in (None, ONYX, None, ONYX):        # Linen / Onyx / Linen / Onyx
-        spec.append((_np(e, theme=theme), 6, 170))
-        e += 1                                    # ~1s hold -> +1s playback
-    return _save_gif("themes.gif", spec)
+    for i, (name, sub, pal) in enumerate(THEMES):
+        theme = None if name == "Linen" else pal   # Linen == the live default
+        ms = 1400 if i == 0 else 900
+        spec.append((_np(e, theme=theme), 1, ms))
+        e += 1                                     # one hold -> +1s playback
+    return _save_gif("themes.gif", spec, colors=64)
 
 
 def gif_lock():
@@ -1040,7 +1140,8 @@ def gif_lock():
 
 
 def gif_settings():
-    """SETTINGS: the Sound screen's Volume slider ramps up then back down."""
+    """SETTINGS: the Sound screen's Volume slider ramps up then back down, then
+    settles on the seven-theme picker."""
     def sound_vol(v):
         rows = list(SOUND_ROWS)
         rows[0] = ("Volume", "%d%%" % v, v, 100)
@@ -1053,6 +1154,7 @@ def gif_settings():
     for v in reversed(vals[:-1]):
         spec.append((sound_vol(v), 2, 130))
     spec.append((sound_vol(20), 3, 150))
+    spec.append((screen_theme(), 2, 700))     # end on the theme picker
     return _save_gif("settings.gif", spec)
 
 
@@ -1060,7 +1162,7 @@ def gif_settings():
 # Extra library / browsing screens
 # ---------------------------------------------------------------------------
 MAIN_MENU_FULL = [  # full menu, a track is loaded so "Now Playing" shows active
-    ("Music", True), ("Playlists", False), ("Podcasts", False),
+    ("Music", True), ("Playlists", True), ("Podcasts", False),
     ("Audiobooks", False), ("Settings", True), ("Now Playing", True),
 ]
 
@@ -1088,7 +1190,9 @@ def screen_artists():
         if r >= len(ARTISTS):
             break
         name, cnt = ARTISTS[r]
-        list_row(sc, LIST_Y0, r, name, right=str(cnt), selected=(r == ARTISTS_SEL))
+        # main.c artists_row_draw: list_row(..., right=0, chevron=1) — a
+        # disclosure chevron, no per-row album count (the count is header-only).
+        list_row(sc, LIST_Y0, r, name, chevron=True, selected=(r == ARTISTS_SEL))
     scrollbar(sc, LIST_Y0, 0, LIST_ROWS, len(ARTISTS))
     return sc.img
 
@@ -1151,6 +1255,27 @@ def screen_allsongs(sel=ALLSONGS_SEL):
         list_row(sc, LIST_Y0, vr, t, sub=album, right=dur, selected=(r == sel),
                  rh=ROW_H2, title_priority=True)
     scrollbar(sc, LIST_Y0, top, LIST_ROWS2, len(ALLSONGS))
+    return sc.img
+
+
+# Music -> Playlists (main.c playlists_render / playlists_row_draw): a plain
+# single-line list (list_row, ROW_H) of the .m3u8 files in Music/Playlists,
+# each row a name + disclosure chevron — no sub-line, no per-row right value
+# (the count lives in the header only, like Artists).
+PLAYLISTS = [
+    "Road Trip", "Late Night", "Sunday Morning", "Gym", "Favourites", "Focus",
+]
+PLAYLISTS_SEL = 1
+
+def screen_playlists(sel=PLAYLISTS_SEL):
+    sc = Screen()
+    status_strip(sc, "CORE")
+    header(sc, "Playlists", "%d / %d" % (sel + 1, len(PLAYLISTS)), back=True)
+    for r in range(LIST_ROWS):
+        if r >= len(PLAYLISTS):
+            break
+        list_row(sc, LIST_Y0, r, PLAYLISTS[r], chevron=True, selected=(r == sel))
+    scrollbar(sc, LIST_Y0, 0, LIST_ROWS, len(PLAYLISTS))
     return sc.img
 
 
@@ -1222,11 +1347,12 @@ def fmt_ms(ms):
 # phases leave behind; setting it here would let the picture disagree with the
 # figures, which is the one thing this screen must never do.
 DIAG_TOTAL = 3300
-DIAG_LCD, DIAG_DISK, DIAG_LIB, DIAG_RESUME = 0, 300, 1800, 900
-DIAG_RES_DIR, DIAG_RES_OPEN, DIAG_RES_SEEK = 0, 700, 40
-DIAG_DECODE_PCT = 61          # of the 22676 us/kframe 44.1kHz real-time budget
-DIAG_SEQ = 7
-DIAG_LBA = (49236472, 49236474)
+DIAG_LCD, DIAG_DISK, DIAG_LIB, DIAG_RESUME = 210, 1900, 610, 480
+DIAG_RES_DIR, DIAG_RES_OPEN, DIAG_RES_SEEK = 120, 300, 40
+DIAG_DECODE_PCT = 34          # of the 22676 us/kframe 44.1kHz real-time budget
+DIAG_SEQ = 500
+DIAG_LBA = (49236472, 49236474)     # CONFIG slot LBAs (config_save())
+DIAG_LOG_LBA = (49238456, 49238464)  # event log header / next-flush LBAs
 
 def screen_diag():
     sc = Screen()
@@ -1288,11 +1414,14 @@ def screen_diag():
         x += text_width(v, FONT_SMALL) + 12
     sc.fill_rect(16, 196, W - 32, 1, BORDER)
 
-    # settings-file locator: the two absolute LBAs config_save() writes to —
-    # with no serial cable, the panel is the only place to read them back
-    sc.text(16, 214, "CONFIG", FONT_SMALL, MUTED)
-    sc.text_right(W - 16, 214, "seq %d" % DIAG_SEQ, FONT_SUB, INK)
-    sc.text_right(W - 16, 230, "%d / %d" % DIAG_LBA, FONT_SMALL, MUTED_D)
+    # settings-file locator: two rows, label left, "a / b" right — the
+    # absolute LBAs config_save() writes to, then the event log's header /
+    # next-flush LBAs. With no serial cable, the panel is the only place to
+    # read them back.
+    sc.text(16, 214, "CONFIG seq %d" % DIAG_SEQ, FONT_SMALL, MUTED)
+    sc.text_right(W - 16, 214, "%d / %d" % DIAG_LBA, FONT_SMALL, MUTED_D)
+    sc.text(16, 230, "LOG", FONT_SMALL, MUTED)
+    sc.text_right(W - 16, 230, "%d / %d" % DIAG_LOG_LBA, FONT_SMALL, MUTED_D)
     return sc.img
 
 
@@ -1339,42 +1468,54 @@ def screen_clicker():
         if sel:
             _sel_bar(sc, LIST_Y0, ROW_H, r)
         fg = SEL_FG if sel else INK
-        markc = SEL_SUB if sel else INK
+        # settings.c: the active profile's row draws a middot in the generic
+        # list_render right-value slot — regular_11 (FONT_SUB), MUTED_D when
+        # not selected, same as any other row's right value.
+        markc = SEL_SUB if sel else MUTED_D
         sc.text(14, ry + 15, label, FONT_HEADER if sel else FONT_ROW, fg)
         if r == CLICK_ACTIVE:
-            sc.text_right(W - 16, ry + 15, MIDDOT, bold_13, markc)  # marks active
+            sc.text_right(W - 16, ry + 15, MIDDOT, regular_11, markc)  # marks active
     return sc.img
 
 
-TH_ROW_H = 40
-TH_SWATCH = [0xF79D, 0x18C2]   # each theme's own surface tone
-TH_INK = [0x18A2, 0xEF3C]      # ink hint bar
-TH_NAME = ["Linen", "Onyx"]
-TH_SUB = ["Warm light - text-forward", "Warm dark - terracotta"]
+# Theme picker (core/ui/screen_settings.c theme_render): 39px rows, five
+# visible ((240-42)/39), windowed + scrollbarred like every other list.
+TH_ROW_H = 39
+TH_ROWS = (H - LIST_Y0) // TH_ROW_H     # 5
 TH_CURRENT = 0                  # Linen active
 TH_SEL = 1                      # cursor on Onyx
 
-def screen_theme():
+def screen_theme(sel=TH_SEL, current=TH_CURRENT):
     sc = Screen()
-    header(sc, "Theme", "2 themes", back=True)
-    for r in range(2):
-        ry = LIST_Y0 + r * TH_ROW_H
-        sel = (r == TH_SEL)
-        if sel:
-            _sel_bar(sc, LIST_Y0, TH_ROW_H, r)
+    header(sc, "Theme", "%d themes" % len(THEMES), back=True)
+    n = len(THEMES)
+    top = scroll_window(sel, n, TH_ROWS)
+    for vr in range(TH_ROWS):
+        r = top + vr
+        if r >= n:
+            break
+        name, sub, pal = THEMES[r]
+        ry = LIST_Y0 + vr * TH_ROW_H
+        is_sel = (r == sel)
+        if is_sel:
+            _sel_bar(sc, LIST_Y0, TH_ROW_H, vr)
+        # Swatch tile: that theme's OWN surface/ink/accent (never the live
+        # palette), so a row previews the theme it would switch to.
         sw, sx = 26, 14
         sy = ry + (TH_ROW_H - sw) // 2
-        sc.fill_rect(sx - 1, sy - 1, sw + 2, sw + 2, SEL_SUB if sel else BORDER)
-        sc.fill_rect(sx, sy, sw, sw, rgb565(TH_SWATCH[r]))
-        sc.fill_rect(sx + 6, sy + 10, 14, 3, rgb565(TH_INK[r]))
+        sc.fill_rect(sx - 1, sy - 1, sw + 2, sw + 2, SEL_SUB if is_sel else BORDER)
+        sc.fill_rect(sx, sy, sw, sw, rgb565(pal["SURFACE"]))
+        sc.fill_rect(sx + 6, sy + 10, 14, 3, rgb565(pal["INK"]))
+        sc.fill_rect(sx + 6, sy + 16, 4, 4, rgb565(pal["ACCENT"]))
         tx = sx + sw + 10
-        fg = SEL_FG if sel else INK
-        subc = SEL_SUB if sel else MUTED
-        sc.text(tx, ry + 17, TH_NAME[r], FONT_HEADER, fg)
-        sc.text(tx, ry + 31, TH_SUB[r], FONT_SMALL, subc)
-        if r == TH_CURRENT:
+        fg = SEL_FG if is_sel else INK
+        subc = SEL_SUB if is_sel else MUTED
+        sc.text(tx, ry + 17, name, FONT_HEADER, fg)
+        sc.text(tx, ry + 31, sub, FONT_SMALL, subc)
+        if r == current:
             sc.text_right(W - 14, ry + 20, "CURRENT", FONT_SMALL,
-                          SEL_FG if sel else MUTED2)
+                          SEL_FG if is_sel else MUTED2)
+    scrollbar(sc, LIST_Y0, top, TH_ROWS, n)
     return sc.img
 
 
@@ -1427,7 +1568,7 @@ def _bolt(sc, cx, y0, bh, c):
             if R > L:
                 sc.fill_rect(L, y, R - L, 1, c)
 
-def screen_charging(pct=62, charging=True, external=True):
+def screen_charging(pct=64, charging=True, external=True):
     CHG_BG = rgb565(0x0861)
     CHG_OUTLINE = rgb565(0x5A89)
     CHG_FILL = rgb565(0xEF3B)
@@ -1475,6 +1616,50 @@ def screen_charging(pct=62, charging=True, external=True):
     return sc.img
 
 
+# ---------------------------------------------------------------------------
+# Low-battery full-screen warnings (core/ui/screen_battery.c
+# screen_battery_render) — the charging screen's dark field + battery glyph
+# (0%, red stub), with the DISKSAFE / SHUTOFF copy.
+# ---------------------------------------------------------------------------
+def screen_battery_low(kind="disksafe"):
+    CHG_BG = rgb565(0x0861)
+    CHG_OUTLINE = rgb565(0x5A89)
+    CHG_RED = rgb565(0xDA46)
+    CHG_TEXT = rgb565(0xEF3B)
+    CHG_UNIT = rgb565(0xACF2)
+    CHG_MUTED = rgb565(0x7B8D)
+    BW, BH = 150, 68
+    BX, BY, BT, INSET = (W - BW) // 2, 56, 3, 8
+    NUB_W, NUB_H = 6, 24
+    sc = Screen(CHG_BG)
+    # battery glyph: outline + nub + a pct=0 red stub (min 8px, never bare)
+    sc.fill_rect(BX, BY, BW, BT, CHG_OUTLINE)
+    sc.fill_rect(BX, BY + BH - BT, BW, BT, CHG_OUTLINE)
+    sc.fill_rect(BX, BY, BT, BH, CHG_OUTLINE)
+    sc.fill_rect(BX + BW - BT, BY, BT, BH, CHG_OUTLINE)
+    for cxx, cyy in ((BX, BY), (BX + BW - 1, BY), (BX, BY + BH - 1), (BX + BW - 1, BY + BH - 1)):
+        sc.px[cxx, cyy] = CHG_BG
+    sc.fill_rect(BX + BW, BY + (BH - NUB_H) // 2, NUB_W, NUB_H, CHG_OUTLINE)
+    ix, iy = BX + INSET, BY + INSET
+    iw, ih = BW - 2 * INSET, BH - 2 * INSET
+    fw = max(8, min(iw, iw * 0 // 100))
+    sc.fill_rect(ix, iy, fw, ih, CHG_RED)
+
+    head, body, hint = bold_13, regular_11, regular_9
+    if kind == "shutoff":
+        # SHUTOFF: three lines, no dismiss hint — there is nothing to press.
+        sc.text_centered(150, "Battery empty", head, CHG_TEXT)
+        sc.text_centered(172, "Powering off now", body, CHG_UNIT)
+        sc.text_centered(190, "Plug in to charge", body, CHG_UNIT)
+    else:
+        # DISKSAFE (default): the write-gate warning.
+        sc.text_centered(150, "Battery very low", head, CHG_TEXT)
+        sc.text_centered(172, "Plug in now to keep listening.", body, CHG_UNIT)
+        sc.text_centered(190, "Settings will not be saved until then.", body, CHG_UNIT)
+        sc.text_centered(218, "Press any button to dismiss", hint, CHG_MUTED)
+    return sc.img
+
+
 def screen_boot():
     sc = Screen(SURFACE)
     sc.text_centered(120, "Core Player", FONT_TITLE, INK)
@@ -1498,6 +1683,7 @@ def main():
     outputs.append(save_png(screen_artists(), "artists.png"))
     outputs.append(save_png(screen_songs(), "songs.png"))
     outputs.append(save_png(screen_allsongs(), "allsongs.png"))
+    outputs.append(save_png(screen_playlists(), "playlists.png"))
     # --- new: settings ---
     outputs.append(save_png(screen_settings(), "settings.png"))
     outputs.append(save_png(screen_diag(), "bootdetails.png"))
@@ -1509,6 +1695,7 @@ def main():
     outputs.append(save_png(screen_albums_onyx(), "albums_onyx.png"))
     # --- new: system ---
     outputs.append(save_png(screen_charging(), "charging.png"))
+    outputs.append(save_png(screen_battery_low(), "battery_low.png"))
     outputs.append(save_png(screen_boot(), "boot.png"))
     # --- big walkthrough gif (unchanged) ---
     gifs = [build_walkthrough_gif()]

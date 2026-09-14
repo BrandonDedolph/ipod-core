@@ -13,7 +13,8 @@ core/
 ├── boot/        crt0.S, .ipod image header, linker script
 ├── kernel/      cooperative scheduler, IRQ, timer, clock, cache,
 │                framebuffer console, PCM ring, panic/fault handlers,
-│                CORECFG.DAT settings store — and main.c (the UI)
+│                CORECFG.DAT settings store, the CORELOG.BIN event log
+│                — and main.c (the UI)
 ├── hal/
 │   ├── hal.h    hardware contract shared by both backends
 │   ├── hw/      ARM drivers: lcd, ata, i2c, i2s, wm8758, dma, audio,
@@ -24,9 +25,10 @@ core/
 ├── lib/         freestanding mem.c (memcpy/memset)
 ├── codecs/      dr_flac + dr_mp3 (freestanding), static arena, read-ahead
 │                disk source, FLAC metadata reader, unified decoder ABI
+├── library/     CORELIB.IDX loader, artists/genres, playlist rows
 ├── player/      queue + transport engine (open/next/prev/seek/end-of-queue)
 ├── ui/          gamma-correct AA text renderer + Nunito atlases, the
-│                runtime palette (Linen/Onyx), art thumbnail cache,
+│                runtime palette (seven themes), art thumbnail cache,
 │                settings model, and per-screen renderers
 ├── cli/         Go host CLI (`core` — .ipod firmware pack/unpack, sim)
 ├── docs/hw/     hardware reference the drivers were written against
@@ -65,7 +67,7 @@ make sim        # configures + builds the HOST TEST SUITE (see note below)
 make verify-hw  # static checks against a fresh `make hw` (see below)
 make help       # all targets
 
-meson test -C build-sim     # 36 host unit + MMIO golden-trace tests
+meson test -C build-sim     # 58 host unit + MMIO golden-trace suites
 ```
 
 `make verify-hw` is the static half of the safety net — the checks that
@@ -131,9 +133,40 @@ between two slots so a power loss mid-write always leaves one good record.
 pre-flight before the first write on a given device.
 
 The record is v2: v1 held settings only, v2 appends a resume locator
-(name hash + elapsed seconds + track length). With **Resume** enabled, a
-cold boot reopens the track you were on and seeks to where you left off,
-**paused** — never surprising you with audio at boot.
+(name hash + elapsed seconds + track length) and, since the queue work, the
+kind of queue the track was playing in and the shuffle seeds. With
+**Resume** enabled, a cold boot reopens the track you were on, in that
+queue, and seeks to where you left off, **paused** — never surprising you
+with audio at boot.
+
+## Event log
+
+`CORELOG.BIN` is a 4 MiB ring of 2048-byte blocks, created on the host by
+[`../tools/make_log.py`](../tools/make_log.py) (`--create`), that captures
+every `core:` line the UART would carry: a 16 KiB RAM ring in
+`kernel/evlog.c` is flushed one block at a time through the same write gate
+as the settings file — a full block at idle, a forced FINAL block at sleep,
+power-off and Disk Mode entry, the last one at the disk-safe battery edge.
+Block 0 is a validated header the device never writes; every other block
+carries a sequence number, boot number, length and CRC-32, and the cursor
+is found at boot by a binary search over the ring. `--dump` reads a pulled
+copy back per boot; About shows `LOG <seq> on`, Boot Details the header and
+next-flush LBAs.
+
+## Sleep and power-off
+
+Hold PLAY for two seconds: the player pauses, settings and position are
+force-committed, the log flushes, the drive parks, the panel blanks white
+and the backlight drops, the codec powers down, and the main loop halts
+between wheel samples until a button is pressed; wake re-boosts the CPU,
+spins the drive,
+repaints while dark and only then lights the backlight. Hold past five
+seconds for PMU standby (a true off; any button cold-boots). Asleep on
+battery the device keeps sampling the cell and escalates to standby after
+thirty minutes or at the shut-off edge. The deeper savings (`SUSPEND_*`
+switches at the top of `kernel/main.c`: PLL park, peripheral clock gates,
+ATA SLEEP instead of STANDBY, panel sleep) are compiled out until each is
+proven alone on the device.
 
 ## Audio path
 
@@ -188,10 +221,11 @@ Runs on real iPod 5.5G hardware, booting directly from the firmware
 partition: boot + MMAP0 remap, LCD, click-wheel, backlight, WM8758B audio,
 DMA streaming playback, ATA + FAT32, and streaming FLAC off the device's disk
 (MP3 is parked — see "Audio path"), with the full menu / browser /
-now-playing UI, persistent settings and resume-on-boot.
+now-playing UI, seven themes, persistent settings, resume-on-boot, sleep /
+power-off from the Play button, and the on-disk event log.
 
-Not yet confirmed on hardware: gapless playback, the 500 mA charge-current
-change, and the post-fix FLAC seek timing (the fix is in — see
+Not yet confirmed on hardware: gapless playback, playlists with real
+`.m3u8` files, and the post-fix FLAC seek timing (the fix is in — see
 [`codecs/README.md`](codecs/README.md) — but the improvement has not been
-re-measured on the device). See [`../STATUS.md`](../STATUS.md) for the
-running list.
+re-measured on the device). The charger is held at 100 mA. See
+[`../STATUS.md`](../STATUS.md) for the running list.

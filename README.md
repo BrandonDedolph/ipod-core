@@ -73,6 +73,13 @@ See the [**Screens**](#screens) gallery below for a full tour.
   hidden from the browser entirely — its float synthesis filter can't
   hit real time on this FPU-less CPU, so the ring starves and playback
   stutters. Re-enabling it needs a fixed-point or second-core decoder.
+- **Real sleep.** Hold Play for two seconds and the device goes to sleep:
+  playback pauses, the position is saved, the drive parks, the panel blanks
+  white and the backlight drops, the codec powers down, and the CPU idles
+  until any button wakes it — straight back to where you were. Hold Play
+  past five seconds for a true power-off (PMU standby; a button press cold
+  boots). A sleeping device keeps sampling its battery, and on battery
+  power escalates itself to a power-off after thirty minutes.
 - **Real type.** `core/ui/text.c` is a libc-free, gamma-correct
   antialiased text renderer that draws pre-rasterized Nunito glyph
   atlases straight into the RGB565 framebuffer — no FreeType, no malloc,
@@ -88,17 +95,27 @@ See the [**Screens**](#screens) gallery below for a full tour.
   6000 songs / 1024 albums / 512 artists / 128 genres in full UTF-8. Album-
   art chips, a 120×120 now-playing cover, a scrolling marquee for long
   titles, seven themes (warm-light **Linen**, warm-dark **Onyx**, and Sage,
-  Plaster, Olive, Umber, Mushroom), plus
-  settings (tone/balance, backlight, click profiles), volume and lock
-  overlays, and a battery gauge that warns red when low.
+  Plaster, Olive, Umber, Mushroom), `.m3u8` playlists read straight off the
+  disk, plus settings (tone/balance, backlight, click profiles), volume and
+  lock overlays, and a battery gauge that warns red when low and stays
+  honest on the charger (it reads the cell, not the charge current).
 - **It remembers.** Settings persist across reboots to a pre-allocated
   `CORECFG.DAT` — two alternating slots, each a whole physical sector, each
   CRC-32 checked, written through the ATA write path with the target LBA
   re-resolved and re-validated before every write. The device never creates,
   grows, moves or deletes the file, so no FAT metadata is ever touched. On
   top of that, **Resume** brings you back on the track you left, *paused*,
-  at the saved position — bound by a folded name hash (confirmed by
-  duration where possible), so it survives a library rebuild.
+  at the saved position — and in the queue you were playing it from (an
+  album, an artist, a shuffle, a playlist), bound by a folded name hash
+  (confirmed by duration where possible), so it survives a library rebuild.
+- **It keeps a log.** Every diagnostic line the firmware would send down a
+  serial cable is also captured into `CORELOG.BIN`, a 4 MiB on-disk ring
+  (2048-byte CRC-checked blocks, pre-allocated on the host by
+  `tools/make_log.py`, never grown or moved by the device). It flushes a
+  block at idle and forces one at sleep, power-off and Disk Mode entry, so
+  a report of "it stuttered after I woke it" comes with the boot narration,
+  battery samples, present timings and audio underrun counts that explain
+  it. `make_log.py --dump` reads it back; About shows `LOG n on`.
 
 ## Screens
 
@@ -111,6 +128,9 @@ Main menu → Music → browse by **Artist / Album / Song / Genre**, all off a
 host-built index that loads in one read. Two-line rows carry album-art
 chips; long titles scroll a marquee. An artist's **All Songs** row collapses
 their whole discography into one list, with the album on the sub-line.
+
+Playlists are `.m3u8` files dropped into `Music/Playlists/`; they show up
+under Music → Playlists and play as a queue.
 
 <p align="center"><img src="docs/screens/browse.gif" alt="browsing the library" width="360"></p>
 
@@ -127,7 +147,7 @@ their whole discography into one list, with the album on the sub-line.
   </tr>
   <tr>
     <td><img src="docs/screens/allsongs.png" width="260" alt="An artist's All Songs"></td>
-    <td></td>
+    <td><img src="docs/screens/playlists.png" width="260" alt="Playlists"></td>
     <td></td>
   </tr>
 </table>
@@ -148,17 +168,17 @@ grows its sound waves as you turn it up.
   </tr>
 </table>
 
-### Seven themes — Linen, Onyx, and five more
+### Seven themes
 
-The same UI in a warm-light (Linen) and a warm-dark (Onyx) palette, shown
-below, swapped live from Settings. Five more ship alongside them: **Sage**
-(dark green-grey, clay accent), **Plaster** (pink-beige limewash, oxblood),
-**Olive** (greige-olive, burnt ochre), **Umber** (espresso, caramel) and
-**Mushroom** (warm greige, muted rust). Every theme keeps the same design
-language — the selection bar is always the ink colour behind surface-coloured
-text, so it inverts with the theme.
+Warm-light **Linen** and warm-dark **Onyx**, plus **Sage** (dark green-grey,
+clay accent), **Plaster** (pink-beige limewash, oxblood), **Olive**
+(greige-olive, burnt ochre), **Umber** (espresso, caramel) and **Mushroom**
+(warm greige, muted rust) — swapped live from a five-row picker in Settings.
+Every theme keeps the same design language: the selection bar is always the
+ink colour behind surface-coloured text, so it inverts with the theme, and
+the warning red never changes.
 
-<p align="center"><img src="docs/screens/themes.gif" alt="Linen and Onyx themes" width="360"></p>
+<p align="center"><img src="docs/screens/themes.gif" alt="the seven themes on Now Playing" width="360"></p>
 
 <table>
   <tr>
@@ -174,10 +194,14 @@ text, so it inverts with the theme.
 ### Settings
 
 Nine rows, and they stick: Playback (shuffle / repeat / resume), Sound
-(volume / bass / treble / balance via the WM8758B EQ), a theme picker,
+(volume / bass / treble / balance via the WM8758B EQ), the theme picker,
 Display (backlight timeout + brightness), **seven** piezo click profiles, an
 About dashboard, **Boot Details**, Disk Mode, and Reset. Everything but the
 diagnostics is saved to disk and comes back after a reboot.
+
+**About** is a small dashboard: the library's counts, a storage card, a
+battery card with the cell's millivolts, and one muted footer with the raw
+ADC code and the event log's state.
 
 <p align="center"><img src="docs/screens/settings.gif" alt="adjusting a Sound slider" width="360"></p>
 
@@ -197,14 +221,20 @@ diagnostics is saved to disk and comes back after a reboot.
 **Boot Details** is the diagnostics page: a live phase breakdown of the last
 cold boot — LCD/BCM bring-up, disk + mount, library load, resume, and the
 unattributed remainder — as a stacked proportional bar plus a legend, with
-the FLAC decode cost against the 44.1 kHz real-time budget, the underrun
-count, and the settings file's slot LBAs. The remainder is *derived* (total
-minus the named phases) and the total is measured independently rather than
-summed, so unmeasured time shows up instead of vanishing.
+the FLAC decode cost against the 44.1 kHz real-time budget, the audio
+underrun count (red, only when it is not zero), and the on-disk locators of
+the settings file and the event log — the same LBAs the host tools print,
+so a mismatch is visible before anything is written. The remainder is
+*derived* (total minus the named phases) and the total is measured
+independently rather than summed, so unmeasured time shows up instead of
+vanishing.
 
 ### System
 
-Boot splash, charging screen, and the Hold-switch lock / unlock overlays.
+Boot splash, charging screen, the low-battery warning, and the Hold-switch
+lock / unlock overlays. Low battery is a state machine with hysteresis: a
+toast at 3.7 V, a full-screen warning at the disk-safe line (settings and
+log writes stop there), and a goodbye screen before the PMU would cut power.
 
 <p align="center"><img src="docs/screens/lock.gif" alt="lock and unlock overlays" width="360"></p>
 
@@ -212,8 +242,12 @@ Boot splash, charging screen, and the Hold-switch lock / unlock overlays.
   <tr>
     <td><img src="docs/screens/boot.png" width="260" alt="Boot splash"></td>
     <td><img src="docs/screens/charging.png" width="260" alt="Charging"></td>
+    <td><img src="docs/screens/battery_low.png" width="260" alt="Low battery"></td>
+  </tr>
+  <tr>
     <td><img src="docs/screens/lock.png" width="260" alt="Unlocked"></td>
     <td><img src="docs/screens/locked.png" width="260" alt="Locked"></td>
+    <td></td>
   </tr>
 </table>
 
@@ -225,7 +259,7 @@ Boot splash, charging screen, and the Hold-switch lock / unlock overlays.
 | SoC | PortalPlayer PP5022 (dual ARM7TDMI, ARMv4T) |
 | Audio DAC | Wolfson WM8758B over I²C control + I²S data |
 | Display | 320×240 LCD driven through the BCM framebuffer path |
-| Storage | ATA disk (PIO); read-only FAT32 reader + an in-place write to one pre-allocated file |
+| Storage | ATA disk (PIO); read-only FAT32 reader + in-place writes to two pre-allocated files (settings, event log) |
 | Input | Apple click-wheel + buttons + hold switch (polled) |
 | Boot | Direct — our image *is* the OSOS in the firmware partition; no chainloader, no boot menu |
 | Recovery | Boot ROM's Select + Play disk mode, which runs before any image loads |
@@ -285,30 +319,48 @@ of the project is how little the hardware gives you.
 - **Idle costs something, so spend less of it.** At idle the CPU drops to
   30 MHz and halts, and the drive spins down after 20 s — including while
   paused. At stop, the codec is powered down and the audio clocks are gated.
+  Asleep (Play held), the drive is parked, the panel and backlight are off,
+  the codec is down and the CPU idles between wheel samples.
+- **A pause stocks the buffer.** While a track sits paused and the platters
+  are still up, the player quietly reads ~9 s of the file ahead, and a
+  resume over a parked drive with a shallow buffer spins the drive up
+  *before* the DAC starts — so waking the device never stalls a second into
+  the music. Found on the device with the event log: eleven underruns,
+  every one of them a spin-up the ring could not cover.
+- **Give the display controller time.** The BCM retires a full frame after
+  the present returns; a partial update sent too soon behind it stalls the
+  main loop past the audio ring. Presents are paced from the measured cost
+  of the last full frame, on every path including the wake from sleep.
 
 ## Status
 
 Working on real hardware today: direct boot as the OSOS image, LCD present,
 click-wheel input, backlight, WM8758B sound, DMA continuous playback,
 ATA + FAT32 read, **streaming FLAC playback off the iPod's own disk**,
-**settings that persist to disk**, and **resume-on-boot**. The menu UI,
-browser and Now Playing screens render on device via the freestanding text
-renderer. There is no serial cable in the loop — on-device state is
-confirmed through an on-screen framebuffer console and the Boot Details page.
+**settings that persist to disk**, **resume-on-boot**, **sleep and
+power-off from the Play button**, **seven themes**, and the **on-disk event
+log**. The menu UI, browser and Now Playing screens render on device via
+the freestanding text renderer. There is no serial cable in the loop —
+on-device state is read back through the Boot Details page and the event
+log, which is how the last round of audio and sleep bugs was found and
+confirmed fixed.
 
 **Playlists** read from disk: drop `.m3u8` files into `Music/Playlists/`
 (paths absolute from the volume root or relative to that folder) and they
-appear under Music → Playlists — written on the host, merged, host-tested
-end to end, **not yet flashed**. Not there yet, and honestly labelled:
-**writing** playlists needs FAT32 cluster allocation, which doesn't exist.
-**Search**, **Podcasts / Audiobooks / Composers**, and codecs beyond FLAC
-are all unimplemented. Panel sleep at idle is written but switched off (it
-wedged the LCD white). Library sync is manual: build the index and convert
-art on the host, then copy.
+appear under Music → Playlists — host-tested end to end and flashed, but
+**not yet exercised on the device** with real playlist files. Not there
+yet, and honestly labelled: **writing** playlists needs FAT32 cluster
+allocation, which doesn't exist. **Search**, **Podcasts / Audiobooks /
+Composers**, and codecs beyond FLAC are all unimplemented. Panel sleep at
+idle is written but switched off (the panel comes back white). The deeper
+sleep savings — a 10 Hz tick, gated peripheral clocks, parking the PLL —
+are written and switchable but off until each is proven alone on the
+bench. Library sync is manual: build the index and convert art on the
+host, then copy.
 
-Not yet verified on the device: gapless hand-over, the 500 mA charge-current
-change (needs an inline USB current meter), and seek performance outside the
-boot path.
+Not yet verified on the device: gapless hand-over and seek performance
+outside the boot path. The charger is held at 100 mA; raising it needs an
+inline USB current meter first.
 
 See [`STATUS.md`](STATUS.md) for the running list of what works, what's
 pending, and what to pick up next, and [`PLAN.md`](PLAN.md) for the phased
@@ -332,7 +384,7 @@ make ipod          # → build-hw/core.ipod (transport-wrapped image)
 
 # Host build + unit tests (freestanding drivers/codecs, MMIO golden traces)
 make sim           # configures + builds the host TEST target — see below
-meson test -C build-sim              # 36 tests
+meson test -C build-sim              # 58 suites
 
 # Static checks against the linked ARM image: crt0/linker layout, the
 # header↔docs address consistency check, name-hash parity across its three
@@ -366,9 +418,19 @@ every push (pinned and rolling ARM toolchains, plus the suite under
 ASan + UBSan), because a stale build directory once reported a green suite
 from month-old objects.
 
-Two host tools exist purely for the type work, and both are worth knowing
-about because they are the reason the spacing numbers are measured rather
-than eyeballed:
+Three host tools create the files the firmware writes to — it never creates
+or grows a file itself — and print the LBAs it must agree on:
+
+```bash
+tools/make_config.py --create /path/to/iPod    # CORECFG.DAT (settings + resume)
+tools/make_log.py    --create /path/to/iPod    # CORELOG.BIN (4 MiB event log)
+tools/make_log.py    --dump   CORELOG.BIN      # read a pulled log back
+tools/build_index.py ...                       # CORELIB.IDX (the library)
+```
+
+Two more exist purely for the type work, and both are worth knowing about
+because they are the reason the spacing numbers are measured rather than
+eyeballed:
 
 ```bash
 # Render the REAL firmware text stack on the host — this links core/ui/text.c
@@ -418,8 +480,8 @@ floor and nothing we ship can remove it.
 core/                     bare-metal firmware + host test build
 ├── boot/                 crt0 (SDRAM remap, COP wake) + linker script
 ├── kernel/               cooperative scheduler, IRQ, timer, clock, PCM ring,
-│                         panic/fault handlers, settings persistence, and the
-│                         player UI (main.c)
+│                         panic/fault handlers, settings persistence, the
+│                         event log (evlog.c), and the player UI (main.c)
 ├── hal/
 │   ├── hal.h             hardware contract
 │   ├── hw/               ARM drivers — LCD, ATA, I²C, I²S, WM8758B, DMA,
@@ -430,8 +492,9 @@ core/                     bare-metal firmware + host test build
 ├── lib/                  freestanding mem.c (memcpy/memset)
 ├── codecs/               dr_flac + dr_mp3 (freestanding), static arena,
 │                         read-ahead disk source, FLAC metadata reader
-├── ui/                   AA text renderer + Nunito atlases, palette, art cache,
-│                         settings model, per-screen renderers
+├── ui/                   AA text renderer + Nunito atlases, the seven palettes,
+│                         art cache, settings model, per-screen renderers
+├── library/              index loader + playlist rows
 ├── player/               playback engine — queue, transport, gapless hand-over
 ├── cli/                  Go host CLI — `.ipod` image pack/unpack (and the
 │                         image header format); install/flash are stubs
@@ -443,8 +506,9 @@ core/                     bare-metal firmware + host test build
 design_reference/         UI design source — palette, chrome, icon paths
 docs/screens/             interface screenshots + demo GIFs (this README)
 tools/                    host tooling — atlas + glyphmap generator, album-art
-                          converter, library-index builder, CORECFG.DAT
-                          creator, text preview + spacing metrics, font sources
+                          converter, library-index builder, CORECFG.DAT and
+                          CORELOG.BIN creators, text preview + spacing
+                          metrics, font sources
 ```
 
 See [`core/README.md`](core/README.md) for firmware-side build detail and
