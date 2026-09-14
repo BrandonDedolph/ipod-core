@@ -5099,9 +5099,16 @@ static void suspend_to_ram(uint32_t play_down_us)
          * un-parks the PLL and cpu_unboost() leaves it at 30 MHz — so a
          * future disk touch in this loop would silently spend the rest of
          * the suspend off the crystal. Re-park if that happened. */
+#if SUSPEND_PARK_PLL
         if (g_suspend_lp && cpu_frequency() != CPUFREQ_DEFAULT) {
             (void)clock_suspend();
         }
+#endif
+        /* DEVICE 2026-09-13: the guard above used to run UNCONDITIONALLY —
+         * so the PLL park executed on every suspend of every image that
+         * evening, including the ones with SUSPEND_PARK_PLL 0, and the wake
+         * side (which honours the switch) never un-parked it. Every "all
+         * off" bisect step was therefore really "PLL park on". */
 
         /*
          * Watch the battery. battery_refresh() only ever ran from the main
