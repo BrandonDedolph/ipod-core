@@ -175,7 +175,8 @@ The running list of what works and what is next is [`STATUS.md`](STATUS.md).
 
 Versions are git tags, `v0.1.0` and up. The boot screen's bottom-right stamp and Settings → About
 show the version the device runs; an untagged build shows the nearest tag, the commit distance and
-the hash, for example `v0.1.0-3-g7617196`.
+the hash, for example `v0.1.0-3-g7617196`. What changed in each release is in
+[`CHANGELOG.md`](CHANGELOG.md) and on the GitHub release, which carries the flashable `core.ipod`.
 
 ## Design
 
