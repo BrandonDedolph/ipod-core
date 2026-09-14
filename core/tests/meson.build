@@ -237,6 +237,20 @@ if target == 'sim'
   )
   test('settings', settings_test, suite: 'unit')
 
+  # palette: the seven theme tables + theme_set() (core/ui/palette.c) — the SAME
+  # source the ARM build links into core.elf. Asserts every table is fully
+  # populated, that light themes are light and dark themes dark (the selection
+  # bar is derived from ink/surface, so polarity is what keeps it legible), the
+  # derived-tone contract documented in palette.h, and that theme_set() loads
+  # exactly the named table with anything out of range landing on Linen.
+  palette_test = executable(
+    'palette_test',
+    sources: ['ui/palette_test.c', '../ui/palette.c'],
+    include_directories: include_directories('../ui'),
+    override_options: test_opts,
+  )
+  test('palette', palette_test, suite: 'unit')
+
   tag_mp3_test = executable(
     'tag_mp3_test',
     sources: ['tag_mp3_test.c'],

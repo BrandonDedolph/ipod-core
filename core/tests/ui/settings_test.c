@@ -129,12 +129,53 @@ int main(void)
     settings_adjust(SETTINGS_DISPLAY, &s, 0, -1);
     check("bl-0-clamp", s.backlight_secs == 0);
 
-    /* --- Test 9: Theme select sets the theme index (Linen=0 / Onyx=1) --- */
+    /* --- Test 9: Theme select sets the theme id (the picker row IS the id) --- */
     settings_defaults(&s);
     settings_activate(SETTINGS_THEME, &s, 1);
     check("theme-set-onyx", s.theme == 1);
     settings_activate(SETTINGS_THEME, &s, 0);
     check("theme-set-linen", s.theme == 0);
+    {
+        /* All seven, by name and in picker order — main.c hands s.theme
+         * straight to theme_set(), so the row order here is the palette
+         * order in ui/palette.h. */
+        static const char *const want[] = {
+            "Linen", "Onyx", "Sage", "Plaster", "Olive", "Umber", "Mushroom",
+        };
+        const int n = (int)(sizeof want / sizeof want[0]);
+        check("theme-count-7", settings_count(SETTINGS_THEME) == n);
+        int names_ok = 1, picks_ok = 1;
+        for (int i = 0; i < n; i++) {
+            names_ok &= strcmp(settings_label(SETTINGS_THEME, i), want[i]) == 0;
+            names_ok &= strcmp(settings_theme_name(i), want[i]) == 0;
+            settings_defaults(&s);
+            s.theme = (i + 1) % n;                 /* start on some other one */
+            picks_ok &= settings_activate(SETTINGS_THEME, &s, i)
+                        == SETTINGS_ACTION_NONE;
+            picks_ok &= (s.theme == i);
+        }
+        check("theme-names-in-order", names_ok);
+        check("theme-pick-each",      picks_ok);
+        /* Past the end: no row label, the name falls back to Linen, and a
+         * pick is refused (the id must never leave the palette's range). */
+        settings_defaults(&s);
+        check("theme-label-past-end",
+              strcmp(settings_label(SETTINGS_THEME, n), "") == 0);
+        check("theme-name-past-end",
+              strcmp(settings_theme_name(n), "Linen") == 0 &&
+              strcmp(settings_theme_name(-1), "Linen") == 0 &&
+              strcmp(settings_theme_name(255), "Linen") == 0);
+        check("theme-pick-past-end",
+              settings_activate(SETTINGS_THEME, &s, n) == SETTINGS_ACTION_NOOP &&
+              settings_activate(SETTINGS_THEME, &s, -1) == SETTINGS_ACTION_NOOP &&
+              s.theme == 0);
+        /* The right-hand value on the root Theme row is the current name. */
+        char buf[24];
+        int tg = 0, on = 0, num = 0, den = 0;
+        s.theme = 6;
+        settings_value(SETTINGS_ROOT, &s, 2, buf, &tg, &on, &num, &den);
+        check("theme-root-value", strcmp(buf, "Mushroom") == 0);
+    }
 
     /* --- Test 10: Root rows return the right action codes --- */
     check("enter-playback",
@@ -180,7 +221,7 @@ int main(void)
     check("count-root",  settings_count(SETTINGS_ROOT) == 9);
     check("count-play",  settings_count(SETTINGS_PLAYBACK) == 3);
     check("count-sound", settings_count(SETTINGS_SOUND) == 4);
-    check("count-theme", settings_count(SETTINGS_THEME) == 2);
+    check("count-theme", settings_count(SETTINGS_THEME) == 7);
 
     settings_defaults(&s);
     {
@@ -268,7 +309,8 @@ int main(void)
               settings_activate(SETTINGS_THEME, &s, other) == SETTINGS_ACTION_NONE);
         check("none-theme-changed", s.theme == other && memcmp(&copy, &s, sizeof s) != 0);
         check("noop-theme-range",
-              settings_activate(SETTINGS_THEME, &s, 7) == SETTINGS_ACTION_NOOP);
+              settings_activate(SETTINGS_THEME, &s, 7) == SETTINGS_ACTION_NOOP &&
+              settings_activate(SETTINGS_THEME, &s, 99) == SETTINGS_ACTION_NOOP);
 
         /* Same for the clicker profile. */
         settings_defaults(&s);
