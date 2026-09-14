@@ -280,6 +280,21 @@ boot → Boot Details underruns 0; short-hold suspend → wake → resume with n
 stutter, underruns still 0. 58 suites green, ARM `-Werror` + `verify-hw`
 clean, readback-verified flash.
 
+**CORRECTION, same night (second log pull):** the pacing fix was not the
+whole story. A run that ended in a power-off, then a cold boot that
+restored the track PAUSED, then Play ~2 min later: 11 underruns, ring_low
+8 %, decode 61 ms/kframe for 25 s, 20 BCM timeouts. The buffer under a
+paused-at-boot track held only the 1.49 s ring prime's worth of file; the
+main loop's 20 s idle spin-down parked the drive; Play drained the ring
+into diskbuf's synchronous fallback, which blocked on the spin-up. Fix
+(d9197e4): the paused pump stocks the anti-skip buffer to DISK_LOW while
+the platters are up (never on a parked drive), the playing pump honours
+`ata_is_parked()` alongside its own flag, and `player_resume` pre-pays
+the spin-up before the DAC starts when the buffer is under DISK_LOW/2.
+Five host cases (player-queue 13b). Flashed, readback OK, **awaiting the
+owner's re-test** of exactly that sequence. Whether the BCM timeouts were
+a side effect of the stalls is the thing to read in the next log.
+
 ## Where we are right now (2026-07-28)
 
 **A full music player on real hardware, and it is now the device's own
