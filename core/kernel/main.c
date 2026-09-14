@@ -4612,6 +4612,16 @@ static void paint_current_screen(void)
  */
 static void suspend_lowpower_leave(void);
 
+/* DEVICE RESULT 2026-09-13: OFF. The idle-path twin (PANEL_SLEEP_AT_IDLE)
+ * came back WHITE on the first wake on the real 5.5G — the LCD_SLEEP →
+ * lcd_wake → absorbed first present sequence does not bring the panel back
+ * as modelled. Same pair here, so off until that is understood on the
+ * bench. The LED is still off across a suspend; the panel merely holds a
+ * black frame instead of being slept. */
+#ifndef SUSPEND_PANEL_SLEEP
+#define SUSPEND_PANEL_SLEEP 0
+#endif
+
 static int enter_standby(void)
 {
     /* If a suspend brought us here (its hold-escalation, its 30-minute
@@ -4640,7 +4650,9 @@ static int enter_standby(void)
     lcd_present_fb(console_framebuffer()); /* stale colour lingers on the panel */
     cpu_wait_ms(80);                      /* let the BCM push the black frame  */
     backlight_set(0);
+#if SUSPEND_PANEL_SLEEP
     lcd_sleep();                          /* panel off; the BCM stays alive   */
+#endif
     (void)power_standby();                /* PMU cuts power — normally no return */
 
     /*
@@ -4714,9 +4726,6 @@ static int enter_standby(void)
  * after a suspend, set this to 0: the panel then stays driven-black for the
  * suspend exactly as before (backlight off only), and nothing else changes.
  */
-#ifndef SUSPEND_PANEL_SLEEP
-#define SUSPEND_PANEL_SLEEP 1
-#endif
 
 /*
  * How long a suspend may last on battery before it escalates to a real PMU
@@ -5077,8 +5086,13 @@ static void suspend_to_ram(uint32_t play_down_us)
  * LCD_SLEEP at the BL_OFF edge and the wake block's lcd_wake go away (the
  * wake block is then a no-op, since panel_slept never sets).
  */
+/* DEVICE RESULT 2026-09-13: WHITE on the first wake (backlight timed out
+ * while playing, ~1 min dark, Menu → solid white). Rolled back to 0 as the
+ * note above says. What the bench still needs: whether the white is the
+ * first present racing the panel init (then the absorb window is wrong)
+ * or LCD_SLEEP itself needing a different wake command on this BCM. */
 #ifndef PANEL_SLEEP_AT_IDLE
-#define PANEL_SLEEP_AT_IDLE  1
+#define PANEL_SLEEP_AT_IDLE  0
 #endif
 
 /*
