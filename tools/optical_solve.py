@@ -166,7 +166,8 @@ def solve(ttf, px, symbol, bold, lines, tol, verbose, floor_alpha):
     curve = []
     for A in frange(1.0, 5.0, 0.05):
         opt = atlas_gen.optical_kern(glyphs, data, track, 2, band,
-                                     mode="area", area_px=A, table=table)
+                                     mode="area", area_px=A, table=table,
+                                     font_kerns=r["kerns"])
         kern = merged_kern(r["kerns"], opt)
         letters, _ = string_gaps(gd, data, kern, track, band, lines)
         rr = rhythm(letters, [])

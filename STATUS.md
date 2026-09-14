@@ -50,6 +50,118 @@ What changed (see `git log 054c722..`):
   timed from first paint; pending SELECT dropped on screen change / Hold;
   modals replace rather than overflow the screen stack; rail-pinned sliders
   don't write; lock plate no longer busy-spins; stale strip gauge repaints.
+- **Hold banner (2026-09-14)** — the centred 180x110 lock plate is gone. A
+  Hold edge now inverts the TOP CHROME for a second instead: a dot-keyhole
+  padlock that pops open, "Locked" / "Unlocked", and HOLD ON / HOLD OFF where
+  the header count sits — 22 px on Now Playing, strip + header through the
+  divider on lists and Settings. The title and the art are never covered. A
+  button press while locked is drained from the wheel latch and re-shows the
+  banner; wheel motion is dropped silently. The present is the band alone
+  when nothing else is pending (a full frame when the strip is dirty or the
+  panel is stale). Gallery redrawn to match:
+  `docs/screens/lock.png`, `locked.png`, the new `locked_list.png`,
+  `lock.gif`. **UNFLASHED.**
+- **Transport confined to the player screens (2026-09-14)** — RIGHT/LEFT now
+  skip ONLY on Now Playing and the queue view: a skip from a list you were
+  merely browsing changed the music under you. On every other screen RIGHT
+  PUSHES Now Playing (MENU returns to the exact row) and LEFT does nothing
+  (MENU is already "back"); the wheel delta is cleared so the push does not
+  arrive with a stale detent. `top_banner_render` stayed the reusable
+  primitive it became, and ellipsises its label to the room left of the
+  token. **UNFLASHED.** Bench list: (a) RIGHT on Albums → Now Playing,
+  MENU → same row; same from inside a tracklist; (b) RIGHT/LEFT still skip on
+  Now Playing and the queue; (c) LEFT on a list does nothing.
+  *A track-change banner was built the same day and then dropped: the status
+  strip already renames itself when the queue advances, and that is enough —
+  no band, nothing to dismiss, one less thing composed over every list paint.*
+- **Status strip on the Settings screens (2026-09-14)** — Settings used to be
+  the one place the top band went blank: `ui/screen_settings.c` follows the
+  jsx, which draws no strip. Crossing from a list into Settings dropped the
+  battery and the playing track off the screen. `settings_render_cur()` now
+  paints `status_strip_render()` over the painters' clear band (verified: no
+  settings painter draws in rows 0..14 — the header's bold-13 ink starts at
+  y 16), and the Hold banner's recoloured strip row no longer skips Settings.
+  Gallery redrawn. **UNFLASHED.**
+- **The strip is blank when nothing is playing (2026-09-14)** — it used to
+  fall back to the `CORE` wordmark. It is a now-playing readout, not a
+  wordmark: idle now shows only the battery (and the Hold padlock). The main
+  menu's header still says `Core`, as does About's chip. Both C sites
+  (`status_strip_render`, `top_banner_render`'s strip row) and the gallery
+  renderer changed together. **UNFLASHED.**
+- **Leaving Settings no longer spins the drive up (2026-09-14)** — the stall
+  on every Settings back-out was a forced commit: the exit calls
+  `resume_capture()` (which dirties the record whenever a track is loaded,
+  because the position moved) and then `settings_commit(CFG_COMMIT_FORCE)`,
+  and FORCE with parked platters means `ata_wakeup()` — 1-3 s — BEFORE the pop
+  is rendered. New `CFG_COMMIT_SOFT`: no debounce, like FORCE, but a parked
+  drive is never woken; the change stays pending. The IDLE rule tightened the
+  same way (`parked` alone defers now, not `parked && player_active`) so the
+  deferred write cannot ambush the user with a spin-up three seconds later
+  mid-browse. The pending write lands the next time the platters turn for any
+  reason, or at suspend / power-off / disk mode / the DISKSAFE flush, all of
+  which still force. Trade-off, stated in `cfg_commit.h`: a change made while
+  the drive is parked is lost only on a HARD power cut before any of those,
+  and the suspend timeout forces a commit within 30 minutes of idle.
+  `cfg_commit_test.c` grew the SOFT and parked-IDLE cases (40 → 50 checks).
+  **UNFLASHED.** Bench: Settings → MENU with the drive parked is instant and
+  silent; a setting changed there survives a suspend/wake and a power-off.
+- **The boot is one screen now (2026-09-14)** — the "Core Player / loading"
+  splash and the separate titled progress bar are gone; `boot_screen_render`
+  draws both. The click-wheel mark (an AA ring + dot, `fill_disc_aa` — the
+  plates' corner mask stops at r=16 and the ring is 19), "Core" under it, the
+  device line under that, and along the bottom a 2 px ink bar with the phase in
+  small caps — `LOADING`, then `LOADING LIBRARY` / `LOADING SONGS` /
+  `SHUFFLING SONGS`. Bottom right, in the border colour, a build stamp:
+  `git describe --always --dirty --abbrev=7`, baked in by a meson `vcs_tag`
+  header (`kernel/core_version.h.in`), screen-only — never on the UART, so the
+  clicky boot golden is untouched. **The saved theme is applied BEFORE the
+  library load**: the settings read (which needs only `fs`) moved ahead of
+  `library_ensure`, so a dark-theme user gets the Linen splash for the disk
+  spin-up — unavoidable, the theme is *on* that disk — then one flip, and the
+  bar, the placeholder album chips (`chip_placeholder_init` moved after
+  `theme_set`) and the menu are all Onyx. Boot Details' OTHER bucket (total
+  minus the named phases) absorbs the moved config read; `g_lib_load_ms` is
+  measured inside `library_ensure` and is unchanged. **UNFLASHED.**
+- **Boot Details no longer spins the drive up (2026-09-14)** — the page probed
+  CORECFG.DAT's two slot LBAs and the log's header/next LBAs on EVERY paint,
+  and each probe walks the FAT chain, so opening it with the platters parked
+  cost a 1-3 s wake before the first pixel. The same four values are already
+  probed at boot with the drive spinning; they are kept, the page re-probes
+  only `if (!ata_is_parked())`, and a failed probe cannot blank a good
+  boot-time value. Nothing about the page changes when the drive is up.
+  **UNFLASHED.**
+- **The unlock banner no longer eats a second of input (2026-09-14, device
+  bug)** — while the Hold banner was up, the main loop `continue`d past the
+  render for the whole ~1 s window, so every scroll and press after an UNLOCK
+  was *applied* but nothing was drawn until it expired. The banner is
+  confirmation, not a modal: the first event after Hold comes off disarms the
+  window (`g_lock_flash.armed = 0`) and falls through to the normal render in
+  that same pass. The LOCKED banner is unaffected — input while locked is
+  swallowed earlier and re-arms the window. **UNFLASHED.**
+- **`Fa` was tucked under the F's arm (2026-09-14)** — the atlas generator
+  re-solves every letter pair optically, putting each pair's MEAN daylight
+  over the x-height band on the face's target. A mean cannot see a recess:
+  `F`'s right edge in that band is its open stem on most rows and its middle
+  arm on one or two, so the solver kept pulling the next letter left until
+  the arm row bottomed out on the 1 px no-touch floor. `Fa` at regular 12
+  shipped at a 3 px pen step against the design's 6, with the bounding boxes
+  4 px into each other where the font overlaps them 1 — and the same for
+  every pair whose left glyph overhangs or recesses (`Ta Ya Va LT AV Fz rT`
+  …). Fixed in `tools/atlas_gen.py` only, with a cap
+  (`OPTICAL_MAX_BOX_OVERLAP_PX = 1`): a pair's boxes may overlap by 1 px, or
+  by as much as the font's own kern for that pair already overlaps them,
+  whichever is more. It only ever loosens, it moves 45–166 pairs per face out
+  of ~4 200–6 000, and every other pair keeps the step the rhythm solve chose
+  (the lowercase rhythm sd over `tools/ui_strings.txt` is unchanged to two
+  decimals in all six faces). Regenerated: all six `core/ui/atlas/*.h` — kern
+  tables only, no bitmap and no advance moved. regular 12 `Fa` 3→6 px,
+  `Ta` 5→6, `LT` 4→5, `rT` 2→4; bold 18 `Fa` 8→9, `Ta` 8→10, `Fz` 6→9.
+  `docs/screens/render.py` now reads the atlas `_KERN[]` table instead of
+  re-deriving the FONT's kerning, and rounds the pen once per pair like
+  `text.c`'s `pen_step` — so the gallery shows the device's spacing for the
+  first time, and stills with `T/Y/L/V/F` pairs shifted by a pixel or two.
+  **UNFLASHED.** Bench: Albums (`F-1 Trillion`, `Taylor Swift`), the Now
+  Playing title in bold 18, About — read `Fa`, `Ta`, `LT` at arm's length.
 
 **Device verdicts so far (2026-09-13 evening):** audio noise fixed
 (VMID); panel sleep white on wake (off); suspend wakes with the PLL park

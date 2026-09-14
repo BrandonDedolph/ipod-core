@@ -36,6 +36,7 @@
 #include "resume_ctx.h"
 #include "cfg_commit.h"
 #include "evlog.h"
+#include "core_version.h"   /* CORE_BUILD_ID: meson vcs_tag, boot screen only */
 #include "../ui/text.h"
 #include "../ui/thumb.h"
 #include "../ui/artcache.h"
@@ -77,7 +78,7 @@ static void cpu_wait_us(uint8_t us) {
 }
 
 /* ---------------------------------------------------------------------------
- * Timed UI windows (volume overlay, lock/unlock plate)
+ * Timed UI windows (volume overlay, Hold banner, low-battery toast)
  *
  * USEC_TIMER is a free-running 1 MHz counter, so it WRAPS every ~71.6 min. An
  * absolute "now < deadline" compare is wrong across that wrap (the deadline
@@ -154,7 +155,7 @@ static const uint8_t *aa_corner_mask(int r)
  * whatever is already in the framebuffer — smooth corners instead of the integer
  * stair-steps of fill_round_rect. Reads the FB, so the background under the
  * corners must already be drawn (true for the modals). Costlier than the plain
- * version, so it's used only for the volume/lock plates (drawn on events). */
+ * version, so it is used only for the volume plate (drawn on events). */
 static void fill_round_rect_aa(int x, int y, int w, int h, int r, uint16_t c)
 {
     if (r < 1) { console_fill_rect(x, y, w, h, c); return; }
@@ -184,6 +185,43 @@ static void fill_round_rect_aa(int x, int y, int w, int h, int r, uint16_t c)
                     uint16_t *d = &fb[py * LCD_WIDTH + px];
                     *d = (a >= 256) ? c : blend565(*d, c, a);
                 }
+        }
+    }
+}
+
+/* Anti-aliased filled disc of radius r, centred on the pixel EDGE (cx, cy) —
+ * it covers pixels cx-r .. cx+r-1, the same convention as
+ * fill_round_rect_aa(cx-r, cy-r, 2r, 2r, r). The boot mark's ring, dot and
+ * hole. fill_round_rect_aa cannot draw it: its memoized corner mask stops at
+ * UI_RR_MAX_R (16) and the ring is 19, and sizing that table for one caller
+ * would grow it for every plate. Same 4x4 super-sampling and the same blend565
+ * as the plates, boundary pixels only; pixels wholly inside are solid, wholly
+ * outside untouched. Reads the FB, so paint the background first, and paint
+ * the discs largest first (the ring is an INK disc with a SURFACE disc inside
+ * it). Drawn a few times per second at most (the boot screen), so the
+ * per-pixel sub-sampling is fine. */
+static void fill_disc_aa(int cx, int cy, int r, uint16_t c)
+{
+    uint16_t *fb = console_fb();
+    int R2 = (8 * r) * (8 * r);
+    /* Blended straight into the framebuffer, so the damage tracker would never
+     * see it: report the bounding box once, as fill_round_rect_aa does. */
+    console_damage_add(cx - r - 1, cy - r - 1, 2 * r + 2, 2 * r + 2);
+    for (int py = cy - r - 1; py <= cy + r; py++) {
+        if (py < 0 || py >= LCD_HEIGHT) continue;
+        for (int px = cx - r - 1; px <= cx + r; px++) {
+            if (px < 0 || px >= LCD_WIDTH) continue;
+            int inside = 0;
+            for (int j = 0; j < 4; j++) {
+                int dy = 8 * (py - cy) + 2 * j + 1;
+                for (int i = 0; i < 4; i++) {
+                    int dx = 8 * (px - cx) + 2 * i + 1;
+                    if (dx * dx + dy * dy <= R2) inside++;
+                }
+            }
+            if (inside == 0) continue;
+            uint16_t *d = &fb[py * LCD_WIDTH + px];
+            *d = (inside >= AA_SS) ? c : blend565(*d, c, inside * (256 / AA_SS));
         }
     }
 }
@@ -457,6 +495,13 @@ static uint32_t     g_boot_res_open_ms = BOOT_MS_NA; /* open + art + prime   */
 static uint32_t     g_boot_res_seek_ms = BOOT_MS_NA; /* player_seek_to()     */
 static uint32_t     g_boot_total_ms; /* to the first UI paint                 */
 
+/* Boot Details' locator: CORECFG.DAT's two slot LBAs and the event log's
+ * header / next-flush LBAs, as probed at boot with the drive spinning. The
+ * page re-probes only while the drive is up: config_probe_lba and the evlog
+ * probes walk the FAT chain (disk reads), so opening the page with the drive
+ * parked used to spin it up for 1-3 s before its first paint. */
+static uint32_t     g_diag_cfg_lba[2], g_diag_log_lba[2];
+
 /* ms since g_boot_t0_us (USEC_TIMER wraps; the subtraction is unsigned so a
  * wrap mid-boot still yields the right delta). */
 static uint32_t boot_ms_now(void)
@@ -563,7 +608,8 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
  * ------------------------------------------------------------------------- */
 
 /* Hold-switch lock state. While g_locked, all wheel/button input is swallowed
- * (playback keeps running); a brief plate flashes on the engage/disengage edge,
+ * (playback keeps running); the top chrome inverts into a brief banner on the
+ * engage/disengage edge and on a refused button press (lock_banner_render),
  * and a small padlock stays in the status strip while held. */
 static int         g_locked;
 
@@ -666,9 +712,10 @@ static int  enter_standby(void);
  * backlight/idle state with the screen enter_standby already relit. */
 static int g_standby_refused;
 
-/* settings_commit() modes — CFG_COMMIT_IDLE / _FORCE / _LAST — and the
- * policy behind them (the DISKSAFE exemption in particular, which is not
- * optional) live in cfg_commit.h with the gate that implements them. */
+/* settings_commit() modes — CFG_COMMIT_IDLE / _SOFT / _FORCE / _LAST — and
+ * the policy behind them (the DISKSAFE exemption in particular, which is not
+ * optional, and the rule that only a FORCE ever wakes a parked drive) live in
+ * cfg_commit.h with the gate that implements them. */
 
 /* Measured cost of the last full-frame present; defined with the present
  * throttle further down. Reported on the stats line below so the number the
@@ -942,16 +989,19 @@ static int battery_glyph_key(int pct)
  * battery.h "DEVICE-GATED CALIBRATION"). */
 static void status_strip_render(void)
 {
-    /* Left: playing track (or the wordmark when idle). Clipped by the right
-     * cluster, which is painted over it. */
-    const char *left = player_active() ? track_display(player_track_name())
-                                       : "CORE";
+    /* Left: the playing track, and NOTHING when nothing is playing — the strip
+     * is a now-playing readout, not a wordmark (the main menu's own header
+     * already says "Core"). Clipped by the right cluster, which is painted
+     * over it. */
+    const char *left = player_active() ? track_display(player_track_name()) : "";
     /* CLIP the name before the right-hand cluster rather than drawing it full
      * width and then painting a 70x15 rectangle back over its tail — same look,
      * without rasterising glyphs that are immediately overwritten (and without
      * dirtying that band for a partial present). */
-    ui_text_clip(12, STATUS_Y0 + 11, left, FONT_SMALL, LINEN_MUTED2,
-                 12, LCD_WIDTH - 70);
+    if (left[0]) {
+        ui_text_clip(12, STATUS_Y0 + 11, left, FONT_SMALL, LINEN_MUTED2,
+                     12, LCD_WIDTH - 70);
+    }
 
     int bx = LCD_WIDTH - 12 - 24;             /* battery block (22 + 2 nub)        */
     draw_battery(bx, STATUS_Y0 + 1, g_bat_pct);
@@ -1765,9 +1815,63 @@ static uint32_t folder_clus_h(uint32_t hash, const char *name)
     return 0;
 }
 
-/* A titled loading screen with a determinate progress bar (0..100%). Rendered
- * from the library load phases so a multi-second first-load shows real progress
- * instead of a frozen splash. */
+/* ---------------------------------------------------------------------------
+ * Boot screen — the one screen from power-on to the menu.
+ *
+ * The design reference's boot splash (system-screens.jsx BootSplash), made
+ * Core's and stacked: the click-wheel mark, "Core" under it, the device line
+ * under that, and along the bottom a 2 px ink bar with the phase in small caps
+ * beneath it. main() paints it with no bar the moment the panel is ours
+ * ("LOADING"), and the library load repaints it with the bar as the phases
+ * advance. One painter, so the boot never changes voice halfway through.
+ *
+ * THEME: everything here is drawn from g_pal, so once theme_set has run the
+ * screen is the user's theme. The FIRST paint, before the disk is mounted, is
+ * necessarily the default (Linen) palette: the saved theme lives in the
+ * settings record on the music partition, and reading anything from the disk
+ * is the spin-up this screen exists to cover. run_ui repaints it in the theme
+ * as soon as the settings are read, BEFORE the library load — one early flip
+ * for a dark-theme user, then a themed bar (see the setup order there).
+ *
+ * `phase` is the small-caps line under the bar; pct < 0 draws no bar.
+ * ------------------------------------------------------------------------- */
+#define BOOT_MARK_CY   86
+#define BOOT_BAR_Y     (LCD_HEIGHT - 34)
+#define BOOT_BAR_X     60
+#define BOOT_BAR_W     (LCD_WIDTH - 120)
+
+static void boot_screen_render(const char *phase, int pct)
+{
+    console_clear(LINEN_SURFACE);
+    int cx = LCD_WIDTH / 2, cy = BOOT_MARK_CY;
+    fill_disc_aa(cx, cy, 19, LINEN_INK);       /* ring: ink disc ...       */
+    fill_disc_aa(cx, cy, 17, LINEN_SURFACE);   /* ... with a surface disc  */
+    fill_disc_aa(cx, cy,  6, LINEN_INK);       /* centre dot               */
+    fill_disc_aa(cx, cy,  2, LINEN_SURFACE);   /* its hole                 */
+    ui_text_centered(cy + 19 + 30, "Core", FONT_TITLE, LINEN_INK);
+    ui_text_centered(cy + 19 + 46, "IPOD VIDEO  " UI_GLYPH_MIDDOT "  5.5 GEN",
+                     FONT_SMALL, LINEN_MUTED2);
+    if (pct >= 0) {
+        if (pct > 100) pct = 100;
+        console_fill_rect(BOOT_BAR_X, BOOT_BAR_Y, BOOT_BAR_W, 2, LINEN_TRK);
+        int fw = BOOT_BAR_W * pct / 100;
+        if (fw > 0) console_fill_rect(BOOT_BAR_X, BOOT_BAR_Y, fw, 2, LINEN_INK);
+    }
+    ui_text_centered(LCD_HEIGHT - 16, phase, FONT_SMALL, LINEN_MUTED2);
+    /* Build stamp, bottom right, in the border colour: readable if you look,
+     * invisible if you don't. `git describe --always --dirty --abbrev=7` at
+     * build time (core/meson.build vcs_tag) — so an image flashed off an
+     * uncommitted tree says "-dirty" on its own boot screen. */
+    int vw = text_width(CORE_BUILD_ID, FONT_SMALL);
+    ui_text(LCD_WIDTH - 8 - vw, LCD_HEIGHT - 4, CORE_BUILD_ID, FONT_SMALL,
+            LINEN_BORDER);
+    lcd_present_fb(console_framebuffer());
+}
+
+/* The boot screen with its progress bar (0..100%), repainted from the library
+ * load phases so a multi-second first load shows real progress instead of a
+ * frozen splash. Same screen main() already put up — only the bar and the
+ * phase line change. */
 /*
  * Rate-limited so callers can call it as often as they like.
  *
@@ -1786,7 +1890,7 @@ static uint32_t folder_clus_h(uint32_t hash, const char *name)
 static uint32_t g_load_bar_last_us;
 static int      g_load_bar_last_pct = -1;
 
-static void load_bar(const char *title, int pct)
+static void load_bar(const char *phase, int pct)
 {
     if (pct < 0)   pct = 0;
     if (pct > 100) pct = 100;
@@ -1801,16 +1905,7 @@ static void load_bar(const char *title, int pct)
     g_load_bar_last_us  = mmio_read32(USEC_TIMER_ADDR);
     g_load_bar_last_pct = pct;
 
-    console_clear(LINEN_SURFACE);
-    ui_text_centered(112, title, FONT_TITLE, LINEN_INK);
-    int bx = 60, by = 138, bw = LCD_WIDTH - 120, bh = 6;
-    ui_round_rect(bx, by, bw, bh, 3, LINEN_BORDER);
-    if (pct > 0) {
-        int fw = bw * pct / 100;
-        if (fw < bh) fw = bh;                 /* keep the rounded cap visible */
-        ui_round_rect(bx, by, fw, bh, 3, LINEN_ACCENT);
-    }
-    lcd_present_fb(console_framebuffer());
+    boot_screen_render(phase, pct);
 }
 
 /*
@@ -1838,7 +1933,7 @@ static void load_bar_begin(void)
     g_load_bar_shown = 0;
 }
 
-static void load_bar_progress(const char *title, int pct)
+static void load_bar_progress(const char *phase, int pct)
 {
     if (!g_load_bar_shown) {
         if ((uint32_t)(mmio_read32(USEC_TIMER_ADDR) - g_load_bar_t0)
@@ -1847,7 +1942,7 @@ static void load_bar_progress(const char *title, int pct)
         }
         g_load_bar_shown = 1;                 /* crossed the threshold: show it */
     }
-    load_bar(title, pct);
+    load_bar(phase, pct);
 }
 
 /* Songs are keyed by file_hash — the folded hash of the FULL on-disk
@@ -2069,7 +2164,7 @@ static void library_resolve_art(fat32_t *fs)
         int i = order[p];
         /* load_bar is time-throttled, so calling it per album is free and the
          * bar advances smoothly instead of in 4-album jumps. */
-        load_bar("Loading Library", 75 + (n ? p * 25 / n : 25));
+        load_bar("LOADING LIBRARY", 75 + (n ? p * 25 / n : 25));
         (void)album_resolve(fs, i);    /* failure is recorded on the album */
     }
 }
@@ -2257,7 +2352,7 @@ static int library_load_index(fat32_t *fs)
             album_intern(folder, dc);          /* album has >=1 indexed song */
         }
         n += recs;
-        load_bar("Loading Library",            /* first ~75% = reading the index */
+        load_bar("LOADING LIBRARY",            /* first ~75% = reading the index */
                  count ? (int)(n * 75u / count) : 0);
     }
     if (n < count) g_lib_truncated = 1;    /* ran out of song slots: the only
@@ -2415,7 +2510,7 @@ static void library_ensure(fat32_t *fs)
      * boot and it is dominated by disk seeks, so it is worth being able to see
      * whether a change actually helped instead of judging it by feel. */
     uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
-    load_bar("Loading Library", 0);       /* the load phases fill this in */
+    load_bar("LOADING LIBRARY", 0);       /* the load phases fill this in */
     g_lib_load_err     = 0;
     g_lib_orphaned     = 0;
     g_lib_unreadable   = 0;
@@ -2505,7 +2600,7 @@ static int library_play_song(fat32_t *fs, int songview_idx)
     player_queue_begin();
     int start = 0, added = 0;
     for (int i = 0; i < g_songview_n; i++) {
-        if ((i & 255) == 0) load_bar_progress("Loading Songs", i * 100 / g_songview_n);
+        if ((i & 255) == 0) load_bar_progress("LOADING SONGS", i * 100 / g_songview_n);
         lib_song_t *s = &g_songs[g_songview[i]];
         /* Record the start position BEFORE the resolved-check: a pick that the
          * index lists but the disk no longer has would otherwise leave start at
@@ -2571,7 +2666,7 @@ static int shuffle_songs_build(fat32_t *fs, uint32_t seed, int start_si)
     player_queue_begin();
     int start = -1, added = 0;
     for (int i = 0; i < ns; i++) {
-        if ((i & 255) == 0) load_bar_progress("Shuffling Songs", i * 100 / ns);
+        if ((i & 255) == 0) load_bar_progress("SHUFFLING SONGS", i * 100 / ns);
         lib_song_t *s = &g_songs[ord[i]];
         if (!s->file_clus) continue;       /* unresolved (missing on disk) — skip */
         if (ord[i] == start_si) start = added;
@@ -3119,6 +3214,10 @@ static void evlog_commit(int mode)
     }
 }
 
+/* Every Settings screen gets the same status strip as the lists: the painters
+ * in ui/screen_settings.c leave rows 0..STATUS_H-1 clear (their console_clear
+ * is what puts the surface there), so the strip is painted over that band here,
+ * after the painter returns. */
 static void settings_render_cur(void)
 {
     if (g_set_screen == SETTINGS_ABOUT) {
@@ -3137,15 +3236,30 @@ static void settings_render_cur(void)
         /* Boot Details owns the diagnostics now: the cold-boot phase
          * breakdown and the settings-file locator. They used to be squeezed
          * into About's spare gaps, which is how the CFG rows ended up on top
-         * of the stat columns. main.c resolves the LBAs here because
-         * config_probe_lba() must resolve FRESH, exactly as a save would,
-         * rather than reporting something cached. Read-only. */
-        uint32_t lba0 = 0, lba1 = 0, log_hdr = 0, log_next = 0;
-        (void)config_probe_lba(0, &lba0);
-        (void)config_probe_lba(1, &lba1);
-        if (evlog_enabled()) {
-            (void)evlog_probe_header_lba(&log_hdr);
-            (void)evlog_probe_lba(evlog_seq(), &log_next);
+         * of the stat columns. Read-only.
+         *
+         * The LBAs resolve FRESH here — exactly what a save would target,
+         * rather than something cached — but ONLY while the drive is already
+         * spinning, because every probe walks the FAT chain and this page is
+         * repainted on every frame. With the drive parked, opening the page
+         * paid a 1-3 s spin-up before its first pixel; it now shows the pair
+         * probed at boot, which is the same address unless the file moved (it
+         * does not — the host pre-allocates it). Each probe zeroes its
+         * out-param before it can fail, so they land in locals and are copied
+         * back only on success: a transient read error must not blank a good
+         * boot-time value. The log's "next" LBA advances as blocks flush, so
+         * the parked reading can lag by a few blocks — acceptable, since the
+         * cross-check against make_log.py --verify is done with the device on
+         * the cable and the drive up. */
+        if (!ata_is_parked()) {
+            uint32_t p0 = 0, p1 = 0;
+            if (config_probe_lba(0, &p0) == 0) g_diag_cfg_lba[0] = p0;
+            if (config_probe_lba(1, &p1) == 0) g_diag_cfg_lba[1] = p1;
+            if (evlog_enabled()) {
+                uint32_t h = 0, n = 0;
+                if (evlog_probe_header_lba(&h) == 0)          g_diag_log_lba[0] = h;
+                if (evlog_probe_lba(evlog_seq(), &n) == 0)    g_diag_log_lba[1] = n;
+            }
         }
         const player_stats_t *ps = player_stats();
         settings_diag_render(g_boot_total_ms, g_boot_lcd_ms, g_boot_disk_ms,
@@ -3154,24 +3268,14 @@ static void settings_render_cur(void)
                              g_boot_res_seek_ms,
                              ps ? ps->decode_us_per_kframe : 0,
                              ps ? ps->underruns : 0,
-                             config_writable(), config_seq(), lba0, lba1,
-                             log_hdr, log_next);
+                             config_writable(), config_seq(),
+                             g_diag_cfg_lba[0], g_diag_cfg_lba[1],
+                             g_diag_log_lba[0], g_diag_log_lba[1]);
     } else {
         settings_render(g_set_screen, &g_settings, g_set_sel);
     }
+    status_strip_render();
 }
-
-/* Boot splash: Nunito CORE branding on the Linen surface the moment the panel
- * is ours, so the disk-spin-up / mount delay reads as "loading" rather than the
- * leftover chainloader framebuffer. */
-static void boot_splash(void)
-{
-    console_clear(LINEN_SURFACE);
-    ui_text_centered(120, "Core Player", FONT_TITLE, LINEN_INK);
-    ui_text_centered(142, "loading",     FONT_SUB,   LINEN_MUTED);
-    lcd_present_fb(console_framebuffer());
-}
-
 
 /* Right-side circle arc (a ")" shape): radius R, +/- span rows tall, centred at
  * (cx, cy); ~2px thick. The speaker's sound waves + the lock shackle use it. */
@@ -3182,22 +3286,6 @@ static void draw_arc_thin(int cx, int cy, int R, int span, uint16_t c)
     for (int dy = -span; dy <= span; dy++) {
         int dx = ui_isqrt(R * R - dy * dy);
         console_fill_rect(cx + dx, cy + dy, 1, 1, c);
-    }
-}
-
-/* Top half of an annulus (ring): outer radius Ro, inner Ri, centred (cx, cy) —
- * a padlock shackle arch. Rows above the inner hole are a solid cap. */
-static void draw_ring_top(int cx, int cy, int Ro, int Ri, uint16_t c)
-{
-    for (int dy = -Ro; dy <= 0; dy++) {
-        int xo = ui_isqrt(Ro * Ro - dy * dy);
-        if (-dy <= Ri) {
-            int xi = ui_isqrt(Ri * Ri - dy * dy);
-            console_fill_rect(cx - xo, cy + dy, xo - xi + 1, 1, c);   /* left band  */
-            console_fill_rect(cx + xi, cy + dy, xo - xi + 1, 1, c);   /* right band */
-        } else {
-            console_fill_rect(cx - xo, cy + dy, 2 * xo + 1, 1, c);    /* solid cap  */
-        }
     }
 }
 
@@ -3249,66 +3337,6 @@ static void volume_overlay_render(int vol)
     u32_to_dec(p, (unsigned)vol);
     int w = text_width(p, text_font_bold_12());       /* percent is 11/700       */
     ui_text(PX + PW - 14 - w, PY + PH / 2 + 4, p, text_font_bold_12(), LINEN_INK);
-}
-
-/* Padlock for the lock/unlock plate: a rounded body with a keyhole (punched in
- * the plate colour `bg`) + a curved shackle. Closed = the shackle arch sits
- * latched on the body; open = it's swung up and left so the right end floats off
- * the body (the gap reads as unlatched). `cy` is the body's top edge. */
-/* Padlock shackle: a thick semicircular arch (outer radius Ro, inner Ri) centred
- * at (sx, ay) on its diameter line, plus two straight prongs dropping from the
- * arch ends. lL/rL are the left/right prong lengths (independent so the open
- * state can raise one prong). Prong thickness matches the arch band so the join
- * is seamless. Drawn BEFORE the body so the body covers the seated prong feet. */
-static void draw_shackle(int sx, int ay, int Ro, int Ri,
-                         int lL, int rL, uint16_t c)
-{
-    int w = Ro - Ri + 1;                              /* band/prong thickness */
-    draw_ring_top(sx, ay, Ro, Ri, c);                /* semicircular top     */
-    console_fill_rect(sx - Ro, ay, w, lL, c);        /* left prong           */
-    console_fill_rect(sx + Ri, ay, w, rL, c);        /* right prong          */
-}
-
-/* Keyhole punched in the plate colour `bg`, centred at (kx, ky): a round hole
- * with a tapered slot widening downward, symmetric about kx. */
-/* Minimal keyhole: a small round hole + short slot, punched in the plate bg. */
-static void draw_keyhole(int kx, int ky, uint16_t bg)
-{
-    ui_round_rect(kx - 3, ky - 3, 6, 6, 3, bg);    /* round hole (~d6)      */
-    console_fill_rect(kx - 1, ky + 2, 2, 4, bg);     /* short slot            */
-}
-
-/* Padlock for the lock/unlock plate (design: "Minimal dot"). `cy` is the
- * VERTICAL CENTRE (~32 wide x ~40 tall). `c` = icon colour, `bg` = plate colour.
- * LOCKED = shackle latched, both prongs seated; UNLOCKED = shackle popped
- * straight UP, floating clear of the body (visible gap beneath). */
-static void draw_lock_icon(int cx, int cy, int open, uint16_t c, uint16_t bg)
-{
-    if (open)
-        draw_shackle(cx, cy - 14, 10, 6, 6, 6, c);   /* lifted straight up   */
-    else
-        draw_shackle(cx, cy - 9,  10, 6, 8, 8, c);   /* latched              */
-
-    ui_round_rect(cx - 16, cy - 3, 32, 22, 4, c);  /* body, over prong feet */
-    draw_keyhole(cx, cy + 7, bg);
-}
-
-/* Centered lock/unlock plate (system-screens.jsx LockedScreen/UnlockedScreen):
- * LOCKED = dark plate + light closed lock; UNLOCKED = light plate + dark open
- * lock. Drawn over whatever screen is currently in the framebuffer. */
-static void lock_plate_render(int locked)
-{
-    const int PX = 70, PY = 65, PW = 180, PH = 110;
-    uint16_t plate = locked ? LINEN_INK : LINEN_SURFACE;
-    uint16_t fg    = locked ? LINEN_SURFACE : LINEN_INK;
-    if (!locked) {                                    /* light plate: draw a ring */
-        fill_round_rect_aa(PX - 1, PY - 1, PW + 2, PH + 2, 11, LINEN_BORDER);
-    }
-    fill_round_rect_aa(PX, PY, PW, PH, 10, plate);
-    draw_lock_icon(PX + PW / 2, PY + 45, !locked, fg, plate);  /* cy = vertical centre */
-    const char *label = locked ? "LOCKED" : "UNLOCKED";
-    int w = text_width(label, FONT_HEADER);
-    ui_text(PX + (PW - w) / 2, PY + 84, label, FONT_HEADER, fg);
 }
 
 /* Now-playing album art at 120x120 — the stored folder.art's native size, so it
@@ -3589,7 +3617,9 @@ typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_SONGS, SCR_GENRES,
  * this used to be exactly 8 without SONGS counted, and a DISKSAFE edge at
  * the bottom of that path retried the push every pass with dirty set — a
  * full-repaint loop until a button cleared it. A new screen still deserves
- * a look at the arithmetic; the UART line is what says it was wrong. */
+ * a look at the arithmetic; the UART line is what says it was wrong. RIGHT
+ * on a list pushes NOWPLAYING where a SELECT would have, so the jump adds no
+ * depth beyond the path above. */
 #define SCR_STACK_MAX 12
 static screen_t g_scr[SCR_STACK_MAX];
 static int      g_scr_n;
@@ -4266,8 +4296,9 @@ static void ui_click(void)
  *
  * Each of those calls settings_touch(), so it inherits the existing debounce
  * AND the "don't spin the platters up for 1 KB" guard in settings_commit() —
- * a capture during playback rides out on the next anti-skip refill rather than
- * costing its own spin-up. Continuous playback therefore costs roughly one
+ * a capture made while the drive is parked rides out on the next time the
+ * platters turn (an anti-skip refill, say) rather than costing its own
+ * spin-up. Continuous playback therefore costs roughly one
  * write per track (~20/hour); an idle or paused device costs none.
  * ------------------------------------------------------------------------- */
 
@@ -4646,7 +4677,7 @@ static void resume_restore(fat32_t *fs)
 }
 
 /* Render whatever screen is on top of the stack into the framebuffer (no
- * present) — used to paint context behind the lock/unlock plate. */
+ * present) — used to paint context behind the Hold banner. */
 static void paint_current_screen(void)
 {
     g_mq.active = 0;                       /* a fresh paint re-registers any marquee */
@@ -4671,6 +4702,165 @@ static void paint_current_screen(void)
     case SCR_CHARGING:
         screen_charging_render(g_bat_pct, power_is_charging(), power_is_external());
         break;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Top banner — the Hold "plate"; the primitive is reusable if another
+ * announcement ever needs the top chrome
+ *
+ * A Hold edge does not raise a card over the screen (the reference jsx's
+ * centred 180x110 plate, which covered the title and half the art for one
+ * bit of information). The TOP CHROME INVERTS for LOCK_FLASH_US and then
+ * settles back into the persistent strip padlock. Locked borrows the
+ * selected-row pair (INK band, SURFACE marks, SEL_SUB for the secondary
+ * marks); unlocked is the surface with the ordinary border rule under it.
+ * Both pairs come out of the palette, so the polarity is "emphasis" and
+ * "normal" in every theme — not dark and light (in Onyx the locked band is
+ * the bright one, exactly as its selection bar is).
+ *
+ * The band is whatever the top chrome is on the current screen:
+ *   - Now Playing (and the chrome-less modals): the 22 px status row, plus
+ *     the border rule under it when the band is not inverted;
+ *   - list and Settings screens: status strip + header, through the divider
+ *     (39 px); the header line carries the announcement where the title was
+ *     and the strip row above keeps its track name (blank when idle) and
+ *     battery, recoloured.
+ * The battery never leaves — the right cluster does not flicker.
+ *
+ * Design: docs/screens lock.png / locked.png / locked_list.png, from the
+ * 2026-09-14 "Hold Plate Redesign" review (pill, banner and card compared;
+ * banner chosen, dot-keyhole padlock, pop-open).
+ * ------------------------------------------------------------------------- */
+
+/* Dot-keyhole padlock, 14 px wide, as row bitmasks (bit 13 = left column).
+ * Closed = 16 rows; open = 18 rows, the shackle "popped" clear of the body
+ * with both legs floating. Blitted as horizontal runs. The 8x10 strip glyph
+ * (draw_lock_glyph) is its persistent little sibling. */
+static const uint16_t LOCK_BM_CLOSED[16] = {
+    0x03F0, 0x07F8, 0x0E1C, 0x0C0C, 0x0C0C, 0x0C0C,
+    0x1FFE, 0x3FFF, 0x3FFF, 0x3F3F, 0x3F3F, 0x3FFF,
+    0x3FFF, 0x3FFF, 0x3FFF, 0x1FFE,
+};
+static const uint16_t LOCK_BM_OPEN[18] = {
+    0x03F0, 0x07F8, 0x0E1C, 0x0C0C, 0x0C0C, 0x0C0C,
+    0x0000, 0x0000, 0x1FFE, 0x3FFF, 0x3FFF, 0x3F3F,
+    0x3F3F, 0x3FFF, 0x3FFF, 0x3FFF, 0x3FFF, 0x1FFE,
+};
+
+/* Blit a 14-wide row-mask bitmap at (x, y) as horizontal runs. */
+static void draw_bitmap14(int x, int y, const uint16_t *rows, int n, uint16_t c)
+{
+    for (int r = 0; r < n; r++) {
+        uint16_t m   = rows[r];
+        int      run = -1;
+        for (int col = 0; col <= 14; col++) {
+            int on = (col < 14) && (m & (1u << (13 - col)));
+            if (on && run < 0) {
+                run = col;
+            } else if (!on && run >= 0) {
+                console_fill_rect(x + run, y + r, col - run, 1, c);
+                run = -1;
+            }
+        }
+    }
+}
+
+/* draw_battery in explicit colours, so it can sit on an inverted band. */
+static void draw_battery_c(int x, int y, int pct, uint16_t outline, uint16_t fill)
+{
+    const int w = 22, h = 12;
+    console_fill_rect(x, y, w, 1, outline);
+    console_fill_rect(x, y + h - 1, w, 1, outline);
+    console_fill_rect(x, y, 1, h, outline);
+    console_fill_rect(x + w - 1, y, 1, h, outline);
+    console_fill_rect(x + w, y + 4, 2, h - 8, outline);
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    int fw = ((w - 4) * pct) / 100;
+    if (fw > 0) {
+        console_fill_rect(x + 2, y + 2, fw, h - 4, pct <= 20 ? BATT_LOW_RED : fill);
+    }
+}
+
+/* Height of the band a banner inverts on the current screen (see above). The
+ * present of a banner is exactly this band when nothing else is pending. */
+static int top_banner_h(void)
+{
+    switch (scr_cur()) {
+    case SCR_NOWPLAYING:
+    case SCR_BATTERY:
+    case SCR_CHARGING:
+        return 23;                        /* the 22 px row + the rule under it */
+    default:
+        return HDR_DIV_Y + 1;
+    }
+}
+
+/* Paint a banner over the top chrome of whatever is in the framebuffer:
+ * `inverted` picks the selected-row pair (else surface + border rule); `bm`
+ * is a 14-wide bitmap of `bn` rows, drawn `bm_dy` px below where a 16-row
+ * glyph sits (so a taller open padlock keeps its body in place); `label` is
+ * the announcement; `token` (may be NULL) is the small-caps right-hand value
+ * on the list variant, where the header count was. The strip row keeps the
+ * chrome's own text (the track name, or nothing when idle). The label is
+ * ellipsised to the room left of the token, as ui_header does for a title
+ * next to its count. */
+static void top_banner_render(int inverted, const uint16_t *bm, int bn, int bm_dy,
+                              const char *label, const char *token)
+{
+    uint16_t band = inverted ? LINEN_INK     : LINEN_SURFACE;
+    uint16_t fg   = inverted ? LINEN_SURFACE : LINEN_INK;
+    uint16_t sub  = inverted ? LINEN_SEL_SUB : LINEN_MUTED2;
+    int      h    = top_banner_h();
+
+    if (h == 23) {
+        /* Now Playing's own top row: glyph + label left, battery right. A
+         * surface band on the surface needs an edge to read as a banner at
+         * all, so the un-inverted one gets the border rule under it (the
+         * inverted band is its own edge; its row 22 stays the surface). */
+        console_fill_rect(0, 0, LCD_WIDTH, 22, band);
+        if (!inverted) {
+            console_fill_rect(0, 22, LCD_WIDTH, 1, LINEN_BORDER);
+        }
+        draw_bitmap14(12, 3 + bm_dy, bm, bn, fg);
+        ui_text(12 + 14 + 6, 15, label, text_font_bold_12(), fg);
+        draw_battery_c(LCD_WIDTH - 12 - 19, 3, g_bat_pct, sub, fg);
+        return;
+    }
+    console_fill_rect(0, 0, LCD_WIDTH, h, band);
+    /* Strip row, recoloured (every screen with a strip — Settings included,
+     * where main.c paints one over the painter's clear band), then the header
+     * line as the announcement, then the divider in the band's own secondary
+     * colour so the inverted block ends where the header does. */
+    {
+        const char *left = player_active() ? track_display(player_track_name()) : "";
+        if (left[0]) {
+            ui_text_clip(12, STATUS_Y0 + 11, left, FONT_SMALL, sub, 12, LCD_WIDTH - 70);
+        }
+        draw_battery_c(LCD_WIDTH - 12 - 24, STATUS_Y0 + 1, g_bat_pct, sub, fg);
+    }
+    draw_bitmap14(12, HDR_BASE - 12 + bm_dy, bm, bn, fg);
+    int lx        = 12 + 14 + 6;
+    int show_tok  = (token && token[0]);
+    int tok_w     = show_tok ? text_width(token, FONT_SMALL) : 0;
+    int label_max = show_tok ? (LCD_WIDTH - 12 - tok_w - 8) - lx
+                             : (LCD_WIDTH - 12) - lx;
+    ui_text_ellipsis(lx, HDR_BASE, label, FONT_HEADER, fg, label_max);
+    if (show_tok) {
+        ui_text(LCD_WIDTH - 12 - tok_w, HDR_BASE - 1, token, FONT_SMALL, sub);
+    }
+    console_fill_rect(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, inverted ? sub : LINEN_BORDER);
+}
+
+/* The Hold banner: locked = inverted + closed padlock + "Locked" / HOLD ON;
+ * unlocked = surface + popped-open padlock + "Unlocked" / HOLD OFF. */
+static void lock_banner_render(int locked)
+{
+    if (locked) {
+        top_banner_render(1, LOCK_BM_CLOSED, 16,  0, "Locked",   "HOLD ON");
+    } else {
+        top_banner_render(0, LOCK_BM_OPEN,   18, -1, "Unlocked", "HOLD OFF");
     }
 }
 
@@ -5302,29 +5492,20 @@ _Noreturn static void run_ui(fat32_t *fs)
      * may be an unenumerated port current-limiting under a 500 mA pull. This
      * flash asks for 100 mA so the owner can compare. */
     charger_set_max_current(CHARGER_MAX_MA); /* LTC4066 HPWR: 100 mA cap until asserted */
-    chip_placeholder_init();
     artcache_init();                  /* ways must start at key -1; .bss gives 0,
                                        * which is album 0's real index */
-    library_ensure(fs);                   /* preload the index at boot (drive is
-                                           * spinning) so Songs/Albums/Artists/
-                                           * Genres open INSTANTLY, like Apple —
-                                           * not a multi-second stall on first use */
-    battery_refresh(1);                   /* prime the status-strip gauge         */
-    g_volume = hal_volume_get();          /* reflect the codec's default gain      */
-    g_dir_depth = 0;
-    g_browse_n  = 0;
-    g_br_sel = g_br_accum = 0;
-    g_main_sel  = 0;
-    g_music_sel = MU_ALBUMS;
-    g_menu_accum = 0;
-    g_artist_filter[0] = '\0';
-    g_artist_sel = g_artist_accum = 0;
     /*
      * Settings: defaults FIRST, then let the saved record overwrite them.
      * config_load() only touches g_settings when it finds a record whose
      * magic, version and CRC all check out, so any failure — file absent,
      * torn write, corrupt slot, unresolvable cluster — leaves the full
      * default set in place. Defaults are the floor, never skipped.
+     *
+     * Read BEFORE the library (it needs only `fs`, and the drive is spinning
+     * right after the mount either way) so the saved theme is known before
+     * anything paints a loading screen. Boot Details' OTHER bucket — total
+     * minus the named phases — absorbs this read either way; g_lib_load_ms is
+     * measured inside library_ensure and is unaffected.
      */
     settings_defaults(&g_settings);
     int cfg_ok = config_load(fs, &g_settings);
@@ -5347,6 +5528,35 @@ _Noreturn static void run_ui(fat32_t *fs)
     uart_putc('/');
     uart_put_hex32(cfg_lba1);
     uart_putc('\n');
+    g_diag_cfg_lba[0] = cfg_lba0;         /* Boot Details, without a spin-up      */
+    g_diag_cfg_lba[1] = cfg_lba1;
+
+    /* The saved theme is known now. Apply it BEFORE the library load so the
+     * loading screen (and the album-chip placeholders below) come up in the
+     * user's theme; settings_apply() later re-applies it harmlessly along with
+     * the audio settings, which want the codec path settled first. */
+    theme_set(g_settings.theme);
+    boot_screen_render("LOADING", -1);    /* the same screen, now themed          */
+
+    chip_placeholder_init();              /* after theme_set: it bakes
+                                           * LINEN_BORDER in at call time (a live
+                                           * theme change in Settings still
+                                           * leaves it stale — pre-existing, out
+                                           * of scope here) */
+    library_ensure(fs);                   /* preload the index at boot (drive is
+                                           * spinning) so Songs/Albums/Artists/
+                                           * Genres open INSTANTLY, like Apple —
+                                           * not a multi-second stall on first use */
+    battery_refresh(1);                   /* prime the status-strip gauge         */
+    g_volume = hal_volume_get();          /* reflect the codec's default gain      */
+    g_dir_depth = 0;
+    g_browse_n  = 0;
+    g_br_sel = g_br_accum = 0;
+    g_main_sel  = 0;
+    g_music_sel = MU_ALBUMS;
+    g_menu_accum = 0;
+    g_artist_filter[0] = '\0';
+    g_artist_sel = g_artist_accum = 0;
 
     /*
      * The event log: locate CORELOG.BIN, validate its header, find the
@@ -5374,6 +5584,8 @@ _Noreturn static void run_ui(fat32_t *fs)
     uart_putc('/');
     uart_put_hex32(ev_lban);
     uart_putc('\n');
+    g_diag_log_lba[0] = ev_lba0;          /* Boot Details, without a spin-up      */
+    g_diag_log_lba[1] = ev_lban;
     settings_apply();                     /* push shuffle/repeat/volume out       */
     /* Pick up where the user left off — after settings_apply (it needs the
      * saved volume, which the restore mutes across the open and puts back) and
@@ -5403,7 +5615,7 @@ _Noreturn static void run_ui(fat32_t *fs)
     uint32_t last_mq = 0;                /* rate-limit the marquee scroll        */
     int      hold_prev = clickwheel_hold() ? 1 : 0;  /* seed hold-edge detect    */
     int      ext_prev  = power_is_external() ? 1 : 0; /* seed plug-in edge detect */
-    int      lock_flashing = 0;          /* a lock/unlock plate is on screen     */
+    int      lock_flashing = 0;          /* the Hold banner is on screen         */
     char     az_prev = 0;                /* A-Z locator letter on screen         */
     int      toast_prev = 0;             /* low-battery toast on screen          */
     int      bat_glyph_prev = battery_glyph_key(g_bat_pct); /* strip gauge as drawn */
@@ -5656,17 +5868,17 @@ _Noreturn static void run_ui(fat32_t *fs)
         }
 
         /* Hold-switch edge (a cheap GPIO read, independent of the wheel block
-         * which is gated off while held): flash the lock/unlock plate and toggle
+         * which is gated off while held): flash the Hold banner and toggle
          * the input lock. Playback is untouched. */
         int held = clickwheel_hold() ? 1 : 0;
         if (held != hold_prev) {
             hold_prev = held;
             g_locked  = held;
             keyhold_reset(&play_key);     /* a press under the switch is void */
-            /* Force the plate to REPAINT for the new state. Without this, a second
+            /* Force the banner to REPAINT for the new state. Without this, a second
              * edge (e.g. on->off within the 1 s window) leaves lock_flashing set
              * from the first edge, so the render guard (!lock_flashing) suppresses
-             * the new plate and the unlock modal never shows. */
+             * the new banner and the unlock one never shows. */
             lock_flashing = 0;
             ui_window_arm(&g_lock_flash);
             last_input = mmio_read32(USEC_TIMER_ADDR);   /* wake the backlight    */
@@ -5684,7 +5896,45 @@ _Noreturn static void run_ui(fat32_t *fs)
          * so a tap that lands while this loop is blocked in a disk read isn't
          * lost — we just drain the latch here. */
         wheel_event_t ev;
-        if (!g_locked && clickwheel_get_event(&ev)) {
+        int have_ev = clickwheel_get_event(&ev) ? 1 : 0;
+        if (have_ev && g_locked) {
+            /* Hold is on: the event is swallowed — DRAINED, so it cannot fire
+             * as a stale press the moment Hold comes off (it used to sit in
+             * the latch untouched). A BUTTON press re-shows the banner, the
+             * reference prototype's blockedByHold, lighting the panel like any
+             * other press so the refusal is seen. Wheel motion is dropped
+             * silently: pocket friction on the wheel is exactly what Hold is
+             * for, and it must not keep the backlight awake. */
+            if (ev.buttons) {
+                lock_flashing = 0;
+                ui_window_arm(&g_lock_flash);
+                last_input = mmio_read32(USEC_TIMER_ADDR);
+                if (bl_state != BL_FULL) {
+                    if (!panel_slept) backlight_set(g_settings.backlight_bright);
+                    bl_state = BL_FULL;
+                    wheel_accel_reset();
+                    dirty = 1;                /* stale panel: the banner's present is full */
+                }
+            }
+            have_ev = 0;
+        } else if (have_ev && g_lock_flash.armed && (ev.buttons || ev.wheel_delta)) {
+            /* Hold has just come OFF and the unlock banner is still up: it is
+             * confirmation, not a modal, so the first touch of the wheel or a
+             * button ends it early and THIS pass falls through to the normal
+             * render. Real input only: the Hold edge itself arrives through
+             * this drain as an event with no buttons and no delta, in the same
+             * pass the edge block armed the banner — without the buttons/delta
+             * test it dismissed its own banner and the unlock never showed.
+             * With the event applied. Without this the banner's block
+             * below `continue`s for the rest of its 1 s window, so every scroll
+             * and press in it was processed but nothing was drawn. The LOCKED
+             * banner is unaffected: input while locked is swallowed above (and
+             * a button there re-arms the window), so it never reaches here. */
+            g_lock_flash.armed = 0;       /* ui_window_arm's counterpart          */
+            lock_flashing = 0;
+            dirty = 1;
+        }
+        if (have_ev) {
             last_input = mmio_read32(USEC_TIMER_ADDR);
             if (bl_state != BL_FULL) {
                 int was_off = (bl_state == BL_OFF);
@@ -5732,18 +5982,52 @@ _Noreturn static void run_ui(fat32_t *fs)
                 ev.buttons     = 0;
                 ev.wheel_delta = 0;
             }
-            /* Transport buttons are global (work from any screen while playing),
-             * like a real iPod: RIGHT/LEFT skip track. PLAY is decided by press
-             * length in the keyhold block above, not here at the down-edge. */
-            if ((ev.buttons & WHEEL_BTN_RIGHT) && player_active()) {
-                player_next();
-                hal_volume_set(g_volume);         /* re-apply over codec re-init */
-                dirty = 1;
-            }
-            if ((ev.buttons & WHEEL_BTN_LEFT) && player_active()) {
-                player_prev();
-                hal_volume_set(g_volume);
-                dirty = 1;
+            /* RIGHT/LEFT are transport ONLY on the player screens (Now Playing
+             * and the queue view, which lists the live queue with the playing
+             * row marked). Everywhere else a skip from a list you were merely
+             * browsing changed the music under you; instead RIGHT jumps to
+             * Now Playing — PUSHED over the current screen, so MENU from there
+             * lands back exactly where you were (inside an album's tracklist,
+             * mid-browse) — and LEFT does nothing (MENU is already "back" on
+             * every screen; a second back key is a second convention). PLAY
+             * stays global: press length in the keyhold block above. Nothing
+             * here ever runs on a press that woke the backlight, dismissed a
+             * modal or landed under Hold — all three zeroed ev.buttons. */
+            {
+                int on_player = (scr_cur() == SCR_NOWPLAYING || scr_cur() == SCR_QUEUE);
+                if (on_player) {
+                    if ((ev.buttons & WHEEL_BTN_RIGHT) && player_active()) {
+                        player_next();
+                        hal_volume_set(g_volume);     /* re-apply over codec re-init */
+                        dirty = 1;
+                    }
+                    if ((ev.buttons & WHEEL_BTN_LEFT) && player_active()) {
+                        player_prev();
+                        hal_volume_set(g_volume);
+                        dirty = 1;
+                    }
+                } else if ((ev.buttons & WHEEL_BTN_RIGHT) && player_active()) {
+                    /* Now Playing is never beneath a list today (only MENU or a
+                     * SELECT-hold leave it, and modals eat every press), so this
+                     * is insurance against a future screen that could sit above
+                     * it: a second Now Playing entry would make MENU look dead. */
+                    int np_on_stack = 0;
+                    for (int i = 0; i < g_scr_n; i++) {
+                        if (g_scr[i] == SCR_NOWPLAYING) { np_on_stack = 1; break; }
+                    }
+                    if (!np_on_stack) {
+                        scr_push(SCR_NOWPLAYING);
+                        np_first = 1;
+                        dirty    = 1;
+                    }
+                    /* consumed: not a list press */
+                    ev.buttons = (uint8_t)(ev.buttons & ~WHEEL_BTN_RIGHT);
+                    /* The switch below runs on the NEW top. A thumb landing on
+                     * the ring to press RIGHT can latch a sub-detent delta in
+                     * the same tick; on Now Playing that reads as a volume
+                     * nudge (+ the plate). The press was a jump, nothing else. */
+                    ev.wheel_delta = 0;
+                }
             }
             switch (scr_cur()) {
             case SCR_MENU:
@@ -6180,10 +6464,22 @@ _Noreturn static void run_ui(fat32_t *fs)
                          * of costing a second write when the interval next
                          * comes round. */
                         resume_capture();
-                        /* The natural "I'm done" moment: commit now rather than
+                        /*
+                         * The natural "I'm done" moment: commit now rather than
                          * waiting out the debounce, so the record is on the
-                         * platter before the user can reach for the Hold switch. */
-                        settings_commit(1);
+                         * platter before the user can reach for the Hold switch.
+                         *
+                         * SOFT, not FORCE. resume_capture() above marks the
+                         * record dirty whenever a track is loaded (the position
+                         * moved), so a FORCE here meant that leaving Settings
+                         * with the drive PARKED paid a 1-3 s ata_wakeup() spin-up
+                         * before the pop was even rendered — the stall was the
+                         * back-out itself, every time. SOFT writes when the
+                         * platters are already turning and otherwise leaves the
+                         * change pending for the idle path or the next forced
+                         * commit (suspend / power-off / disk mode).
+                         */
+                        settings_commit(CFG_COMMIT_SOFT);
                     }
                     dirty = 1;
                 }
@@ -6351,7 +6647,7 @@ _Noreturn static void run_ui(fat32_t *fs)
         }
 
         /* Panel wake: the instant we leave the fully-off state, bring the panel
-         * back BEFORE any other present can happen this pass (the lock-plate
+         * back BEFORE any other present can happen this pass (the Hold-banner
          * flash or the render block below), in the only order that is safe and
          * the same one suspend_to_ram / enter_standby use:
          *
@@ -6392,25 +6688,37 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
         }
 
-        /* Lock/unlock plate takes over the screen for ~1s on a Hold edge. Paint
-         * the context + plate once, hold it, then repaint underneath when it
-         * fades. Suppresses the normal render while up. */
+        /* The Hold banner holds the top chrome for ~1s on a Hold edge (and on
+         * a button press while locked). Paint the context + banner once, hold
+         * it, then repaint underneath when it fades. Suppresses the normal
+         * render while up — which is why the input block above disarms the
+         * window on the first event after an UNLOCK: the banner would otherwise
+         * eat the render for the rest of its second while happily applying
+         * every scroll and press behind it. The paint is always full; the PRESENT is the band
+         * alone unless something else is pending — a Hold edge marks the strip
+         * dirty for the padlock, and a wake from dark has a stale panel — in
+         * which case the whole frame goes, as it always did. */
         uint32_t now_us = mmio_read32(USEC_TIMER_ADDR);
         if (ui_window_up(&g_lock_flash, LOCK_FLASH_US, now_us)) {
             if (!lock_flashing && bl_state != BL_OFF) {
                 paint_current_screen();
-                lock_plate_render(g_locked);
-                lcd_present_fb(console_framebuffer());
-                dirty = 0;
+                lock_banner_render(g_locked);
+                if (dirty) {
+                    lcd_present_fb(console_framebuffer());
+                    dirty = 0;
+                } else {
+                    lcd_present_rect(console_framebuffer(), 0, 0, LCD_WIDTH,
+                                     top_banner_h());
+                }
             }
             lock_flashing = 1;
-            /* The plate skips the render below — and with it the loop's two
+            /* The banner skips the render below — and with it the loop's two
              * halts, so it halts here itself. Idle (which includes paused: no
              * DMA to pace) parks the core for a tick, as the main 10 ms halt
              * does. PLAYING takes the same 200 us halt as the bottom of the
              * loop, under the same "the pump did nothing" gate: without it a
              * Hold flip mid-track free-spun the core at 80 MHz for the whole
-             * second the plate is up, re-polling the wheel through masked IRQs
+             * second the banner is up, re-polling the wheel through masked IRQs
              * — the exact spin the bottom halt exists to prevent. */
             if (!player_playing()) {
                 cpu_wait_ms(10);
@@ -6419,7 +6727,7 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
             continue;                     /* skip the normal render this pass      */
         }
-        if (lock_flashing) {              /* plate just faded: repaint underneath  */
+        if (lock_flashing) {              /* banner just faded: repaint underneath */
             lock_flashing = 0;
             dirty = 1;
         }
@@ -6899,7 +7207,7 @@ _Noreturn void kernel_main(void) {
      * is precisely where we are now — before cpu_boost(), not after.
      *
      * Cost: the panel is lit for the duration of lcd_init() (up to ~500 ms of
-     * BCM bring-up) before boot_splash() paints, so a cold boot can show a
+     * BCM bring-up) before the boot screen paints, so a cold boot can show a
      * brief bright field. That is the price of being able to see a boot at
      * all, and it is one line to put back.
      */
@@ -6930,10 +7238,12 @@ _Noreturn void kernel_main(void) {
                                           * rails up, and an inherited live codec  *
                                           * hisses on the jack with nothing playing */
 
-        /* Paint the boot splash immediately, so the panel shows CORE branding
-         * instead of the chainloader's leftover framebuffer (a blue field with
-         * a green stripe) while the disk spins up and the volume mounts. */
-        boot_splash();
+        /* Paint the boot screen immediately, so the panel shows CORE branding
+         * instead of whatever the panel held while the disk spins up and the
+         * volume mounts. No bar yet — nothing measurable has started. This one
+         * paint is necessarily the default palette; run_ui repaints it in the
+         * user's theme as soon as the settings are read. */
+        boot_screen_render("LOADING", -1);
 
         /* Read the MBR, find the FAT32 data partition (type 0B/0C), mount it. */
         uint8_t *mbr = (uint8_t *)mbr_sector;

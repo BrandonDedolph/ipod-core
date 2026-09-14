@@ -158,6 +158,14 @@ A 120×120 cover, marquee title, artist/album, `TRACK N OF M`, elapsed /
 −remaining, and a rounded progress bar. The volume overlay's speaker icon
 grows its sound waves as you turn it up.
 
+Next/Previous belong to the player: **RIGHT and LEFT skip track only on Now
+Playing and the queue view.** Anywhere else, a skip from a list you were
+merely browsing would change the music under you — so **RIGHT jumps to Now
+Playing** instead, pushed over whatever you were in, and MENU brings you back
+to the exact row you left; LEFT does nothing (MENU is already "back"). If a
+track ends while you are still browsing, the status strip's track name changes
+where it stands — no banner, nothing to dismiss.
+
 <p align="center"><img src="docs/screens/volume.gif" alt="volume overlay with growing sound waves" width="360"></p>
 
 <table>
@@ -231,23 +239,34 @@ vanishing.
 
 ### System
 
-Boot splash, charging screen, the low-battery warning, and the Hold-switch
-lock / unlock overlays. Low battery is a state machine with hysteresis: a
+Boot screen, charging screen, the low-battery warning, and the Hold-switch
+banner. The boot is one screen from power-on to the menu — the click-wheel
+mark, "Core", the device line, and a hairline bar along the bottom that fills
+as the library loads; it comes up in the default theme for the disk spin-up
+(the saved theme is *on* that disk) and repaints in the user's theme the moment
+the settings are read, before the bar appears. The Hold-switch banner: flipping Hold inverts the top chrome for a second — an ink band with
+a closed padlock and "Locked", a surface band with the popped-open padlock and
+"Unlocked" — and a small padlock stays in the status strip the whole time Hold
+is on. Low battery is a state machine with hysteresis: a
 toast at 3.7 V, a full-screen warning at the disk-safe line (settings and
 log writes stop there), and a goodbye screen before the PMU would cut power.
 
-<p align="center"><img src="docs/screens/lock.gif" alt="lock and unlock overlays" width="360"></p>
+<p align="center"><img src="docs/screens/lock.gif" alt="the lock and unlock banner" width="360"></p>
 
 <table>
   <tr>
-    <td><img src="docs/screens/boot.png" width="260" alt="Boot splash"></td>
+    <td><img src="docs/screens/boot.png" width="260" alt="Boot screen"></td>
+    <td><img src="docs/screens/loading.png" width="260" alt="Loading the library"></td>
+    <td><img src="docs/screens/loading_onyx.png" width="260" alt="Loading the library, in Onyx"></td>
+  </tr>
+  <tr>
     <td><img src="docs/screens/charging.png" width="260" alt="Charging"></td>
     <td><img src="docs/screens/battery_low.png" width="260" alt="Low battery"></td>
   </tr>
   <tr>
     <td><img src="docs/screens/lock.png" width="260" alt="Unlocked"></td>
     <td><img src="docs/screens/locked.png" width="260" alt="Locked"></td>
-    <td></td>
+    <td><img src="docs/screens/locked_list.png" width="260" alt="Locked, over a list"></td>
   </tr>
 </table>
 

@@ -10,9 +10,12 @@
  * dark-ink selection bar with light text), replicated locally as tiny helpers
  * so this stays a self-contained module (main.c is not edited).
  *
- * The jsx Settings screens carry no status strip (unlike the browser), so this
- * leaves the top band clear and places the header at main.c's header baseline —
- * the header stays put when you cross from the main menu into Settings.
+ * These painters leave the top band (rows 0..STATUS_H-1) clear — the jsx
+ * Settings screens carry no status strip of their own — and place the header at
+ * main.c's header baseline, so the header stays put when you cross from the
+ * main menu into Settings. The firmware paints the ordinary status strip (track
+ * name, battery, Hold padlock) over that clear band afterwards, in main.c's
+ * settings_render_cur(), so Settings carries the same strip as the lists.
  *
  * Pure rendering: integer-only, no libc/libm/malloc, no hardware access, no
  * present. The caller hands the framebuffer to lcd_present_fb().

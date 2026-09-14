@@ -16,15 +16,22 @@
  * that wrote to the user's disk, and this is its only caller, so these few
  * decisions are the whole write policy. (The event log, kernel/evlog.c,
  * has since become the second writer — and goes through THIS gate with its
- * own cfg_commit_t, plus a stricter idle rule: it never wakes a parked
- * drive.)
+ * own cfg_commit_t, plus its own idle rule: it also waits for a whole block
+ * before spending a write. Never waking a parked drive, once evlog's alone,
+ * is now the gate's own rule for every non-forced mode.)
  *
  *   - DEBOUNCE: a change is written CFG_SAVE_DEBOUNCE_US after the LAST
  *     change, not on every wheel tick — one write per settling.
- *   - PARKED DRIVE UNDER A LIVE PLAYER: an idle commit does not spin the
- *     platters up for 1 KB while audio plays out of the anti-skip buffer;
- *     the change rides out on the next refill, on playback stopping, or on
- *     the forced commit at suspend/power-off.
+ *   - PARKED DRIVE: neither an idle nor a soft commit ever spins the
+ *     platters up for 1 KB. A spin-up is 1-3 seconds of audible, blocking
+ *     wait for a write with no deadline, so a parked drive simply defers the
+ *     change (dirty untouched). It lands the next time the platters turn for
+ *     any other reason — the idle path runs every pass and writes as soon as
+ *     the drive is spinning — or at the next FORCED commit: suspend,
+ *     power-off, disk mode, the DISKSAFE flush. The trade-off is explicit: a
+ *     change made while the drive is parked is lost only on a HARD power cut
+ *     before any of those happens, and the suspend timeout forces a commit
+ *     within 30 minutes of going idle.
  *   - BATTERY: below the disk-safe line nothing is written (a cut mid-sector
  *     tears a record) — except the ONE flush the low-battery policy makes at
  *     the DISKSAFE edge, which is exempt. See the modes below.
@@ -46,11 +53,18 @@
  *
  * settings_commit() MODES (the `mode` argument):
  *
- *   CFG_COMMIT_IDLE   the main loop: debounced, deferred while the drive is
- *                     parked under a live player, refused below the
+ *   CFG_COMMIT_IDLE   the main loop: debounced, never wakes a parked drive
+ *                     (the change stays pending), refused below the
  *                     disk-safe battery line.
- *   CFG_COMMIT_FORCE  now (suspend, power-off): no debounce, no parked
- *                     check — still refused below the disk-safe line.
+ *   CFG_COMMIT_SOFT   now if the drive is spinning; a parked drive is never
+ *                     woken — the change stays pending for the idle path or
+ *                     a forced exit. No debounce (like FORCE), still subject
+ *                     to the battery gate and the writable check. Used where
+ *                     the moment is right for a write but the user is
+ *                     waiting on the screen: leaving the Settings root.
+ *   CFG_COMMIT_FORCE  now (suspend, power-off, disk mode): no debounce, no
+ *                     parked check — it WILL pay the spin-up — still refused
+ *                     below the disk-safe line.
  *   CFG_COMMIT_LAST   the ONE write the low-battery policy makes at the
  *                     DISKSAFE edge, exempt from the battery gate.
  *
@@ -73,6 +87,7 @@
 #define CFG_COMMIT_IDLE   0
 #define CFG_COMMIT_FORCE  1
 #define CFG_COMMIT_LAST   2
+#define CFG_COMMIT_SOFT   3
 
 #define CFG_SAVE_DEBOUNCE_US   3000000u   /* 3 s after the last change        */
 #define CFG_SAVE_MAX_FAILURES  3u         /* consecutive failed writes before
@@ -91,7 +106,10 @@ typedef struct {
 typedef struct {
     uint32_t now_us;          /* the microsecond clock (wraps)               */
     int      parked;          /* ata_is_parked()                             */
-    int      player_active;   /* player_active()                             */
+    int      player_active;   /* player_active() — no longer consulted by the
+                               * gate (a parked drive defers regardless), kept
+                               * because callers already gather it and the
+                               * verdict may want it again                    */
     int      battery_ok;      /* battery_disk_writes_allowed()               */
     int      writable;        /* config_writable()                           */
 } cfg_commit_env_t;
@@ -99,8 +117,9 @@ typedef struct {
 /* The gate's verdicts. */
 enum {
     CFG_GATE_NOTHING = 0,     /* nothing pending, or not yet: the debounce is
-                               * still running, or the drive is parked under
-                               * a live player (idle mode only)              */
+                               * still running, or the drive is parked (idle
+                               * and soft modes), or there is no file to
+                               * write to                                    */
     CFG_GATE_DEFER_LOG,       /* refused by the battery gate: the change stays
                                * pending; LOG this (first refusal)           */
     CFG_GATE_DEFER_QUIET,     /* refused by the battery gate, already logged */

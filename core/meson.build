@@ -27,6 +27,20 @@ project(
 target = get_option('target')
 cc = meson.get_compiler('c')
 
+# Build stamp, screen-only: the boot screen prints it bottom-right in the
+# border colour. `git describe --always --dirty --abbrev=7` — the --dirty is
+# the point, since device images are routinely built from an uncommitted tree
+# and the screen should say so. Never printed on the UART (the clicky boot
+# golden matches those lines exactly), so this cannot move a test. Without git
+# (or outside a checkout) meson substitutes the fallback rather than failing.
+core_version_h = vcs_tag(
+  input: 'kernel/core_version.h.in',
+  output: 'core_version.h',
+  command: ['git', 'describe', '--always', '--dirty', '--abbrev=7'],
+  fallback: 'unknown',
+  replace_string: '@VCS_TAG@',
+)
+
 # Warning flags that only exist on newer compilers go through
 # get_supported_arguments(), which probes the ACTUAL compiler in use. This
 # matters for -Wno-error= in particular: passing -Wno-error=<name-the-compiler-
@@ -334,7 +348,8 @@ if target == 'hw'
 
   core_elf = executable(
     'core.elf',
-    boot_sources + kernel_sources + fs_sources + files('codecs/arena.c'),
+    boot_sources + kernel_sources + fs_sources + files('codecs/arena.c')
+      + [core_version_h],   # generated build stamp; main.c includes it
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
     link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, keyhold_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
     include_directories: codec_inc,

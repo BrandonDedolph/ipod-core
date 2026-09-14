@@ -17,6 +17,12 @@
  *
  * Every case is an exact (mode, environment, clock) triple against the
  * verdict, and the pending flag is asserted after every step.
+ *
+ * 2026-09-14 added CFG_COMMIT_SOFT and tightened the parked rule: NO
+ * non-forced mode wakes the platters any more. Leaving Settings forced a
+ * commit, resume_capture() had just marked the record dirty, and the spin-up
+ * landed before the pop was rendered — the stall the user felt on every
+ * back-out.
  */
 
 #include <stdio.h>
@@ -131,10 +137,19 @@ static void test_parked(void)
     check("idle + parked + player active: NOTHING (no spin-up for 1 KB)",
           cfg_commit_gate(&c, CFG_COMMIT_IDLE, &e) == CFG_GATE_NOTHING && c.dirty == 1);
 
-    /* Idle, parked, player idle: write — but WAKE the drive first. */
+    /* Idle, parked, NOTHING PLAYING: still no spin-up. This used to say
+     * WRITE_WAKE, which is how a change deferred at a Settings exit could
+     * ambush the user with a 1-3 s spin-up three seconds later, mid-browse.
+     * Only a FORCE wakes the platters now. */
     e.player_active = 0;
-    check("idle + parked + player idle: WRITE_WAKE",
-          cfg_commit_gate(&c, CFG_COMMIT_IDLE, &e) == CFG_GATE_WRITE_WAKE);
+    check("idle + parked + player idle: NOTHING, still pending",
+          cfg_commit_gate(&c, CFG_COMMIT_IDLE, &e) == CFG_GATE_NOTHING && c.dirty == 1);
+
+    /* Drive spinning, the debounce run: the deferred change lands. */
+    e.parked = 0;
+    check("idle + spinning after the debounce: WRITE",
+          cfg_commit_gate(&c, CFG_COMMIT_IDLE, &e) == CFG_GATE_WRITE && c.dirty == 1);
+    e.parked = 1;
 
     /* THE BUG: the forced commit at suspend/power-off skipped the parked
      * check and wrote straight into the parked drive. It must still write
@@ -150,6 +165,63 @@ static void test_parked(void)
     check("force + spinning: WRITE",
           cfg_commit_gate(&c, CFG_COMMIT_FORCE, &e) == CFG_GATE_WRITE);
     check("still pending after every verdict above", c.dirty == 1);
+}
+
+/* ---- 3b. CFG_COMMIT_SOFT ------------------------------------------------ */
+
+/*
+ * SOFT is "now, if it is free": the debounce is skipped like FORCE, but a
+ * parked drive is never woken. Leaving the Settings root uses it — a FORCE
+ * there paid a 1-3 s ata_wakeup() before the pop was even rendered, because
+ * resume_capture() marks the record dirty on the way out whenever a track is
+ * loaded. The battery gate and the writable check still apply.
+ */
+static void test_soft(void)
+{
+    cfg_commit_t c;
+    memset(&c, 0, sizeof c);
+    cfg_commit_touch(&c, T0);
+
+    /* Parked: nothing happens, and the change is untouched. */
+    cfg_commit_env_t e = env_at(T0 + 1u);
+    e.parked = 1;
+    check("soft + parked: NOTHING (never a WRITE_WAKE)",
+          cfg_commit_gate(&c, CFG_COMMIT_SOFT, &e) == CFG_GATE_NOTHING);
+    check("soft + parked: the change stays pending", c.dirty == 1);
+    e.player_active = 1;
+    check("soft + parked + player active: NOTHING too",
+          cfg_commit_gate(&c, CFG_COMMIT_SOFT, &e) == CFG_GATE_NOTHING && c.dirty == 1);
+
+    /* Spinning: write immediately — no debounce wait (the change was made
+     * one microsecond ago). */
+    e.parked = 0;
+    check("soft + spinning: WRITE, without waiting out the debounce",
+          cfg_commit_gate(&c, CFG_COMMIT_SOFT, &e) == CFG_GATE_WRITE);
+    check("soft: a WRITE verdict does not clear the pending flag", c.dirty == 1);
+
+    /* Still gated by the battery, like FORCE. */
+    e.battery_ok = 0;
+    check("soft below disk-safe: refused (DEFER_LOG), change kept",
+          cfg_commit_gate(&c, CFG_COMMIT_SOFT, &e) == CFG_GATE_DEFER_LOG && c.dirty == 1);
+    e.battery_ok = 1;
+
+    /* And by the writable check, like FORCE: no file, drop it. */
+    e.writable = 0;
+    check("soft with no CORECFG.DAT: NOTHING, and the change is dropped",
+          cfg_commit_gate(&c, CFG_COMMIT_SOFT, &e) == CFG_GATE_NOTHING && c.dirty == 0);
+
+    /* A parked SOFT leaves the change for the idle path, which writes it as
+     * soon as the platters are turning again — the deferral is not a loss. */
+    memset(&c, 0, sizeof c);
+    cfg_commit_touch(&c, T0);
+    e = env_at(T0 + 1u);
+    e.parked = 1;
+    check("soft + parked, then the drive spins up: idle writes it",
+          cfg_commit_gate(&c, CFG_COMMIT_SOFT, &e) == CFG_GATE_NOTHING);
+    e = env_at(AFTER);
+    e.parked = 0;
+    check("...on the next idle pass past the debounce",
+          cfg_commit_gate(&c, CFG_COMMIT_IDLE, &e) == CFG_GATE_WRITE && c.dirty == 1);
 }
 
 /* ---- 4. the battery gate ----------------------------------------------- */
@@ -282,6 +354,7 @@ int main(void)
     test_idle_nothing();
     test_debounce();
     test_parked();
+    test_soft();
     test_battery();
     test_not_writable();
     test_result();

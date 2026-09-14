@@ -4,16 +4,18 @@ Faithful 320x240 renderer for the Core (iPod firmware) "Linen" warm-light UI.
 
 Reproduces the on-device look of core/kernel/main.c + core/ui/screen_settings.c:
 the status strip, titled headers, list rows (single + two-line with art chips),
-album detail, now-playing, the volume overlay, the lock/unlock modal, the About
-dashboard and the Boot Details diagnostics page.
+album detail, now-playing, the volume overlay, the Hold lock/unlock banner, the
+About dashboard and the Boot Details diagnostics page.
 
 Text is drawn with the real Nunito faces via PIL, gamma-correct (sRGB->linear,
 blend by glyph coverage, re-encode) so it reads as crisply as the device's
-gamma-aware atlas — and, since the firmware's text stack grew a 26.6 pen,
-kerning and per-atlas tracking, it lays glyphs out with the DEVICE's metrics
-rather than PIL's defaults (see the Fonts section). Tracking is read out of
-core/ui/atlas/*.h at runtime, so a screenshot cannot quietly drift from the
-firmware again. Album art is quantized to RGB565 to match the panel.
+gamma-aware atlas — and it lays glyphs out with the DEVICE's metrics rather
+than PIL's defaults (see the Fonts section): tracking, the KERN TABLE and the
+per-pair pen rounding all come out of core/ui/atlas/*.h at runtime, so a
+screenshot cannot quietly drift from the firmware. The kerning in particular
+is the atlas's optically solved table, not the font's own — deriving it from
+the font (what this did until 2026-09-14) drew spacing the panel has never
+shown. Album art is quantized to RGB565 to match the panel.
 
 Outputs PNGs (3x, NEAREST) + a marquee demo GIF into this directory.
 
@@ -158,16 +160,26 @@ def _l2s(v):
 # screenshots that disagree with the panel by several pixels per string (which
 # is exactly what these did).
 #
-# So mirror the generator: tools/atlas_gen.py derives every advance and every
-# kern pair from THIS Pillow, through getlength() under the Raqm layout engine,
-# then quantizes them. Doing the same arithmetic here means the numbers below
-# are the numbers baked into core/ui/atlas/*.h, not an approximation of them.
+# So mirror the generator: tools/atlas_gen.py derives every advance from THIS
+# Pillow, through getlength() under the Raqm layout engine, then quantizes it.
+# Doing the same arithmetic here means the advances below are the ones baked
+# into core/ui/atlas/*.h, not an approximation of them.
 #
 # The basic layout engine is not an option: it applies no kerning at all and
 # returns advances already rounded to whole pixels.
+#
+# KERNING IS READ OUT OF THE ATLAS, not re-derived from the font. It used to
+# be re-derived (getlength(ab) - getlength(a) - getlength(b)), which is the
+# FONT's kerning — but the generator overrides every letter pair with an
+# optically solved value (atlas_gen.optical_kern), so the font's number and
+# the device's number are different for thousands of pairs. The renderer
+# therefore drew spacing the panel has never shown, and a spacing bug in the
+# atlas ('Fa' tucked under the F's arm) was invisible in this gallery. Parsing
+# `<face>_KERN[]` out of the generated header is the only way these stills can
+# be evidence about the device. Same reason `layout()` rounds the pen ONCE PER
+# PAIR below instead of carrying a 26.6 pen: that is text.c's pen_step().
 ADV_ONE     = 64      # 26.6, == ATLAS_ADV_ONE   (core/ui/atlas.h)
-KERN_ONE    = 32      # 1/32 px, == atlas_kern_t.adj scale
-KERN_MIN_PX = 0.25    # == KERN_MIN_PX           (tools/atlas_gen.py)
+KERN_TO_ADV = 2       # atlas_kern_t.adj is 1/32 px -> 26.6 (core/ui/atlas.h)
 
 
 def _atlas_field(header, field):
@@ -190,21 +202,59 @@ def _atlas_field(header, field):
 
 
 def _atlas_charset():
-    """Codepoints the atlases actually carry: printable ASCII plus whatever
-    tools/atlas_gen.py appended (read from the generated glyphmap, so it cannot
-    drift from the firmware). Anything outside this renders as a .notdef box on
-    the device, which is a different picture from what PIL would draw."""
-    cps = set(range(0x20, 0x7F))
+    """Codepoint -> glyph index for everything the atlases carry: printable
+    ASCII at 0x20+i -> i, plus whatever tools/atlas_gen.py appended (read from
+    the generated glyphmap, so it cannot drift from the firmware). Anything
+    outside this renders as a .notdef box on the device, which is a different
+    picture from what PIL would draw. The index is what the kern table is
+    keyed by, so this is also the lookup `Face.kern()` needs."""
+    cps = {0x20 + i: i for i in range(95)}
     path = os.path.join(ATLAS, "glyphmap.h")
     try:
         with open(path, encoding="utf-8") as f:
             src = f.read()
     except OSError as e:
         raise SystemExit(f"atlas glyphmap not readable: {path} ({e})")
-    cps.update(int(h, 16) for h in re.findall(r"\{\s*0x([0-9A-Fa-f]{4})\s*,", src))
+    rows = re.findall(r"\{\s*0x([0-9A-Fa-f]{4})\s*,\s*(\d+)\s*\}", src)
+    if not rows:
+        raise SystemExit(f"no codepoint rows in {path} — atlas format changed?")
+    cps.update({int(h, 16): int(i) for h, i in rows})
     return cps
 
 ATLAS_CHARS = _atlas_charset()
+
+
+def _atlas_kern(header):
+    """`{ left, right, adj }` rows of the generated `<face>_KERN[]` table, as
+    {(left_idx, right_idx): adj} in 1/32 px. Absent table = no kerning at all,
+    which the atlas writes as a single {0,0,0} placeholder; anything else
+    missing is a format change and must be loud, not silently unkerned."""
+    path = os.path.join(ATLAS, header)
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        raise SystemExit(f"atlas header not readable: {path} ({e})")
+    m = re.search(r"_KERN\[\d+\] = \{(.*?)\};", src, re.S)
+    if not m:
+        raise SystemExit(f"no '_KERN[...] = {{' in {path} — atlas format changed?")
+    return {(int(l), int(r)): int(adj) for l, r, adj in
+            re.findall(r"\{ *(\d+), *(\d+), *(-?\d+) \}", m.group(1))}
+
+
+def _atlas_space_advance(header):
+    """Glyph 0's (the space's) advance in 26.6, out of the generated header.
+    atlas_gen.py's fit_space_advance() overrides the font's own space width,
+    so PIL's getlength(" ") is NOT what the device steps by — every word gap
+    in the gallery was 1.2–2.3 px narrower than the panel's until this read
+    the atlas value. Loud on absence, like the other atlas readers."""
+    path = os.path.join(ATLAS, header)
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    m = re.search(r"\[ *0\] = \{[^}]*\.advance = *(\d+)", src)
+    if not m:
+        raise SystemExit(f"no glyph [0] advance in {path} — atlas format changed?")
+    return int(m.group(1))
 
 
 class Face:
@@ -217,8 +267,8 @@ class Face:
         self.tracking = _atlas_field(header, "tracking")     # 26.6
         self.ascent = _atlas_field(header, "ascent")
         self.line_height = _atlas_field(header, "line_height")
-        self._adv = {}
-        self._kern = {}
+        self._adv = {" ": _atlas_space_advance(header)}   # the device's space, not PIL's
+        self._kern = _atlas_kern(header)          # (left idx, right idx) -> 1/32 px
         self._len = {}
 
     def _length(self, s):
@@ -240,39 +290,49 @@ class Face:
         return a
 
     def kern(self, a, b):
-        """Kern for the ordered pair in 26.6, quantized exactly as the atlas
-        bakes it (1/32 px, pairs under KERN_MIN_PX dropped)."""
-        k = self._kern.get((a, b))
-        if k is None:
-            raw = self._length(a + b) - self._length(a) - self._length(b)
-            adj = 0 if abs(raw) < KERN_MIN_PX else int(round(raw * KERN_ONE))
-            k = self._kern[(a, b)] = adj * 2          # 1/32 -> 26.6
-        return k
+        """Kern for the ordered pair in 26.6, straight out of the atlas's own
+        `_KERN[]` table (adj is 1/32 px there, 26.6 here — ATLAS_KERN_TO_ADV).
+        Deriving it from the font instead would be the FONT's kerning, which
+        the generator's optical pass has overridden for every letter pair."""
+        pair = (ATLAS_CHARS[ord(a)], ATLAS_CHARS[ord(b)])
+        return self._kern.get(pair, 0) * KERN_TO_ADV
+
+    def _pen_step(self, a, b):
+        """Whole-pixel step from glyph `a` to glyph `b` — core/ui/text.c
+        pen_step(): a's advance plus the pair's tracking and kerning, rounded
+        ONCE. `b` may be None for the end of the string (no pair)."""
+        adv = self.advance(a)
+        if b is None:
+            return (adv + ADV_ONE // 2) >> 6
+        # A space counts as ONE tracking unit (text.c track_adv): tracking
+        # goes in on the way INTO a space, not on the way out. Both sides
+        # would widen every word gap by twice the tracking; neither side grows
+        # the letter gaps while the word gap stays put, which is what made
+        # words merge. One side moves the word gap by the same amount as every
+        # letter gap, so the ratio the face was designed with survives.
+        # Kerning still applies across a space if the face has such a pair.
+        track = 0 if a == " " else self.tracking
+        return (adv + track + self.kern(a, b) + ADV_ONE // 2) >> 6
 
     def layout(self, s):
-        """(glyphs, width): glyphs is [(char, x offset in px)] with the pen
-        rounded per glyph, width is the pen rounded once at the end — the two
-        halves of core/ui/text.c's contract (text_draw returns text_width)."""
+        """(glyphs, width): glyphs is [(char, x offset in px)], width is the
+        pen past the last glyph — core/ui/text.c's contract (text_draw puts
+        each glyph at the pen, and text_width returns the same total). The pen
+        is WHOLE pixels and every step is rounded on its own; carrying a 26.6
+        pen and rounding at blit time (what this did before) puts identical
+        pairs at different distances in one word, which is the quantisation
+        artefact text.c's pen_step() exists to remove."""
         pen = 0
         prev = None
         out = []
         for ch in s:
             if prev is not None:
-                # A space counts as ONE tracking unit (text.c track_adv):
-                # tracking goes in on the way INTO a space, not on the way out.
-                # Both sides would widen every word gap by twice the tracking;
-                # neither side grows the letter gaps while the word gap stays
-                # put, which is what made words merge. One side moves the word
-                # gap by the same amount as every letter gap, so the ratio the
-                # face was designed with survives. Kerning still applies across
-                # a space if the face has such a pair.
-                if prev != " ":
-                    pen += self.tracking
-                pen += self.kern(prev, ch)
-            out.append((ch, (pen + ADV_ONE // 2) >> 6))
-            pen += self.advance(ch)
+                pen += self._pen_step(prev, ch)
+            out.append((ch, pen))
             prev = ch
-        return out, (pen + ADV_ONE // 2) >> 6
+        if prev is not None:
+            pen += self._pen_step(prev, None)
+        return out, pen
 
     def width(self, s):
         return self.layout(s)[1] if s else 0
@@ -308,6 +368,30 @@ MIDDOT = "·"
 
 def text_width(s, font):
     return font.width(s)
+
+
+UI_ELLIPSIS = "\u2026"
+
+
+def text_ellipsis_fit(s, font, max_w):
+    """chrome.c ui_text_ellipsis_fit: `s` itself when it fits in max_w,
+    otherwise the longest prefix that fits WITH a trailing ellipsis, shortened
+    a codepoint at a time and with trailing spaces dropped ("of the\u2026", never
+    "of the \u2026"). The whole candidate is re-measured each step, as on device,
+    because kerning makes per-glyph sums drift. "" when nothing fits."""
+    if max_w <= 0:
+        return ""
+    if text_width(s, font) <= max_w:
+        return s
+    n = len(s)
+    while n > 0:
+        n -= 1
+        while n > 0 and s[n - 1] == " ":
+            n -= 1
+        cand = s[:n] + UI_ELLIPSIS
+        if text_width(cand, font) <= max_w:
+            return cand
+    return ""
 
 # ---------------------------------------------------------------------------
 # Surface / primitives
@@ -397,14 +481,51 @@ class Screen:
                                     _l2s(lb * a + LIN[bb] * (1 - a)),
                                 )
 
+    def fill_disc_aa(self, cx, cy, r, c):
+        """AA filled disc of radius r centred on the pixel EDGE (cx, cy) — it
+        covers pixels cx-r .. cx+r-1. Mirrors main.c fill_disc_aa EXACTLY (the
+        boot mark's ring/dot/hole): 4x4 sub-sample centres at 8*(p - c) + 2k + 1,
+        inside when dx^2 + dy^2 <= (8r)^2, solid at 16/16, otherwise blended
+        onto what is already there. NOT fill_round_rect_aa — the firmware's
+        corner mask stops at UI_RR_MAX_R (16) and the ring is 19, which is why
+        the device has a separate painter at all."""
+        R2 = (8 * r) * (8 * r)
+        lr, lg, lb = LIN[c[0]], LIN[c[1]], LIN[c[2]]
+        for py_ in range(cy - r - 1, cy + r + 1):
+            if py_ < 0 or py_ >= H:
+                continue
+            for px_ in range(cx - r - 1, cx + r + 1):
+                if px_ < 0 or px_ >= W:
+                    continue
+                inside = 0
+                for j in range(4):
+                    dy = 8 * (py_ - cy) + 2 * j + 1
+                    for i in range(4):
+                        dx = 8 * (px_ - cx) + 2 * i + 1
+                        if dx * dx + dy * dy <= R2:
+                            inside += 1
+                if inside == 0:
+                    continue
+                if inside >= 16:
+                    self.px[px_, py_] = c
+                    continue
+                a = inside / 16.0
+                br, bg, bb = self.px[px_, py_]
+                self.px[px_, py_] = (
+                    _l2s(lr * a + LIN[br] * (1 - a)),
+                    _l2s(lg * a + LIN[bg] * (1 - a)),
+                    _l2s(lb * a + LIN[bb] * (1 - a)),
+                )
+
     # -- text (gamma-correct) -------------------------------------------
     def text(self, x, baseline, s, font, ink, clip=None):
         if not s:
             return x
-        # Glyph BY GLYPH at the device's pen positions (kerned, tracked, 26.6
-        # carried) — handing PIL the whole string would lay it out with none of
-        # that. Each glyph goes down at its own rounded pen x, which is what
-        # text.c does before it blits.
+        # Glyph BY GLYPH at the device's pen positions (the atlas's kerning and
+        # tracking, one rounding per pair) — handing PIL the whole string would
+        # lay it out with the font's own kerning and none of the rest. Each
+        # glyph goes down at its own pen x, which is what text.c does before it
+        # blits.
         glyphs, width = font.layout(s)
         mask = Image.new("L", (W, H), 0)
         md = ImageDraw.Draw(mask)
@@ -512,10 +633,13 @@ def draw_lock_glyph(sc, x, y, c):
     sc.fill_rect(x + 5, y, 2, 5, c)
     sc.fill_rect(x + 1, y, 6, 2, c)
 
-def status_strip(sc, left="CORE", pct=78, locked=False):
-    # main.c status_strip_render: left text clipped before the right cluster
-    # (12, LCD_WIDTH-70), not drawn full width and painted over.
-    sc.text(12, STATUS_H - 4, left, FONT_SMALL, MUTED2, clip=(12, W - 70))
+def status_strip(sc, left="", pct=78, locked=False):
+    # main.c status_strip_render: the playing track's name, clipped before the
+    # right cluster (12, LCD_WIDTH-70) rather than drawn full width and painted
+    # over — and NOTHING when nothing is playing (the strip is a now-playing
+    # readout, not a wordmark; the main menu's own header says "Core").
+    if left:
+        sc.text(12, STATUS_H - 4, left, FONT_SMALL, MUTED2, clip=(12, W - 70))
     bx = W - 12 - 24
     draw_battery(sc, bx, 1, pct)
     if locked:
@@ -621,7 +745,7 @@ ALBUMS_SEL = next(i for i, a in enumerate(ALBUMS) if a[0].startswith("Rearrange"
 
 def screen_albums(sel=ALBUMS_SEL, title_offset=0):
     sc = Screen()
-    status_strip(sc, "CORE")
+    status_strip(sc)
     header(sc, "Albums", "%d / %d" % (sel + 1, len(ALBUMS)), back=True)
     for r, (t, a, art) in enumerate(ALBUMS):
         s = (r == sel)
@@ -642,7 +766,7 @@ GENRES_SEL = 2
 
 def screen_genres():
     sc = Screen()
-    status_strip(sc, "CORE")
+    status_strip(sc)
     header(sc, "Genres", "%d / %d" % (GENRES_SEL + 1, len(GENRES)), back=True)
     for r in range(LIST_ROWS):
         if r >= len(GENRES):
@@ -667,7 +791,7 @@ DETAIL_N = 17
 
 def screen_detail(sel=DETAIL_SEL):
     sc = Screen()
-    status_strip(sc, "CORE")
+    status_strip(sc)
     header(sc, "Albums", "%d / %d" % (sel + 1, DETAIL_N), back=True)
     sc.blit_art(12, 42, 56, "austin")
     tx = 12 + 56 + 12
@@ -775,55 +899,129 @@ def screen_volume():
     return _now_playing_base(vol_overlay=78).img
 
 
-# -- lock modal --------------------------------------------------------------
-def draw_ring_top(sc, cx, cy, Ro, Ri, c):
-    for dy in range(-Ro, 1):
-        xo = sc._isqrt(Ro * Ro - dy * dy)
-        if -dy <= Ri:
-            xi = sc._isqrt(Ri * Ri - dy * dy)
-            sc.fill_rect(cx - xo, cy + dy, xo - xi + 1, 1, c)
-            sc.fill_rect(cx + xi, cy + dy, xo - xi + 1, 1, c)
-        else:
-            sc.fill_rect(cx - xo, cy + dy, 2 * xo + 1, 1, c)
+# -- Hold banner -------------------------------------------------------------
+# main.c "Top banner": a Hold edge does NOT raise a centred 180x110 plate any
+# more. The TOP CHROME INVERTS for LOCK_FLASH_US and then settles back into the
+# persistent strip padlock. Ported row for row from top_banner_render /
+# lock_banner_render, including the bitmaps and the explicit-colour battery.
 
-def draw_shackle(sc, sx, ay, Ro, Ri, lL, rL, c):
-    w = Ro - Ri + 1
-    draw_ring_top(sc, sx, ay, Ro, Ri, c)
-    sc.fill_rect(sx - Ro, ay, w, lL, c)
-    sc.fill_rect(sx + Ri, ay, w, rL, c)
+# Dot-keyhole padlock, 14 px wide, as row bitmasks (bit 13 = left column).
+# Closed = 16 rows; open = 18, the shackle "popped" clear of the body. Values
+# verbatim from main.c LOCK_BM_CLOSED / LOCK_BM_OPEN.
+LOCK_BM_CLOSED = [
+    0x03F0, 0x07F8, 0x0E1C, 0x0C0C, 0x0C0C, 0x0C0C,
+    0x1FFE, 0x3FFF, 0x3FFF, 0x3F3F, 0x3F3F, 0x3FFF,
+    0x3FFF, 0x3FFF, 0x3FFF, 0x1FFE,
+]
+LOCK_BM_OPEN = [
+    0x03F0, 0x07F8, 0x0E1C, 0x0C0C, 0x0C0C, 0x0C0C,
+    0x0000, 0x0000, 0x1FFE, 0x3FFF, 0x3FFF, 0x3F3F,
+    0x3F3F, 0x3FFF, 0x3FFF, 0x3FFF, 0x3FFF, 0x1FFE,
+]
 
-def draw_keyhole(sc, kx, ky, bg):
-    sc.fill_round_rect(kx - 3, ky - 3, 6, 6, 3, bg)
-    sc.fill_rect(kx - 1, ky + 2, 2, 4, bg)
 
-def draw_lock_icon(sc, cx, cy, open_, c, bg):
-    if open_:
-        draw_shackle(sc, cx, cy - 14, 10, 6, 6, 6, c)
+def draw_bitmap14(sc, x, y, rows, c):
+    """main.c draw_bitmap14: blit a 14-wide row-mask bitmap at (x, y) as
+    horizontal runs (bit 13 is the leftmost column)."""
+    for r, m in enumerate(rows):
+        run = -1
+        for col in range(15):
+            on = col < 14 and (m & (1 << (13 - col)))
+            if on and run < 0:
+                run = col
+            elif not on and run >= 0:
+                sc.fill_rect(x + run, y + r, col - run, 1, c)
+                run = -1
+
+
+def draw_battery_c(sc, x, y, pct, outline, fill):
+    """main.c draw_battery_c: draw_battery in explicit colours, so the right
+    cluster can sit on an inverted band without flickering."""
+    w, h = 22, 12
+    sc.fill_rect(x, y, w, 1, outline)
+    sc.fill_rect(x, y + h - 1, w, 1, outline)
+    sc.fill_rect(x, y, 1, h, outline)
+    sc.fill_rect(x + w - 1, y, 1, h, outline)
+    sc.fill_rect(x + w, y + 4, 2, h - 8, outline)
+    pct = max(0, min(100, pct))
+    fw = ((w - 4) * pct) // 100
+    if fw > 0:
+        sc.fill_rect(x + 2, y + 2, fw, h - 4, BATT_RED if pct <= 20 else fill)
+
+
+def _as_screen(img):
+    """Wrap an already-rendered frame so the banner can be painted over its top
+    chrome (the screen builders hand back a PIL image, not the Screen)."""
+    sc = Screen()
+    sc.img = img
+    sc.px = img.load()
+    return sc
+
+
+def top_banner(sc, inverted, bm, bm_dy, label, token, screen,
+               left="", pct=78):
+    """main.c top_banner_render: paint a banner over the top chrome of whatever
+    is already in the framebuffer. `inverted` picks the selected-row pair (INK
+    band / SURFACE marks / SEL_SUB secondaries), else surface + the ordinary
+    border rule. `bm_dy` drops a taller bitmap so its body stays put. `screen`
+    is which top chrome the band covers (top_banner_h): "np" = the 22 px status
+    row (Now Playing and the chrome-less modals), "list" and "settings" = strip
+    + header through the divider (HDR_DIV_Y + 1 = 39) — the firmware keeps the
+    strip on Settings too, painted over the painter's clear band. `left` is the
+    strip row's track name, blank when nothing is playing. The label is
+    ellipsised to the room left of the token, as the header does for a title
+    next to its count."""
+    band = INK if inverted else SURFACE
+    fg = SURFACE if inverted else INK
+    sub = SEL_SUB if inverted else MUTED2
+    h = 23 if screen == "np" else HDR_DIV_Y + 1
+
+    if h == 23:
+        # Now Playing's own top row: glyph + label left, battery right. The
+        # un-inverted band gets the border rule under it (row 22) so a surface
+        # band on the surface still reads as a banner; the present is 23 rows.
+        sc.fill_rect(0, 0, W, 22, band)
+        if not inverted:
+            sc.fill_rect(0, 22, W, 1, BORDER)
+        draw_bitmap14(sc, 12, 3 + bm_dy, bm, fg)
+        sc.text(12 + 14 + 6, 15, label, bold_12, fg)
+        draw_battery_c(sc, W - 12 - 19, 3, pct, sub, fg)
+        return
+    sc.fill_rect(0, 0, W, h, band)
+    # Strip row, recoloured (every screen with a strip — Settings included),
+    # then the header line as the announcement, then the divider in the band's
+    # own secondary colour so the inverted block ends where the header does.
+    if left:
+        sc.text(12, STATUS_H - 4, left, FONT_SMALL, sub, clip=(12, W - 70))
+    draw_battery_c(sc, W - 12 - 24, 1, pct, sub, fg)
+    draw_bitmap14(sc, 12, HDR_BASE - 12 + bm_dy, bm, fg)
+    lx = 12 + 14 + 6
+    tok_w = text_width(token, FONT_SMALL) if token else 0
+    label_max = (W - 12 - tok_w - 8 if token else W - 12) - lx
+    sc.text(lx, HDR_BASE, text_ellipsis_fit(label, FONT_HEADER, label_max),
+            FONT_HEADER, fg)
+    if token:
+        sc.text_right(W - 12, HDR_BASE - 1, token, FONT_SMALL, sub)
+    sc.fill_rect(12, HDR_DIV_Y, W - 24, 1, sub if inverted else BORDER)
+
+
+def lock_banner(sc, locked, screen, **kw):
+    """main.c lock_banner_render: locked = inverted + closed padlock +
+    "Locked" / HOLD ON; unlocked = surface + popped-open padlock +
+    "Unlocked" / HOLD OFF."""
+    if locked:
+        top_banner(sc, True, LOCK_BM_CLOSED, 0, "Locked", "HOLD ON",
+                   screen, **kw)
     else:
-        draw_shackle(sc, cx, cy - 9, 10, 6, 8, 8, c)
-    sc.fill_round_rect(cx - 16, cy - 3, 32, 22, 4, c)
-    draw_keyhole(sc, cx, cy + 7, bg)
-
-def lock_plate(sc, locked):
-    PX, PY, PW, PH = 70, 65, 180, 110
-    plate = INK if locked else SURFACE
-    fg = SURFACE if locked else INK
-    if not locked:
-        sc.fill_round_rect_aa(PX - 1, PY - 1, PW + 2, PH + 2, 11, BORDER)
-    sc.fill_round_rect_aa(PX, PY, PW, PH, 10, plate)
-    draw_lock_icon(sc, PX + PW // 2, PY + 45, not locked, fg, plate)
-    label = "LOCKED" if locked else "UNLOCKED"
-    sc.text_centered_at(PY + 84, PX, PW, label, FONT_HEADER, fg)
+        top_banner(sc, False, LOCK_BM_OPEN, -1, "Unlocked", "HOLD OFF",
+                   screen, **kw)
 
 
 def _lock_screen(locked, elapsed=73, glyph=False):
-    # `glyph` draws the persistent Hold padlock in the status strip (engaged).
+    # `glyph` draws the persistent Hold padlock in the status strip (engaged);
+    # while the banner is up the band covers it, which is what the device does.
     sc = _now_playing_base(elapsed=elapsed, locked=glyph)
-    # add a helper for centered-in-plate text
-    def centered(baseline, x, w, s, font, ink):
-        sc.text(x + (w - text_width(s, font)) // 2, baseline, s, font, ink)
-    sc.text_centered_at = lambda baseline, x, w, s, font, ink: centered(baseline, x, w, s, font, ink)
-    lock_plate(sc, locked)
+    lock_banner(sc, locked, "np")
     return sc.img
 
 
@@ -832,6 +1030,14 @@ def screen_lock():
 
 def screen_locked():
     return _lock_screen(True)
+
+def screen_locked_list():
+    """The locked banner over list chrome: the strip row keeps its track name
+    (blank here — nothing is playing) and the battery, recoloured; the header
+    line carries the announcement where the title and the count were."""
+    sc = _as_screen(screen_albums())
+    lock_banner(sc, True, "list")
+    return sc.img
 
 
 # -- about -------------------------------------------------------------------
@@ -868,6 +1074,7 @@ def _about_card(sc, x, label):
 def screen_about(lib_truncated=AB_LIB_TRUNCATED):
     sc = Screen()
     header(sc, "About", back=True)
+    status_strip(sc)                 # main.c settings_render_cur
 
     # --- device row: name left, firmware chip right, one baseline ---
     sc.text(16, 66, "iPod 5.5G", FONT_TITLE, INK)
@@ -955,7 +1162,7 @@ MUSIC_MENU = [
 
 def screen_menu(title, items, sel, back):
     sc = Screen()
-    status_strip(sc, "CORE")
+    status_strip(sc)
     header(sc, title, back=back)
     for i, (label, active) in enumerate(items):
         if i >= LIST_ROWS:
@@ -1122,18 +1329,20 @@ def gif_themes():
 
 
 def gif_lock():
-    """LOCK: Now Playing (no lock) -> LOCKED modal -> the screen WHILE locked with
-    the persistent padlock in the status strip -> UNLOCKED modal -> back to Now
-    Playing (glyph gone). Playback keeps running, so the clock ticks up throughout
-    and the padlock stays in the strip the whole time Hold is engaged."""
+    """LOCK: Now Playing (no lock) -> the LOCKED banner inverting the top row ->
+    the screen WHILE locked with the persistent padlock in the status strip ->
+    the UNLOCKED banner -> back to Now Playing (glyph gone). Playback keeps
+    running, so the clock ticks up throughout and the padlock stays in the strip
+    the whole time Hold is engaged."""
     e = 73
     spec = []
     spec.append((_np(e), 3, 160)); e += 1
-    # Hold engaged: modal flashes, and the strip padlock appears (glyph=True).
+    # Hold engaged: the top row inverts, and the strip padlock appears under it
+    # (glyph=True) ready for when the banner goes.
     spec.append((_lock_screen(True, elapsed=e, glyph=True), 5, 170)); e += 1
-    # Modal dismissed but still locked: the small padlock persists top-right.
+    # Banner gone but still locked: the small padlock persists top-right.
     spec.append((_np(e, locked=True), 5, 170)); e += 1
-    # Hold disengaged: UNLOCKED modal, and the strip padlock is gone (glyph=False).
+    # Hold disengaged: the UNLOCKED banner, and the strip padlock is gone.
     spec.append((_lock_screen(False, elapsed=e, glyph=False), 5, 170)); e += 1
     spec.append((_np(e), 3, 160))
     return _save_gif("lock.gif", spec)
@@ -1184,7 +1393,7 @@ ARTISTS_SEL = next(i for i, a in enumerate(ARTISTS) if a[0] == "LANY")
 
 def screen_artists():
     sc = Screen()
-    status_strip(sc, "CORE")
+    status_strip(sc)
     header(sc, "Artists", "%d / %d" % (ARTISTS_SEL + 1, len(ARTISTS)), back=True)
     for r in range(LIST_ROWS):
         if r >= len(ARTISTS):
@@ -1211,7 +1420,7 @@ SONGS_SEL = next(i for i, s in enumerate(SONGS) if s[0].startswith("Rearrange"))
 
 def screen_songs():
     sc = Screen()
-    status_strip(sc, "CORE")
+    status_strip(sc)
     header(sc, "Songs", "%d / %d" % (SONGS_SEL + 1, len(SONGS)), back=True)
     for r, (t, a, dur) in enumerate(SONGS):
         list_row(sc, LIST_Y0, r, t, sub=a, right=dur, selected=(r == SONGS_SEL),
@@ -1244,7 +1453,7 @@ ALLSONGS_SEL = next(i for i, s in enumerate(ALLSONGS) if s[0] == "Something Real
 
 def screen_allsongs(sel=ALLSONGS_SEL):
     sc = Screen()
-    status_strip(sc, "CORE")
+    status_strip(sc)
     header(sc, ALLSONGS_ARTIST, "%d / %d" % (sel + 1, len(ALLSONGS)), back=True)
     top = scroll_window(sel, len(ALLSONGS), LIST_ROWS2)
     for vr in range(LIST_ROWS2):
@@ -1269,7 +1478,7 @@ PLAYLISTS_SEL = 1
 
 def screen_playlists(sel=PLAYLISTS_SEL):
     sc = Screen()
-    status_strip(sc, "CORE")
+    status_strip(sc)
     header(sc, "Playlists", "%d / %d" % (sel + 1, len(PLAYLISTS)), back=True)
     for r in range(LIST_ROWS):
         if r >= len(PLAYLISTS):
@@ -1302,6 +1511,7 @@ def scroll_window(sel, total, visible):
 def screen_settings(sel=ROOT_SEL):
     sc = Screen()
     header(sc, "Settings", back=True)
+    status_strip(sc)                 # main.c settings_render_cur
     right_vals = {2: "Linen", 4: "Tick"}   # Theme + Clicker carry their choice
     top = scroll_window(sel, len(ROOT_L), LIST_ROWS)
     for vr in range(LIST_ROWS):
@@ -1357,6 +1567,7 @@ DIAG_LOG_LBA = (49238456, 49238464)  # event log header / next-flush LBAs
 def screen_diag():
     sc = Screen()
     header(sc, "Boot Details", back=True)
+    status_strip(sc)                 # main.c settings_render_cur
 
     # headline: label left, total right, on one line
     sc.text(16, 60, "COLD BOOT", FONT_SMALL, MUTED)
@@ -1438,6 +1649,7 @@ def screen_sound(rows=None, sel_row=SOUND_SEL):
     rows = rows if rows is not None else SOUND_ROWS
     sc = Screen()
     header(sc, "Sound", back=True)
+    status_strip(sc)                 # main.c settings_render_cur
     for r, (label, val, num, den) in enumerate(rows):
         ry = LIST_Y0 + r * ROW_H
         sel = (r == sel_row)
@@ -1462,6 +1674,7 @@ CLICK_SEL = 2      # Click
 def screen_clicker():
     sc = Screen()
     header(sc, "Clicker", back=True)
+    status_strip(sc)                 # main.c settings_render_cur
     for r, label in enumerate(CLICK_L):
         ry = LIST_Y0 + r * ROW_H
         sel = (r == CLICK_SEL)
@@ -1488,6 +1701,7 @@ TH_SEL = 1                      # cursor on Onyx
 def screen_theme(sel=TH_SEL, current=TH_CURRENT):
     sc = Screen()
     header(sc, "Theme", "%d themes" % len(THEMES), back=True)
+    status_strip(sc)                 # main.c settings_render_cur
     n = len(THEMES)
     top = scroll_window(sel, n, TH_ROWS)
     for vr in range(TH_ROWS):
@@ -1660,11 +1874,52 @@ def screen_battery_low(kind="disksafe"):
     return sc.img
 
 
-def screen_boot():
+# The boot screen's build stamp is `git describe --always --dirty --abbrev=7`
+# baked in at build time (core/meson.build vcs_tag). The gallery has no build,
+# so it draws a FIXED placeholder — the device shows its own real hash.
+BOOT_BUILD_ID = "d93e97f"
+BOOT_MARK_CY  = 86
+BOOT_BAR_Y    = H - 34
+BOOT_BAR_X    = 60
+BOOT_BAR_W    = W - 120
+
+
+def boot_screen(phase, pct, build=BOOT_BUILD_ID):
+    """main.c boot_screen_render(): the click-wheel mark, "Core", the device
+    line, and along the bottom a 2 px bar with the phase in small caps. pct < 0
+    draws no bar (the pre-mount splash)."""
     sc = Screen(SURFACE)
-    sc.text_centered(120, "Core Player", FONT_TITLE, INK)
-    sc.text_centered(142, "loading", FONT_SUB, MUTED)
+    cx, cy = W // 2, BOOT_MARK_CY
+    sc.fill_disc_aa(cx, cy, 19, INK)        # ring: ink disc ...
+    sc.fill_disc_aa(cx, cy, 17, SURFACE)    # ... with a surface disc
+    sc.fill_disc_aa(cx, cy, 6, INK)         # centre dot
+    sc.fill_disc_aa(cx, cy, 2, SURFACE)     # its hole
+    sc.text_centered(cy + 19 + 30, "Core", FONT_TITLE, INK)
+    sc.text_centered(cy + 19 + 46, "IPOD VIDEO  " + MIDDOT + "  5.5 GEN",
+                     FONT_SMALL, MUTED2)
+    if pct >= 0:
+        pct = min(pct, 100)
+        sc.fill_rect(BOOT_BAR_X, BOOT_BAR_Y, BOOT_BAR_W, 2, TRK)
+        fw = BOOT_BAR_W * pct // 100
+        if fw > 0:
+            sc.fill_rect(BOOT_BAR_X, BOOT_BAR_Y, fw, 2, INK)
+    sc.text_centered(H - 16, phase, FONT_SMALL, MUTED2)
+    sc.text_right(W - 8, H - 4, build, FONT_SMALL, BORDER)
     return sc.img
+
+
+def screen_boot():
+    """Pre-mount: the panel is ours, the disk is still spinning up."""
+    return boot_screen("LOADING", -1)
+
+
+def screen_loading():
+    """Mid library load — the same screen, with the bar and the phase."""
+    return boot_screen("LOADING LIBRARY", 62)
+
+
+def screen_loading_onyx():
+    return with_palette(ONYX, screen_loading)
 
 
 def main():
@@ -1677,6 +1932,7 @@ def main():
     outputs.append(save_png(screen_volume(), "volume.png"))
     outputs.append(save_png(screen_lock(), "lock.png"))
     outputs.append(save_png(screen_locked(), "locked.png"))
+    outputs.append(save_png(screen_locked_list(), "locked_list.png"))
     # --- new: library / browsing ---
     outputs.append(save_png(screen_mainmenu(), "mainmenu.png"))
     outputs.append(save_png(screen_music(), "music.png"))
@@ -1697,6 +1953,8 @@ def main():
     outputs.append(save_png(screen_charging(), "charging.png"))
     outputs.append(save_png(screen_battery_low(), "battery_low.png"))
     outputs.append(save_png(screen_boot(), "boot.png"))
+    outputs.append(save_png(screen_loading(), "loading.png"))
+    outputs.append(save_png(screen_loading_onyx(), "loading_onyx.png"))
     # --- big walkthrough gif (unchanged) ---
     gifs = [build_walkthrough_gif()]
     # --- per-feature gifs ---

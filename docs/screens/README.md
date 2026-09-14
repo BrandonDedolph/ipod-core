@@ -17,6 +17,16 @@ tracking, ascent and line height straight out of `core/ui/atlas/*.h`, and
 refuses any character that is not in the atlas, so a screenshot cannot use
 a glyph the device would draw as a box.
 
+**Kerning comes from the atlas too, as of 2026-09-14**, and the pen is
+rounded once per pair exactly as `core/ui/text.c`'s `pen_step` does: the
+renderer parses each face's `_KERN[]` table out of `core/ui/atlas/<face>.h`
+rather than re-deriving pair kerning from the TTF. Those are different
+numbers — the generator's optical pass overrides the font on every letter
+pair — so until this change the gallery showed spacing the panel has never
+drawn, and an atlas spacing bug could not show up here at all. The SPACE
+advance is read from the atlas as well (glyph 0's `.advance`): the generator
+fits its own space width, and PIL's was 1.2–2.3 px narrower per word gap.
+
 ## The one rule: the firmware is the source of truth
 
 A screenshot here is a claim about what the device draws. So:
@@ -32,17 +42,26 @@ A screenshot here is a claim about what the device draws. So:
     Display/Clicker lists, the theme picker `theme_render`, About
     `settings_about_render`, Boot Details `settings_diag_render`) and the
     row tables in `core/ui/settings.c` (`ROOT_L`, `PLAY_L`, `SOUND_L`,
-    `DISP_L`, `THEME_L`, `CLICK_L`);
+    `DISP_L`, `THEME_L`, `CLICK_L`). Those painters leave the top band clear;
+    `main.c`'s `settings_render_cur` paints the ordinary status strip over it,
+    so Settings carries the same strip as the lists;
   - low-battery screens and the charging screen: `core/ui/screen_battery.c`,
     `core/ui/screen_charging.c`;
   - everything else — status strip, main menu, Music menu, Artists/Albums/
     Songs/Genres/Playlists lists, album detail, Now Playing, the volume
-    plate, the lock plate: `core/kernel/main.c` (`status_strip_render`,
+    plate, the Hold banner: `core/kernel/main.c`
+    (`status_strip_render`,
     `main_menu_render`, `music_menu_render`, `g_main_menu`, `g_music_menu`,
     `albumlist_render`, `detail_render`, `artists_render`, `songs_render`,
     `genres_render`, `playlists_render`, `playlist_render`,
     `nowplaying_render`, `nowplaying_transport_render`,
-    `volume_overlay_render`, `lock_plate_render`).
+    `volume_overlay_render`, `top_banner_render`, `lock_banner_render`,
+    `boot_screen_render`).
+- **The status strip shows the playing track, and nothing when nothing is
+  playing.** `status_strip_render` draws the name or an empty left side — it is
+  a now-playing readout, not a wordmark, so the gallery's idle stills carry only
+  the battery (and the Hold padlock when locked). The main menu's *header* still
+  says `Core`; that is the header, not the strip.
 - **Where the host can build the real renderer, match it pixel for pixel.**
   `core/ui/screen_settings.c`, `screen_battery.c` and `screen_charging.c`
   compile on the host (the test suite does it). A small harness that links
@@ -69,13 +88,13 @@ A screenshot here is a claim about what the device draws. So:
 
 | File | Screen | Drawn by |
 |---|---|---|
-| `boot.png` | boot splash | `screen_boot` |
+| `boot.png` `loading.png` `loading_onyx.png` | boot screen: splash, library load, in Onyx | `screen_boot`, `screen_loading`, `screen_loading_onyx` |
 | `mainmenu.png` `music.png` | main menu, Music menu | `screen_mainmenu`, `screen_music` |
 | `artists.png` `albums.png` `songs.png` `genres.png` `allsongs.png` | library lists | `screen_*` |
 | `playlists.png` | Music → Playlists list | `screen_playlists` |
 | `detail.png` | album detail (tracklist) | `screen_detail` |
 | `nowplaying.png` `volume.png` | Now Playing, volume plate | `screen_nowplaying`, `screen_volume` |
-| `lock.png` `locked.png` | Hold-switch plates | `screen_lock`, `screen_locked` |
+| `lock.png` `locked.png` `locked_list.png` | Hold-switch banners (Now Playing row / list chrome) | `screen_lock`, `screen_locked`, `screen_locked_list` |
 | `settings.png` `sound.png` `clicker.png` `theme.png` | Settings | `screen_settings`, `screen_sound`, `screen_clicker`, `screen_theme` |
 | `about.png` `bootdetails.png` | About dashboard, Boot Details | `screen_about`, `screen_diag` |
 | `nowplaying_onyx.png` `albums_onyx.png` | the Onyx theme | `with_palette(ONYX, …)` |

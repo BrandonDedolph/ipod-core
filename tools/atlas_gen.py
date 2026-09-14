@@ -145,6 +145,27 @@ OPTICAL_MODE = os.environ.get("CORE_OPTICAL_MODE", "area")    # "min" | "area"
 # daylight.band_daylight.
 OPTICAL_FLOOR_PX = int(os.environ.get("CORE_OPTICAL_FLOOR", "1"))
 OPTICAL_FLOOR_ALPHA = int(os.environ.get("CORE_OPTICAL_FLOOR_ALPHA", "64"))
+# Tuck ceiling: how far a pair's BOUNDING BOXES may overlap, in px, beyond
+# what the font's own kerning for that pair already overlaps them.
+#
+# The daylight criterion above is a MEAN over the x-height band, and a mean
+# cannot see a recess. 'F' is the clean case: inside the band its right edge
+# is the recessed stem on most rows and the middle arm on one or two, so the
+# mean is dominated by the open stem rows and the solver keeps pulling the
+# next letter left until the arm row bottoms out on the no-touch floor. The
+# result is a letter tucked under the arm — 'Fa' at regular 12 came out at a
+# 3px pen step against the design's 6, with the boxes overlapping 4px where
+# the font overlaps them 1. Same mechanism wherever one glyph overhangs or
+# recesses in the band: T Y L V K F C W r.
+#
+# The font's own tuck is therefore the ceiling: a pair may overlap its boxes
+# by this much, or by as much as the design already does, whichever is more.
+# That is a cap and not a clamp — it only ever LOOSENS a pair, it touches
+# only the pairs the mean misread (45-166 per face), and every other pair
+# keeps the step the rhythm solve chose. Clamping against the font kern
+# itself instead would move 170-720 pairs per face and undo the solve.
+OPTICAL_MAX_BOX_OVERLAP_PX = int(
+    os.environ.get("CORE_OPTICAL_MAX_BOX_OVERLAP", "1"))
 # SOLVED per atlas by tools/optical_solve.py, not chosen by eye: (area px,
 # word px). Area is the daylight target — coverage-integrated white between
 # the cores, tools/daylight.py — within a quarter pixel of the face's own
@@ -413,7 +434,7 @@ def pair_table(glyphs, glyph_data, band, floor_px=None, floor_alpha=None):
 
 def optical_kern(glyphs, glyph_data, tracking, target_px, band=None,
                  mode=None, area_px=None, floor_px=None, floor_alpha=None,
-                 table=None):
+                 table=None, font_kerns=None):
     """Per-pair corrections that put every letter pair at the SAME ink gap.
 
     The font's own kerning is a design for print at large sizes; at 9-12px on
@@ -443,6 +464,16 @@ def optical_kern(glyphs, glyph_data, tracking, target_px, band=None,
     the no-touch floor (tightest row at floor_alpha ink clears floor_px).
     Row extents are compared row against row throughout — the extreme
     column of a glyph over all its rows is not its edge at any one height.
+    Either way the step is then capped so the pair's bounding boxes never
+    overlap by more than OPTICAL_MAX_BOX_OVERLAP_PX, or by more than the
+    font's own kerning for that pair already overlaps them, whichever is
+    looser: the mean-daylight criterion cannot see that the open rows of an
+    F, T, Y, L, V, K, C, W or r belong to a RECESS, so it tucks the next
+    letter under the arm until the one closed row hits the floor. See
+    OPTICAL_MAX_BOX_OVERLAP_PX. `font_kerns` is kern_pairs()' output — the
+    design's own tuck, and so the ceiling; without it the cap falls back to
+    the flat one-pixel overlap.
+
     `table` is pair_table()'s output if the caller already has it (the
     solver builds it once and sweeps); otherwise it is built here.
     Parameters default to the module settings so atlas_gen.sh and the
@@ -457,8 +488,26 @@ def optical_kern(glyphs, glyph_data, tracking, target_px, band=None,
     idx = {chr(0x20 + i): i for i in range(95)}
     adv_of = {ch: glyphs[idx[ch]][4] for ch in LETTERS}
 
+    fk_px = {}
+    for _l, _r, _adj in (font_kerns or ()):
+        fk_px[(_l, _r)] = _adj / KERN_ONE
+
+    def capped(a, b, step):
+        """The solved step, loosened until the boxes stop overlapping past
+        the design's own tuck. See OPTICAL_MAX_BOX_OVERLAP_PX."""
+        ox_a, _oy_a, w_a = glyphs[idx[a]][:3]
+        a_right, b_left = ox_a + w_a, glyphs[idx[b]][0]
+        # The design's own pen step for the pair, rounded the way the device
+        # pen rounds (half up, core/ui/text.c pen_step) — no tracking: this
+        # is the font's spacing, not ours.
+        fk = fk_px.get((idx[a], idx[b]), 0.0)
+        font_step = math.floor(adv_of[a] / ADV_ONE + fk + 0.5)
+        font_gap = font_step + b_left - a_right      # negative = overlap
+        cap = (a_right - b_left) + min(-OPTICAL_MAX_BOX_OVERLAP_PX, font_gap)
+        return max(step, cap)
+
     def emit(out, a, b, step):
-        adj64 = step * ADV_ONE - adv_of[a] - tracking
+        adj64 = capped(a, b, step) * ADV_ONE - adv_of[a] - tracking
         adj = int(round(adj64 / 2.0))          # 1/64 -> 1/32
         if adj != 0:
             out.append((idx[a], idx[b],
@@ -670,7 +719,7 @@ def render_atlas(ttf_path: str, px_size: int, symbol: str) -> str:
         if OPTICAL_MODE != "area":
             word_px = OPTICAL_WORD_PX
         opt = optical_kern(glyphs, glyph_data, track, OPTICAL_TARGET_PX, band,
-                           area_px=area_px)
+                           area_px=area_px, font_kerns=kerns)
         merged = {(l, r): v for l, r, v in kerns}
         merged.update({(l, r): v for l, r, v in opt})   # optical wins
         kerns = [(l, r, v) for (l, r), v in merged.items() if v != 0]

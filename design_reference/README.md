@@ -94,8 +94,25 @@ Centered transient overlay shown when the user spins the wheel during playback. 
 - Theme picker (with current selection check)
 - 5-band Equalizer (60Hz / 230Hz / 910Hz / 3.6k / 14k, ±12dB)
 
+*Firmware note (2026-09-14):* the jsx Settings screens carry no status strip,
+but the firmware **keeps the strip on every Settings screen** — playing track
+name, battery, Hold padlock — exactly as the lists have it. `screen_settings.c`
+still leaves the top band clear; `main.c`'s `settings_render_cur()` paints the
+strip over it after the painter returns. Crossing from a list into Settings no
+longer drops the battery and the track off the top of the screen.
+
 ### System
 - Boot splash with progress bar
+
+> *Firmware note (2026-09-14):* implemented **stacked** — the click-wheel mark,
+> "Core", the device line, and a 2 px hairline bar along the bottom with the
+> phase in small caps under it (`boot_screen_render` in `core/kernel/main.c`);
+> see `docs/screens/boot.png` and `docs/screens/loading.png`. It is one painter
+> for the whole boot: the pre-mount splash is the same screen with no bar. The
+> first paint is the default palette (the saved theme lives on the disk being
+> spun up); the settings are read before the library load, so the bar and
+> everything after it are in the user's theme — `docs/screens/loading_onyx.png`.
+
 - Shutdown / sleep
 - File browser (raw filesystem)
 
@@ -103,6 +120,13 @@ Centered transient overlay shown when the user spins the wheel during playback. 
 - Charging — full-screen battery, big %, time-to-full estimate (charging vs unplugged variants)
 - Locked — dim Now Playing context + centered black plate ("LOCKED") — flashes ~1s then dismisses; persistent small lock indicator stays in status bar near battery
 - Unlocked — light plate ("UNLOCKED") — flashes ~1s then dismisses; corner lock disappears
+
+> Firmware note: the centred plate is intent, not what ships. The firmware
+> announces a Hold edge by inverting the TOP CHROME for ~1 s instead — an ink
+> band with a closed padlock and "Locked", a surface band with the popped-open
+> padlock and "Unlocked" — so the title and the art stay uncovered. The
+> persistent strip padlock is unchanged. See `docs/screens/locked.png`,
+> `docs/screens/lock.png` and `docs/screens/locked_list.png`.
 
 ---
 
@@ -121,7 +145,7 @@ The interactive prototype treats navigation as a stack of frames:
 - **Wheel rotation:**
   - On Now Playing → volume (briefly shows overlay)
   - On lists → moves selection
-- **Hold switch (top of device):** toggles a global lock. While locked, all wheel input is blocked and shows a 1s "LOCKED" plate. Status bars across all screens render a small lock glyph next to the battery.
+- **Hold switch (top of device):** toggles a global lock. While locked, all wheel input is blocked and shows a 1s "LOCKED" plate (the firmware ships this as a top-chrome banner rather than a centred plate — `docs/screens/locked.png`). Status bars across all screens render a small lock glyph next to the battery.
 
 Lists scroll automatically so the selection stays visible (~1/3 from the top of the viewport).
 
