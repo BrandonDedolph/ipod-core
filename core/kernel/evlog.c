@@ -302,6 +302,14 @@ int evlog_probe_lba(uint32_t seq, uint32_t *lba)
     return seq_lba(seq, lba);
 }
 
+int evlog_probe_header_lba(uint32_t *lba)
+{
+    if (lba == 0) {
+        return -1;
+    }
+    return block_lba(0, lba);
+}
+
 /* ---- mount ------------------------------------------------------------- */
 
 /* Weak, as in config.c: the host test links this file with no timer and
@@ -590,8 +598,11 @@ int evlog_flush(int mode, const cfg_commit_env_t *env_in)
     cfg_commit_env_t env = *env_in;
     env.writable = 1;                   /* this module's own writability */
     int gate = cfg_commit_gate(&g_ev.commit, mode, &env);
-    if (gate == CFG_GATE_DEFER_LOG || gate == CFG_GATE_DEFER_QUIET) {
+    if (gate == CFG_GATE_DEFER_LOG) {
         return EVLOG_FLUSH_DEFERRED;
+    }
+    if (gate == CFG_GATE_DEFER_QUIET) {
+        return EVLOG_FLUSH_DEFERRED_QUIET;
     }
     if (gate != CFG_GATE_WRITE && gate != CFG_GATE_WRITE_WAKE) {
         return EVLOG_FLUSH_NONE;

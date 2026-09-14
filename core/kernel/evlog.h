@@ -166,7 +166,10 @@ uint32_t evlog_failures(void);
 enum {
     EVLOG_FLUSH_NONE = 0,     /* nothing to do, not yet, or the log is OFF   */
     EVLOG_FLUSH_WROTE,        /* one block is on the platter                 */
-    EVLOG_FLUSH_DEFERRED,     /* refused by the battery gate (stays pending) */
+    EVLOG_FLUSH_DEFERRED,     /* refused by the battery gate (stays pending):
+                               * the FIRST refusal of this episode — worth a
+                               * UART line                                   */
+    EVLOG_FLUSH_DEFERRED_QUIET, /* refused again, already reported           */
     EVLOG_FLUSH_FAILED,       /* the resolve or the write failed; see
                                * evlog_last_rc(); the bytes stay pending     */
 };
@@ -193,6 +196,10 @@ int evlog_flush(int mode, const cfg_commit_env_t *env);
  * check them against tools/make_log.py --verify before any flush.
  */
 int evlog_probe_lba(uint32_t seq, uint32_t *lba);
+
+/* The same for block 0, the header — the address tools/make_log.py --verify
+ * prints first. Read-only; the device never writes it. */
+int evlog_probe_header_lba(uint32_t *lba);
 
 /* ---- format codec, exposed for the host tests --------------------------- */
 

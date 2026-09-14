@@ -267,7 +267,7 @@ void settings_render(int screen, const settings_t *s, int sel)
     if (screen == SETTINGS_ABOUT) {
         /* main.c should call settings_about_render() with live values; this
          * placeholder path keeps settings_render total over every screen. */
-        settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0);
+        settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, ABOUT_LOG_OFF);
         return;
     }
 
@@ -338,7 +338,8 @@ static void su_append(char *d, const char *w)
  * (used vs free), and a device footer, instead of a plain key/value list. */
 void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
-                           int n_songs, int n_albums, int n_artists)
+                           int n_songs, int n_albums, int n_artists,
+                           uint32_t log_seq, int log_state)
 {
     console_clear(S_SURFACE);
     ui_header("About", "", 1);
@@ -369,6 +370,25 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
         int chw = cw + 16, chx = LCD_WIDTH - 16 - chw, chy = 140;
         ui_round_rect(chx, chy, chw, 15, 7, S_ACCENT);
         st_text(chx + 8, 151, "Core", F_SUB, S_SURFACE);
+    }
+    /*
+     * The event log, next to the firmware label the way the millivolts sit
+     * next to the battery: a diagnostic sharing a row, not a design element.
+     * "LOG off" is the one that matters — it says CORELOG.BIN is missing or
+     * did not validate, so a report of "it died in the night" will come
+     * with no log. The number is the next block's sequence: it climbing
+     * across sessions is how you know flushes are landing.
+     */
+    {
+        if (log_state == ABOUT_LOG_OFF) {
+            su_copy(v, "LOG off");
+        } else {
+            su_copy(v, "LOG ");
+            su_to_str(v + 4, (unsigned)log_seq);
+            su_append(v, log_state == ABOUT_LOG_ERR ? " err" : " on");
+        }
+        st_text(16 + text_width("FIRMWARE", F_SMALL) + 8, 150, v,
+                F_SMALL, S_MUTED_D);
     }
 
     /* --- storage bar (used = accent fill on a faint track) --- */

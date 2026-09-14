@@ -253,13 +253,21 @@ int settings_adjust(int screen, settings_t *s, int idx, int delta);
  */
 void settings_render(int screen, const settings_t *s, int sel);
 
+/* The on-disk event log's state, for the About screen's "LOG" line. */
+#define ABOUT_LOG_OFF 0     /* no CORELOG.BIN, or it did not validate       */
+#define ABOUT_LOG_ON  1     /* writing; log_seq is the next block's number  */
+#define ABOUT_LOG_ERR 2     /* turned itself off after failed writes        */
+
 /*
  * Render the About screen from live values (main.c owns these — do not
  * fabricate). free/total are whole megabytes; pct<0 or mv<=0 render as "--".
+ * log_seq / log_state describe the event log (kernel/evlog.c): the line
+ * reads "LOG <seq> on", "LOG off" or "LOG <seq> err".
  */
 void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
-                           int n_songs, int n_albums, int n_artists);
+                           int n_songs, int n_albums, int n_artists,
+                           uint32_t log_seq, int log_state);
 
 /*
  * Render the Boot Details screen (SETTINGS_DIAG). All times are milliseconds

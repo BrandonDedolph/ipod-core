@@ -446,8 +446,9 @@ static void test_mount(void)
 
     /* Addresses: the test's own chain formula vs the module's resolver. */
     uint32_t lba = 0;
-    check("probe: block 0 (seq n/a) -> cluster 3 = LBA 76",
-          evlog_probe_lba(0, &lba) == 0 && lba == block_lba_expected(1) && lba == 64 + 5 * 4);
+    check("probe: header block 0 -> cluster 3 = LBA 76",
+          evlog_probe_header_lba(&lba) == 0 && lba == block_lba_expected(0) && lba == 64 + 3 * 4);
+    check("probe: header probe null out refused", evlog_probe_header_lba(0) != 0);
     check("probe: seq 0 -> block 1 = cluster 5 (LBA 84)",
           evlog_probe_lba(0, &lba) == 0 && lba == 84);
     check("probe: seq 1 -> block 2 = cluster 4 (LBA 80), the chain goes BACKWARDS",
@@ -466,7 +467,8 @@ static void test_mount(void)
     build_image(6, CHAIN6, 0, 0, 0);
     mount_fs();
     check("mount: absent -> OFF", evlog_mount(&g_fs, mem_write, mem_wake) == 0 && !evlog_enabled());
-    check("mount: absent -> probe refuses", evlog_probe_lba(0, &lba) != 0 && lba == 0);
+    check("mount: absent -> probe refuses", evlog_probe_lba(0, &lba) != 0 && lba == 0 &&
+                                           evlog_probe_header_lba(&lba) != 0 && lba == 0);
 
     /* Header magic wrong. */
     reset_io();
@@ -639,10 +641,10 @@ static void test_flush_policy(void)
     e = env_at(40000000 + CFG_SAVE_DEBOUNCE_US, 0, 0);
     check("policy: idle below disk-safe -> DEFERRED (logged once)",
           evlog_flush(CFG_COMMIT_IDLE, &e) == EVLOG_FLUSH_DEFERRED && g_writes == 5);
-    check("policy: idle below disk-safe again -> DEFERRED (quiet)",
-          evlog_flush(CFG_COMMIT_IDLE, &e) == EVLOG_FLUSH_DEFERRED && g_writes == 5);
-    check("policy: forced below disk-safe -> DEFERRED",
-          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_DEFERRED && g_writes == 5);
+    check("policy: idle below disk-safe again -> DEFERRED_QUIET",
+          evlog_flush(CFG_COMMIT_IDLE, &e) == EVLOG_FLUSH_DEFERRED_QUIET && g_writes == 5);
+    check("policy: forced below disk-safe -> DEFERRED_QUIET (same episode)",
+          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_DEFERRED_QUIET && g_writes == 5);
     check("policy: LAST below disk-safe -> WROTE (the exempt flush)",
           evlog_flush(CFG_COMMIT_LAST, &e) == EVLOG_FLUSH_WROTE && g_writes == 6);
     check("policy: the last write's block is FINAL",
