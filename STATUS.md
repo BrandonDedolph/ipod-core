@@ -256,6 +256,30 @@ C:\Users\<you>\CORELOG.BIN` (Windows-native; a drvfs read can serve a stale
 copy) → `python3 tools/make_log.py --dump /mnt/c/Users/<you>/CORELOG.BIN`
 (`--blocks` for the per-block headers).
 
+### 2026-09-13, night — stutter solved, About redesigned, both confirmed on the device
+
+The event log paid for itself on its first pull: all 12 "audio underrun"
+counts came at one moment, playback start, coincident with "lcd: BCM
+idle-wait timed out" and a 20 ms present gap — a partial present handed to
+the BCM while it was still retiring the previous full frame stalled the main
+loop past the PCM ring. One more timeout after every "suspend: wake" was the
+resume stutter. Fix (1a7067b): only FULL presents set `g_present_cost_us`,
+the transport partial is paced by `present_gap_us()` since `last_present`,
+and `last_present` is re-stamped after `suspend_to_ram` returns.
+`EVLOG_RING_BYTES` 8 → 16 KiB (the log was dropping bytes at boot).
+
+About (bcb7bca) is now a dashboard: name + Core chip on one row, the three
+stat columns, STORAGE and BATTERY on side-by-side `PAL_PLATE` cards each
+with a big value, its own gauge and a caption ("53.5 of 74.5 GB", "3912
+mV"), and one muted footer "ADC n · LOG n on". The "library too large"
+warning is drawn by the renderer (`lib_truncated` argument), not painted
+over from main.c. Rendered on the host for every theme before flashing.
+
+**Device verdicts (owner, all three):** About layout good; play from a cold
+boot → Boot Details underruns 0; short-hold suspend → wake → resume with no
+stutter, underruns still 0. 58 suites green, ARM `-Werror` + `verify-hw`
+clean, readback-verified flash.
+
 ## Where we are right now (2026-07-28)
 
 **A full music player on real hardware, and it is now the device's own
