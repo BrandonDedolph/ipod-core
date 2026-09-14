@@ -31,4 +31,10 @@ void piezo_click(void);
  * for the selectable clicker sound profiles. */
 void piezo_click_ex(uint32_t hz, uint32_t us);
 
+/* Suspend-to-RAM: gate the PWM clock off (DEV_EN DEV_PWM) / restore it. The
+ * restore only re-sets a bit the suspend found set, and a click issued while
+ * gated restores it itself first. Both are no-ops on the sim. */
+void piezo_clock_suspend(void);
+void piezo_clock_resume(void);
+
 #endif /* CORE_HAL_HW_PIEZO_H */

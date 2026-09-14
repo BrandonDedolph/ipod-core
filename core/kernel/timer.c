@@ -58,17 +58,42 @@ static volatile uint32_t g_tick;
 static uint32_t g_last_us;      /* USEC_TIMER value at the last reconcile */
 static int      g_have_us;      /* g_last_us seeded yet? */
 
-void timer_init(void)
+/*
+ * (Re)arm TIMER1 at `hz` interrupts per second. The same four documented
+ * accesses whether it is the boot arm or a rate change: the disarm and the
+ * TIMER1_VAL read clear whatever the previous period left latched, so a
+ * change never delivers a stale IRQ at the old rate.
+ *
+ * THE TICK UNIT DOES NOT CHANGE WITH THE RATE. g_tick stays in HZ (10 ms)
+ * units because the ISR reconciles against USEC_TIMER (above): at 10 Hz
+ * each interrupt finds ~100 ms elapsed and advances the counter by ten.
+ * current_tick() and sleep_ms() therefore keep their meaning at any rate,
+ * only their granularity coarsens. What DOES change with the rate is how
+ * often the ISR's per-interrupt work runs — clickwheel_service samples the
+ * wheel once per interrupt, so at 10 Hz a press shorter than ~100 ms can
+ * fall between samples. That is the trade the suspend loop makes on
+ * purpose (kernel/main.c suspend_to_ram): it wants ten wakeups a second
+ * instead of a hundred, and "hold any button" is the wake gesture.
+ */
+void timer_set_rate(uint32_t hz)
 {
+    if (hz == 0u || hz > TIMER_FREQ) {
+        hz = HZ;
+    }
     /* 1. Disarm: clear any stale enable/reload. */
     mmio_write32(TIMER1_CFG_ADDR, 0);
     /* 2. Clear a pending IRQ latched from a prior arm. */
     (void)mmio_read32(TIMER1_VAL_ADDR);
-    /* 3. Arm periodic: enable + IRQ/reload + (TIMER_FREQ/HZ)-1 us period. */
+    /* 3. Arm periodic: enable + IRQ/reload + (TIMER_FREQ/hz)-1 us period. */
     mmio_write32(TIMER1_CFG_ADDR,
-                 TIMER_CFG_ENABLE | TIMER_CFG_IRQEN | ((TIMER_FREQ / HZ) - 1u));
+                 TIMER_CFG_ENABLE | TIMER_CFG_IRQEN | ((TIMER_FREQ / hz) - 1u));
     /* 4. Unmask TIMER1_IRQ (#0) in the CPU interrupt-enable register. */
     mmio_write32(CPU_INT_EN_ADDR, 1u << TIMER1_IRQ);
+}
+
+void timer_init(void)
+{
+    timer_set_rate(HZ);
 }
 
 void timer_tick_isr(void)
@@ -78,14 +103,15 @@ void timer_tick_isr(void)
      * rather than in timer_init so the arm sequence stays exactly the four
      * documented accesses. */
     uint32_t now = mmio_read32(USEC_TIMER_ADDR);
+    uint32_t ticks;
     if (!g_have_us) {
         g_have_us = 1;
         g_last_us = now;
-        g_tick++;
+        ticks = 1;
     } else {
         uint32_t elapsed = now - g_last_us;      /* wrap-safe */
         if (elapsed >= TICK_PERIOD_US) {
-            uint32_t ticks = elapsed / TICK_PERIOD_US;
+            ticks = elapsed / TICK_PERIOD_US;
             if (ticks > TICK_MAX_CATCHUP) {
                 ticks = TICK_MAX_CATCHUP;
                 g_last_us = now;                 /* reference was stale: resync */
@@ -93,15 +119,15 @@ void timer_tick_isr(void)
                 /* Keep the remainder so the tick clock does not drift. */
                 g_last_us += ticks * TICK_PERIOD_US;
             }
-            g_tick += ticks;
         } else {
             /* The IRQ fired slightly early against the microsecond counter
              * (jitter, or a counter that does not advance at all — the host
              * mock). It is still a real tick: count it and resync. */
-            g_tick++;
+            ticks = 1;
             g_last_us = now;
         }
     }
+    g_tick += ticks;
     (void)mmio_read32(TIMER1_VAL_ADDR);   /* ack: clears the pending IRQ */
 
     /* Sample the click wheel every tick (10 ms). Running this from the tick
@@ -115,9 +141,18 @@ void timer_tick_isr(void)
     /* Backlight screen-off power policy (drop the charge pump once the panel
      * has been dark for a few seconds). At most one bus write per call.
      * Declared weak so the host timer test — which links kernel/timer.c
-     * without the hal/hw backlight driver — still resolves. */
+     * without the hal/hw backlight driver — still resolves.
+     *
+     * Called once per RECONCILED tick, not once per interrupt: it counts
+     * calls as 10 ms (BL_OFF_GRACE_TICKS, backlight.c), so at the suspend
+     * loop's 10 Hz rate a single call per interrupt would stretch its ~3 s
+     * grace to ~30 s of charge pump — and a repaint that masked IRQs for
+     * 50 ms used to cost it 40 ms of grace too. Cheap: it is a counter
+     * compare until the one write, and returns at once after it. */
     if (backlight_service) {
-        backlight_service();
+        for (uint32_t i = 0; i < ticks; i++) {
+            backlight_service();
+        }
     }
 }
 

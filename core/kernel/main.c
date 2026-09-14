@@ -638,6 +638,8 @@ static int      g_bat_mv  = -1;
 static int      g_bat_pct = -1;
 static int      g_bat_ext = 0;               /* external power present            */
 static uint32_t g_bat_last_us;
+/* Battery sample cadence (battery_refresh / battery_due). */
+#define BATTERY_SAMPLE_US  5000000u
 static int      g_bat_raw = -1;              /* 10-bit ADC code, for calibration  */
 static int      g_bat_mv_raw = -1;           /* mV before the plausibility clamp  */
 static int      g_bat_mv_filt = -1;          /* median of recent samples (policy) */
@@ -680,11 +682,19 @@ static void uart_dec(int v)
  * About screen. g_free_mb == 0xFFFFFFFF means the FSInfo free count was absent. */
 static uint32_t g_total_mb, g_free_mb = 0xFFFFFFFFu;
 
+/* Would battery_refresh(0) sample now? The suspend loop asks first so it can
+ * bring the clocks back before the sample rather than after finding out. */
+static int battery_due(void)
+{
+    return (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - g_bat_last_us)
+           >= BATTERY_SAMPLE_US;
+}
+
 /* Returns 1 if it actually resampled this call (so a live screen can repaint). */
 static int battery_refresh(int force)
 {
     uint32_t now = mmio_read32(USEC_TIMER_ADDR);
-    if (!force && (uint32_t)(now - g_bat_last_us) < 5000000u) {
+    if (!force && (uint32_t)(now - g_bat_last_us) < BATTERY_SAMPLE_US) {
         return 0;
     }
     g_bat_last_us = now;
@@ -4600,8 +4610,19 @@ static void paint_current_screen(void)
  * On the device this path has never been seen to fire; it is the I2C-wedged
  * case, and the recovery sequence is UNVERIFIED on hardware.
  */
+static void suspend_lowpower_leave(void);
+
 static int enter_standby(void)
 {
+    /* If a suspend brought us here (its hold-escalation, its 30-minute
+     * escalation, or the SHUTOFF edge inside its battery sample), the PLL
+     * is parked, the tick is at 10 Hz and SER0/PWM/I2C are gated. Every
+     * step below — the codec's I2C writes, the settings write on a boosted
+     * ATA transfer, the BCM frame, and the PMU's own I2C command — was
+     * calibrated at the PLL operating points, so come back first. No-op
+     * from the main loop. */
+    suspend_lowpower_leave();
+
     /* BEFORE player_stop(): once the transport is torn down there is no track
      * name and no elapsed clock left to record. */
     resume_capture();
@@ -4645,11 +4666,14 @@ static int enter_standby(void)
  *   audio     paused; the codec powers itself down through player_pump()'s
  *             persistent-pause timeout, which the idle loop keeps calling;
  *   settings  written now (forced), with the resume position;
- *   clock     boost released, so the core idles at 30 MHz between ticks;
  *   drive     ata_sleep(): cache flushed, heads parked, platters down, then
  *             SLEEP so the interface logic is off too — a reset wakes it;
  *   panel     black frame, backlight off, then LCD_SLEEP (SUSPEND_PANEL_SLEEP;
- *             the BCM stays powered so no firmware re-upload on wake).
+ *             the BCM stays powered so no firmware re-upload on wake);
+ *   SoC       boost released, then suspend_lowpower_enter(): SER0, PWM0 and
+ *             I2C clocks gated in DEV_EN (each re-gates itself on use),
+ *             TIMER1 at 10 Hz, and the PLL disabled and unpowered with the
+ *             bus on the 24 MHz crystal (kernel/clock.c clock_suspend).
  *
  * While suspended the loop samples the battery on the main loop's 5 s
  * cadence and runs the same DISKSAFE / SHUTOFF policy, so a forgotten device
@@ -4664,11 +4688,15 @@ static int enter_standby(void)
  * be empty. A refused PMU standby from any of the escalations falls through
  * this same wake path with the player stopped and nothing to resume.
  *
- * What still draws: the CPU, RAM, PLL and the 100 Hz tick (the wake is what
- * they buy), and the BCM. That is why the escalation exists. NOT MEASURED on
- * the device: the suspend draw before or after this, whether the panel
- * comes back from LCD_SLEEP (SUSPEND_PANEL_SLEEP has the rollback), and the
- * drive's post-SLEEP reset wake — all first-flash items.
+ * What still draws: the CPU at 24 MHz and the SDRAM (the wake is what they
+ * buy — the doc's 32 kHz point is for a core that has stopped), the OPTO
+ * block (the wake source), the BCM, and whatever the ROM's undocumented
+ * DEV_EN bits (USB/FireWire/IDE) keep clocked. That is why the escalation
+ * exists. NOT MEASURED on the device: the suspend draw before or after any
+ * of this, whether the panel comes back from LCD_SLEEP
+ * (SUSPEND_PANEL_SLEEP has the rollback), the drive's post-SLEEP reset
+ * wake, and whether the I2C controller and the wheel come back cleanly
+ * from a gate / a crystal-clocked spell — all first-flash items.
  */
 /*
  * Put the LCD PANEL to sleep for the suspend, not just the backlight.
@@ -4709,12 +4737,64 @@ static int enter_standby(void)
 #define SUSPEND_TO_STANDBY_US  (30u * 60u * 1000000u)     /* 30 minutes */
 #endif
 
-/* Idle-loop period while suspended. Nothing in the loop needs to be
- * prompt: the 100 Hz tick samples the wheel into the latch regardless, so a
- * press is seen within one period, and the battery sample is on its own
- * 5 s cadence. Longer periods mean fewer wakeups of a core that is
- * otherwise halted (cpu_wait_ms). */
+/* Idle-loop period while suspended, and the tick rate the loop runs under.
+ * Nothing in the loop needs to be prompt: the tick samples the wheel into
+ * the latch regardless, so a press is seen within one tick period, and the
+ * battery sample is on its own 5 s cadence. The loop period matches the
+ * tick period, so a suspended core wakes ~20 times a second at most (once
+ * for the tick, once for the countdown) instead of ~110; a press shorter
+ * than one tick period can fall between samples, which is why "hold any
+ * button" is the wake gesture. */
 #define SUSPEND_IDLE_MS        100u
+#define SUSPEND_TICK_HZ        10u
+
+/*
+ * The suspend operating point, entered once the drive, panel and backlight
+ * are down (kernel/clock.c, kernel/timer.c):
+ *
+ *   clock_gate_suspend   DEV_EN: SER0, PWM0 and I2C clocks off — each block
+ *                        re-gates itself on its next use, so a UART line,
+ *                        an I2C transaction or a click still works;
+ *   timer_set_rate(10)   TIMER1 at 10 Hz (the tick counter keeps its 10 ms
+ *                        unit; only the wheel sampling coarsens);
+ *   clock_suspend        bus onto the 24 MHz crystal, PLL disabled and
+ *                        unpowered. Refused (logged) if a boost is still
+ *                        held — nothing in this file should be holding one
+ *                        by then.
+ *
+ * In that order, so the core clock is the last thing to move. Left in the
+ * reverse order. Both are idempotent through g_suspend_lp so the battery
+ * sample, the escalations and the wake path can each call them without
+ * caring who went first — and so timer_set_rate is not re-issued on every
+ * loop pass, which at a 100 ms period would restart the countdown before
+ * it ever fired.
+ */
+static int g_suspend_lp;
+
+static void suspend_lowpower_enter(void)
+{
+    if (g_suspend_lp) {
+        return;
+    }
+    g_suspend_lp = 1;
+    clock_gate_suspend();
+    timer_set_rate(SUSPEND_TICK_HZ);
+    if (clock_suspend() != 0) {
+        /* The UART re-gates itself for this line. */
+        uart_puts("core: suspend: PLL park refused (boost held or DMA live)\n");
+    }
+}
+
+static void suspend_lowpower_leave(void)
+{
+    if (!g_suspend_lp) {
+        return;
+    }
+    g_suspend_lp = 0;
+    clock_resume();
+    timer_set_rate(HZ);
+    clock_gate_resume();
+}
 
 static void suspend_to_ram(uint32_t play_down_us)
 {
@@ -4747,6 +4827,7 @@ static void suspend_to_ram(uint32_t play_down_us)
     lcd_sleep();                          /* panel driver off; drains the black
                                            * frame first, then LCD_SLEEP     */
 #endif
+    suspend_lowpower_enter();             /* gates, 10 Hz tick, PLL parked */
 
     /* Wait for the trigger PLAY hold to release (so it can't instantly wake us).
      * Held past ~5s total => a real power-down instead. If the PMU refuses
@@ -4779,13 +4860,19 @@ static void suspend_to_ram(uint32_t play_down_us)
     }
     while (clickwheel_get_event(&drain)) { }   /* drop the trigger's latched events */
 
-    /* Low-power idle until any button is pressed. The 100 Hz tick keeps sampling
-     * the wheel into the latch through each cpu_wait, so a press is seen fast. */
-    while (!standby_refused && clickwheel_buttons() == 0) {
+    /* Low-power idle until any button is pressed. The (now 10 Hz) tick keeps
+     * sampling the wheel into the latch through each cpu_wait. A press is
+     * seen two ways: the live held-button state below, and any button
+     * DOWN-EDGE the drain hands back — at 10 Hz a press can start and end
+     * between two of the loop's own looks at the live state, but the tick
+     * sampler latched its edge, and dropping that on the floor would be a
+     * wake the user made and the device ignored. */
+    int pressed = 0;
+    while (!standby_refused && !pressed && clickwheel_buttons() == 0) {
         /*
          * DRAINING HERE IS WHAT MAKES THE DEVICE WAKE AT ALL.
          *
-         * clickwheel_buttons() returns a CACHED value that only the 100 Hz tick
+         * clickwheel_buttons() returns a CACHED value that only the tick
          * sampler refreshes. When the Hold switch goes off, the sampler gates
          * the OPTO block's clock back on but deliberately defers the reset/
          * config sequence out of ISR context by setting s_need_bringup — and
@@ -4800,8 +4887,16 @@ static void suspend_to_ram(uint32_t play_down_us)
          *
          * Draining does not clear the cached state, so the loop condition is
          * unaffected — it only lets the deferred bring-up actually run.
+         * (A Hold edge is an event with no buttons: not a wake.)
          */
-        while (clickwheel_get_event(&drain)) { }
+        while (clickwheel_get_event(&drain)) {
+            if (drain.buttons != 0) {
+                pressed = 1;
+            }
+        }
+        if (pressed) {
+            break;                /* wake now, not after another 100 ms halt */
+        }
         /*
          * Pump while suspended, so the codec actually powers down.
          *
@@ -4830,8 +4925,18 @@ static void suspend_to_ram(uint32_t play_down_us)
          * enter_standby(). If the PMU refuses THAT, enter_standby has already
          * stopped the player and relit the screen: leave the loop the way a
          * refused hold-escalation does, and do not resume.
+         *
+         * The sample runs at the normal operating point: the clocks come
+         * back for it and are parked again after. The gated blocks would
+         * re-gate themselves, but the sample's consequences — a DISKSAFE
+         * settings write on a boosted ATA transfer, a SHUTOFF power-off
+         * through enter_standby — are paths calibrated at the PLL clocks,
+         * and the log line goes out on the boot-tested UART setup. Two PLL
+         * relocks per 5 s is a few hundred microseconds of duty.
          */
-        if (battery_refresh(0)) {
+        if (battery_due()) {
+            suspend_lowpower_leave();
+            (void)battery_refresh(0);
             if (g_standby_refused) {
                 standby_refused = 1;
                 was_playing     = 0;
@@ -4840,6 +4945,7 @@ static void suspend_to_ram(uint32_t play_down_us)
             if (!ata_is_slept()) {
                 ata_sleep();        /* the handler re-parks with STANDBY only */
             }
+            suspend_lowpower_enter();
         }
 
         /* Keep the jack debouncer fed (a GPIO read), so the answer it gives
@@ -4868,6 +4974,13 @@ static void suspend_to_ram(uint32_t play_down_us)
         cpu_wait_ms(20);
     }
     while (clickwheel_get_event(&drain)) { }
+
+    /* Back to the normal operating point FIRST — PLL at 30 MHz, 100 Hz tick,
+     * SER0/PWM/I2C clocks restored — so the boost below is an ordinary
+     * 30 -> 80 MHz switch and everything after it runs on the clocks it
+     * was calibrated at. No-op if a refused standby already brought us
+     * back, or if the park was never entered. */
+    suspend_lowpower_leave();
 
     /* Re-boost BEFORE the drive and the repaint: cpu_boost/cpu_unboost are
      * refcounted, so this pairs with the unboost on the way in and keeps the

@@ -356,16 +356,42 @@ if target == 'sim'
   # hw-clock: the PLL/clock-boost driver's register grammar (arm CFG +
   # lock poll + timing), the bounded lock-spin (clicky never sets the PLL
   # lock bit), and the boost refcount edges — host-side under -DMMIO_MOCK.
+  # clock.c now also orchestrates the suspend-time DEV_EN gating through
+  # the owning drivers (uart/piezo/i2c), so they link in; none of them
+  # emits bus traffic unless a gate function is called.
   clock_test = executable(
     'clock_test',
     sources: ['hw_clock/clock_test.c',
               '../kernel/clock.c',
+              '../hal/hw/uart.c',
+              '../hal/hw/piezo.c',
+              '../hal/hw/i2c.c',
               'hw_mmio/mmio_mock.c'],
     include_directories: include_directories('../hal', '../hal/hw', '../kernel', 'hw_mmio'),
     c_args: ['-DMMIO_MOCK'],
     override_options: test_opts,
   )
   test('hw-clock', clock_test, suite: 'unit')
+
+  # hw-clock-gate: the suspend-time DEV_EN hygiene — clock_gate_suspend
+  # clears exactly SER0/PWM/I2C (one masked RMW each, DEV_OPTO and the
+  # ROM's bits untouched), resume restores only what was on, and each
+  # driver re-gates itself on its next use so nothing can spin against an
+  # unclocked block. The i2c/uart golden traces elsewhere never suspend
+  # and are unchanged by this.
+  gate_test = executable(
+    'gate_test',
+    sources: ['hw_clock/gate_test.c',
+              '../kernel/clock.c',
+              '../hal/hw/uart.c',
+              '../hal/hw/piezo.c',
+              '../hal/hw/i2c.c',
+              'hw_mmio/mmio_mock.c'],
+    include_directories: include_directories('../hal', '../hal/hw', '../kernel', 'hw_mmio'),
+    c_args: ['-DMMIO_MOCK'],
+    override_options: test_opts,
+  )
+  test('hw-clock-gate', gate_test, suite: 'unit')
 
   # hw-audio: the first-sound driver chain (I2C controller -> WM8758
   # codec -> I2S serializer), host-side under -DMMIO_MOCK. The only

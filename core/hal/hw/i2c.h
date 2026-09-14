@@ -41,4 +41,14 @@ int i2c_send(uint8_t dev, const uint8_t *bytes, int len);
  */
 int i2c_read(uint8_t dev, uint8_t reg, uint8_t *buf, int n);
 
+/*
+ * Suspend-to-RAM: gate the controller clock off (DEV_EN DEV_I2C) / restore
+ * it. The restore only re-sets a bit the suspend found set. Self-restoring:
+ * any i2c_send / i2c_read / i2c_init issued while gated re-gates first, so
+ * the codec power-down, the 5 s battery sample and the PMU standby command
+ * all work from inside a suspend without the caller having to know.
+ */
+void i2c_clock_suspend(void);
+void i2c_clock_resume(void);
+
 #endif /* CORE_HAL_HW_I2C_H */

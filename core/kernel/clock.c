@@ -28,6 +28,9 @@
 #include "clock.h"
 #include "hw/pp5022.h"
 #include "hw/mmio.h"
+#include "hw/uart.h"
+#include "hw/piezo.h"
+#include "hw/i2c.h"
 
 /*
  * Upper bound on the PLL-lock poll so a dead PLL — or the clicky
@@ -54,6 +57,9 @@
 static uint32_t g_freq = CPUFREQ_DEFAULT;
 /* Boost refcount: >0 means at least one outstanding cpu_boost(). */
 static int g_boost;
+/* Set by clock_suspend(): the PLL is off and unpowered and the core runs on
+ * the 24 MHz crystal. Cleared by any full switch (set_cpu_frequency). */
+static int g_suspended;
 
 /*
  * Set while the audio DMA is streaming PCM out of SDRAM (hal/hw/audio.c calls
@@ -127,6 +133,11 @@ static void set_cpu_frequency(uint32_t pll_value, uint32_t operating_timing,
     }
     g_pending = 0;
 
+    /* Any full switch powers and re-enables the PLL below, so whatever
+     * clock_suspend() parked is undone from here on — whether this is a
+     * clock_resume() or a cpu_boost() issued while suspended. */
+    g_suspended = 0;
+
     /* 1. Power up the PLL (preserve the other DEV_INIT2 bits). */
     mmio_write32(DEV_INIT2_ADDR,
                  mmio_read32(DEV_INIT2_ADDR) | DEV_INIT2_PLL_POWER);
@@ -187,6 +198,123 @@ uint32_t cpu_frequency(void)
     return g_freq;
 }
 
+/*
+ * Park the clock tree for suspend-to-RAM: bus onto the 24 MHz crystal, slow
+ * timing, PLL disabled, PLL unpowered (01-soc-pp5022.md, "Clock tree" ->
+ * "For sleep", and the driver note "clock_suspend"). What this buys is the
+ * PLL's own draw plus 24 vs 30 MHz on the core; the doc gives no figure for
+ * either and none has been measured on the device.
+ *
+ * WHY THE 24 MHz CRYSTAL AND NOT THE 32 kHz OSCILLATOR. The doc's sleep
+ * point (CPUFREQ_SLEEP, CLOCK_SOURCE = 0x20000000) is the operating point
+ * for "suspend both cores via PROC_SLEEP and let the PMU finish it" — a core
+ * that is not executing. Ours keeps executing: the suspend loop in
+ * kernel/main.c services the wheel from the tick ISR, samples the battery
+ * over I2C, and prints a UART line every 5 s, and at 32 768 Hz the ISR
+ * entry alone would be a good fraction of a 10 Hz tick period. The doc also
+ * says nothing about which peripheral clocks (I2C, SER0, OPTO) follow the
+ * core domain down to 32 kHz, so nothing in that loop could be trusted
+ * there. The crystal point is the one the firmware already runs on — it is
+ * the boot state and set_cpu_frequency's degrade state — so it is the one
+ * park that needs no new hardware facts. 32 kHz is a device-measured
+ * follow-up, not a code change to be made blind.
+ *
+ * Refuses (returns -1, no bus traffic) while a boost is outstanding or the
+ * audio DMA is streaming: the caller is expected to have released its
+ * boost (cpu_unboost) and paused playback first, and parking the PLL under
+ * a holder that believes it has 80 MHz — or under a DMA master reading SDRAM
+ * — is exactly the hazard set_cpu_frequency guards against. A second call
+ * while already parked is a silent success.
+ *
+ * Order matters: the bus leaves the PLL BEFORE the PLL is disabled, and the
+ * PLL is disabled before it is unpowered — the reverse of the bring-up.
+ * The post-divider disable the doc lists for the 32 kHz point
+ * (PLL_CONTROL |= 0x0C000000) is not applied: it belongs to that point,
+ * and the PLL is being switched off, not run through its dividers.
+ */
+int clock_suspend(void)
+{
+    if (g_boost != 0 || g_dma_active) {
+        return -1;
+    }
+    if (g_suspended) {
+        return 0;
+    }
+    /* 1. Take the bus off the PLL onto the crystal (PLL-independent). */
+    mmio_write32(CLOCK_SOURCE_ADDR, CLOCK_SOURCE_XTAL);
+    /* 2. Memory/peripheral timing for the slow clock. */
+    mmio_write32(DEV_TIMING1_ADDR, DEV_TIMING1_SLOW);
+    /* 3. Disable the PLL (preserve the other PLL_CONTROL bits). */
+    mmio_write32(PLL_CONTROL_ADDR,
+                 mmio_read32(PLL_CONTROL_ADDR) & ~PLL_CONTROL_ENABLE);
+    /* 4. Drop PLL power (preserve the other DEV_INIT2 bits — the I2S pad
+     *    routing lives in this register too, 05-audio.md). */
+    mmio_write32(DEV_INIT2_ADDR,
+                 mmio_read32(DEV_INIT2_ADDR) & ~DEV_INIT2_PLL_POWER);
+
+    g_freq      = CPUFREQ_DEFAULT;
+    g_suspended = 1;
+    return 0;
+}
+
+/*
+ * Undo clock_suspend(): the full 30 MHz switch (PLL power, enable, program,
+ * bounded lock wait, timing, route) — register-for-register the clock_init
+ * sequence, which is safe from any current state. A no-op when not parked,
+ * so the wake path can call it unconditionally; a cpu_boost() issued while
+ * parked has already un-parked the tree and this then does nothing.
+ */
+void clock_resume(void)
+{
+    if (!g_suspended) {
+        return;
+    }
+    set_cpu_frequency(PLL_CONTROL_30MHZ, DEV_TIMING1_SLOW, CPUFREQ_NORMAL);
+}
+
+/*
+ * DEV_EN hygiene for suspend-to-RAM (01-soc-pp5022.md, "Power management").
+ *
+ * Three peripheral clocks are left running by their drivers with nothing
+ * to do while the device is asleep: SER0 (uart.c, on from boot for the
+ * debug channel), PWM0 (piezo.c, on from piezo_init for the click), and
+ * the I2C controller (i2c.c, on from the first codec bring-up). Each
+ * driver owns its own bit — it is the driver that set it, and it is the
+ * driver that must re-gate before touching the block — so this is only the
+ * orchestration: gate all three on the way in, restore on the way out, in
+ * reverse order. Every driver's suspend records whether its bit was on and
+ * its resume restores only that, so a build that never ran piezo_init
+ * ends up exactly where it started.
+ *
+ * The blocks are SELF-RESTORING on use (a UART byte, an I2C transaction,
+ * a click), so the suspend loop's battery sample and the PMU standby
+ * command work without the caller re-gating first — and so nothing can
+ * ever spin against an unclocked block. clock_gate_resume() after such a
+ * use is then partly a no-op, which is fine.
+ *
+ * NOT touched: DEV_OPTO — the wheel is the wake source and clickwheel.c
+ * gates it only while Hold is on — and whatever the ROM left set in the
+ * 0xC2000124 boot value (the doc names none of those bits, so USB /
+ * FireWire / IDE gating stays a device-verified follow-up). DEV_I2S and
+ * DEV_EXTCLOCKS are gated by hal/hw/audio.c's codec power-down, which the
+ * suspend loop drives through player_pump.
+ *
+ * What this saves is not in the doc and has not been measured.
+ */
+void clock_gate_suspend(void)
+{
+    uart_clock_suspend();
+    piezo_clock_suspend();
+    i2c_clock_suspend();
+}
+
+void clock_gate_resume(void)
+{
+    i2c_clock_resume();
+    piezo_clock_resume();
+    uart_clock_resume();
+}
+
 #ifdef MMIO_MOCK
 /*
  * Host-test-only hook. Restores the driver's static state to its
@@ -200,5 +328,6 @@ void clock_test_reset(void)
     g_boost      = 0;
     g_dma_active = 0;
     g_pending    = 0;
+    g_suspended  = 0;
 }
 #endif
