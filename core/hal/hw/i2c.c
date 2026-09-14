@@ -83,6 +83,17 @@ void i2c_clock_suspend(void)
     hw_irq_restore(f);
 }
 
+/*
+ * Undo the gate: clock on, then the reset pulse and the clock/config poke
+ * — the whole "Controller init" sequence (09-i2c.md), not just the enable
+ * bit. Nothing documents what a DEV_EN gate does to the controller's
+ * configuration, and nobody (Rockbox included) has gated this block at
+ * runtime before; if the config is lost, an enable-only restore hands the
+ * codec power-down, the 5 s battery ADC read and — worst — the PMU
+ * GOSTDBY command to an unconfigured controller. The three extra writes
+ * cost microseconds and need no new hardware facts. No idle drain before
+ * the reset: the block was unclocked, nothing can be in flight.
+ */
 void i2c_clock_resume(void)
 {
     if (!g_gated) {
@@ -92,6 +103,18 @@ void i2c_clock_resume(void)
     mmio_write32(DEV_EN_ADDR, mmio_read32(DEV_EN_ADDR) | DEV_I2C);
     hw_irq_restore(f);
     g_gated = 0;
+
+    f = hw_irq_save();
+    mmio_write32(DEV_RS_ADDR, mmio_read32(DEV_RS_ADDR) | DEV_I2C);
+    hw_irq_restore(f);
+    for (volatile uint32_t i = 0; i < I2C_RESET_HOLD_SPIN; i++) {
+        /* hold reset */
+    }
+    f = hw_irq_save();
+    mmio_write32(DEV_RS_ADDR, mmio_read32(DEV_RS_ADDR) & ~DEV_I2C);
+    hw_irq_restore(f);
+    mmio_write32(I2C_CLKCFG_ADDR, 0x00000000);
+    mmio_write32(I2C_CLKCFG_ADDR, 0x00000080);
 }
 
 void i2c_init(void)

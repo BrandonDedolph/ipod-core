@@ -18,6 +18,9 @@
  *      against an unclocked block, and the existing i2c/uart golden traces
  *      (which never suspend) are unchanged.
  *   4. i2c_init while gated re-gates before its idle drain.
+ *   5. The I2C re-gate is the whole documented bring-up (clock, reset
+ *      pulse, clock/config poke), because a gated controller's config is
+ *      not documented to survive and the PMU standby command rides it.
  */
 
 #include "pp5022.h"
@@ -29,6 +32,22 @@
 #include "trace_expect.h"
 
 extern void i2c_test_reset(void);
+
+
+/* The I2C restore is the documented bring-up (09-i2c.md, "Controller init"):
+ * clock on, reset pulse, clock/config poke. `en` is what DEV_EN reads at
+ * the time, so the enable write is en|DEV_I2C. DEV_RS reads 0. */
+static void expect_i2c_restore(trace_cursor *tc, uint32_t en)
+{
+    expect_r(tc, 32, DEV_EN_ADDR);
+    expect_w(tc, 32, DEV_EN_ADDR, en | DEV_I2C);
+    expect_r(tc, 32, DEV_RS_ADDR);
+    expect_w(tc, 32, DEV_RS_ADDR, DEV_I2C);
+    expect_r(tc, 32, DEV_RS_ADDR);
+    expect_w(tc, 32, DEV_RS_ADDR, 0);
+    expect_w(tc, 32, I2C_CLKCFG_ADDR, 0x00000000);
+    expect_w(tc, 32, I2C_CLKCFG_ADDR, 0x00000080);
+}
 
 static int check(const char *label, int cond)
 {
@@ -66,10 +85,10 @@ static int test_gate_all_on(void)
     /* Resume: now the bits read clear; each write sets its own bit only. */
     mmio_mock_reset();
     mmio_mock_set_read(DEV_EN_ADDR, OTHERS);
+    mmio_mock_set_read(DEV_RS_ADDR, 0);
     clock_gate_resume();
     tc = trace_begin("clock_gate_resume");
-    expect_r(&tc, 32, DEV_EN_ADDR);
-    expect_w(&tc, 32, DEV_EN_ADDR, OTHERS | DEV_I2C);
+    expect_i2c_restore(&tc, OTHERS);
     expect_r(&tc, 32, DEV_EN_ADDR);
     expect_w(&tc, 32, DEV_EN_ADDR, OTHERS | DEV_PWM);
     expect_r(&tc, 32, DEV_EN_ADDR);
@@ -108,10 +127,12 @@ static int test_gate_pwm_was_off(void)
 
     mmio_mock_reset();
     mmio_mock_set_read(DEV_EN_ADDR, OTHERS);
+    mmio_mock_set_read(DEV_RS_ADDR, 0);
     clock_gate_resume();
     fails += check("gate resume: PWM not restored (was never on)",
                    mmio_mock_count(MMIO_OP_WRITE, DEV_EN_ADDR) == 2 &&
-                   mmio_mock_log_len() == 4);
+                   mmio_mock_count(MMIO_OP_WRITE, DEV_RS_ADDR) == 2 &&
+                   mmio_mock_count(MMIO_OP_WRITE, I2C_CLKCFG_ADDR) == 2);
     return fails;
 }
 
@@ -126,15 +147,19 @@ static int test_i2c_self_restore(void)
 
     mmio_mock_reset();
     mmio_mock_set_read(DEV_EN_ADDR, 0);
+    mmio_mock_set_read(DEV_RS_ADDR, 0);
     mmio_mock_set_read(I2C_STATUS_ADDR, 0);      /* idle */
     mmio_mock_set_read(I2C_CTRL_ADDR, 0);
     const uint8_t b[1] = { 0x2F };
     fails += check("i2c_send while gated: succeeds",
                    i2c_send(0x08, b, 1) == 0);
 
+    /* The restore is the documented bring-up — clock on, reset pulse,
+     * clock/config poke — not the enable bit alone (09-i2c.md, "Controller
+     * init"): a gated controller's configuration is not documented to
+     * survive, and the PMU standby command rides this bus. */
     trace_cursor tc = trace_begin("i2c_send_regates");
-    expect_r(&tc, 32, DEV_EN_ADDR);
-    expect_w(&tc, 32, DEV_EN_ADDR, DEV_I2C);                    /* re-gate  */
+    expect_i2c_restore(&tc, 0);                                 /* re-gate  */
     expect_r(&tc, 8,  I2C_STATUS_ADDR);                         /* then the */
     expect_w(&tc, 8,  I2C_ADDR_ADDR, 0x10);                     /* ordinary */
     expect_r(&tc, 8,  I2C_CTRL_ADDR);                           /* grammar  */
@@ -233,11 +258,11 @@ static int test_i2c_init_while_gated(void)
 
     mmio_mock_reset();
     mmio_mock_set_read(DEV_EN_ADDR, 0);
+    mmio_mock_set_read(DEV_RS_ADDR, 0);
     mmio_mock_set_read(I2C_STATUS_ADDR, 0);
-    i2c_init();                                  /* re-init: drain only */
+    i2c_init();                                  /* re-init: restore + drain */
     trace_cursor tc = trace_begin("i2c_init_regates");
-    expect_r(&tc, 32, DEV_EN_ADDR);
-    expect_w(&tc, 32, DEV_EN_ADDR, DEV_I2C);
+    expect_i2c_restore(&tc, 0);
     expect_r(&tc, 8,  I2C_STATUS_ADDR);
     trace_expect_end(&tc);
     fails += trace_done(&tc);

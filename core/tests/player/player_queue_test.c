@@ -1329,7 +1329,17 @@ int main(void)
         player_pump();
         xpect(&c, "warm paused skips re-arm the power-down from the last skip",
               stub_audio_suspends == susp);
-        set_usec(104000000u);
+        set_usec(103000000u + PLAYER_PAUSE_CODEC_OFF_US);
+        player_pump();
+        xpect(&c, "...and it fires at the re-armed deadline",
+              stub_audio_suspends == susp + 1 && stub_audio_cold == 1);
+        /* Wake it again so the resume below is the warm-row case. */
+        set_usec(103500000u + PLAYER_PAUSE_CODEC_OFF_US);
+        player_resume();
+        player_pause();
+        set_usec(104000000u + PLAYER_PAUSE_CODEC_OFF_US);
+        inits = stub_audio_inits; wakes = stub_audio_wakes;
+        starts = stub_audio_starts;
         player_resume();
         xpect(&c, "resume after warm paused skips is a bare start",
               stub_audio_inits == inits && stub_audio_wakes == wakes &&

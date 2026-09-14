@@ -4913,6 +4913,13 @@ static void suspend_to_ram(uint32_t play_down_us)
          * would defeat the whole exercise.
          */
         player_pump();
+        /* Nothing above may hold a boost, but cpu_boost() from the crystal
+         * un-parks the PLL and cpu_unboost() leaves it at 30 MHz — so a
+         * future disk touch in this loop would silently spend the rest of
+         * the suspend off the crystal. Re-park if that happened. */
+        if (g_suspend_lp && cpu_frequency() != CPUFREQ_DEFAULT) {
+            (void)clock_suspend();
+        }
 
         /*
          * Watch the battery. battery_refresh() only ever ran from the main
@@ -5834,7 +5841,12 @@ _Noreturn static void run_ui(fat32_t *fs)
                              * you turn, so the wheel drives the panel in real
                              * time. */
                             if (g_set_screen == SETTINGS_DISPLAY && g_set_sel == 1) {
-                                backlight_set(g_settings.backlight_bright);
+                                if (!panel_slept) {   /* the Panel-wake block
+                                                       * lights it after the
+                                                       * first present, else
+                                                       * a white flash */
+                                    backlight_set(g_settings.backlight_bright);
+                                }
                                 bl_state = BL_FULL;
                             }
                         }
