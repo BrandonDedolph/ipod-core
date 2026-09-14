@@ -4007,16 +4007,23 @@ static int list_repaint_partial(void)
         rows |= (1u << r_old) | (1u << r_new);
     }
 
-    /* The rows: clear each band (the new content may be narrower) + redraw. */
+    /* The rows: clear each band (the new content may be narrower) + redraw.
+     * The clear stops short of the scrollbar column (ui_list_row_clear). A
+     * full-width clear here, with the bar only redrawn on a MOVE below, is how
+     * the album list's scrollbar vanished under a fast scroll: the covers
+     * landing on the settled window repainted every row band edge to edge and
+     * took the bar with them, slice by slice, until the next full paint. */
     for (int r = 0; r < v.visible; r++) {
         if (!(rows & (1u << r))) continue;
-        console_fill_rect(0, v.y0 + r * v.rh, LCD_WIDTH, v.rh, LINEN_SURFACE);
+        ui_list_row_clear(v.y0, r, v.rh);
         int idx = top + r;
         if (idx < v.count) v.row(r, idx);
     }
-    if (moved) {
-        ui_scrollbar(v.y0, top, v.visible, v.count);
-    }
+    /* Unconditional, not just on `moved`: every partial present that touches a
+     * row band carries the bar with it, so no row repaint can leave the panel
+     * without one. Two small fills — nothing to save by skipping them. (A
+     * no-op when everything fits, exactly as in the full render.) */
+    ui_scrollbar(v.y0, top, v.visible, v.count);
     g_lp.rows = 0;
     return 1;
 }

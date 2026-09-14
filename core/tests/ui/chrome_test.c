@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "chrome.h"
+#include "artcache.h"        /* ARTCACHE_DIM: the row chip the repaint test blits */
 #include "palette.h"
 #include "text.h"
 #include "console.h"
@@ -360,6 +361,57 @@ int main(void)
           thumb_bot == thumb_top);
     xpect(&c, "the thumb never leaves the panel",
           count_outside(LCD_WIDTH - 4, 0, 3, LCD_HEIGHT, LINEN_SB_THMB) == 0);
+
+    /* ---- 6b. a row repaint must not eat the scrollbar --------------------- *
+     * The partial-repaint path (main.c list_repaint_partial) clears a row band
+     * and redraws the row for every cover chip that lands. It used to clear the
+     * band edge to edge, and only redrew the bar on a selection MOVE — so on
+     * the album list a fast scroll into a fresh window, whose six covers then
+     * landed on a still selection, wiped the bar one row slice at a time. The
+     * clear must stop at the bar's column, and nothing a row draws may reach
+     * it either: a tall, selected, chipped, long-titled row with a right value
+     * and a chevron is the widest thing a list can put in a band. */
+    console_clear(0x0000);
+    ui_scrollbar(LIST_Y0, 0, LIST_ROWS2, 100);
+    {
+        int col_thumb = count_in(UI_SB_X, 0, LCD_WIDTH - UI_SB_X, LCD_HEIGHT,
+                                 LINEN_SB_THMB);
+        int col_track = count_in(UI_SB_X, 0, LCD_WIDTH - UI_SB_X, LCD_HEIGHT,
+                                 LINEN_SB_TRK);
+        xpect(&c, "the bar lives entirely inside its column",
+              col_thumb > 0 && col_track > 0 &&
+              count_outside(UI_SB_X, 0, LCD_WIDTH - UI_SB_X, LCD_HEIGHT,
+                            LINEN_SB_THMB) == 0 &&
+              count_outside(UI_SB_X, 0, LCD_WIDTH - UI_SB_X, LCD_HEIGHT,
+                            LINEN_SB_TRK) == 0);
+
+        static uint16_t chip[ARTCACHE_DIM * ARTCACHE_DIM];
+        for (int i = 0; i < ARTCACHE_DIM * ARTCACHE_DIM; i++) chip[i] = 0x07E0;
+        char longt[256];
+        memset(longt, 'W', sizeof longt - 1);
+        longt[sizeof longt - 1] = '\0';
+        for (int r = 0; r < LIST_ROWS2; r++) {
+            ui_list_row_clear(LIST_Y0, r, ROW_H2);
+            ui_list_row(LIST_Y0, r, longt, "an artist line", "12:34", 1,
+                        r == 2, 0, chip, r & 1, ROW_H2);
+        }
+        xpect(&c, "clearing + redrawing every row band leaves the bar intact",
+              count_in(UI_SB_X, 0, LCD_WIDTH - UI_SB_X, LCD_HEIGHT,
+                       LINEN_SB_THMB) == col_thumb &&
+              count_in(UI_SB_X, 0, LCD_WIDTH - UI_SB_X, LCD_HEIGHT,
+                       LINEN_SB_TRK) == col_track);
+    }
+
+    /* The clear itself, alone on a black canvas: exactly its band, panel edge
+     * to the bar's column and not a pixel further. */
+    console_clear(0x0000);
+    ui_list_row_clear(LIST_Y0, 3, ROW_H2);
+    xpect(&c, "a row clear covers its band from the left edge to the bar",
+          count_in(0, LIST_Y0 + 3 * ROW_H2, UI_SB_X, ROW_H2, LINEN_SURFACE)
+              == UI_SB_X * ROW_H2);
+    xpect(&c, "a row clear stops short of the bar's column and its own band",
+          count_outside(0, LIST_Y0 + 3 * ROW_H2, UI_SB_X, ROW_H2, LINEN_SURFACE)
+              == 0);
 
     /* ---- 7. the injected marquee seam ----------------------------------- */
     xpect(&c, "chrome runs with no scroll-text hook registered", 1);
