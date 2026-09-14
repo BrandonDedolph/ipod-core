@@ -1,547 +1,202 @@
-# core — a modern music player for the iPod 5.5G
+# core
 
-`core` is a **from-scratch, Apache-2.0 firmware** for the 5th-generation
-iPod ("iPod Video", PortalPlayer PP5022). It boots on real hardware,
-reads music off the iPod's own disk, and plays it back through a custom
-Nunito/Linen interface.
-
-It's **a different take on the iPod, not a replacement for another
-firmware.** Where [Rockbox](https://www.rockbox.org/) is the do-everything
-option, `core` aims at one thing: a clean, modern player experience on the
-original hardware. It's independent firmware in its own right — not a
-Rockbox theme, patch, or plugin, and it contains no copied Rockbox code.
-
-> ### ▶ This runs on a real iPod. Not an emulator, not a simulator.
-> It boots and plays on **actual 2006 Apple hardware** — a physical iPod
-> 5.5G. Written from scratch in C and ARM assembly, flashed to the device,
-> coming up from a cold start and streaming music straight off the iPod's
-> own hard drive. Bare metal: no OS, no libc, nothing between this code and
-> the silicon. *(The screenshots and GIFs below are host-rendered
-> reproductions of the on-device UI — same layout, palette and Nunito
-> faces, drawn by `docs/screens/render.py`. They are not photographs and
-> not framebuffer captures; the panel is hard to photograph cleanly and
-> the firmware has no screenshot path.)*
-
-**And it's the firmware, not a payload.** There is no chainloader and no
-boot menu. `core` is written into the iPod's firmware partition as the
-OSOS image, so Apple's boot ROM hands control straight to our `crt0.S`,
-which does the SDRAM remap to `0x00000000` itself. Installing replaces the
-whole OSOS — Apple's firmware is no longer on the device. The way back is
-unchanged and unconditional: the boot ROM's **Select + Play** disk mode
-runs before any image loads, so nothing we flash can pre-empt it.
-
-The whole bare-metal stack is proven end-to-end on an actual iPod 5.5G:
-boot ROM → `crt0.S` + memory remap → clock/PLL → timer/IRQ → LCD (BCM
-framebuffer present) → I²C/WM8758B/I²S first sound → DMA playback → ATA PIO
-reader → FAT32 → streaming FLAC decode → audio out the headphone jack —
-and, going the other way, the first bytes this firmware has ever *written*
-back to the user's disk.
+A from-scratch firmware for the iPod 5.5G. It is written in C and ARM assembly, boots as the
+device's own OSOS image, reads FLAC off the iPod's disk and plays it through a designed
+interface: Nunito type, seven palettes, album art, a status strip, a Hold banner. Apache-2.0,
+no Rockbox code.
 
 <p align="center">
-  <img src="docs/screens/demo.gif" alt="core UI in motion — main menu to Now Playing" width="420">
-  <br><em>Cold boot → browse → play, on the real device.</em>
+  <img src="docs/screens/hero.gif" alt="cold boot, browse, play" width="420">
+  <br><em>Cold boot to Now Playing. Host render of the device UI, not a photo.</em>
 </p>
 
-See the [**Screens**](#screens) gallery below for a full tour.
+New to the device? Read the [user guide](docs/USER_GUIDE.md).
 
----
+## What it does
 
-## What it is
-
-- **Cleanroom-by-facts.** Every driver is written from hardware facts —
-  PortalPlayer register maps, the WM8758B datasheet, the FAT32 spec. Where
-  those facts were cross-referenced against existing sources (including
-  Rockbox), only non-copyrightable facts were taken — register addresses,
-  bit values, init sequences — never code bodies; the implementations are
-  our own. See [`core/docs/hw/`](core/docs/hw/) for the subsystem-by-
-  subsystem hardware reference the drivers were written against, which
-  cites its sources.
-- **Bare metal.** No RTOS, no libc on the device. A small cooperative
-  kernel, a static-arena allocator, and our own `mem.c` back the
-  freestanding decoders; integer division and soft-float come from the
-  compiler runtime (`libgcc`), never libc.
-- **Real audio.** `dr_flac` is compiled freestanding
-  (`-DCORE_FREESTANDING`) and fed by a read-ahead disk source on top of an
-  8 MB anti-skip buffer, into an SPSC PCM ring drained by the DMA-completion
-  ISR. Streaming, not preload — a full-length track plays off the disk.
-  Track hand-over is gapless: at end-of-stream the next track is opened over
-  the same arena, buffer and ring, and when two tracks share a sample rate
-  the DAC is never stopped at all *(implemented and unit-tested; not yet
-  confirmed by ear on the device)*. **The device is FLAC-only today:**
-  `dr_mp3` is built and linked, but MP3 is disabled
-  (`CORE_ENABLE_MP3 0` in `core/kernel/main.c`) and `.mp3` files are
-  hidden from the browser entirely — its float synthesis filter can't
-  hit real time on this FPU-less CPU, so the ring starves and playback
-  stutters. Re-enabling it needs a fixed-point or second-core decoder.
-- **Real sleep.** Hold Play for two seconds and the device goes to sleep:
-  playback pauses, the position is saved, the drive parks, the panel blanks
-  white and the backlight drops, the codec powers down, and the CPU idles
-  until any button wakes it — straight back to where you were. Hold Play
-  past five seconds for a true power-off (PMU standby; a button press cold
-  boots). A sleeping device keeps sampling its battery, and on battery
-  power escalates itself to a power-off after thirty minutes.
-- **Real type.** `core/ui/text.c` is a libc-free, gamma-correct
-  antialiased text renderer that draws pre-rasterized Nunito glyph
-  atlases straight into the RGB565 framebuffer — no FreeType, no malloc,
-  all `.rodata`. It decodes UTF-8 and covers Latin-1 + smart punctuation,
-  so accented names and curly quotes render true. The pen is 26.6 fixed
-  point and carries the fractional advance across a whole string; each of
-  the six faces ships its own kerning table (1,700–3,700 pairs) and its own
-  tracking value, solved from measured ink-to-ink spacing rather than
-  guessed.
-- **A real library UI.** Browse by Playlists / Artists / Albums / Songs /
-  Genres — plus an artist's whole discography as one **All Songs** list — off a
-  host-built index (`CORELIB.IDX`) that loads in one read and holds up to
-  6000 songs / 1024 albums / 512 artists / 128 genres in full UTF-8. Album-
-  art chips, a 120×120 now-playing cover, a scrolling marquee for long
-  titles, seven themes (warm-light **Linen**, warm-dark **Onyx**, and Sage,
-  Plaster, Olive, Umber, Mushroom), `.m3u8` playlists read straight off the
-  disk, plus settings (tone/balance, backlight, click profiles), volume and
-  lock overlays, and a battery gauge that warns red when low and stays
-  honest on the charger (it reads the cell, not the charge current).
-- **It remembers.** Settings persist across reboots to a pre-allocated
-  `CORECFG.DAT` — two alternating slots, each a whole physical sector, each
-  CRC-32 checked, written through the ATA write path with the target LBA
-  re-resolved and re-validated before every write. The device never creates,
-  grows, moves or deletes the file, so no FAT metadata is ever touched. On
-  top of that, **Resume** brings you back on the track you left, *paused*,
-  at the saved position — and in the queue you were playing it from (an
-  album, an artist, a shuffle, a playlist), bound by a folded name hash
-  (confirmed by duration where possible), so it survives a library rebuild.
-- **It keeps a log.** Every diagnostic line the firmware would send down a
-  serial cable is also captured into `CORELOG.BIN`, a 4 MiB on-disk ring
-  (2048-byte CRC-checked blocks, pre-allocated on the host by
-  `tools/make_log.py`, never grown or moved by the device). It flushes a
-  block at idle and forces one at sleep, power-off and Disk Mode entry, so
-  a report of "it stuttered after I woke it" comes with the boot narration,
-  battery samples, present timings and audio underrun counts that explain
-  it. `make_log.py --dump` reads it back; About shows `LOG n on`.
+- **Boots as the firmware.** No chainloader, no boot menu. The image is the OSOS in the firmware
+  partition; the boot ROM hands to `crt0.S`. Select + Play still reaches Apple's disk mode, so
+  recovery is unconditional.
+- **Plays FLAC from the disk.** Streaming decode over an anti-skip buffer, DMA to the WM8758B, and
+  a track hand-over that does not stop the DAC. MP3 is compiled but switched off: the decoder
+  cannot hold real time on this CPU.
+- **Loads the library in one read.** A host-built index (`CORELIB.IDX`) with up to 6000 songs,
+  1024 albums, 512 artists and 128 genres, full UTF-8. Album-art sidecars for list chips and the
+  Now Playing cover.
+- **Browses by playlist, artist, album, song and genre.** Two-line rows, art chips, a marquee for
+  long titles, an artist's whole discography as one list, `.m3u8` playlists read from the disk.
+- **Draws real type.** A libc-free, gamma-correct text renderer with six Nunito atlases, kerned
+  and tracked from measured ink.
+- **Has seven themes.** Linen, Onyx, Sage, Plaster, Olive, Umber, Mushroom. The selection bar is
+  always the theme's ink behind its surface, so every screen inverts with the theme.
+- **Remembers.** Settings, the resume position and the queue it was in persist to a pre-allocated
+  file on the disk, CRC-checked, never moving a cluster. A 4 MiB on-disk event log captures every
+  diagnostic line.
+- **Sleeps.** Hold Play to sleep; the drive parks, the panel and codec go down, the CPU idles. On
+  battery, a sleeping device powers itself off after thirty minutes.
 
 ## Screens
 
-A tour of what's on the device. *(Host-rendered reproductions, not device
-captures — see the note at the top.)*
+Every image below is drawn by `docs/screens/render.py` with the firmware's own glyph atlases and
+palette; see the [user guide](docs/USER_GUIDE.md) for what each control does.
 
-### Browse your whole library
+### Library
 
-Main menu → Music → browse by **Artist / Album / Song / Genre**, all off a
-host-built index that loads in one read. Two-line rows carry album-art
-chips; long titles scroll a marquee. An artist's **All Songs** row collapses
-their whole discography into one list, with the album on the sub-line.
+Main menu, Music, and the lists. An artist's All Songs row is the whole discography with the album
+on the sub-line.
 
-Playlists are `.m3u8` files dropped into `Music/Playlists/`; they show up
-under Music → Playlists and play as a queue.
-
-<p align="center"><img src="docs/screens/browse.gif" alt="browsing the library" width="360"></p>
+<p align="center"><img src="docs/screens/browse.gif" alt="browsing the album list" width="360"></p>
 
 <table>
   <tr>
     <td><img src="docs/screens/mainmenu.png" width="260" alt="Main menu"></td>
-    <td><img src="docs/screens/music.png" width="260" alt="Music menu"></td>
-    <td><img src="docs/screens/artists.png" width="260" alt="Artists"></td>
-  </tr>
-  <tr>
     <td><img src="docs/screens/albums.png" width="260" alt="Albums"></td>
-    <td><img src="docs/screens/songs.png" width="260" alt="Songs"></td>
-    <td><img src="docs/screens/genres.png" width="260" alt="Genres"></td>
+    <td><img src="docs/screens/detail.png" width="260" alt="Album detail"></td>
   </tr>
   <tr>
-    <td><img src="docs/screens/allsongs.png" width="260" alt="An artist's All Songs"></td>
+    <td><img src="docs/screens/artists.png" width="260" alt="Artists"></td>
+    <td><img src="docs/screens/allsongs.png" width="260" alt="An artist's songs"></td>
     <td><img src="docs/screens/playlists.png" width="260" alt="Playlists"></td>
-    <td></td>
   </tr>
 </table>
 
 ### Now Playing
 
-A 120×120 cover, marquee title, artist/album, `TRACK N OF M`, elapsed /
-−remaining, and a rounded progress bar. The volume overlay's speaker icon
-grows its sound waves as you turn it up.
+Cover, title, artist, album, track count, times and a progress bar. The wheel sets the volume; a
+Select tap turns it into a scrubber. Right on any list jumps here, and Menu returns to the row you
+left.
 
-Next/Previous belong to the player: **RIGHT and LEFT skip track only on Now
-Playing and the queue view.** Anywhere else, a skip from a list you were
-merely browsing would change the music under you — so **RIGHT jumps to Now
-Playing** instead, pushed over whatever you were in, and MENU brings you back
-to the exact row you left; LEFT does nothing (MENU is already "back"). If a
-track ends while you are still browsing, the status strip's track name changes
-where it stands — no banner, nothing to dismiss.
-
-<p align="center"><img src="docs/screens/volume.gif" alt="volume overlay with growing sound waves" width="360"></p>
+<p align="center"><img src="docs/screens/jump.gif" alt="Right jumps to Now Playing, Menu returns" width="360"></p>
 
 <table>
   <tr>
     <td><img src="docs/screens/nowplaying.png" width="260" alt="Now Playing"></td>
-    <td><img src="docs/screens/detail.png" width="260" alt="Album detail"></td>
     <td><img src="docs/screens/volume.png" width="260" alt="Volume overlay"></td>
+    <td><img src="docs/screens/locked.png" width="260" alt="Hold banner"></td>
   </tr>
 </table>
 
-### Seven themes
+### Themes
 
-Warm-light **Linen** and warm-dark **Onyx**, plus **Sage** (dark green-grey,
-clay accent), **Plaster** (pink-beige limewash, oxblood), **Olive**
-(greige-olive, burnt ochre), **Umber** (espresso, caramel) and **Mushroom**
-(warm greige, muted rust) — swapped live from a five-row picker in Settings.
-Every theme keeps the same design language: the selection bar is always the
-ink colour behind surface-coloured text, so it inverts with the theme, and
-the warning red never changes.
+Seven palettes, swapped live from Settings. Same layout, same type, different ink and surface.
 
-<p align="center"><img src="docs/screens/themes.gif" alt="the seven themes on Now Playing" width="360"></p>
+<p align="center"><img src="docs/screens/themes.gif" alt="the seven themes" width="360"></p>
 
 <table>
   <tr>
-    <td><img src="docs/screens/nowplaying.png" width="260" alt="Now Playing — Linen"></td>
-    <td><img src="docs/screens/nowplaying_onyx.png" width="260" alt="Now Playing — Onyx"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/screens/albums.png" width="260" alt="Albums — Linen"></td>
-    <td><img src="docs/screens/albums_onyx.png" width="260" alt="Albums — Onyx"></td>
+    <td><img src="docs/screens/nowplaying.png" width="260" alt="Linen"></td>
+    <td><img src="docs/screens/nowplaying_onyx.png" width="260" alt="Onyx"></td>
+    <td><img src="docs/screens/nowplaying_sage.png" width="260" alt="Sage"></td>
   </tr>
 </table>
 
 ### Settings
 
-Nine rows, and they stick: Playback (shuffle / repeat / resume), Sound
-(volume / bass / treble / balance via the WM8758B EQ), the theme picker,
-Display (backlight timeout + brightness), **seven** piezo click profiles, an
-About dashboard, **Boot Details**, Disk Mode, and Reset. Everything but the
-diagnostics is saved to disk and comes back after a reboot.
+Playback, Sound, Theme, Display, Clicker, About, Boot Details, Disk Mode, Reset. Everything but
+the diagnostics is saved to the disk.
 
-**About** is a small dashboard: the library's counts, a storage card, a
-battery card with the cell's millivolts, and one muted footer with the raw
-ADC code and the event log's state.
-
-<p align="center"><img src="docs/screens/settings.gif" alt="adjusting a Sound slider" width="360"></p>
+<p align="center"><img src="docs/screens/settings.gif" alt="a Sound slider, then the theme picker" width="360"></p>
 
 <table>
   <tr>
     <td><img src="docs/screens/settings.png" width="260" alt="Settings"></td>
-    <td><img src="docs/screens/sound.png" width="260" alt="Sound"></td>
-    <td><img src="docs/screens/clicker.png" width="260" alt="Clicker profiles"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/screens/theme.png" width="260" alt="Theme picker"></td>
     <td><img src="docs/screens/about.png" width="260" alt="About"></td>
     <td><img src="docs/screens/bootdetails.png" width="260" alt="Boot Details"></td>
   </tr>
 </table>
 
-**Boot Details** is the diagnostics page: a live phase breakdown of the last
-cold boot — LCD/BCM bring-up, disk + mount, library load, resume, and the
-unattributed remainder — as a stacked proportional bar plus a legend, with
-the FLAC decode cost against the 44.1 kHz real-time budget, the audio
-underrun count (red, only when it is not zero), and the on-disk locators of
-the settings file and the event log — the same LBAs the host tools print,
-so a mismatch is visible before anything is written. The remainder is
-*derived* (total minus the named phases) and the total is measured
-independently rather than summed, so unmeasured time shows up instead of
-vanishing.
-
 ### System
 
-Boot screen, charging screen, the low-battery warning, and the Hold-switch
-banner. The boot is one screen from power-on to the menu — the click-wheel
-mark, "Core", the device line, and a hairline bar along the bottom that fills
-as the library loads; it comes up in the default theme for the disk spin-up
-(the saved theme is *on* that disk) and repaints in the user's theme the moment
-the settings are read, before the bar appears. The Hold-switch banner: flipping Hold inverts the top chrome for a second — an ink band with
-a closed padlock and "Locked", a surface band with the popped-open padlock and
-"Unlocked" — and a small padlock stays in the status strip the whole time Hold
-is on. Low battery is a state machine with hysteresis: a
-toast at 3.7 V, a full-screen warning at the disk-safe line (settings and
-log writes stop there), and a goodbye screen before the PMU would cut power.
+The boot screen is one screen from power-on to the menu; the bar fills as the library loads, in
+your theme. Low battery is a toast, then a full-screen warning at the disk-safe line, then a
+goodbye.
 
-<p align="center"><img src="docs/screens/lock.gif" alt="the lock and unlock banner" width="360"></p>
+<p align="center"><img src="docs/screens/boot.gif" alt="boot: splash, library load, menu" width="360"></p>
 
 <table>
   <tr>
-    <td><img src="docs/screens/boot.png" width="260" alt="Boot screen"></td>
     <td><img src="docs/screens/loading.png" width="260" alt="Loading the library"></td>
-    <td><img src="docs/screens/loading_onyx.png" width="260" alt="Loading the library, in Onyx"></td>
-  </tr>
-  <tr>
     <td><img src="docs/screens/charging.png" width="260" alt="Charging"></td>
     <td><img src="docs/screens/battery_low.png" width="260" alt="Low battery"></td>
   </tr>
-  <tr>
-    <td><img src="docs/screens/lock.png" width="260" alt="Unlocked"></td>
-    <td><img src="docs/screens/locked.png" width="260" alt="Locked"></td>
-    <td><img src="docs/screens/locked_list.png" width="260" alt="Locked, over a list"></td>
-  </tr>
 </table>
 
-## Hardware target
+## Hardware
 
 | | |
 |---|---|
 | Device | iPod 5.5G (Video), 80 GB |
-| SoC | PortalPlayer PP5022 (dual ARM7TDMI, ARMv4T) |
-| Audio DAC | Wolfson WM8758B over I²C control + I²S data |
-| Display | 320×240 LCD driven through the BCM framebuffer path |
-| Storage | ATA disk (PIO); read-only FAT32 reader + in-place writes to two pre-allocated files (settings, event log) |
-| Input | Apple click-wheel + buttons + hold switch (polled) |
-| Boot | Direct — our image *is* the OSOS in the firmware partition; no chainloader, no boot menu |
-| Recovery | Boot ROM's Select + Play disk mode, which runs before any image loads |
+| SoC | PortalPlayer PP5022, two ARM7TDMI cores, no FPU |
+| Audio | Wolfson WM8758B, I²C control, I²S data, DMA |
+| Display | 320×240 through the BCM framebuffer |
+| Storage | ATA in PIO, FAT32 read, in-place writes to two pre-allocated files |
+| Input | Click wheel, five buttons, Hold switch |
+| Boot | The OSOS image in the firmware partition; Boot Details reports the cold boot live |
+| Recovery | Select + Play at power-on, in the boot ROM |
 
-## Performance — real-time on a 2006 SoC
+Hardware notes the drivers were written against: [`core/docs/hw/`](core/docs/hw/).
 
-The PP5022 is a pair of ~80 MHz ARM7TDMI cores with **no FPU, no hardware
-divide**, a small unified cache, and a **PIO** disk (no DMA to the drive,
-~170 KB/s). Decoding FLAC in real time *and* driving a smooth, animated,
-antialiased UI on that budget took deliberate work — the interesting part
-of the project is how little the hardware gives you.
+## Build
 
-- **Clock + cache first.** Enabling the PP5022 unified cache and holding an
-  80 MHz boost across the whole open/decode path is the line between
-  stuttering and real-time FLAC.
-- **Measure the boot, don't guess at it.** "Boot takes ten seconds" had
-  nowhere to aim, so the boot path got instrumented per phase and the
-  numbers got their own screen. A cold boot measured **8.4 s**, of which
-  **5.1 s was a single FLAC seek**; removing that should leave roughly 3 s,
-  but the post-fix total has deliberately not been written down here because
-  nobody has yet read it off the device. Boot Details reports it live, on
-  every boot rather than on the one day someone times it — which is the
-  point of the screen.
-- **A `#define` that cost five seconds.** `DR_FLAC_NO_CRC` was set purely to
-  save per-frame decode cost — but `dr_flac` guards its *binary-search seek*
-  behind that same flag, because landing on an arbitrary byte means proving
-  a candidate frame header is real rather than audio that happens to look
-  like a sync code, and the CRC is the proof. These files also carry no
-  SEEKTABLE, so with both paths gone every seek fell through to decoding
-  from the start of the track: 5.1 s of that 8.4 s boot was one seek.
-  Seeking is O(log n) now, at a cost of ~14 KB of text and some per-frame
-  decode margin — which is exactly why Boot Details reports the decode
-  margin instead of assuming it.
-- **No divides in the hot path.** The gamma-correct text blend runs entirely
-  in integers off pre-baked sRGB↔linear LUTs (never touches `<math.h>`), and
-  the per-pixel alpha composite replaces three soft-divides with an exact
-  `floor(x/255)` add-shift — the divide-less ARM7 never pays for a divide
-  while painting glyphs.
-- **Draw only what changed.** The marquee scrolls through a tiny partial
-  present (just the title band), not a full-frame blit, and clips per pixel to
-  its row — so continuous animation costs almost nothing.
-- **Instant library.** The song database is built on the host into a single
-  index the firmware loads in *one read*; Songs / Albums / Genres open with no
-  per-file tag scan at boot, and per-genre counts are precomputed. Records bind
-  to files by a hash, not a directory-walking string compare.
-- **Streaming without skips.** A read-ahead disk buffer does bursty reads so
-  the drive head parks between them (anti-skip), feeding a lock-free SPSC PCM
-  ring drained by the DMA-completion ISR — audio never waits on the UI. Bulk
-  ATA reads land straight in the caller's buffer, with a one-sector bounce only
-  for unaligned tails.
-- **Album art that never stalls audio.** Covers are pre-converted on the host
-  to raw RGB565 sidecars (no on-device JPEG decode); the list-chip cache loads
-  at most one thumbnail per main-loop pass so scrolling can't starve the audio
-  DMA, and the 28 px chip is an exact-size file — a 1:1 copy, no resample.
-- **No allocator in the render path.** The Nunito glyph atlases are `const`
-  `.rodata` resolved at link time — no FreeType, no malloc, no init step.
-- **Idle costs something, so spend less of it.** At idle the CPU drops to
-  30 MHz and halts, and the drive spins down after 20 s — including while
-  paused. At stop, the codec is powered down and the audio clocks are gated.
-  Asleep (Play held), the drive is parked, the panel and backlight are off,
-  the codec is down and the CPU idles between wheel samples.
-- **A pause stocks the buffer.** While a track sits paused and the platters
-  are still up, the player quietly reads ~9 s of the file ahead, and a
-  resume over a parked drive with a shallow buffer spins the drive up
-  *before* the DAC starts — so waking the device never stalls a second into
-  the music. Found on the device with the event log: eleven underruns,
-  every one of them a spin-up the ring could not cover.
-- **Give the display controller time.** The BCM retires a full frame after
-  the present returns; a partial update sent too soon behind it stalls the
-  main loop past the audio ring. Presents are paced from the measured cost
-  of the last full frame, on every path including the wake from sleep.
-
-## Status
-
-Working on real hardware today: direct boot as the OSOS image, LCD present,
-click-wheel input, backlight, WM8758B sound, DMA continuous playback,
-ATA + FAT32 read, **streaming FLAC playback off the iPod's own disk**,
-**settings that persist to disk**, **resume-on-boot**, **sleep and
-power-off from the Play button**, **seven themes**, and the **on-disk event
-log**. The menu UI, browser and Now Playing screens render on device via
-the freestanding text renderer. There is no serial cable in the loop —
-on-device state is read back through the Boot Details page and the event
-log, which is how the last round of audio and sleep bugs was found and
-confirmed fixed.
-
-**Playlists** read from disk: drop `.m3u8` files into `Music/Playlists/`
-(paths absolute from the volume root or relative to that folder) and they
-appear under Music → Playlists — host-tested end to end and flashed, but
-**not yet exercised on the device** with real playlist files. Not there
-yet, and honestly labelled: **writing** playlists needs FAT32 cluster
-allocation, which doesn't exist. **Search**, **Podcasts / Audiobooks /
-Composers**, and codecs beyond FLAC are all unimplemented. Panel sleep at
-idle is written but switched off (the panel comes back white). The deeper
-sleep savings — a 10 Hz tick, gated peripheral clocks, parking the PLL —
-are written and switchable but off until each is proven alone on the
-bench. Library sync is manual: build the index and convert art on the
-host, then copy.
-
-Not yet verified on the device: gapless hand-over and seek performance
-outside the boot path. The charger is held at 100 mA; raising it needs an
-inline USB current meter first.
-
-See [`STATUS.md`](STATUS.md) for the running list of what works, what's
-pending, and what to pick up next, and [`PLAN.md`](PLAN.md) for the phased
-roadmap.
-
----
-
-## Building
-
-Requires `meson`, `ninja`, `pkg-config`, a C11 host compiler, and (for
-the device build) `arm-none-eabi-gcc` with binutils + newlib. `libsdl2-dev`
-backs the host HAL build. On Arch: `pacman -S arm-none-eabi-gcc
-arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf sdl2`.
+Needs `meson`, `ninja`, `pkg-config`, a C11 host compiler, and `arm-none-eabi-gcc` with binutils
+and newlib for the device.
 
 ```bash
 cd core
-
-# Device firmware — ARMv4T bare-metal ELF + flat binary
-make hw            # → build-hw/core.elf, build-hw/core.bin
-make ipod          # → build-hw/core.ipod (transport-wrapped image)
-
-# Host build + unit tests (freestanding drivers/codecs, MMIO golden traces)
-make sim           # configures + builds the host TEST target — see below
-meson test -C build-sim              # 58 suites
-
-# Static checks against the linked ARM image: crt0/linker layout, the
-# header↔docs address consistency check, name-hash parity across its three
-# implementations, resume-matcher parity, and the size budget.
-make verify-hw
-
-# The same tests under AddressSanitizer + UndefinedBehaviorSanitizer. The
-# FAT32 reader and the codec container parsers consume whatever is on a
-# user's disk, so this is the build that matters for them.
-meson setup build-asan -Dtarget=sim \
-    -Db_sanitize=address,undefined -Doptimization=0 -Db_lto=false
-meson test -C build-asan
+make hw                        # build-hw/core.elf, core.bin
+make ipod                      # build-hw/core.ipod
+make sim && meson test -C build-sim   # host tests, 58 suites
+make verify-hw                 # layout, header/doc and size checks on the ARM image
 ```
 
-> **`make sim` builds the tests, not a simulator.** The name is aspirational:
-> the sim target compiles `codecs/` and `tests/` only. `core/hal/sim/sim_hal.c`
-> exists and builds into a static library, but **no executable links it** —
-> there is no runnable SDL2 emulator you can point at a music folder. What
-> `make sim` gives you is the host test suite: the same freestanding driver,
-> codec and text-renderer sources the device links, exercised against a
-> recording mock MMIO bus. That is genuinely useful — it is the only automated
-> check of the hardware register grammar — but it is not a simulator, and the
-> device remains the only place the UI can be seen.
+Detail, sanitizer builds and the host tools: [`core/README.md`](core/README.md),
+[`tools/README.md`](tools/README.md).
 
-The host (`sim`) target compiles the same freestanding driver, codec, and
-text-renderer sources the device links, plus the MMIO golden-trace tests
-that assert each hardware driver's exact register grammar against a
-recording mock bus — the automated safety net for code that otherwise
-needs a logic analyzer to verify. CI builds every job **from nothing** on
-every push (pinned and rolling ARM toolchains, plus the suite under
-ASan + UBSan), because a stale build directory once reported a green suite
-from month-old objects.
+## Flash
 
-Three host tools create the files the firmware writes to — it never creates
-or grows a file itself — and print the LBAs it must agree on:
+You need an iPod 5.5G, a FLAC library, and ipodpatcher. The image replaces Apple's
+firmware. Back the partition up first. Paths are relative to `core/`, as in Build.
 
 ```bash
-tools/make_config.py --create /path/to/iPod    # CORECFG.DAT (settings + resume)
-tools/make_log.py    --create /path/to/iPod    # CORELOG.BIN (4 MiB event log)
-tools/make_log.py    --dump   CORELOG.BIN      # read a pulled log back
-tools/build_index.py ...                       # CORELIB.IDX (the library)
-```
-
-Two more exist purely for the type work, and both are worth knowing about
-because they are the reason the spacing numbers are measured rather than
-eyeballed:
-
-```bash
-# Render the REAL firmware text stack on the host — this links core/ui/text.c
-# and the shipped atlases unmodified, so what it draws is what the panel draws.
-cc -Icore/ui -o /tmp/text_preview tools/text_preview.c core/ui/text.c
-/tmp/text_preview out.ppm 4
-
-# Measure glyph spacing objectively out of the baked atlases, using the
-# device's own pen arithmetic (tracking + kerning + 26.6 advance), reading
-# ink-to-ink daylight from the alpha bitmaps rather than from bboxes.
-tools/.venv/bin/python3 tools/text_metrics.py --worst 20
-```
-
-## Flashing
-
-`core` is installed **over** Apple's firmware, as the OSOS image in the
-iPod's firmware partition. There is no bootloader to install and nothing to
-copy to the music partition — a `core.ipod` sitting on the FAT32 data
-partition does nothing at all, because nothing loads it.
-
-```bash
-make ipod
-# Put the iPod in disk mode, then, with raw block-device access:
-ipodpatcher <disk> -wf build-hw/core.ipod     # write our OSOS image
-
-# Always verify the write before booting it:
+ipodpatcher <disk> -r bootpartition-backup.bin   # once
+ipodpatcher <disk> -wf build-hw/core.ipod        # iPod in disk mode
 ipodpatcher <disk> -rfb readback.bin
-cmp readback.bin build-hw/core.bin            # byte-identical, or don't boot
+cmp readback.bin build-hw/core.bin               # identical, or do not boot it
 ```
 
-Back up the firmware partition first (`ipodpatcher <disk> -r
-bootpartition-backup.bin`); restoring it (`-w`) puts Apple's firmware back.
+If a build does not boot, hold Select + Play at power-on. That is Apple's disk mode in the boot
+ROM; nothing this firmware writes can remove it. Reflash, or restore the backup with `-w`.
 
-**Recovery, if a build doesn't boot:** hold **Select + Play** at power-on to
-reach Apple's disk mode. This lives in the boot ROM and runs before any
-image is loaded, so it works with a black screen, a bad OSOS, or no
-bootloader at all — it has been exercised on this device in exactly that
-state. Then reflash, or restore the backup. The firmware also offers a
-Disk Mode entry under Settings for convenience, but the ROM combo is the
-floor and nothing we ship can remove it.
+## Status
 
----
+Runs on the device: direct boot, FLAC playback, the library, themes, settings and resume, sleep
+and power-off, the event log. Not there: MP3 in real time, writing playlists, search, podcasts.
+The running list of what works and what is next is [`STATUS.md`](STATUS.md).
 
-## Repo layout
+Versions are git tags, `v0.1.0` and up. The boot screen's bottom-right stamp and Settings → About
+show the version the device runs; an untagged build shows the nearest tag, the commit distance and
+the hash, for example `v0.1.0-3-g7617196`.
+
+## Design
+
+The interface comes from a design reference built at the panel's native 320×240: palette tokens,
+chrome, list rows, Now Playing, the system screens. The firmware implements it directly in C;
+where the two differ the reference notes say so. [`design_reference/`](design_reference/).
+
+## Layout
 
 ```
-core/                     bare-metal firmware + host test build
-├── boot/                 crt0 (SDRAM remap, COP wake) + linker script
-├── kernel/               cooperative scheduler, IRQ, timer, clock, PCM ring,
-│                         panic/fault handlers, settings persistence, the
-│                         event log (evlog.c), and the player UI (main.c)
-├── hal/
-│   ├── hal.h             hardware contract
-│   ├── hw/               ARM drivers — LCD, ATA, I²C, I²S, WM8758B, DMA,
-│   │                     click-wheel, backlight, battery, power, piezo, UART
-│   └── sim/              host HAL backend (SDL2)
-├── fs/                   from-scratch read-only FAT32 reader (LFN → UTF-8)
-│                         + an M3U8 playlist reader and a bounded path walk
-├── lib/                  freestanding mem.c (memcpy/memset)
-├── codecs/               dr_flac + dr_mp3 (freestanding), static arena,
-│                         read-ahead disk source, FLAC metadata reader
-├── ui/                   AA text renderer + Nunito atlases, the seven palettes,
-│                         art cache, settings model, per-screen renderers
-├── library/              index loader + playlist rows
-├── player/               playback engine — queue, transport, gapless hand-over
-├── cli/                  Go host CLI — `.ipod` image pack/unpack (and the
-│                         image header format); install/flash are stubs
-├── docs/hw/              hardware reference the drivers were written against
-├── docs/design/          design notes (settings persistence)
-├── cross/                Meson cross file (arm-none-eabi)
-└── tests/                host unit + MMIO golden-trace tests, static-check scripts
-
-design_reference/         UI design source — palette, chrome, icon paths
-docs/screens/             interface screenshots + demo GIFs (this README)
-tools/                    host tooling — atlas + glyphmap generator, album-art
-                          converter, library-index builder, CORECFG.DAT and
-                          CORELOG.BIN creators, text preview + spacing
-                          metrics, font sources
+core/         firmware: boot/, kernel/, hal/, fs/, codecs/, ui/, library/, player/, tests/, docs/
+core/cli/     Go host CLI: .ipod image pack/unpack
+tools/        host tooling: atlases, album art, library index, settings and log files
+docs/screens/ the screenshots and GIFs in this README, and the renderer that draws them
+docs/         the user guide
+design_reference/  the UI design source
+STATUS.md     what works, what is pending, what is next
 ```
-
-See [`core/README.md`](core/README.md) for firmware-side build detail and
-[`tools/README.md`](tools/README.md) for the host toolchain.
-
----
 
 ## License
 
-Apache-2.0, first-party. The firmware contains no copied Rockbox code and
-vendors no GPL code: its drivers are written from hardware facts (register
-maps, datasheets, the FAT32 spec), and where those facts were
-cross-referenced against existing sources — including Rockbox — only the
-facts themselves were taken (register addresses, bit values, init
-sequences), not code bodies. Vendored decoders are permissively licensed
-and unrelated to Rockbox — `dr_flac` / `dr_mp3` (public domain / MIT-0).
-The Nunito font is under the SIL Open Font License 1.1 (`tools/fonts-src/`).
+Apache-2.0 ([`core/LICENSE`](core/LICENSE)). Vendored decoders `dr_flac` and `dr_mp3` are public
+domain / MIT-0. Nunito is under the SIL Open Font License 1.1
+([`tools/fonts-src/OFL.txt`](tools/fonts-src/OFL.txt)).

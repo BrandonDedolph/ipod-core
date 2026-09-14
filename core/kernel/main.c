@@ -36,7 +36,8 @@
 #include "resume_ctx.h"
 #include "cfg_commit.h"
 #include "evlog.h"
-#include "core_version.h"   /* CORE_BUILD_ID: meson vcs_tag, boot screen only */
+#include "core_version.h"       /* CORE_BUILD_ID: meson vcs_tag, git describe   */
+#include "core_version_tag.h"   /* CORE_VERSION:  meson vcs_tag, nearest tag    */
 #include "../ui/text.h"
 #include "../ui/thumb.h"
 #include "../ui/artcache.h"
@@ -3231,7 +3232,7 @@ static void settings_render_cur(void)
                               evlog_seq(),
                               evlog_enabled()  ? ABOUT_LOG_ON :
                               evlog_failures() ? ABOUT_LOG_ERR : ABOUT_LOG_OFF,
-                              g_lib_truncated);
+                              g_lib_truncated, CORE_VERSION);
     } else if (g_set_screen == SETTINGS_DIAG) {
         /* Boot Details owns the diagnostics now: the cold-boot phase
          * breakdown and the settings-file locator. They used to be squeezed
@@ -3270,7 +3271,8 @@ static void settings_render_cur(void)
                              ps ? ps->underruns : 0,
                              config_writable(), config_seq(),
                              g_diag_cfg_lba[0], g_diag_cfg_lba[1],
-                             g_diag_log_lba[0], g_diag_log_lba[1]);
+                             g_diag_log_lba[0], g_diag_log_lba[1],
+                             CORE_BUILD_ID);
     } else {
         settings_render(g_set_screen, &g_settings, g_set_sel);
     }

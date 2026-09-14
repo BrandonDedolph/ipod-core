@@ -291,7 +291,8 @@ void settings_render(int screen, const settings_t *s, int sel)
     if (screen == SETTINGS_ABOUT) {
         /* main.c should call settings_about_render() with live values; this
          * placeholder path keeps settings_render total over every screen. */
-        settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, ABOUT_LOG_OFF, 0);
+        settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, ABOUT_LOG_OFF,
+                              0, "v0.0.0");
         return;
     }
 
@@ -397,20 +398,38 @@ static int about_card(int x, const char *label)
 void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
                            int n_songs, int n_albums, int n_artists,
-                           uint32_t log_seq, int log_state, int lib_truncated)
+                           uint32_t log_seq, int log_state, int lib_truncated,
+                           const char *version)
 {
     console_clear(S_SURFACE);
     ui_header("About", "", 1);
 
     char v[48], w[24];
 
-    /* --- device row: name left, firmware chip right, one baseline --- */
+    /* --- device row: name left, firmware chip right, one baseline ---
+     * The chip is the release version: "Core v0.1.0", from the nearest git
+     * tag (CORE_VERSION, passed in — this file is host-built and cannot see
+     * the generated header). It is sized from text_width, so a longer version
+     * simply widens it leftwards; "iPod 5.5G" ends at x=101 and even a chip
+     * reading "Core v0.10.12" starts at x=211, so the row has ~110 px spare.
+     * The build id (tag + commits + hash + -dirty) is the LONG string and
+     * lives on the boot screen and in Boot Details, not here. */
     st_text(16, 66, "iPod 5.5G", F_BIG, S_INK);
     {
-        int cw = text_width("Core", F_SUB);
+        char chip[32];
+        su_copy(chip, "Core");
+        if (version && version[0]) {
+            int i = 4;
+            chip[i++] = ' ';
+            for (int j = 0; version[j] && i < (int)sizeof chip - 1; j++) {
+                chip[i++] = version[j];
+            }
+            chip[i] = '\0';
+        }
+        int cw = text_width(chip, F_SUB);
         int chw = cw + 16, chx = LCD_WIDTH - 16 - chw, chy = 52;
         ui_round_rect(chx, chy, chw, 16, 8, S_ACCENT);
-        st_text(chx + 8, chy + 12, "Core", F_SUB, S_SURFACE);
+        st_text(chx + 8, chy + 12, chip, F_SUB, S_SURFACE);
     }
     /* A capped load is the one thing the stat columns below cannot show on
      * their own: a library that hit LIB_MAX_* just looks smaller. Warning
@@ -575,11 +594,21 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                           uint32_t decode_us_kframe, uint32_t underruns,
                           int cfg_writable, uint32_t cfg_seq,
                           uint32_t lba0, uint32_t lba1,
-                          uint32_t log_hdr_lba, uint32_t log_next_lba)
+                          uint32_t log_hdr_lba, uint32_t log_next_lba,
+                          const char *build_id)
 {
     char v[48];
     console_clear(S_SURFACE);
-    ui_header("Boot Details", "", 1);
+    /* The full build stamp goes in the header's right-hand slot. Everything
+     * below is claimed — the phase bar, a two-column legend, the resume
+     * split, the underrun warning and two LBA rows run to y=230 of a 240 px
+     * panel — so this is the only free text row on the page, and it costs no
+     * pixels from the bars. ui_header measures the right value first and
+     * ellipsises the title into what is left: "Boot Details" is 80 px at
+     * F_HEADER, the longest plausible stamp ("v0.10.12-123-g1234567-dirty")
+     * 145 px at F_SMALL, and 24 + 80 + 8 + 145 + 12 = 269 < 320, so neither
+     * is clipped. */
+    ui_header("Boot Details", (build_id && build_id[0]) ? build_id : "", 1);
 
     /* --- headline: label left, total right, on one line --- */
     st_text(16, 60, "COLD BOOT", F_SMALL, S_MUTED);

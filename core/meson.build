@@ -28,16 +28,39 @@ target = get_option('target')
 cc = meson.get_compiler('c')
 
 # Build stamp, screen-only: the boot screen prints it bottom-right in the
-# border colour. `git describe --always --dirty --abbrev=7` — the --dirty is
-# the point, since device images are routinely built from an uncommitted tree
-# and the screen should say so. Never printed on the UART (the clicky boot
-# golden matches those lines exactly), so this cannot move a test. Without git
-# (or outside a checkout) meson substitutes the fallback rather than failing.
+# border colour, and Boot Details prints it in the header. `git describe
+# --tags --always --dirty --abbrev=7` — the --dirty is the point, since device
+# images are routinely built from an uncommitted tree and the screen should say
+# so, and --tags makes LIGHTWEIGHT tags count too (plain `git describe` only
+# sees annotated ones, so a `git tag v0.1.0` would have been invisible here).
+# Never printed on the UART (the clicky boot golden matches those lines
+# exactly), so this cannot move a test. Without git (or outside a checkout)
+# meson substitutes the fallback rather than failing.
 core_version_h = vcs_tag(
   input: 'kernel/core_version.h.in',
   output: 'core_version.h',
-  command: ['git', 'describe', '--always', '--dirty', '--abbrev=7'],
+  command: ['git', 'describe', '--tags', '--always', '--dirty', '--abbrev=7'],
   fallback: 'unknown',
+  replace_string: '@VCS_TAG@',
+)
+
+# The release version — the NEAREST tag alone, no commit count and no hash, so
+# Settings > About can print a chip that reads "Core v0.1.0". Separate from the
+# build id above because vcs_tag does exactly one substitution per call, and
+# separate from a run_command() because run_command only runs at CONFIGURE
+# time: vcs_tag re-runs on every `ninja`, so a freshly created tag shows up in
+# the next build without a reconfigure.
+#
+# `git describe --tags --abbrev=0` FAILS in a repository with no tags at all
+# (it exits non-zero and prints nothing). That is the state of this tree until
+# the first tag is cut, and it must not break the build: meson's vcs_tag
+# catches the failure and substitutes the fallback, so an untagged tree builds
+# and reports v0.0.0.
+core_version_tag_h = vcs_tag(
+  input: 'kernel/core_version_tag.h.in',
+  output: 'core_version_tag.h',
+  command: ['git', 'describe', '--tags', '--abbrev=0'],
+  fallback: 'v0.0.0',
   replace_string: '@VCS_TAG@',
 )
 
@@ -349,7 +372,7 @@ if target == 'hw'
   core_elf = executable(
     'core.elf',
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c')
-      + [core_version_h],   # generated build stamp; main.c includes it
+      + [core_version_h, core_version_tag_h],   # generated stamps; main.c includes both
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
     link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, keyhold_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
     include_directories: codec_inc,

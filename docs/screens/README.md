@@ -27,6 +27,33 @@ drawn, and an atlas spacing bug could not show up here at all. The SPACE
 advance is read from the atlas as well (glyph 0's `.advance`): the generator
 fits its own space width, and PIL's was 1.2–2.3 px narrower per word gap.
 
+**Version stamps come from `git describe` at render time, as of
+2026-09-14.** `render.py` runs the same two commands `core/meson.build`'s
+`vcs_tag` calls run at build time, from the repo root, with the same
+fallbacks: `git describe --tags --always --dirty --abbrev=7` → `BUILD_ID`
+(fallback `unknown`, the firmware's `CORE_BUILD_ID`) and `git describe --tags
+--abbrev=0` → `VERSION` (fallback `v0.0.0`, the firmware's `CORE_VERSION`).
+`BUILD_ID` is the boot/loading stills' bottom-right stamp and the Boot Details
+header; `VERSION` is the About chip's "Core v0.1.0". This used to be a
+hard-coded hash, which meant `boot.png` claimed a commit that had not been the
+tip for weeks. Consequence worth knowing: **those five stills change whenever
+the working tree's describe output changes** — a fresh commit, or a dirty tree
+adding `-dirty` — so regenerate them from a clean tree at the commit you want
+them to name.
+
+**Release override.** A tagged release has to ship stills that name the tag,
+which `git describe` cannot report while the tag does not exist yet. Set both
+environment variables and `render.py` uses them verbatim instead of calling
+git:
+
+```bash
+CORE_STAMP_BUILD_ID=v0.1.0 CORE_STAMP_VERSION=v0.1.0 \
+  tools/.venv/bin/python3 docs/screens/render.py
+```
+
+Use it only for the render that goes in with the commit being tagged, with the
+same string you are about to tag. Any other time, let git answer.
+
 ## The one rule: the firmware is the source of truth
 
 A screenshot here is a claim about what the device draws. So:
@@ -81,8 +108,9 @@ A screenshot here is a claim about what the device draws. So:
   49238456 / 49238464; About: 4127 songs / 318 albums / 142 artists,
   21.0 GB free of 74.5, battery 73 % at 3912 mV, ADC 2731, LOG 6 on).
 - **GIFs tell one story each** and hold on the frames a reader needs to see.
-  The frame lists live in `render.py` (`build_walkthrough_gif`, `gif_*`).
-  Keep total sizes reasonable (the walkthrough is under 1 MB).
+  The frame lists live in `render.py` (`walkthrough_spec`, `_boot_spec`,
+  `gif_*`). Keep total sizes reasonable (the walkthrough is under 1 MB, the
+  hero under 1.5 MB).
 
 ## What the gallery contains
 
@@ -98,9 +126,18 @@ A screenshot here is a claim about what the device draws. So:
 | `settings.png` `sound.png` `clicker.png` `theme.png` | Settings | `screen_settings`, `screen_sound`, `screen_clicker`, `screen_theme` |
 | `about.png` `bootdetails.png` | About dashboard, Boot Details | `screen_about`, `screen_diag` |
 | `nowplaying_onyx.png` `albums_onyx.png` | the Onyx theme | `with_palette(ONYX, …)` |
+| `nowplaying_sage.png` | the Sage theme | `screen_nowplaying_sage` |
 | `charging.png` `battery_low.png` | charging screen, low-battery warning | `screen_charging`, `screen_battery_low` |
-| `demo.gif` | cold boot → browse → play walkthrough | `build_walkthrough_gif` |
+| `hero.gif` | the README hero: boot to the menu, then the walkthrough | `gif_hero` (`_boot_spec` + `walkthrough_spec`) |
+| `demo.gif` | the walkthrough alone: browse → play | `build_walkthrough_gif` (`walkthrough_spec`) |
+| `boot.gif` | power-on: splash, library bar, main menu | `gif_boot` (`_boot_spec`) |
+| `jump.gif` | Right jumps to Now Playing, Menu returns to the row | `gif_jump` |
 | `browse.gif` `volume.gif` `themes.gif` `lock.gif` `settings.gif` | one feature each | `gif_*` |
+
+Indexed here, not referenced by the top-level README: `demo.gif`, `lock.gif`,
+`volume.gif`, `music.png`, `songs.png`, `genres.png`, `sound.png`,
+`clicker.png`, `theme.png`, `lock.png`, `locked_list.png`, `loading_onyx.png`,
+`albums_onyx.png`. They stay in the gallery; the README shows a smaller set.
 
 ## Keeping it honest
 

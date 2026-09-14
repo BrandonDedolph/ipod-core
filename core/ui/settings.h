@@ -266,11 +266,19 @@ void settings_render(int screen, const settings_t *s, int sel);
  * log_seq / log_state describe the event log (kernel/evlog.c): the footer
  * reads "LOG <seq> on", "LOG off" or "LOG <seq> err". lib_truncated != 0
  * draws the "library too large" warning (the counts hit a LIB_MAX_* cap).
+ *
+ * `version` is the release tag ("v0.1.0"), drawn in the firmware chip as
+ * "Core v0.1.0". It is a PARAMETER rather than a #include because this file
+ * is host-built (the settings unit test links it) and CORE_VERSION lives in a
+ * meson-generated header that only the firmware build produces; main.c passes
+ * CORE_VERSION, everything else passes "v0.0.0". NULL or "" renders the bare
+ * "Core" chip. Long strings are fine — the chip is sized from text_width.
  */
 void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
                            int n_songs, int n_albums, int n_artists,
-                           uint32_t log_seq, int log_state, int lib_truncated);
+                           uint32_t log_seq, int log_state, int lib_truncated,
+                           const char *version);
 
 /*
  * Render the Boot Details screen (SETTINGS_DIAG). All times are milliseconds
@@ -281,6 +289,13 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
  * log_hdr_lba/log_next_lba are the event log's header block and the block
  * its next flush would write (both 0 when the log is off) — the same
  * cross-check against tools/make_log.py --verify.
+ *
+ * `build_id` is the full build stamp ("v0.1.0-3-g1234567-dirty"), drawn in
+ * the header's right-hand slot — the one place on this page with a free text
+ * row, since every pixel between the phase bar and the LOG line is spoken
+ * for. A parameter for the same reason as settings_about_render's `version`:
+ * this file is host-built and cannot see the generated header. NULL or ""
+ * draws the plain header.
  */
 void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                           uint32_t lib_ms, uint32_t resume_ms,
@@ -289,6 +304,7 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                           uint32_t decode_us_kframe, uint32_t underruns,
                           int cfg_writable, uint32_t cfg_seq,
                           uint32_t lba0, uint32_t lba1,
-                          uint32_t log_hdr_lba, uint32_t log_next_lba);
+                          uint32_t log_hdr_lba, uint32_t log_next_lba,
+                          const char *build_id);
 
 #endif /* CORE_UI_SETTINGS_H */

@@ -24,6 +24,7 @@ Regenerate:  tools/.venv/bin/python3 docs/screens/render.py
 
 import os
 import re
+import subprocess
 from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +39,39 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 FONTS = os.environ.get("CORE_FONTS_DIR", os.path.join(REPO, "tools", "fonts-src"))
 ATLAS = os.path.join(REPO, "core", "ui", "atlas")
 ART = os.path.join(HERE, "art")
+
+
+def _git_describe(args, fallback):
+    """One `git describe` against the repo, with meson's fallback semantics.
+
+    The firmware's two version strings come from meson vcs_tag (core/meson.build),
+    which runs git describe at build time and substitutes a fallback when git
+    fails or is absent. The gallery used to paint a hard-coded hash, which meant
+    the stills drifted from the firmware the moment anything was committed; run
+    the same commands here instead, with the same fallbacks, so a still shows
+    what a build off this tree would show.
+    """
+    try:
+        out = subprocess.run(["git", "describe"] + args, cwd=REPO,
+                             capture_output=True, text=True, check=True)
+        return out.stdout.strip() or fallback
+    except (OSError, subprocess.CalledProcessError):
+        # No git, not a checkout, or — for --abbrev=0 — a repo with no tags
+        # yet, which is a non-zero exit with empty output.
+        return fallback
+
+
+# Mirrors core/meson.build: CORE_BUILD_ID (full stamp, boot screen + Boot
+# Details header) and CORE_VERSION (nearest tag alone, the About chip).
+BUILD_ID = _git_describe(["--tags", "--always", "--dirty", "--abbrev=7"], "unknown")
+VERSION = _git_describe(["--tags", "--abbrev=0"], "v0.0.0")
+
+# Release override. For the gallery that ships with a tagged commit the stills
+# have to show the tag the commit is about to get, which `git describe` cannot
+# know yet (the tag does not exist while the render runs). Set these and the
+# value is used verbatim, no git call.
+BUILD_ID = os.environ.get("CORE_STAMP_BUILD_ID", BUILD_ID)
+VERSION = os.environ.get("CORE_STAMP_VERSION", VERSION)
 
 if not os.path.isdir(FONTS):
     raise SystemExit(
@@ -1078,10 +1112,11 @@ def screen_about(lib_truncated=AB_LIB_TRUNCATED):
 
     # --- device row: name left, firmware chip right, one baseline ---
     sc.text(16, 66, "iPod 5.5G", FONT_TITLE, INK)
-    cw = text_width("Core", FONT_SUB)
+    chip = "Core " + VERSION if VERSION else "Core"
+    cw = text_width(chip, FONT_SUB)
     chw, chx, chy = cw + 16, W - 16 - (cw + 16), 52
     sc.fill_round_rect(chx, chy, chw, 16, 8, ACCENT)
-    sc.text(chx + 8, chy + 12, "Core", FONT_SUB, SURFACE)
+    sc.text(chx + 8, chy + 12, chip, FONT_SUB, SURFACE)
     if lib_truncated:
         sc.text_centered(84, "Library too large " + MIDDOT + " some items not shown",
                           FONT_SMALL, BATT_RED)
@@ -1172,18 +1207,18 @@ def screen_menu(title, items, sel, back):
     return sc.img
 
 
-def build_walkthrough_gif():
+def walkthrough_spec(marquee=True):
     """A little "someone using the iPod" story: main menu -> Music -> Albums
     (with the long title marqueeing) -> album detail -> now playing, with the
-    selection bar visibly stepping row to row and the progress bar advancing."""
-    frames = []
-    durations = []
+    selection bar visibly stepping row to row and the progress bar advancing.
+
+    Returns a `_save_gif` spec so the same sequence can be reused (the hero GIF
+    appends it to the boot frames). `marquee=False` drops the title-reveal
+    frames, which is the cheapest way to shrink a GIF that carries this story."""
+    spec = []
 
     def add(im, hold=1, ms=140):
-        p = upscale(im, GIF_SCALE).convert("P", palette=Image.ADAPTIVE, colors=96)
-        for _ in range(hold):
-            frames.append(p)
-            durations.append(ms)
+        spec.append((im, hold, ms))
 
     # 1) MAIN MENU — dwell on ACTIVE rows; greyed rows (Podcasts/Audiobooks) are
     #    passed over quickly (1 frame), never selected.
@@ -1207,15 +1242,16 @@ def build_walkthrough_gif():
         add(screen_albums(sel=s), hold=2 if s else 3)
     add(screen_albums(sel=LONG, title_offset=0), hold=3)    # long title (start)
     # marquee reveal
-    t = ALBUMS[LONG][0]
-    tx = 12 + 28 + 8
-    avail = (W - 16) - tx
-    max_off = max(0, text_width(t, FONT_HEADER) - avail)
-    o = 0
-    while o < max_off:
-        o = min(max_off, o + 6)
-        add(screen_albums(sel=LONG, title_offset=o), hold=1, ms=90)
-    add(screen_albums(sel=LONG, title_offset=max_off), hold=3)  # dwell on tail
+    if marquee:
+        t = ALBUMS[LONG][0]
+        tx = 12 + 28 + 8
+        avail = (W - 16) - tx
+        max_off = max(0, text_width(t, FONT_HEADER) - avail)
+        o = 0
+        while o < max_off:
+            o = min(max_off, o + 6)
+            add(screen_albums(sel=LONG, title_offset=o), hold=1, ms=90)
+        add(screen_albums(sel=LONG, title_offset=max_off), hold=3)  # dwell on tail
     add(screen_albums(sel=0), hold=3)                        # bar back to AUSTIN, select
 
     # 4) ALBUM DETAIL — step down a couple of tracks, settle on "Something Real".
@@ -1230,10 +1266,12 @@ def build_walkthrough_gif():
         add(_now_playing_base(elapsed=e).img, hold=2, ms=220)
     add(_now_playing_base(elapsed=6).img, hold=5, ms=220)   # hold a beat, then loop
 
-    path = os.path.join(OUT, "demo.gif")
-    frames[0].save(path, save_all=True, append_images=frames[1:], loop=0,
-                   duration=durations, optimize=True, disposal=2)
-    return path, len(frames), sum(durations)
+    return spec
+
+
+def build_walkthrough_gif():
+    """demo.gif — the walkthrough on its own."""
+    return _save_gif("demo.gif", walkthrough_spec())
 
 
 # ---------------------------------------------------------------------------
@@ -1365,6 +1403,44 @@ def gif_settings():
     spec.append((sound_vol(20), 3, 150))
     spec.append((screen_theme(), 2, 700))     # end on the theme picker
     return _save_gif("settings.gif", spec)
+
+
+def _boot_spec():
+    """BOOT: one screen from power-on to the menu (main.c never swaps screens
+    here, it repaints the same one). The pre-mount splash carries no bar; the
+    bar appears once the settings read has told us the theme and the library
+    load starts reporting percent; the menu replaces it at the end."""
+    return [
+        (boot_screen("LOADING", -1),               1, 1400),  # pre-mount splash
+        (boot_screen("LOADING LIBRARY", 0),        1,  300),
+        (boot_screen("LOADING LIBRARY", 18),       1,  220),
+        (boot_screen("LOADING LIBRARY", 41),       1,  220),
+        (boot_screen("LOADING LIBRARY", 64),       1,  220),
+        (boot_screen("LOADING LIBRARY", 83),       1,  220),
+        (boot_screen("LOADING LIBRARY", 100),      1,  350),
+        (screen_menu("Core", MAIN_MENU, 0, False), 1, 1600),  # main menu, Music
+    ]
+
+
+def gif_boot():
+    return _save_gif("boot.gif", _boot_spec(), colors=64)
+
+
+def gif_jump():
+    """TRANSPORT: Right on a list pushes Now Playing over it, and Menu comes
+    back to the row you left (Albums, "Changes" selected)."""
+    spec = [
+        (screen_albums(sel=1), 1,  900),
+        (_np(73),              1, 1500),   # RIGHT: Now Playing, playback running
+        (_np(74),              1,  600),
+        (screen_albums(sel=1), 1, 1200),   # MENU: back on the same row
+    ]
+    return _save_gif("jump.gif", spec, colors=80)
+
+
+def gif_hero():
+    """The README hero: cold boot to the menu, then the walkthrough."""
+    return _save_gif("hero.gif", _boot_spec() + walkthrough_spec(), colors=96)
 
 
 # ---------------------------------------------------------------------------
@@ -1566,7 +1642,9 @@ DIAG_LOG_LBA = (49238456, 49238464)  # event log header / next-flush LBAs
 
 def screen_diag():
     sc = Screen()
-    header(sc, "Boot Details", back=True)
+    # The full build id rides in the header's right-hand slot — the one free
+    # text row on a page whose bars, legend and LBA rows reach y=230.
+    header(sc, "Boot Details", right=BUILD_ID, back=True)
     status_strip(sc)                 # main.c settings_render_cur
 
     # headline: label left, total right, on one line
@@ -1749,6 +1827,9 @@ def screen_albums_onyx():
 def screen_nowplaying_onyx():
     return with_palette(ONYX, lambda: screen_nowplaying())
 
+def screen_nowplaying_sage():
+    return with_palette(SAGE, screen_nowplaying)
+
 
 # ---------------------------------------------------------------------------
 # System screens: charging + boot splash
@@ -1874,10 +1955,12 @@ def screen_battery_low(kind="disksafe"):
     return sc.img
 
 
-# The boot screen's build stamp is `git describe --always --dirty --abbrev=7`
-# baked in at build time (core/meson.build vcs_tag). The gallery has no build,
-# so it draws a FIXED placeholder — the device shows its own real hash.
-BOOT_BUILD_ID = "d93e97f"
+# The boot screen's build stamp is CORE_BUILD_ID: `git describe --tags --always
+# --dirty --abbrev=7`, baked in at build time (core/meson.build vcs_tag). It is
+# computed at render time from the same command (BUILD_ID, above), so the still
+# carries the stamp an image built from this tree would show — including
+# "-dirty" when the tree is uncommitted.
+BOOT_BUILD_ID = BUILD_ID
 BOOT_MARK_CY  = 86
 BOOT_BAR_Y    = H - 34
 BOOT_BAR_X    = 60
@@ -1948,6 +2031,7 @@ def main():
     outputs.append(save_png(screen_theme(), "theme.png"))
     # --- new: dual theme (Onyx) ---
     outputs.append(save_png(screen_nowplaying_onyx(), "nowplaying_onyx.png"))
+    outputs.append(save_png(screen_nowplaying_sage(), "nowplaying_sage.png"))
     outputs.append(save_png(screen_albums_onyx(), "albums_onyx.png"))
     # --- new: system ---
     outputs.append(save_png(screen_charging(), "charging.png"))
@@ -1963,6 +2047,9 @@ def main():
     gifs.append(gif_themes())
     gifs.append(gif_lock())
     gifs.append(gif_settings())
+    gifs.append(gif_boot())
+    gifs.append(gif_jump())
+    gifs.append(gif_hero())
     for p in outputs:
         print("wrote", p, os.path.getsize(p), "bytes")
     for path, nframes, total_ms in gifs:

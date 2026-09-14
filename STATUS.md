@@ -122,6 +122,32 @@ What changed (see `git log 054c722..`):
   `theme_set`) and the menu are all Onyx. Boot Details' OTHER bucket (total
   minus the named phases) absorbs the moved config read; `g_lib_load_ms` is
   measured inside `library_ensure` and is unchanged. **UNFLASHED.**
+- **Semantic versions in the UI (2026-09-14)** — releases are git tags
+  `vMAJOR.MINOR.PATCH`, and the firmware now reads them instead of carrying a
+  version number nobody updates. Two meson `vcs_tag` headers, both regenerated
+  on every `ninja` (a `run_command` would only refresh at reconfigure):
+  `CORE_BUILD_ID` = `git describe --tags --always --dirty --abbrev=7` (the full
+  stamp — **`--tags` is new**, without it a *lightweight* `git tag v0.1.0`
+  would have been invisible), and `CORE_VERSION` = `git describe --tags
+  --abbrev=0` (the nearest tag alone, `kernel/core_version_tag.h.in`). An
+  untagged tree — which is what this one still is — makes the second command
+  exit non-zero; the `vcs_tag` fallback turns that into `v0.0.0` and the build
+  succeeds, so nothing has to be tagged before it compiles. Today's tree
+  generates `CORE_BUILD_ID "7617196-dirty"` and `CORE_VERSION "v0.0.0"`.
+  Where they show: the boot screen keeps the build id bottom right (its own
+  row, baseline 236, clear of the phase label at 224 — the longest plausible
+  stamp is 145 px of 320, so nothing is clipped or overlapped); Settings →
+  About's firmware chip reads **"Core v0.1.0"** instead of "Core" (the chip is
+  sized from `text_width`, and "iPod 5.5G" ends at x=101 while even "Core
+  v0.10.12" starts at x=211); Boot Details puts the **full build id in the
+  header's right-hand slot**, the only free text row on a page whose bars,
+  legend and LBA rows run to y=230. `screen_settings.c` is host-built and must
+  not see a generated header, so both strings arrive as parameters
+  (`settings_about_render(..., version)`, `settings_diag_render(...,
+  build_id)`); the placeholder call inside `settings_render` passes `"v0.0.0"`.
+  `docs/screens/render.py` runs the same two `git describe` commands with the
+  same fallbacks at render time, so the stills stop drifting from the
+  firmware. **UNFLASHED.**
 - **Boot Details no longer spins the drive up (2026-09-14)** — the page probed
   CORECFG.DAT's two slot LBAs and the log's header/next LBAs on EVERY paint,
   and each probe walks the FAT chain, so opening it with the platters parked
@@ -501,7 +527,7 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   source over an 8 MB anti-skip buffer; a full-length track streams off the
   disk while the UI stays live. **FLAC only.** `dr_mp3` is built and linked
   and passes its host KAT, but MP3 is switched off on the device
-  (`CORE_ENABLE_MP3 0`, `core/kernel/main.c:728`) and `classify_ext()` does
+  (`CORE_ENABLE_MP3 0`, `core/library/names.h`) and `classify_ext()` does
   not surface `.mp3` at all, so those files are invisible in the browser.
   Its float synthesis filter cannot hit real time on this FPU-less CPU —
   the PCM ring starves and playback stutters. Parked, not removed;
@@ -710,7 +736,7 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
 
 ## Testing
 
-`meson test -C build-sim` from `core/` (**57/57** green):
+`meson test -C build-sim` from `core/` (**58/58** green):
 
 - **Codec KAT** — FLAC + MP3 decoders bit-exact against reference PCM.
 - **MMIO golden traces** — each freestanding hw driver is host-compiled against a
@@ -833,3 +859,76 @@ git status -sb                          # ahead/behind for the current branch
 
 See the README for the overview, `core/README.md` for the firmware build, and
 `PLAN.md` for the roadmap.
+
+## Performance notes (moved from README 2026-09-14)
+
+Verbatim from the README, which no longer carries it.
+
+## Performance — real-time on a 2006 SoC
+
+The PP5022 is a pair of ~80 MHz ARM7TDMI cores with **no FPU, no hardware
+divide**, a small unified cache, and a **PIO** disk (no DMA to the drive,
+~170 KB/s). Decoding FLAC in real time *and* driving a smooth, animated,
+antialiased UI on that budget took deliberate work — the interesting part
+of the project is how little the hardware gives you.
+
+- **Clock + cache first.** Enabling the PP5022 unified cache and holding an
+  80 MHz boost across the whole open/decode path is the line between
+  stuttering and real-time FLAC.
+- **Measure the boot, don't guess at it.** "Boot takes ten seconds" had
+  nowhere to aim, so the boot path got instrumented per phase and the
+  numbers got their own screen. A cold boot measured **8.4 s**, of which
+  **5.1 s was a single FLAC seek**; removing that should leave roughly 3 s,
+  but the post-fix total has deliberately not been written down here because
+  nobody has yet read it off the device. Boot Details reports it live, on
+  every boot rather than on the one day someone times it — which is the
+  point of the screen.
+- **A `#define` that cost five seconds.** `DR_FLAC_NO_CRC` was set purely to
+  save per-frame decode cost — but `dr_flac` guards its *binary-search seek*
+  behind that same flag, because landing on an arbitrary byte means proving
+  a candidate frame header is real rather than audio that happens to look
+  like a sync code, and the CRC is the proof. These files also carry no
+  SEEKTABLE, so with both paths gone every seek fell through to decoding
+  from the start of the track: 5.1 s of that 8.4 s boot was one seek.
+  Seeking is O(log n) now, at a cost of ~14 KB of text and some per-frame
+  decode margin — which is exactly why Boot Details reports the decode
+  margin instead of assuming it.
+- **No divides in the hot path.** The gamma-correct text blend runs entirely
+  in integers off pre-baked sRGB↔linear LUTs (never touches `<math.h>`), and
+  the per-pixel alpha composite replaces three soft-divides with an exact
+  `floor(x/255)` add-shift — the divide-less ARM7 never pays for a divide
+  while painting glyphs.
+- **Draw only what changed.** The marquee scrolls through a tiny partial
+  present (just the title band), not a full-frame blit, and clips per pixel to
+  its row — so continuous animation costs almost nothing.
+- **Instant library.** The song database is built on the host into a single
+  index the firmware loads in *one read*; Songs / Albums / Genres open with no
+  per-file tag scan at boot, and per-genre counts are precomputed. Records bind
+  to files by a hash, not a directory-walking string compare.
+- **Streaming without skips.** A read-ahead disk buffer does bursty reads so
+  the drive head parks between them (anti-skip), feeding a lock-free SPSC PCM
+  ring drained by the DMA-completion ISR — audio never waits on the UI. Bulk
+  ATA reads land straight in the caller's buffer, with a one-sector bounce only
+  for unaligned tails.
+- **Album art that never stalls audio.** Covers are pre-converted on the host
+  to raw RGB565 sidecars (no on-device JPEG decode); the list-chip cache loads
+  at most one thumbnail per main-loop pass so scrolling can't starve the audio
+  DMA, and the 28 px chip is an exact-size file — a 1:1 copy, no resample.
+- **No allocator in the render path.** The Nunito glyph atlases are `const`
+  `.rodata` resolved at link time — no FreeType, no malloc, no init step.
+- **Idle costs something, so spend less of it.** At idle the CPU drops to
+  30 MHz and halts, and the drive spins down after 20 s — including while
+  paused. At stop, the codec is powered down and the audio clocks are gated.
+  Asleep (Play held), the drive is parked, the panel and backlight are off,
+  the codec is down and the CPU idles between wheel samples.
+- **A pause stocks the buffer.** While a track sits paused and the platters
+  are still up, the player quietly reads ~9 s of the file ahead, and a
+  resume over a parked drive with a shallow buffer spins the drive up
+  *before* the DAC starts — so waking the device never stalls a second into
+  the music. Found on the device with the event log: eleven underruns,
+  every one of them a spin-up the ring could not cover.
+- **Give the display controller time.** The BCM retires a full frame after
+  the present returns; a partial update sent too soon behind it stalls the
+  main loop past the audio ring. Presents are paced from the measured cost
+  of the last full frame, on every path including the wake from sleep.
+
