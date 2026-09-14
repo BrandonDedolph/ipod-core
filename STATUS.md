@@ -291,9 +291,26 @@ into diskbuf's synchronous fallback, which blocked on the spin-up. Fix
 the platters are up (never on a parked drive), the playing pump honours
 `ata_is_parked()` alongside its own flag, and `player_resume` pre-pays
 the spin-up before the DAC starts when the buffer is under DISK_LOW/2.
-Five host cases (player-queue 13b). Flashed, readback OK, **awaiting the
-owner's re-test** of exactly that sequence. Whether the BCM timeouts were
-a side effect of the stalls is the thing to read in the next log.
+Five host cases (player-queue 13b). **Owner: "no more underruns" on all
+three sequences** (paused-at-boot → park → Play; pause mid-song → park →
+resume; suspend while playing → wake). Third log pull: the one flushed
+window of that boot has a pause, a park and a resume with underruns 0 and
+bcm_timeouts 0 — so the BCM timeouts were a side effect of the stalls,
+not a separate fault. Most of that session was lost, though: the log's
+last flush was a suspend entry and the rest sat in RAM through the
+reboot into disk mode. 1879fa0: entering Disk Mode from Settings now
+forces a settings commit and a FINAL log block first (narrated
+"core: disk mode: entering"). The ROM Select+Play route still loses RAM
+— unavoidable.
+
+**End of night, device image = 1879fa0.** Confirmed on the device today:
+silent jack (VMID), steady charge gauge, scrollbar under fast scroll,
+white blank at sleep, seven themes on a five-row picker, short-hold
+suspend + wake, 5 s power-off + wake, event log end to end, About
+dashboard, zero underruns on every resume path. Open: SUSPEND_SLOW_TICK
+and SUSPEND_GATE_CLOCKS untested alone, clock_suspend (PLL park) needs a
+rework before it comes back, ATA SLEEP vs STANDBY untested alone, USB
+ground-loop noise is the cable. Nothing pushed.
 
 ## Where we are right now (2026-07-28)
 
