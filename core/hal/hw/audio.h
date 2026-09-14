@@ -100,6 +100,11 @@ uint32_t audio_late_worst_us(void);
  * quick pause/unpause never pays it.
  */
 void hal_audio_suspend(void);
+
+/* Boot-time: force the codec into the same cold, muted state a persistent
+ * pause leaves it in, regardless of what the previous image or a warm reset
+ * left behind (an inherited live codec is a hiss with nothing playing). */
+void hal_audio_boot_quiet(void);
 int  hal_audio_wake(void);
 
 #endif /* CORE_HAL_HW_AUDIO_H */

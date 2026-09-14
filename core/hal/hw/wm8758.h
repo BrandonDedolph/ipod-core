@@ -58,7 +58,12 @@
 
 /* ---- PWRMGMT1 (0x01) ------------------------------------------------ */
 #define PWRMGMT1_VMIDSEL_OFF   0x000
-#define PWRMGMT1_VMIDSEL_500K  0x002  /* low-power hold */
+#define PWRMGMT1_VMIDSEL_75K   0x001  /* NORMAL OPERATION — the playback setting */
+#define PWRMGMT1_VMIDSEL_500K  0x002  /* low-power STANDBY hold — not for playback:
+                                        * the high-impedance divider has the worst
+                                        * supply rejection, and on the device it put
+                                        * the HDD motor, the piezo burst and a hiss
+                                        * on the headphone out (2026-09-13) */
 #define PWRMGMT1_VMIDSEL_10K   0x003  /* fast startup   */
 #define PWRMGMT1_BUFIOEN       0x004
 #define PWRMGMT1_BIASEN        0x008

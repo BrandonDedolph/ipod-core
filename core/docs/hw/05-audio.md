@@ -298,7 +298,8 @@ live at bit 8). Source: `firmware/export/wm8758.h:45-315`.
 | Constant | Reg | Value | Meaning |
 |----------|-----|-------|---------|
 | `PWRMGMT1_VMIDSEL_OFF`  | PWRMGMT1 | `0x000` | VMID divider off |
-| `PWRMGMT1_VMIDSEL_500K` | PWRMGMT1 | `0x002` | VMID 500 kΩ (low-power hold) |
+| `PWRMGMT1_VMIDSEL_75K`  | PWRMGMT1 | `0x001` | VMID 75 kΩ — normal operation (playback) |
+| `PWRMGMT1_VMIDSEL_500K` | PWRMGMT1 | `0x002` | VMID 500 kΩ (low-power STANDBY hold; poor supply rejection — audible HDD/piezo/hiss on the device when used for playback) |
 | `PWRMGMT1_VMIDSEL_10K`  | PWRMGMT1 | `0x003` | VMID 10 kΩ (fast startup) |
 | `PWRMGMT1_BUFIOEN`      | PWRMGMT1 | `0x004` | tie-off buffer enable |
 | `PWRMGMT1_BIASEN`       | PWRMGMT1 | `0x008` | analog bias enable |

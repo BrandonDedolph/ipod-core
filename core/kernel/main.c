@@ -6675,6 +6675,10 @@ _Noreturn void kernel_main(void) {
         battery_init();
         hal_volume_init();               /* codec output gain -> safe default      */
         piezo_init();                    /* PWM click for menu navigation          */
+        hal_audio_boot_quiet();          /* codec cold + muted until the first     *
+                                          * track: a Menu+Select reset keeps its   *
+                                          * rails up, and an inherited live codec  *
+                                          * hisses on the jack with nothing playing */
 
         /* Paint the boot splash immediately, so the panel shows CORE branding
          * instead of the chainloader's leftover framebuffer (a blue field with

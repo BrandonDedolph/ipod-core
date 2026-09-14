@@ -654,6 +654,22 @@ static void codec_power_off(void)
     g_cold = 1;
 }
 
+/*
+ * Boot: put the codec into a KNOWN cold state, whatever the previous image,
+ * a Menu+Select warm reset (the codec's rails stay up across it) or disk
+ * mode left behind. Nothing else touches the codec until the first track's
+ * hal_audio_init, so without this an idle device inherits a live VMID and
+ * open headphone amps from whoever ran last — a steady hiss out of the jack
+ * with nothing playing (device, 2026-09-13). Same sequence a persistent
+ * pause uses; the powerdown table is safe against a codec that is already
+ * at its reset defaults.
+ */
+void hal_audio_boot_quiet(void)
+{
+    g_cold = 0;              /* assume live: force the powerdown to run once */
+    codec_power_off();
+}
+
 void hal_audio_suspend(void)
 {
     /*

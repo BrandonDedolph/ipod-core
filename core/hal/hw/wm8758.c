@@ -210,12 +210,20 @@ static const struct wm_write init_seq_b[] = {
 
 /*
  * Bring-up, part C: everything AFTER the VMID settle — hand VMID over to the
- * low-power 500k hold, drop the low-bias, then volume and unmute last.
+ * NORMAL-operation divider, drop the low-bias, then volume and unmute last.
+ *
+ * Not the 500k "low-power hold". That is the datasheet's standby divider:
+ * the reference sits behind the highest impedance the part offers, so every
+ * supply disturbance walks straight onto the outputs. On the device it did:
+ * the drive's spin-up current, the piezo's PWM burst and a steady hiss were
+ * all audible on the headphone jack while playing (2026-09-13). The 75k
+ * divider is what the part is meant to play through; the power-down path
+ * still drains VMID properly on the way to cold.
  */
 static const struct wm_write init_seq_c[] = {
-    /* --- postinit: low-power VMID hold, clear low-bias -------------- */
+    /* --- postinit: normal-operation VMID, clear low-bias ------------ */
     { WM_PWRMGMT1,  PWRMGMT1_PLLEN | PWRMGMT1_BIASEN
-                    | PWRMGMT1_BUFIOEN | PWRMGMT1_VMIDSEL_500K },
+                    | PWRMGMT1_BUFIOEN | PWRMGMT1_VMIDSEL_75K },
     { WM_BIASCTRL,  0 },
 
     /* --- volume + unmute -------------------------------------------- */
