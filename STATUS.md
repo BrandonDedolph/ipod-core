@@ -63,14 +63,50 @@ What changed (see `git log 054c722..`):
    must not reject a real cell).
 5. PLAY tap vs hold feel; a tap must never sleep, a hold must never pause.
 
-Still open from the audit: `DEV_EN` peripheral gating and PLL-off in
-suspend (moot once escalation lands), the BCM power gate, `PANEL_SLEEP_AT_IDLE`
-(still 0). The reserved playlist queue kind has since been wired — see
+Still open from the audit: the BCM power gate, `PANEL_SLEEP_AT_IDLE`
+(still 0), the ROM's undocumented `DEV_EN` bits (USB/FireWire/IDE) and a
+32 kHz suspend point — `DEV_EN` gating of SER0/PWM/I2C and PLL-off in
+suspend have since landed, see "suspend power" below. The reserved playlist queue kind has since been wired — see
 **Playlists** under "What works". Closed since: the same-hash
 tiebreak (`name_bind_exact`, exact on-disk name wins when a bucket has two
 candidates), `flac_meta.c` keeping UTF-8 on the scan fallback, and
 `ata_identify()` waiting for !BSY before it reads ERR/DF. Nothing has been
 pushed.
+
+### 2026-09-13, later — suspend power: PLL parked, peripherals gated, tick at 10 Hz
+
+`suspend_to_ram` used to idle the SoC at the 30 MHz PLL point with the
+PLL running, the 100 Hz tick waking the core to read the wheel, and the
+UART, PWM and I2C clocks on. Now, after the drive/panel/backlight are
+down (`suspend_lowpower_enter`, `kernel/main.c`):
+
+- `clock_gate_suspend` — `DEV_EN` (`0x6000600C`) bits 6 (`DEV_SER0`),
+  17 (`DEV_PWM`), 12 (`DEV_I2C`) cleared, one masked RMW each through
+  the owning driver; each block re-gates itself on its next use, so the
+  codec-off write, the 5 s battery sample and the PMU standby command
+  work unchanged. `DEV_OPTO` (wake source) and the ROM's `0xC2000124`
+  bits are not touched.
+- `timer_set_rate(10)` — `TIMER1_CFG` (`0x60005000`) = `0xC0000000 |
+  99999`; the tick counter keeps its 10 ms unit via the `USEC_TIMER`
+  reconcile, the wheel is sampled at 10 Hz ("hold any button" wakes),
+  and the loop also wakes on a latched button down-edge.
+- `clock_suspend` — `CLOCK_SOURCE` (`0x60006020`) = `0x20002222`,
+  `DEV_TIMING1` (`0x70000034`) = `0x0303`, `PLL_CONTROL` (`0x60006034`)
+  `&= ~0x88000000`, `DEV_INIT2` (`0x70000020`) `&= ~0x40000000`. The
+  24 MHz crystal, not the doc's 32 kHz point: that one is for a core
+  that has stopped, and nothing in the doc says which peripheral clocks
+  follow the core there.
+
+The battery sample, every path into `enter_standby`, and the wake path
+restore all three first (resume = the `clock_init` grammar, `TIMER1_CFG`
+back to `9999`, the `DEV_EN` bits set again). Trace-tested host-side
+(`hw-clock`, new `hw-clock-gate`, `hw-timer`; 55 suites), ARM `-Werror`
++ `verify-hw` clean. **Unverified on the device**: the saving itself
+(nothing in `docs/hw/` gives a current figure for any of it — measure
+suspend draw before/after at the bench), whether the I2C controller
+needs a reset pulse after a gate, and the wheel/UART at the crystal
+rate. If a suspend misbehaves, the three parks are independent — start
+by leaving `clock_suspend` out of `suspend_lowpower_enter`.
 
 ### 2026-09-13, later — cross-branch review, two rounds
 
@@ -245,8 +281,12 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   (`suspend_to_ram`) now actually powers things down: drive to ATA SLEEP
   (flush, standby, `0xE6`; a reset wakes it), panel to `LCD_SLEEP`
   (`SUSPEND_PANEL_SLEEP 1`, rollback documented beside it), clock
-  unboosted, codec off via the pump; it samples the battery on the 5 s
-  cadence and runs the DISKSAFE/SHUTOFF policy while asleep, escalates to
+  unboosted and then **parked** — `DEV_EN` SER0/PWM/I2C gated, `TIMER1`
+  at 10 Hz, PLL disabled + unpowered on the 24 MHz crystal (registers
+  listed under "suspend power" above; **unverified on the device**,
+  draw unmeasured) — codec off via the pump; it samples the battery on
+  the 5 s cadence (clocks restored around the sample) and runs the
+  DISKSAFE/SHUTOFF policy while asleep, escalates to
   real standby after `SUSPEND_TO_STANDBY_US` (30 min) on battery, and on
   wake does `lcd_wake` -> present -> backlight (the present retires the
   panel's wake-init before returning — `bcm_frame_commit` used to absorb

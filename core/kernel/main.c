@@ -4661,11 +4661,14 @@ static int enter_standby(void)
  *   audio     paused; the codec powers itself down through player_pump()'s
  *             persistent-pause timeout, which the idle loop keeps calling;
  *   settings  written now (forced), with the resume position;
- *   clock     boost released, so the core idles at 30 MHz between ticks;
  *   drive     ata_sleep(): cache flushed, heads parked, platters down, then
  *             SLEEP so the interface logic is off too — a reset wakes it;
  *   panel     black frame, backlight off, then LCD_SLEEP (SUSPEND_PANEL_SLEEP;
- *             the BCM stays powered so no firmware re-upload on wake).
+ *             the BCM stays powered so no firmware re-upload on wake);
+ *   SoC       boost released, then suspend_lowpower_enter(): SER0, PWM0 and
+ *             I2C clocks gated in DEV_EN (each re-gates itself on use),
+ *             TIMER1 at 10 Hz, and the PLL disabled and unpowered with the
+ *             bus on the 24 MHz crystal (kernel/clock.c clock_suspend).
  *
  * While suspended the loop samples the battery on the main loop's 5 s
  * cadence and runs the same DISKSAFE / SHUTOFF policy, so a forgotten device
@@ -4680,11 +4683,15 @@ static int enter_standby(void)
  * be empty. A refused PMU standby from any of the escalations falls through
  * this same wake path with the player stopped and nothing to resume.
  *
- * What still draws: the CPU, RAM, PLL and the 100 Hz tick (the wake is what
- * they buy), and the BCM. That is why the escalation exists. NOT MEASURED on
- * the device: the suspend draw before or after this, whether the panel
- * comes back from LCD_SLEEP (SUSPEND_PANEL_SLEEP has the rollback), and the
- * drive's post-SLEEP reset wake — all first-flash items.
+ * What still draws: the CPU at 24 MHz and the SDRAM (the wake is what they
+ * buy — the doc's 32 kHz point is for a core that has stopped), the OPTO
+ * block (the wake source), the BCM, and whatever the ROM's undocumented
+ * DEV_EN bits (USB/FireWire/IDE) keep clocked. That is why the escalation
+ * exists. NOT MEASURED on the device: the suspend draw before or after any
+ * of this, whether the panel comes back from LCD_SLEEP
+ * (SUSPEND_PANEL_SLEEP has the rollback), the drive's post-SLEEP reset
+ * wake, and whether the I2C controller and the wheel come back cleanly
+ * from a gate / a crystal-clocked spell — all first-flash items.
  */
 /*
  * Put the LCD PANEL to sleep for the suspend, not just the backlight.
