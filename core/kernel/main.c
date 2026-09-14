@@ -4780,18 +4780,45 @@ static int enter_standby(void)
  */
 static int g_suspend_lp;
 
+/*
+ * DEVICE BISECT, 2026-09-13. With all three of these on, a suspend went dark
+ * and never woke (no button, no charger; Menu+Select only), and so did the
+ * 5 s hold — its escalation runs from inside the suspend loop, so a loop
+ * that cannot see the wheel never escalates either. Panel sleep was already
+ * off for that flash. Each piece is switchable so a flash can turn one on
+ * at a time; all OFF is the known-good shape (the 2026-09-10 suspend, plus
+ * ATA SLEEP). Order of suspicion: the PLL park (does the wheel's OPTO block
+ * or the tick survive the crystal source?), the 10 Hz tick (the wake IS the
+ * tick sampling the wheel), then the gates.
+ */
+#ifndef SUSPEND_PARK_PLL
+#define SUSPEND_PARK_PLL     0
+#endif
+#ifndef SUSPEND_SLOW_TICK
+#define SUSPEND_SLOW_TICK    1
+#endif
+#ifndef SUSPEND_GATE_CLOCKS
+#define SUSPEND_GATE_CLOCKS  1
+#endif
+
 static void suspend_lowpower_enter(void)
 {
     if (g_suspend_lp) {
         return;
     }
     g_suspend_lp = 1;
+#if SUSPEND_GATE_CLOCKS
     clock_gate_suspend();
+#endif
+#if SUSPEND_SLOW_TICK
     timer_set_rate(SUSPEND_TICK_HZ);
+#endif
+#if SUSPEND_PARK_PLL
     if (clock_suspend() != 0) {
         /* The UART re-gates itself for this line. */
         uart_puts("core: suspend: PLL park refused (boost held or DMA live)\n");
     }
+#endif
 }
 
 static void suspend_lowpower_leave(void)
@@ -4800,9 +4827,15 @@ static void suspend_lowpower_leave(void)
         return;
     }
     g_suspend_lp = 0;
+#if SUSPEND_PARK_PLL
     clock_resume();
+#endif
+#if SUSPEND_SLOW_TICK
     timer_set_rate(HZ);
+#endif
+#if SUSPEND_GATE_CLOCKS
     clock_gate_resume();
+#endif
 }
 
 static void suspend_to_ram(uint32_t play_down_us)
@@ -5105,7 +5138,15 @@ _Noreturn static void run_ui(fat32_t *fs)
 {
     clickwheel_init();
     player_init(fs);
-    charger_set_max_current(500);     /* LTC4066 HPWR: 100 mA cap until asserted */
+    /* DEVICE BISECT 2026-09-13: on USB, the drive's spin-up, the piezo burst
+     * and a high-pitched whine were audible on the jack; unplugged, silent.
+     * A shared-ground loop over the cable explains the first two; the whine
+     * may be an unenumerated port current-limiting under a 500 mA pull. This
+     * flash asks for 100 mA so the owner can compare. */
+#ifndef CHARGER_MAX_MA
+#define CHARGER_MAX_MA 100
+#endif
+    charger_set_max_current(CHARGER_MAX_MA); /* LTC4066 HPWR: 100 mA cap until asserted */
     chip_placeholder_init();
     artcache_init();                  /* ways must start at key -1; .bss gives 0,
                                        * which is album 0's real index */
