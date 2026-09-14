@@ -12,9 +12,12 @@
  * drive when told to, calls config_save() and reports the result back. The
  * precedent is ui/wheel.c and library/idx.c.
  *
- * WHY THE GATE EXISTS. config_save() is the ONLY thing in the firmware that
- * writes to the user's disk, and this is its only caller, so these few
- * decisions are the whole write policy:
+ * WHY THE GATE EXISTS. config_save() was the ONLY thing in the firmware
+ * that wrote to the user's disk, and this is its only caller, so these few
+ * decisions are the whole write policy. (The event log, kernel/evlog.c,
+ * has since become the second writer — and goes through THIS gate with its
+ * own cfg_commit_t, plus a stricter idle rule: it never wakes a parked
+ * drive.)
  *
  *   - DEBOUNCE: a change is written CFG_SAVE_DEBOUNCE_US after the LAST
  *     change, not on every wheel tick — one write per settling.

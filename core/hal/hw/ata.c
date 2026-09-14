@@ -663,13 +663,14 @@ int ata_wakeup(void)
  * PIO WRITE path (LBA28). 04-ata.md, "Read / write paths" -> "Write
  * differences" + "Power-management commands" -> "Flush cache".
  *
- * PROVEN ON HARDWARE 2026-07-27, and wired to exactly ONE caller: the
- * settings save in kernel/config.c, which resolves its target LBA three
- * independent ways before letting a byte leave the CPU and whose banner
- * documents the re-qualification procedure (write a scratch LBA, read back,
- * compare, fsck). Anyone adding a SECOND caller owes that same procedure,
- * because a wrong LBA here does not fail loudly the way a bad read does: it
- * destroys data.
+ * PROVEN ON HARDWARE 2026-07-27 with exactly ONE caller: the settings save
+ * in kernel/config.c, which resolves its target LBA three independent ways
+ * before letting a byte leave the CPU and whose banner documents the
+ * re-qualification procedure (write a scratch LBA, read back, compare,
+ * fsck). Anyone adding a caller owes that same procedure, because a wrong
+ * LBA here does not fail loudly the way a bad read does: it destroys data.
+ * The SECOND caller — the event log, kernel/evlog.c — is wired and
+ * unqualified until STATUS.md's first-flash item 9 has been run.
  *
  * ALIGNMENT IS NOT OPTIONAL. This drive reports 2 logical sectors per
  * physical sector and REJECTS sub-physical-sector access with IDNF (see the

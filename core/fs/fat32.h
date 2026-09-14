@@ -302,4 +302,26 @@ uint32_t fat32_stream_skip(fat32_stream_t *st, uint32_t n);
 int fat32_file_lba(const fat32_t *fs, uint32_t first_clus,
                    uint32_t *lba, uint32_t *max_sectors);
 
+/*
+ * fat32_file_lba() for a BYTE OFFSET inside a file whose chain is longer
+ * than one cluster — kernel/evlog.c's pre-allocated ring, whose blocks live
+ * in every cluster of CORELOG.BIN, not just the first. Same contract, same
+ * fail-closed behaviour (both out-params 0 on any error, never LBA 0):
+ *
+ *   - walks the chain `byte_offset / clus_bytes` hops from `first_clus`,
+ *     BOUNDED, every hop validated; an offset past the chain's end is
+ *     FAT32_ECORRUPT, a FAT sector that will not read is FAT32_EIO;
+ *   - `byte_offset` must be a multiple of 512 (FAT32_EINVAL otherwise);
+ *   - *lba is the absolute 512-byte LBA of that sector, *max_sectors how
+ *     many sectors remain in THAT cluster from it — the chain is not
+ *     followed past the cluster the offset lands in, so a caller can never
+ *     be pointed across a cluster boundary it has not resolved.
+ *
+ * Takes a non-const fs because the chain walk goes through the FAT cache.
+ * Does not consult the file's size; the caller bounds offsets against the
+ * directory entry it found the file by.
+ */
+int fat32_file_lba_at(fat32_t *fs, uint32_t first_clus, uint32_t byte_offset,
+                      uint32_t *lba, uint32_t *max_sectors);
+
 #endif /* CORE_FS_FAT32_H */

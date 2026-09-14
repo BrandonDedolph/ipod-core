@@ -35,6 +35,7 @@
 #include "config.h"
 #include "resume_ctx.h"
 #include "cfg_commit.h"
+#include "evlog.h"
 #include "../ui/text.h"
 #include "../ui/thumb.h"
 #include "../ui/artcache.h"
@@ -656,6 +657,7 @@ static int      g_bat_mv_filt = -1;          /* median of recent samples (policy
  * through them. Forward-declared here rather than moving battery_refresh(),
  * which sits with the status-strip state it feeds. */
 static void settings_commit(int mode);
+static void evlog_commit(int mode);
 static void resume_capture(void);
 static int  enter_standby(void);
 
@@ -834,6 +836,11 @@ static int battery_refresh(int force)
          */
         resume_capture();
         settings_commit(CFG_COMMIT_LAST);
+        /* The log's last write, exempt from the gate the same way: the
+         * DISKSAFE line above and everything before it reach the disk;
+         * the SHUTOFF that follows is narrated but, by design, never
+         * flushed — nothing writes below this line. */
+        evlog_commit(CFG_COMMIT_LAST);
         /* Park, unless the player is mid-stream: it parks between its own
          * refill bursts (player.c) and its next read would only spin the
          * platters straight back up. Same guard as the main loop's idle
@@ -3018,9 +3025,10 @@ static void settings_touch(void)
  * Commit a pending save. `mode` is CFG_COMMIT_IDLE (the main loop: debounced,
  * deferred while the drive is parked under a live player), CFG_COMMIT_FORCE
  * (suspend, power-off: now) or CFG_COMMIT_LAST (the DISKSAFE flush, exempt
- * from the battery gate). config_save() is the ONLY thing in the firmware
- * that writes to the user's disk, and this is its only caller, so the gate's
- * verdict is the whole write policy — see cfg_commit.h.
+ * from the battery gate). config_save() and evlog_flush() (evlog_commit,
+ * below) are the only two things in the firmware that write to the user's
+ * disk, and both go through this gate, so its verdict is the whole write
+ * policy — see cfg_commit.h.
  *
  * Two things the gate is there to get right, because the code that stood
  * here got both wrong: a write into a PARKED drive is preceded by
@@ -3071,11 +3079,54 @@ static void settings_commit(int mode)
     uart_putc('\n');
 }
 
+/*
+ * Flush the event log through the same gate, with the same inputs. `mode`
+ * as settings_commit's. One block at most; the outcome is narrated — which
+ * puts the narration into the NEXT block, cheaply — except the quiet
+ * repeat of a battery refusal, for the same reason settings_commit stays
+ * quiet: this runs every main-loop pass.
+ */
+static void evlog_commit(int mode)
+{
+    cfg_commit_env_t env;
+    env.now_us        = mmio_read32(USEC_TIMER_ADDR);
+    env.parked        = ata_is_parked();
+    env.player_active = player_active();
+    env.battery_ok    = battery_disk_writes_allowed();
+    env.writable      = 0;                /* evlog knows its own */
+    int r = evlog_flush(mode, &env);
+    switch (r) {
+    case EVLOG_FLUSH_WROTE:
+        uart_puts("core: evlog blk ");
+        uart_put_hex32(evlog_seq() - 1u);
+        uart_puts(mode == CFG_COMMIT_IDLE ? "\n" : " final\n");
+        break;
+    case EVLOG_FLUSH_DEFERRED:
+        uart_puts("core: evlog flush deferred — battery below disk-safe\n");
+        break;
+    case EVLOG_FLUSH_FAILED:
+        uart_puts("core: evlog flush rc ");
+        uart_put_hex32((uint32_t)evlog_last_rc());
+        uart_puts(" fails ");
+        uart_dec((int)evlog_failures());
+        if (!evlog_enabled()) {
+            uart_puts(" — log OFF for this session");
+        }
+        uart_putc('\n');
+        break;
+    default:
+        break;
+    }
+}
+
 static void settings_render_cur(void)
 {
     if (g_set_screen == SETTINGS_ABOUT) {
         settings_about_render(g_bat_pct, g_bat_mv, g_bat_raw, g_total_mb, g_free_mb,
-                              g_songs_n, g_albums_n, g_artists_n);
+                              g_songs_n, g_albums_n, g_artists_n,
+                              evlog_seq(),
+                              evlog_enabled()  ? ABOUT_LOG_ON :
+                              evlog_failures() ? ABOUT_LOG_ERR : ABOUT_LOG_OFF);
         /* The counts above are capped (LIB_MAX_SONGS/ALBUMS, ARTISTS_MAX,
          * LIB_MAX_GENRES). When a load actually hit one of those caps, say so —
          * otherwise a library that's too big just looks like it lost tracks.
@@ -4670,6 +4721,10 @@ static int enter_standby(void)
     player_stop();
     hal_audio_close();                    /* codec rails off, audio clocks gated */
     settings_commit(1);                   /* persist while the drive still spins */
+    uart_puts("core: standby: entering\n");
+    evlog_commit(CFG_COMMIT_FORCE);       /* the log's last block, FINAL; same
+                                           * gate — refused below disk-safe, as
+                                           * the settings commit above is    */
     if (!ata_is_parked()) {
         ata_standby();                    /* flush + park + spin down. Not
                                            * ata_sleep(): the rail cut follows
@@ -4898,6 +4953,12 @@ static void suspend_to_ram(uint32_t play_down_us)
      * exact second the user stopped listening. */
     resume_capture();
     settings_commit(1);
+    /* The log's last chance too, in the same breath: what is pending goes
+     * out as a FINAL block while the drive is still up (the forced flush
+     * wakes it if a parked-drive commit above did not). Narrated first, so
+     * the block records that a suspend was entered. */
+    uart_puts("core: suspend: entering\n");
+    evlog_commit(CFG_COMMIT_FORCE);
     cpu_unboost();                        /* the boost refcount is >=1 here (we are
                                            * entered from BL_FULL), so without this
                                            * the "sleeping" device holds the 80 MHz
@@ -4972,6 +5033,17 @@ static void suspend_to_ram(uint32_t play_down_us)
      * between two of the loop's own looks at the live state, but the tick
      * sampler latched its edge, and dropping that on the floor would be a
      * wake the user made and the device ignored. */
+    /* Reached the idle loop: the last thing the log can say before the
+     * device goes quiet, and the first thing a stuck suspend is missing.
+     * Not flushed (the drive is asleep); it rides out in the wake's block.
+     * The line un-gates SER0 to go out — re-gate it, or the suspend spends
+     * the night with the UART clocked. */
+    uart_puts("core: suspend: idle loop\n");
+#if SUSPEND_GATE_CLOCKS
+    if (g_suspend_lp) {
+        uart_clock_suspend();
+    }
+#endif
     int pressed = 0;
     while (!standby_refused && !pressed && clickwheel_buttons() == 0) {
         /*
@@ -5107,6 +5179,8 @@ static void suspend_to_ram(uint32_t play_down_us)
      * back at 80 MHz, which is where their timing was calibrated. */
     cpu_boost();
     ata_wakeup();                         /* reset + spin the drive back up before any read */
+    uart_puts(standby_refused ? "core: suspend: wake (standby refused)\n"
+                              : "core: suspend: wake\n");
     /*
      * Panel back, in the only order that is safe: wake the panel driver,
      * render the real screen while everything is still dark, present it —
@@ -5257,6 +5331,33 @@ _Noreturn static void run_ui(fat32_t *fs)
     uart_put_hex32(cfg_lba0);
     uart_putc('/');
     uart_put_hex32(cfg_lba1);
+    uart_putc('\n');
+
+    /*
+     * The event log: locate CORELOG.BIN, validate its header, find the
+     * write cursor. Everything narrated so far this boot is already in the
+     * capture ring and goes out in the first block. The line below is the
+     * log's own first-flash gate: the two LBAs must equal what
+     * tools/make_log.py --verify computed on the host (see kernel/evlog.h
+     * and the procedure at the top of kernel/config.c, which this module
+     * owes as the write path's second caller). `prev` is the boot reason as
+     * far as the log knows it — whether the previous session's last block
+     * was a forced (final) flush, or the session just stopped.
+     */
+    int ev_on = evlog_mount(fs, ata_write_sectors, ata_wakeup);
+    uart_puts(ev_on ? "core: evlog on seq " : "core: evlog off seq ");
+    uart_put_hex32(evlog_seq());
+    uart_puts(" boot ");
+    uart_put_hex32(evlog_boot_id());
+    uart_puts(evlog_prev_final() < 0 ? " prev none" :
+              evlog_prev_final()     ? " prev final" : " prev unflushed");
+    uint32_t ev_lba0 = 0, ev_lban = 0;
+    (void)evlog_probe_header_lba(&ev_lba0);
+    (void)evlog_probe_lba(evlog_seq(), &ev_lban);
+    uart_puts(" lba ");
+    uart_put_hex32(ev_lba0);
+    uart_putc('/');
+    uart_put_hex32(ev_lban);
     uart_putc('\n');
     settings_apply();                     /* push shuffle/repeat/volume out       */
     /* Pick up where the user left off — after settings_apply (it needs the
@@ -6137,6 +6238,10 @@ _Noreturn static void run_ui(fat32_t *fs)
          * spinning it back up for a 1 KB write. Nothing happens here unless a
          * setting actually changed and the user has since gone quiet. */
         settings_commit(0);
+        /* The event log's idle flush, same placement for the same reason:
+         * a full block lands while the platters still turn. Never wakes a
+         * parked drive; at most one block per pass. */
+        evlog_commit(CFG_COMMIT_IDLE);
 
         const uint32_t disk_idle_us = 20000000u;   /* 20 s: saves ~100 mA, no thrash */
         if (!player_playing() && !ata_is_parked() && idle > disk_idle_us) {

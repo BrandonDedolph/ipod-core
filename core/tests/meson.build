@@ -534,6 +534,49 @@ if target == 'sim'
     test('config', config_test, suite: 'unit')
   endif
 
+  # evlog: the on-disk event log (kernel/evlog.c) — the SECOND writer to the
+  # user's disk, so it gets the config test's treatment over the same kind of
+  # in-RAM volume (BytesPerSector 2048 at a non-zero partition base), with
+  # CORELOG.BIN deliberately FRAGMENTED so the chain walk is load-bearing:
+  #   1. the block format: header + ring-block round trips, every rejection,
+  #      the slot arithmetic — and the host tool's --emit fixture decoded by
+  #      the firmware's decoder (host/device format agreement, as config);
+  #   2. addressing: every block's LBA against the test's own chain formula;
+  #      the recorder refuses any write outside the file's clusters, any
+  #      misaligned write, and any write to block 0;
+  #   3. mount: fresh / absent / bad header / size disagreement / ragged /
+  #      unreadable (retried) / short chain refuses blocks past it;
+  #   4. the flush policy through cfg_commit's gate: idle waits for a full
+  #      block and the debounce and never wakes a parked drive, forced
+  #      writes a partial FINAL block and wakes first, the battery gate,
+  #      one block per call, failed writes, three failures = OFF, ring
+  #      overflow with its marker;
+  #   5. ring order and the boot scan: wrap, remount, boot id, torn blocks
+  #      at and off the cursor, an unreadable slot = OFF, the python-written
+  #      ring scanned, and the 64-slot ring proving the search is O(log n).
+  # Links the real cfg_commit.c and fat32.c; the write and wake are the
+  # test's recorder, so no ata.c — the register grammar of a 4-sector write
+  # is ata_trace_test's job.
+  evlog_test = executable(
+    'evlog_test',
+    sources: ['kernel/evlog_test.c',
+              '../kernel/evlog.c',
+              '../kernel/cfg_commit.c',
+              '../fs/fat32.c'],
+    include_directories: [hw_mmio_inc,
+                          include_directories('../kernel', '../fs')],
+    override_options: test_opts,
+  )
+  if py.found()
+    evlog_fixture = custom_target('evlog-fixture',
+      output: 'evlog_golden.bin',
+      command: [py, files('..' / '..' / 'tools' / 'make_log.py'),
+                '--emit', '@OUTPUT@'])
+    test('evlog', evlog_test, args: [evlog_fixture], suite: 'unit')
+  else
+    test('evlog', evlog_test, suite: 'unit')
+  endif
+
   # hw-console: the on-screen debug console (framebuffer + 8x8 hex font).
   # Pure rendering logic, no MMIO — verifies glyph output pixel-for-pixel.
   console_test = executable(
@@ -1026,6 +1069,18 @@ if target == 'sim'
     test('build-index', py,
          args: [meson.current_source_dir() / 'scripts' /
                 'check_build_index.py'],
+         suite: 'unit')
+
+    # make-log: the host half of the on-disk event log (tools/make_log.py).
+    # Round-trips a synthesized ring through --dump: blocks come back in
+    # sequence order regardless of the slot the ring put them in, an
+    # overwritten or torn block is reported as a gap, boot boundaries and
+    # the FINAL flag show, a bad header is refused. The device side of the
+    # same format is tests/kernel/evlog_test.c, which decodes this tool's
+    # --emit fixture with the firmware's decoder.
+    test('make-log', py,
+         args: [meson.current_source_dir() / '..' / '..' / 'tools' /
+                'make_log.py', '--selftest'],
          suite: 'unit')
   endif
 endif

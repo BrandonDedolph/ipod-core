@@ -12,9 +12,9 @@
 
 # config.c is the ONLY code in the firmware that writes to the user's disk
 # (settings persistence into a pre-allocated CORECFG.DAT, overwritten in place
-# so no filesystem metadata is ever mutated). It is also the only caller of
-# ata_write_sectors. Its record codec + the write path's register grammar are
-# covered host-side by tests/kernel/config_test.c.
+# so no filesystem metadata is ever mutated). It was the only caller of
+# ata_write_sectors until evlog.c (below). Its record codec + the write
+# path's register grammar are covered host-side by tests/kernel/config_test.c.
 #
 # cfg_commit.c is the commit GATE in front of config_save: the debounce, the
 # parked-drive and battery refusals, the wake-before-write, and what becomes
@@ -22,4 +22,12 @@
 # so the host can test it (tests/kernel/cfg_commit_test.c); pure, no
 # hardware — main.c hands it the clock, the drive, the player and the battery.
 
-kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c')
+#
+# evlog.c is the SECOND writer: the on-disk event log (a RAM tap on the UART,
+# flushed one 2048 B block at a time into the pre-allocated CORELOG.BIN
+# through the same gate as config_save, every block's LBA re-resolved
+# through the file's cluster chain). Hardware-free like cfg_commit.c — the
+# write and wake are injected from main.c — so tests/kernel/evlog_test.c
+# drives the whole ring, the boot scan and the flush policy on the host.
+
+kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c')
