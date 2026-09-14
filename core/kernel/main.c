@@ -6244,10 +6244,14 @@ _Noreturn static void run_ui(fat32_t *fs)
         /* Disk spin-down at idle: once nothing needs the drive AND the user has
          * been idle a while, park the platters — the single largest continuous
          * draw on a spinning-HDD unit. "Nothing needs it" = not actively playing;
-         * PAUSED counts as idle (resume plays from the ~73 s RAM anti-skip buffer
-         * and the drive spins up lazily on the next fill, so no gap). The next
-         * real read self-recovers — ata_wait_drq tolerates the multi-second
-         * spin-up — so no explicit wake is wired here. Skipped while actively
+         * PAUSED counts as idle: the player's paused pump stocks the anti-skip
+         * buffer to its low mark while the platters are still up (this park
+         * comes 20 s later), so a resume plays from RAM and the drive spins
+         * up lazily on the next burst. When the buffer is shallow anyway
+         * (paused and parked a second into a track), player_resume pre-pays
+         * the spin-up before the DAC starts. DEVICE 2026-09-13: before that,
+         * a track restored paused at boot resumed into a synchronous read
+         * on this parked drive — 11 underruns. Skipped while actively
          * playing: player.c already parks the drive between bursts and owns that
          * cadence. ata_is_parked() is the shared truth, so we never re-issue
          * STANDBY on an already-parked drive. On an iFlash/SSD mod this is a

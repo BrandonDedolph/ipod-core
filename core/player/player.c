@@ -1313,6 +1313,20 @@ void player_resume(void)
     }
     g_pl_last_us = mmio_read32(USEC_TIMER_ADDR);
     g_pl_paused  = 0;
+    /*
+     * The drive may have been parked under the pause (the main loop's idle
+     * spin-down, or suspend). Normally the paused pump has stocked the
+     * anti-skip buffer past DISK_LOW by then and the spin-up hides behind
+     * ~9 s of buffered file; when it has not — a suspend a second into a
+     * fresh track, before any burst landed — the first decode past the
+     * buffer would block on the spin-up with less audio in the ring than
+     * the spin-up takes. Pre-pay it here, BEFORE the DAC starts: a short
+     * silence after the press instead of a glitch after the music began.
+     */
+    if (ata_is_parked() && !g_dbuf.eos &&
+        diskbuf_fill_ahead(&g_dbuf) < DISK_LOW / 2u) {
+        (void)ata_wakeup();
+    }
     if (g_pl_bringup_pending) {
         /* The track was opened paused: this is its first bring-up. */
         if (bringup_pending() != 0) {
@@ -1651,6 +1665,26 @@ void player_pump(void)
             hal_audio_suspend();
             g_pl_codec_cold = 1;
         }
+        /*
+         * Keep the anti-skip buffer stocked to its low mark while the
+         * platters are still up (DEVICE 2026-09-13, the "stutter after
+         * resume"): a track restored PAUSED at boot holds only what its
+         * 1.49 s ring prime pulled through the buffer, the main loop then
+         * parks the idle drive, and the eventual Play drains the ring past
+         * the buffered bytes into diskbuf's synchronous fallback — which
+         * blocks on a 2-3 s spin-up with 1.49 s of audio left. 11 underruns
+         * in the log, "played a little then buffered" on the jack.
+         *
+         * One chunk per pass, up to DISK_LOW (~9 s of FLAC) — enough that
+         * the resume's own catch-up decode lifts the ring past the disk
+         * gate before it ever needs the platter. Never wakes a parked drive:
+         * the suspend idle loop pumps here too, with the drive deliberately
+         * down.
+         */
+        if (!ata_is_parked() && !g_dbuf.eos && diskbuf_error(&g_dbuf) == 0 &&
+            diskbuf_fill_ahead(&g_dbuf) < DISK_LOW) {
+            diskbuf_pump(&g_dbuf, DISK_CHUNK);
+        }
         return;
     }
 
@@ -1699,7 +1733,12 @@ void player_pump(void)
      * the read as a single non-retrying probe (see g_spinup_probe) so one
      * failure costs one spin-up wait instead of six plus backoff. */
     uint32_t gate = RING_DISK_GATE;
-    if (g_drive_parked) {
+    /* g_drive_parked is only the pump's OWN park. The main loop parks the
+     * drive too (its 20 s idle spin-down, under a pause), and the HAL's flag
+     * is the shared truth — without it a resume over that park took the
+     * six-try retry loop at the half-ring gate instead of the probe at the
+     * nearly-full one. */
+    if (g_drive_parked || ata_is_parked()) {
         gate = RING_PARKED_GATE;
         /* ...unless the compressed buffer is nearly dry. Holding out for a
          * fuller ring then just hands the same spin-up to diskbuf_read's

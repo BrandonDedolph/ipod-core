@@ -69,6 +69,9 @@ int  stub_audio_suspends_while_running;
 int  stub_audio_drains;
 int  stub_audio_drained_while_running;  /* drains issued BEFORE the stop      */
 int  stub_ata_standbys;
+int  stub_ata_wakeups;
+int  stub_disk_pumps;
+static int g_ata_parked;
 int  stub_ata_reads;
 static int g_ata_read_ok = 1;  /* stub_set_ata_read_ok(): make reads fail */
 int  stub_meta_reads;
@@ -136,6 +139,8 @@ void stub_reset(void)
     stub_audio_cold = stub_audio_suspends = stub_audio_wakes = 0;
     stub_audio_suspends_while_running = 0;
     stub_ata_standbys = stub_ata_reads = stub_meta_reads = 0;
+    stub_ata_wakeups = stub_disk_pumps = 0;
+    g_ata_parked = 0;
     stub_seeks = 0;
     stub_last_seek_frame = 0;
     g_seek_ok  = 1;
@@ -259,6 +264,7 @@ uint32_t diskbuf_pump(diskbuf_t *db, uint32_t chunk)
 {
     (void)db;
     (void)chunk;
+    stub_disk_pumps++;    /* observable: the player asked for a burst */
     return 0;             /* always topped up: the pump has nothing to do */
 }
 
@@ -558,6 +564,7 @@ int ata_read_sectors(uint32_t lba, uint32_t count, void *buf)
 {
     (void)lba;
     stub_ata_reads++;
+    g_ata_parked = 0;
     if (!g_ata_read_ok) {
         return -1;
     }
@@ -568,8 +575,27 @@ int ata_read_sectors(uint32_t lba, uint32_t count, void *buf)
 int ata_standby(void)
 {
     stub_ata_standbys++;
+    g_ata_parked = 1;
     return 0;
 }
+
+/* The HAL's "shared truth" for the platter state: set by a STANDBY, cleared
+ * by any read (the real ata_read_raw clears it as the command goes out) and
+ * by the explicit wake. Tests can force it to model a park the main loop
+ * made (its idle spin-down) that the player never saw. */
+int ata_is_parked(void)
+{
+    return g_ata_parked;
+}
+
+int ata_wakeup(void)
+{
+    stub_ata_wakeups++;
+    g_ata_parked = 0;
+    return 0;
+}
+
+void stub_set_ata_parked(int parked) { g_ata_parked = parked; }
 
 void sleep_ms(uint32_t ms)
 {

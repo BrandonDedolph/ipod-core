@@ -1473,6 +1473,54 @@ int main(void)
     }
     stub_set_track_frames(8192u);
 
+    /* ---- 13b. a pause keeps the anti-skip buffer stocked ---------------
+     *
+     * DEVICE 2026-09-13: a track restored paused at boot held only its
+     * ring prime's worth of file; the main loop parked the idle drive; Play
+     * then drained the ring into a synchronous read that blocked on the
+     * spin-up — 11 underruns. While paused with the platters up, the pump
+     * now stocks the buffer to DISK_LOW; it never wakes a parked drive (the
+     * suspend idle loop pumps here too); and a resume over a parked drive
+     * with a shallow buffer pre-pays the spin-up before the DAC starts. */
+    stub_reset();
+    stub_set_track_frames(44100u * 60u);
+    make_entries(ents, 1, 0);
+    player_play_queue(ents, 1, 0, 0, 0);
+    player_pause();
+    stub_set_disk_ahead(0);
+    {
+        int pumps_before = stub_disk_pumps;
+        player_pump();
+        xpect(&c, "paused, drive up, buffer shallow: the pump stocks it",
+              stub_disk_pumps == pumps_before + 1);
+        stub_set_disk_ahead(64u * 1024u * 1024u);
+        pumps_before = stub_disk_pumps;
+        player_pump();
+        xpect(&c, "...and leaves it alone once stocked",
+              stub_disk_pumps == pumps_before);
+        stub_set_ata_parked(1);                /* the main loop's idle park */
+        stub_set_disk_ahead(0);
+        pumps_before = stub_disk_pumps;
+        player_pump();
+        xpect(&c, "a paused pump never wakes a parked drive",
+              stub_disk_pumps == pumps_before);
+        int wakeups_before = stub_ata_wakeups;
+        player_resume();
+        xpect(&c, "resume over a parked drive with a shallow buffer "
+                  "pre-pays the spin-up",
+              stub_ata_wakeups == wakeups_before + 1);
+        xpect(&c, "...and is playing", !player_paused());
+        player_pause();
+        stub_set_ata_parked(1);
+        stub_set_disk_ahead(64u * 1024u * 1024u);
+        wakeups_before = stub_ata_wakeups;
+        player_resume();
+        xpect(&c, "a stocked buffer resumes without touching the drive",
+              stub_ata_wakeups == wakeups_before);
+        stub_set_ata_parked(0);
+    }
+    stub_set_track_frames(8192u);
+
     /* ---- 14. calls with nothing loaded are safe ------------------------ */
     stub_reset();
     player_queue_begin();          /* stops playback, empties the queue */

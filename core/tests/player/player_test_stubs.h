@@ -124,6 +124,11 @@ extern int stub_seeks;
 /* Make the fake decoder's seek refuse, to exercise the failure path. */
 void stub_set_seek_ok(int ok);
 extern int stub_ata_standbys;   /* drive spin-down requests                 */
+extern int stub_ata_wakeups;    /* explicit ata_wakeup() spin-ups           */
+extern int stub_disk_pumps;     /* diskbuf_pump() calls (refill bursts)     */
+/* Force the HAL's parked flag, modelling a park the main loop made (its idle
+ * spin-down under a pause) that the player's own bookkeeping never saw. */
+void stub_set_ata_parked(int parked);
 extern int stub_meta_reads;     /* tag parses                               */
 
 #endif /* CORE_TESTS_PLAYER_STUBS_H */
