@@ -329,6 +329,11 @@ void ui_list_row(int y0, int r, const char *text, const char *sub,
     }
 }
 
+void ui_list_row_clear(int y0, int r, int rh)
+{
+    console_fill_rect(0, y0 + r * rh, UI_SB_X, rh, LINEN_SURFACE);
+}
+
 void ui_scrollbar(int y0, int top, int visible, int total)
 {
     if (total <= visible) {
@@ -336,13 +341,13 @@ void ui_scrollbar(int y0, int top, int visible, int total)
     }
     int track_y = y0;
     int track_h = LCD_HEIGHT - y0 - 4;
-    console_fill_rect(LCD_WIDTH - 4, track_y, 3, track_h, LINEN_SB_TRK);
+    console_fill_rect(UI_SB_X, track_y, 3, track_h, LINEN_SB_TRK);
     int thumb_h = (visible * track_h) / total;
     if (thumb_h < 16) thumb_h = 16;
     int denom = total - visible;
     if (denom < 1) denom = 1;
     int thumb_y = track_y + (top * (track_h - thumb_h)) / denom;
-    console_fill_rect(LCD_WIDTH - 4, thumb_y, 3, thumb_h, LINEN_SB_THMB);
+    console_fill_rect(UI_SB_X, thumb_y, 3, thumb_h, LINEN_SB_THMB);
 }
 
 /* Windowed-list scroll origin (menus.jsx useScrollWindow): keep the selection

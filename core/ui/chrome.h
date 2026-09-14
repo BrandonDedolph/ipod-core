@@ -186,6 +186,18 @@ void ui_list_row(int y0, int r, const char *text, const char *sub,
 /* The right-edge scrollbar. Draws nothing when everything fits. */
 void ui_scrollbar(int y0, int top, int visible, int total);
 
+/* The scrollbar's column: x in [UI_SB_X, LCD_WIDTH). Nothing a row draws
+ * reaches it, and nothing that repaints a row may clear it — the bar is drawn
+ * ONCE per paint, after the rows, and a partial repaint that only touched a
+ * row band would otherwise leave a hole in it (see ui_list_row_clear). */
+#define UI_SB_X    (LCD_WIDTH - 4)
+
+/* Clear list row `r`'s band back to the surface colour ahead of a redraw,
+ * WITHOUT touching the scrollbar column. The full-width clear this replaced is
+ * how the album list lost its scrollbar under a fast scroll: each cover chip
+ * that landed repainted its row band edge to edge, erasing the bar's slice. */
+void ui_list_row_clear(int y0, int r, int rh);
+
 /*
  * How a row title that overflows its column gets drawn.
  *
