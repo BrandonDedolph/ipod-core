@@ -25,6 +25,10 @@ import re
 from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Where the PNGs/GIFs land. Defaults to this directory (the shipped gallery);
+# CORE_SCREENS_OUT lets a work-in-progress run write somewhere else.
+OUT = os.environ.get("CORE_SCREENS_OUT", HERE)
+os.makedirs(OUT, exist_ok=True)
 # Repo-relative, not an absolute path into one person's home directory (which
 # is what this was, and which meant the script only ran on one machine).
 # CORE_FONTS_DIR overrides it if the faces ever live somewhere else.
@@ -227,18 +231,28 @@ class Face:
         return self.layout(s)[1] if s else 0
 
 
+# The six faces the firmware ships (core/ui/text.h): the set changed under
+# this script once — regular_13 / bold_11 / bold_17 became regular_12 /
+# bold_12 / bold_18 — and every screenshot silently stopped rendering. The
+# names below are the atlas names, so a mismatch fails loudly at import.
 regular_9  = Face("Nunito-Regular.ttf",  9, "nunito_regular_9.h")
 regular_11 = Face("Nunito-Regular.ttf", 11, "nunito_regular_11.h")
-regular_13 = Face("Nunito-Regular.ttf", 13, "nunito_regular_13.h")
-bold_11    = Face("Nunito-Bold.ttf",    11, "nunito_bold_11.h")
+regular_12 = Face("Nunito-Regular.ttf", 12, "nunito_regular_12.h")
+bold_12    = Face("Nunito-Bold.ttf",    12, "nunito_bold_12.h")
 bold_13    = Face("Nunito-Bold.ttf",    13, "nunito_bold_13.h")
-bold_17    = Face("Nunito-Bold.ttf",    17, "nunito_bold_17.h")
+bold_18    = Face("Nunito-Bold.ttf",    18, "nunito_bold_18.h")
 
+# ui/chrome.h aliases, same names.
 FONT_SMALL  = regular_9
 FONT_SUB    = regular_11
-FONT_ROW    = regular_13
+FONT_ROW    = regular_12
 FONT_HEADER = bold_13
-FONT_TITLE  = bold_17
+FONT_TITLE  = bold_18
+# Kept for the call sites that named the old faces; the firmware's list-row
+# right values and the Now Playing state label are bold_12 today.
+bold_11     = bold_12
+regular_13  = regular_12
+bold_17     = bold_18
 
 # glyphs used as literals on-device
 LAQUO = "‹"   # 'single left angle quote
@@ -825,7 +839,7 @@ def upscale(im, scale):
     return im.resize((W * scale, H * scale), Image.NEAREST)
 
 def save_png(im, name):
-    path = os.path.join(HERE, name)
+    path = os.path.join(OUT, name)
     upscale(im, SCALE).save(path)
     return path
 
@@ -912,7 +926,7 @@ def build_walkthrough_gif():
         add(_now_playing_base(elapsed=e).img, hold=2, ms=220)
     add(_now_playing_base(elapsed=6).img, hold=5, ms=220)   # hold a beat, then loop
 
-    path = os.path.join(HERE, "demo.gif")
+    path = os.path.join(OUT, "demo.gif")
     frames[0].save(path, save_all=True, append_images=frames[1:], loop=0,
                    duration=durations, optimize=True, disposal=2)
     return path, len(frames), sum(durations)
@@ -930,7 +944,7 @@ def _save_gif(name, spec, colors=96):
         for _ in range(hold):
             frames.append(p)
             durations.append(ms)
-    path = os.path.join(HERE, name)
+    path = os.path.join(OUT, name)
     frames[0].save(path, save_all=True, append_images=frames[1:], loop=0,
                    duration=durations, optimize=True, disposal=2)
     from PIL import Image as _I
