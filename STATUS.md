@@ -68,6 +68,17 @@ What changed (see `git log 054c722..`):
    `PANEL_SLEEP_AT_IDLE 0` in `kernel/main.c`. Then hold PLAY from dark:
    the panel must wake once, sleep into suspend, and come back once. The
    `core: ui` UART line's `bcm_timeouts`/`refused` should read 0/0.
+7. Suspend low power (since 2026-09-13, later): while asleep the SoC runs
+   on the 24 MHz crystal with the PLL off, SER0/PWM/I²C gated, and a 10 Hz
+   tick. Check: the `core: batt` line still prints sane values 10 s and
+   60 s into a suspend (not -1 — the I²C re-gate must bring the controller
+   back), the wheel wakes it from a 10 Hz sample, a hold to 5 s still
+   reaches PMU standby from the crystal, and measure the draw. Rollback is
+   per-park: drop `clock_suspend` from `suspend_lowpower_enter` first,
+   then the gates.
+8. Paused skips: press Next ×5 while paused, then Play — one bring-up,
+   no pops on the skips; a 44.1 → 48 kHz skip while paused then Play
+   must come up at 48 kHz.
 
 Still open from the audit: the BCM power gate, the ROM's undocumented
 `DEV_EN` bits (USB/FireWire/IDE) and a 32 kHz suspend point — `DEV_EN`
