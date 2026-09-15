@@ -1040,11 +1040,11 @@ def top_banner(sc, inverted, bm, bm_dy, label, token, screen,
 
 
 def lock_banner(sc, locked, screen, **kw):
-    """main.c lock_banner_render: locked = inverted + closed padlock +
-    "Locked" / HOLD ON; unlocked = surface + popped-open padlock +
-    "Unlocked" / HOLD OFF."""
+    """main.c lock_banner_render: closed padlock + "Locked" / HOLD ON, or
+    popped-open padlock + "Unlocked" / HOLD OFF, both on the surface (the
+    locked band stopped inverting in v0.1.2)."""
     if locked:
-        top_banner(sc, True, LOCK_BM_CLOSED, 0, "Locked", "HOLD ON",
+        top_banner(sc, False, LOCK_BM_CLOSED, 0, "Locked", "HOLD ON",
                    screen, **kw)
     else:
         top_banner(sc, False, LOCK_BM_OPEN, -1, "Unlocked", "HOLD OFF",

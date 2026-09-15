@@ -1,6 +1,6 @@
 # Using core
 
-This guide describes Core v0.1.1. The device shows its version bottom-right on the boot screen and
+This guide describes Core v0.1.2. The device shows its version bottom-right on the boot screen and
 in Settings → About; Boot Details shows the full build string.
 
 This is the guide for the person holding the iPod. It covers the controls, every screen, putting
@@ -35,7 +35,7 @@ the next press.
 
 ## The Hold switch
 
-Slide Hold on and the top of the screen inverts for a second with a padlock and Locked. Buttons
+Slide Hold on and a banner takes the top of the screen for a second: a padlock and Locked. Buttons
 and the wheel do nothing while it is on; a press shows the banner again. A small padlock stays in
 the status strip. Slide it off for the Unlocked banner. Touch the wheel or a button and the banner
 goes away at once.

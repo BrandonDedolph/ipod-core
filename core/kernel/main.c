@@ -609,7 +609,7 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
  * ------------------------------------------------------------------------- */
 
 /* Hold-switch lock state. While g_locked, all wheel/button input is swallowed
- * (playback keeps running); the top chrome inverts into a brief banner on the
+ * (playback keeps running); a brief banner takes the top chrome on the
  * engage/disengage edge and on a refused button press (lock_banner_render),
  * and a small padlock stays in the status strip while held. */
 static int         g_locked;
@@ -4714,12 +4714,11 @@ static void paint_current_screen(void)
  * A Hold edge does not raise a card over the screen (the reference jsx's
  * centred 180x110 plate, which covered the title and half the art for one
  * bit of information). The TOP CHROME INVERTS for LOCK_FLASH_US and then
- * settles back into the persistent strip padlock. Locked borrows the
- * selected-row pair (INK band, SURFACE marks, SEL_SUB for the secondary
- * marks); unlocked is the surface with the ordinary border rule under it.
- * Both pairs come out of the palette, so the polarity is "emphasis" and
- * "normal" in every theme — not dark and light (in Onyx the locked band is
- * the bright one, exactly as its selection bar is).
+ * settles back into the persistent strip padlock. Both states draw on the
+ * surface with the ordinary border rule under the band; the closed or open
+ * padlock and the words carry the difference. (The primitive can still
+ * invert — `inverted` picks the selected-row pair — but the Hold banner no
+ * longer does: the locked/unlocked flip read as jarring on the device.)
  *
  * The band is whatever the top chrome is on the current screen:
  *   - Now Playing (and the chrome-less modals): the 22 px status row, plus
@@ -4855,12 +4854,15 @@ static void top_banner_render(int inverted, const uint16_t *bm, int bn, int bm_d
     console_fill_rect(12, HDR_DIV_Y, LCD_WIDTH - 24, 1, inverted ? sub : LINEN_BORDER);
 }
 
-/* The Hold banner: locked = inverted + closed padlock + "Locked" / HOLD ON;
- * unlocked = surface + popped-open padlock + "Unlocked" / HOLD OFF. */
+/* The Hold banner: closed padlock + "Locked" / HOLD ON, or popped-open padlock
+ * + "Unlocked" / HOLD OFF — both on the surface with the border rule under
+ * them. The locked one was the inverted (selected-row) pair through v0.1.1;
+ * on the device the flip between the two read as jarring, so the padlock and
+ * the words carry the difference now (v0.1.2). */
 static void lock_banner_render(int locked)
 {
     if (locked) {
-        top_banner_render(1, LOCK_BM_CLOSED, 16,  0, "Locked",   "HOLD ON");
+        top_banner_render(0, LOCK_BM_CLOSED, 16,  0, "Locked",   "HOLD ON");
     } else {
         top_banner_render(0, LOCK_BM_OPEN,   18, -1, "Unlocked", "HOLD OFF");
     }
