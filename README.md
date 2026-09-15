@@ -152,10 +152,48 @@ make verify-hw                 # layout, header/doc and size checks on the ARM i
 Detail, sanitizer builds and the host tools: [`core/README.md`](core/README.md),
 [`tools/README.md`](tools/README.md).
 
+## The `core` app
+
+One binary on your computer does the host side: it puts the music on the iPod in the layout the
+firmware reads, bakes the art sidecars, writes the index, flashes firmware and fetches updates.
+Download the one for your machine from the
+[latest release](https://github.com/BrandonDedolph/ipod-core/releases/latest) — attached from
+v0.1.3 on, or build it from [`core/cli/`](core/cli/README.md).
+
+| File | For |
+|---|---|
+| `core-windows-amd64.exe` | Windows |
+| `core-darwin-arm64` | macOS, Apple silicon |
+| `core-darwin-amd64` | macOS, Intel |
+| `core-linux-amd64` | Linux, x86-64 |
+| `core-linux-arm64` | Linux, ARM |
+
+The same five come as `core-app-*`: a desktop window over the same code, for people who would
+rather press Sync than type it. Keep `core` beside it; it does the elevated flash on Windows.
+
+```bash
+core info                                   # identify the iPod, in disk mode
+core sync --src ~/Music --dst /media/IPOD   # files, art, playlists, index
+core eject /media/IPOD
+core update                                 # newest firmware release, verified and flashed
+```
+
+The walkthrough is in the [user guide](docs/USER_GUIDE.md#the-core-app). The 5.5G 80 GB is the only
+model the firmware has booted on and the only one the app knows; `core flash` refuses other hardware
+without `--untested-hardware`. Its flash path has written to that device and been read back by
+both `core` and `ipodpatcher`.
+
 ## Flash
 
-You need an iPod 5.5G, a FLAC library, and ipodpatcher. The image replaces Apple's
-firmware. Back the partition up first. Paths are relative to `core/`, as in Build.
+The image replaces Apple's firmware, so you need an iPod 5.5G and a backup of its firmware
+partition. `core flash` takes that backup itself, writes only the OSOS image and its directory row,
+and compares the read-back. Paths are relative to `core/`, as in Build.
+
+```bash
+core flash build-hw/core.ipod                    # iPod in disk mode
+```
+
+ipodpatcher is the documented fallback:
 
 ```bash
 ipodpatcher <disk> -r bootpartition-backup.bin   # once
@@ -165,7 +203,8 @@ cmp readback.bin build-hw/core.bin               # identical, or do not boot it
 ```
 
 If a build does not boot, hold Select + Play at power-on. That is Apple's disk mode in the boot
-ROM; nothing this firmware writes can remove it. Reflash, or restore the backup with `-w`.
+ROM; nothing this firmware writes can remove it. Reflash, or restore the partition with
+`core flash --from-backup <file>` (ipodpatcher `-w`).
 
 ## Status
 
@@ -188,8 +227,8 @@ where the two differ the reference notes say so. [`design_reference/`](design_re
 
 ```
 core/         firmware: boot/, kernel/, hal/, fs/, codecs/, ui/, library/, player/, tests/, docs/
-core/cli/     Go host CLI: .ipod image pack/unpack
-tools/        host tooling: atlases, album art, library index, settings and log files
+core/cli/     the core app: info, sync, index, art, backup, flash (Go)
+tools/        host tooling: atlases, and the Python oracles the core app is checked against
 docs/screens/ the screenshots and GIFs in this README, and the renderer that draws them
 docs/         the user guide
 design_reference/  the UI design source

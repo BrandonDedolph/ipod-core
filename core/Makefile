@@ -36,13 +36,15 @@ ipod: hw
 sim: $(BUILD_SIM)/build.ninja
 	ninja -C $(BUILD_SIM)
 
-# Static verification of the hw image that needs the linked ELF:
-# crt0/linker layout asserts, plus the header<->doc address
-# consistency check (also run standalone in `meson test`). Depends on a
-# fresh `make hw`. The MMIO trace tests run under `meson test`.
+# Static verification of the hw image that needs the linked ELF or the flat
+# binary: crt0/linker layout asserts, the size budget, the host-findable
+# version marker in core.bin, plus the header<->doc address consistency check
+# (also run standalone in `meson test`). Depends on a fresh `make hw`. The MMIO
+# trace tests run under `meson test`.
 verify-hw: hw
 	sh tests/scripts/check_hw_layout.sh $(BUILD_HW)/core.elf
 	sh tests/scripts/check_size.sh $(BUILD_HW)/core.elf
+	sh tests/scripts/check_version_marker.sh $(BUILD_HW)/core.bin
 	python3 tests/scripts/check_hw_consistency.py
 	python3 tests/scripts/check_name_hash_parity.py
 	python3 tests/scripts/check_resume_parity.py

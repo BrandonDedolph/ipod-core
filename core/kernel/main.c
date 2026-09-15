@@ -54,6 +54,21 @@
 #include "../ui/keyhold.h"
 #include "hw/volume.h"
 
+/* Host-findable version stamp: `core info` scans the OSOS body for this tag
+ * (see core/docs/design/companion-app-plan.md, S8). Never printed — not on the
+ * UART (the clicky boot golden matches those lines exactly) and not on the
+ * screen; the only reader is the host, which greps the image for
+ * "CORE-FW-VERSION:". `used` stops the compiler dropping an unreferenced
+ * definition; the LINK also needs boot/linker.ld's KEEP on this section,
+ * because --gc-sections collects it otherwise (verified: without the KEEP the
+ * string is absent from core.bin).
+ * tests/scripts/check_version_marker.sh asserts exactly one copy
+ * survives into build-hw/core.bin and that its version half is the repo's
+ * nearest tag. CORE_BUILD_ID carries "-dirty" when the tree is dirty, which
+ * is the point: an image built from an uncommitted tree says so. */
+const char core_version_marker[] __attribute__((used, section(".rodata.core_version"))) =
+    "CORE-FW-VERSION:" CORE_VERSION "|" CORE_BUILD_ID "\0";
+
 /*
  * Idle-task CPU sleep. Program the per-core countdown to wake this core
  * after ~`ms` milliseconds and halt until then (01-soc-pp5022.md, "Sleep

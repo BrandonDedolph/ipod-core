@@ -15,8 +15,8 @@
 //     must preserve it byte-exact. This package neither parses nor
 //     validates it, and cannot supply one — the only copy of a given
 //     device's preamble is the one on that device, which is why the
-//     install safety checklist (internal/cli/install.go) requires a
-//     full partition backup before any write.
+//     write-path safety checklist (internal/fwpart) requires a full
+//     partition backup before any write.
 //
 // Do not describe this file as "done" until the preamble is handled and
 // something outside the tests uses it.
@@ -41,9 +41,15 @@ type DirectoryEntry struct {
 	Length      uint32 // image length in bytes
 	LoadAddr    uint32 // DRAM load address
 	EntryOffset uint32 // entry point within the image (0 = start)
-	Checksum    uint32 // additive checksum (model + sum-of-bytes)
-	Version     uint32
-	LoadAddr2   uint32 // secondary load address
+	// Checksum is a plain additive 32-bit sum (mod 2^32) of the
+	// Length body bytes at DevOffset+0x800 — no model seed, no
+	// padding included. The seed (5, next to the "ipvd" tag) belongs
+	// to the .ipod transport header only; see checksum.go and
+	// ipodfile.go. Measured on the device: OSOS len 237,640,
+	// chksum 0x01589D64 = sum of exactly those 237,640 bytes.
+	Checksum  uint32
+	Version   uint32
+	LoadAddr2 uint32 // secondary load address
 }
 
 // LogicalImageType returns the byte-reversed image-type tag.

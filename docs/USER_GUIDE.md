@@ -3,9 +3,9 @@
 This guide describes Core v0.1.2. The device shows its version bottom-right on the boot screen and
 in Settings → About; Boot Details shows the full build string.
 
-This is the guide for the person holding the iPod. It covers the controls, every screen, putting
-music on the device, power, and what to do if something goes wrong. Building and flashing the
-firmware are in the [README](../README.md).
+This is the guide for the person holding the iPod. It covers the controls, every screen, the `core`
+app that puts music on the device and flashes it, power, and what to do if something goes wrong.
+Building the firmware from source is in the [README](../README.md).
 
 ## Controls
 
@@ -158,10 +158,119 @@ Linen (warm light), Onyx (warm dark), Sage (dark green-grey), Plaster (pink-beig
 (greige-olive), Umber (espresso), Mushroom (warm greige). Every screen uses the theme's ink and
 surface, so the selected row and the Hold banner invert with it. The low-battery red never changes.
 
+## The `core` app
+
+`core` is one program for your computer that does the host side: it puts the music on the iPod in
+the layout the firmware reads, bakes the album art, writes the index, and flashes firmware. One
+file, no installer.
+
+Download the one for your machine from the
+[latest release](https://github.com/BrandonDedolph/ipod-core/releases/latest):
+
+| File | For |
+|---|---|
+| `core-windows-amd64.exe` | Windows |
+| `core-darwin-arm64` | macOS, Apple silicon |
+| `core-darwin-amd64` | macOS, Intel |
+| `core-linux-amd64` | Linux, x86-64 |
+| `core-linux-arm64` | Linux, ARM |
+
+The binaries are attached from v0.1.3 on; for an earlier release, build it with
+`cd core/cli && go build -o core ./cmd/core`. On macOS and Linux, `chmod +x` the downloaded file.
+The examples below call it `core`.
+
+**The window.** `core-app` is the same thing as a desktop application: one window with an iPod card,
+a Music card (folder, Dry run, Sync, Sync + prune), a Firmware card (Check, Update, Flash file,
+Backup), Eject, and a log. It ships beside the command line from v0.1.3 as
+`core-app-windows-amd64.exe`, `core-app-darwin-arm64`, `core-app-darwin-amd64`,
+`core-app-linux-amd64` and `core-app-linux-arm64`. Keep `core` in the same folder: on Windows the
+window runs `core.exe` under Administrator for the flash, and without it the Firmware card prints
+the command to run instead. The confirmations are the ones the command line asks for — the device
+path typed exactly before a flash, the word `prune` before anything is deleted. It has not been on
+a device yet; it drives the same code the commands below do.
+
+**Connect.** Put the iPod in disk mode — Settings, Disk Mode on the device, or hold Select + Play
+at power-on — plug it in, and ask what is there:
+
+```
+core info
+```
+
+That prints the disk, the logical sector size, the partition table and the firmware images, and
+never writes. If it says no iPod, `core info --all-disks` lists every disk the OS can see and which
+opens were refused. Reading a raw disk needs Administrator on Windows and root on Linux and macOS;
+when an open is refused the error prints the exact elevated command to run.
+
+**Music.**
+
+```
+core sync --src "C:\Users\you\Music" --dst D:\
+core eject D:
+```
+
+`--dst` is the iPod's volume root, not its `Music` folder. The source is one folder per album named
+`Album - Artist`, one FLAC per track, and playlists, if you keep any, as `.m3u8` files in a
+`Playlists/` folder beside the albums.
+
+`sync` copies each track to `Music/Artist - Album/NN. Title.flac`, writes `folder.art` and
+`folder.thm` beside it from the file's embedded cover, rewrites the playlists to device paths under
+`Music/Playlists/`, creates `CORECFG.DAT` and `CORELOG.BIN` in the volume root if they are missing
+(a valid one is never reset, so your settings survive), and writes `Music/CORELIB.IDX` last — last
+on purpose, so the index never names files a failed copy did not leave behind. A track already on
+the device is skipped when its size matches and its timestamp is within two seconds; `--verify`
+compares content instead.
+
+```
+core sync --src … --dst D:\ --dry-run       # print the whole plan, write nothing
+core sync --src … --dst D:\ --prune --yes   # also remove what is on the device and not in the source
+```
+
+Nothing is deleted without `--prune --yes`.
+
+**Firmware.**
+
+```
+core update                      # the newest release: download, verify, flash
+core flash core.ipod             # a particular image, e.g. one downloaded from a release
+core backup                      # the whole firmware partition to a file
+core doctor                      # read-only check of the device and its library
+```
+
+`update` reads the latest GitHub release, downloads the image, checks it against its own checksum,
+and flashes it. Writing the firmware partition needs Administrator on Windows and root on macOS and
+Linux. From an ordinary console the download and the check still happen, and then the exact
+elevated command is printed: a `core flash` of the downloaded file, first with `--dry-run` so you
+can read the plan, then with `--yes`. On Windows, paste it into a Command Prompt opened with "Run as
+administrator"; on macOS and Linux, prefix it with `sudo`. `core update` and `core doctor` ship with
+the v0.1.3 binaries.
+
+Every flash backs the whole firmware partition up first, writes only this firmware's image and the
+one directory row describing it — the Apple preamble, the partition table and Apple's other images
+are never touched — and re-reads what it wrote to compare. `--dry-run` prints the plan and opens
+nothing for writing.
+
+**What is verified.** The iPod Video 5.5G 80 GB is the only model this firmware has ever booted,
+and the only one the app knows. Its flash path has been run on that device: the whole-partition
+backup, the write, and the read-back all matched, and `ipodpatcher` read the same image back
+afterwards. `core flash` refuses any other iPod unless you pass `--untested-hardware`. Reading,
+backing up and syncing are not gated.
+
+**Recovery.** Select + Play at power-on is Apple's disk mode in the boot ROM. Nothing the firmware
+or this app writes can remove it, so a bad image is always recoverable: hold it, then flash again.
+A backup from `core backup` puts the partition back exactly as it was, Apple's images included:
+
+```
+core flash --from-backup fwpart-131475456-….bin
+```
+
+`ipodpatcher` remains the documented fallback for flashing and restoring — `ipodpatcher <disk> -wf
+core.ipod`, read back with `-rfb` and compared against the image.
+
 ## Putting music on it
 
-The firmware reads what a host tool prepares. All of this happens on a computer with the iPod in
-disk mode, on the iPod's FAT32 volume.
+`core sync` does all of this in one command. What follows is what has to end up on the volume, and
+how to put it there by hand. Either way it happens on a computer with the iPod in disk mode, on the
+iPod's FAT32 volume.
 
 1. **Folders.** Put each album in its own folder under `Music/`, one FLAC per track. The firmware
    plays FLAC. MP3 files are ignored: the decoder is built but switched off because it cannot keep
@@ -236,8 +345,8 @@ audio counters. If you report a problem, that dump is what explains it.
 - **It will not boot, or the screen is blank.** Hold Select + Play at power-on. That is Apple's disk
   mode, in the boot ROM; the firmware cannot remove it. Then reflash, or restore the backup
   (README, Flash).
-- **The library is missing or stale.** Rebuild `CORELIB.IDX` and copy it over.
-- **Settings do not stick.** `CORECFG.DAT` must exist in the volume root; create it with
+- **The library is missing or stale.** Rebuild `CORELIB.IDX`: `core sync`, or `tools/build_index.py`.
+- **Settings do not stick.** `CORECFG.DAT` must exist in the volume root; `core sync` creates it, or
   `tools/make_config.py --create <iPod>`.
 - **Something else.** Pull `CORELOG.BIN` in disk mode and dump it. Known issues and what is being
   worked on are in [STATUS.md](../STATUS.md).

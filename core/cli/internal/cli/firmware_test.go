@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"os"
@@ -364,5 +365,162 @@ func TestUniformByte(t *testing.T) {
 	}
 	if _, ok := uniformByte([]byte{1, 1, 1, 2}); ok {
 		t.Error("mixed slice reported uniform")
+	}
+}
+
+// --- firmware inspect -------------------------------------------------
+
+// syntheticPartition builds the smallest thing "firmware inspect" must
+// recognize as a firmware partition: the Apple preamble, a v3 directory
+// at 0x4200, and one OSOS entry whose body sits at devOffset + 0x800
+// with a correct plain-sum checksum.
+func syntheticPartition(t *testing.T, image []byte) []byte {
+	t.Helper()
+	const (
+		size      = 96 << 10
+		devOffset = 0x4800
+		dirStart  = 0x4200
+	)
+	part := make([]byte, size)
+	off := 0
+	for _, line := range []string{
+		"{{~~  /-----\\   ", "{{~~ /       \\  ", "{{~~|         | ",
+		"{{~~| S T O P | ", "{{~~|         | ", "{{~~ \\       /  ",
+		"{{~~  \\-----/   ",
+	} {
+		off += copy(part[off:], line)
+	}
+	off += copy(part[off:], "Copyright(C) 2001 Apple Computer, Inc.")
+	for i := off; i < 0xFF; i++ {
+		part[i] = '-'
+	}
+	copy(part[0x100:], firmware.DirectoryMarker[:])
+	// LE32 at 0x104 + 0x200 = 0x4200, LE16 version 3 at 0x10A.
+	part[0x104], part[0x105], part[0x106] = 0x00, 0x40, 0x00
+	part[0x10A] = 3
+
+	var sum uint32
+	for _, b := range image {
+		sum += uint32(b)
+	}
+	var enc bytes.Buffer
+	err := firmware.WriteDirectoryEntry(&enc, firmware.DirectoryEntry{
+		ContainerID: [4]byte{'!', 'A', 'T', 'A'},
+		ImageType:   [4]byte{'s', 'o', 's', 'o'},
+		DevOffset:   devOffset,
+		Length:      uint32(len(image)),
+		LoadAddr:    0x10000000,
+		Checksum:    sum,
+		Version:     0xB012,
+		LoadAddr2:   0xFFFFFFFF,
+	})
+	if err != nil {
+		t.Fatalf("encode entry: %v", err)
+	}
+	copy(part[dirStart:], enc.Bytes())
+	// The terminator row as the device writes it: zero except LoadAddr2.
+	copy(part[dirStart+40+36:], []byte{0xFF, 0xFF, 0xFF, 0xFF})
+	copy(part[devOffset+0x800:], image)
+	return part
+}
+
+func TestFirmwareInspectPartition(t *testing.T) {
+	dir := t.TempDir()
+	image := plausibleImage(8192)
+	path := writeTemp(t, dir, "fwpart.bin", syntheticPartition(t, image))
+
+	out, _, err := runCore(t, "firmware", "inspect", path)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	for _, want := range []string{
+		"iPod firmware partition",
+		"version 3 at 0x4200, 1 images",
+		"OSOS",
+		"0x5000", // body = devOffset + 0x800
+		"8192",
+		"OK",
+		"OSOS capacity",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "BAD") {
+		t.Errorf("a partition with a correct checksum reported BAD:\n%s", out)
+	}
+}
+
+func TestFirmwareInspectPartitionBadChecksum(t *testing.T) {
+	dir := t.TempDir()
+	image := plausibleImage(8192)
+	part := syntheticPartition(t, image)
+	part[0x4800+0x800+100] ^= 0xFF // one body byte
+	path := writeTemp(t, dir, "fwpart.bin", part)
+
+	out, _, err := runCore(t, "firmware", "inspect", path)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !strings.Contains(out, "BAD") {
+		t.Errorf("a flipped body byte was not reported BAD:\n%s", out)
+	}
+	if !strings.Contains(out, "does NOT verify") {
+		t.Errorf("OSOS mismatch not called out:\n%s", out)
+	}
+}
+
+func TestFirmwareInspectIPodFile(t *testing.T) {
+	dir := t.TempDir()
+	image := plausibleImage(8192)
+	in := writeTemp(t, dir, "core.bin", image)
+	out := filepath.Join(dir, "core.ipod")
+	if _, _, err := runCore(t, "firmware", "pack", in, "--out", out); err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+
+	got, _, err := runCore(t, "firmware", "inspect", out)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	var plain uint32
+	for _, b := range image {
+		plain += uint32(b)
+	}
+	for _, want := range []string{
+		".ipod transport file",
+		`"ipvd"`,
+		"recomputes — OK",
+		fmt.Sprintf("%#08x (what a directory entry would carry", plain),
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("inspect output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestFirmwareInspectRawImage(t *testing.T) {
+	dir := t.TempDir()
+	image := plausibleImage(8192)
+	path := writeTemp(t, dir, "core.bin", image)
+
+	got, _, err := runCore(t, "firmware", "inspect", path)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	var plain uint32
+	for _, b := range image {
+		plain += uint32(b)
+	}
+	for _, want := range []string{
+		"raw firmware image",
+		fmt.Sprintf("%#08x (what a directory entry", plain),
+		fmt.Sprintf("%#08x big-endian", plain+uint32(firmware.ModelIPodVideo)),
+		"ARM branch",
+		"8192 bytes once zero-padded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("inspect output missing %q:\n%s", want, got)
+		}
 	}
 }

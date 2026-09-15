@@ -36,6 +36,24 @@ SECTIONS {
     .text : ALIGN(4) {
         KEEP(*(.text.startup))
         *(.text*)
+        /* The host-findable version stamp (kernel/main.c core_version_marker,
+         * docs/design/companion-app-plan.md S8). Nothing in the firmware reads
+         * it, so --gc-sections collects it without this KEEP — measured: drop
+         * the KEEP and the string is gone from core.bin entirely. The `used`
+         * attribute only stops the COMPILER from dropping the definition; it
+         * does not reach the linker once the variable has an explicit section.
+         * This must also precede the *(.rodata*) wildcard below, so the KEEP
+         * is the statement that claims the section.
+         *
+         * The LONG(0) is a guard word, not padding: `strings` breaks records on
+         * non-printable bytes, so without a NUL in front the marker would be
+         * emitted glued to whatever printable byte happens to precede it and an
+         * anchored `grep '^CORE-FW-VERSION:'` would miss it. Four bytes buys a
+         * marker the host can find with a line-anchored match.
+         * tests/scripts/check_version_marker.sh fails the build if it goes. */
+        . = ALIGN(4);
+        LONG(0);
+        KEEP(*(.rodata.core_version))
         *(.rodata*)
         *(.glue_7) *(.glue_7t)
         . = ALIGN(4);

@@ -23,3 +23,6 @@ __pycache__/
 
 # Extracted album covers used to render screenshots (regenerable via ffmpeg)
 docs/screens/art/
+
+# core CLI cross-build output (core/cli/scripts/build-all.sh)
+core/cli/dist/

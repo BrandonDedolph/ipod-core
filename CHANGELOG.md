@@ -3,6 +3,21 @@
 Each release lists what changed on the device since the previous one. Versions are git tags;
 the boot screen and Settings → About show the one the device runs.
 
+## Unreleased
+
+- The image carries a `CORE-FW-VERSION:` marker so `core info` / `core update` can read the
+  version off the device.
+- The host app. `core` is one Go binary for Windows, macOS and Linux: `sync` puts a music tree on
+  the iPod (files, `folder.art`/`folder.thm`, playlists, `CORECFG.DAT`/`CORELOG.BIN` once, the index
+  last), `flash` writes a firmware image after a whole-partition backup and a read-back compare,
+  `update` fetches the latest release, `info`/`backup`/`doctor`/`eject` do what they say. The
+  Python tools in `tools/` stay as the parity oracles: the Go index is byte-identical on the whole
+  library. `core-app` is the same thing as a desktop window (Gio). Both were run against the
+  device: backup and image read identical to ipodpatcher's, a flash of the running image verified
+  by both tools, a sync that left the index byte-identical to the Python one.
+- The artist genre map is compiled into the binary, so a sync run away from the repository still
+  applies it (the first on-device sync had written 919 empty genre fields).
+
 ## v0.1.2 — 2026-09-14
 
 Since v0.1.1.

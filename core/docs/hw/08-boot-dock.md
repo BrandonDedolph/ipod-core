@@ -87,6 +87,48 @@ image): the 32-bit checksum is stored big-endian as the first 4
 bytes of the file, followed by the model name (`ipvd` for Video,
 `nano` for Nano).
 
+### Version marker
+
+Nothing in the partition records which build of OUR firmware is installed:
+the directory entry's `vers` field is Apple's (0xB012 on this device, and
+ipodpatcher leaves it alone), and the entry carries a length and a checksum
+but no version. So the image carries its own. `kernel/main.c` defines
+
+```c
+const char core_version_marker[] __attribute__((used, section(".rodata.core_version"))) =
+    "CORE-FW-VERSION:" CORE_VERSION "|" CORE_BUILD_ID "\0";
+```
+
+which lands in the OSOS **body** as one NUL-terminated string, e.g.
+`CORE-FW-VERSION:v0.1.2|v0.1.2-dirty`. The first half is the nearest git tag
+(`git describe --tags --abbrev=0`), the second the full build id
+(`git describe --tags --always --dirty --abbrev=7`) — a `-dirty` suffix is
+normal and means the image was built from an uncommitted tree, which device
+images routinely are.
+
+A host reads the version by scanning the body it already has to read anyway
+for the checksum: search the `len` bytes at `devOffset + 0x800` for
+`CORE-FW-VERSION:` and take up to the NUL. No offset is fixed — the marker
+moves with every build — so it is always a scan, never a fixed read.
+
+The marker is **never printed**: not on the UART (the clicky boot golden in
+`tests/clicky/boot_uart.golden` matches those lines exactly) and not on the
+screen, which keeps its own `CORE_VERSION` chip in Settings → About. The only
+reader is the host.
+
+Two things keep it alive. `boot/linker.ld` has `KEEP(*(.rodata.core_version))`,
+because the tree builds with `-fdata-sections -Wl,--gc-sections` and an
+unreferenced string is otherwise collected outright (`used` binds the compiler,
+not the linker). Ahead of it the script emits a zero guard word, so the marker
+begins a fresh `strings` record instead of being glued to whatever printable
+byte precedes it. `tests/scripts/check_version_marker.sh`, run from
+`make verify-hw`, then asserts exactly one marker in `build-hw/core.bin` and
+that its version half equals the repo's nearest tag.
+
+**Images built before v0.1.3 have no marker at all**, so a host that finds none
+should report the version as unknown rather than treating it as an error — that
+is a genuine older image, not a corrupt one.
+
 ## Boot ROM → our code: handoff state
 
 When the boot ROM jumps to the OSOS entry point, we inherit:

@@ -2,13 +2,17 @@ package cli
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/firmware"
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/fwpart"
 	"github.com/spf13/cobra"
 )
 
@@ -24,6 +28,8 @@ and "core install", which call into this package internally.`,
 	}
 	cmd.AddCommand(newFirmwarePackCmd())
 	cmd.AddCommand(newFirmwareUnpackCmd())
+	cmd.AddCommand(newFirmwareInspectCmd())
+	cmd.AddCommand(newFirmwareReadCmd())
 	return cmd
 }
 
@@ -143,87 +149,24 @@ func syncDir(dir string) {
 	_ = d.Close()
 }
 
-// Sanity bounds on the raw image handed to "firmware pack".
-//
-// These are not the firmware partition budget — the real limit is the
-// size of partition 0 on the target device, which is only knowable with
-// the device attached, and must be re-checked by any future install
-// path. They exist to catch the failure that actually happens: objcopy
-// producing an empty or truncated core.bin, which today packs into a
-// perfectly "valid" core.ipod and makes `make ipod` report success.
+// The plausibility rules for a raw firmware image now live in
+// internal/firmware, because `core flash` applies the same ones to a
+// .bin handed straight to it and two copies of "is this really a
+// firmware image?" is exactly the kind of pair that drifts. These are
+// the names this package already used, kept so the pack command and its
+// tests read unchanged.
 const (
-	// minPackImageBytes is far below any real build (our own image is
-	// ~220 KB, a stock Rockbox build ~760 KB) but above the 0-and-change
-	// bytes a failed objcopy leaves behind.
-	minPackImageBytes = 4096
-	// maxPackImageBytes is a generous ceiling; Apple's own OSOS images
-	// are a few MB.
-	maxPackImageBytes = 32 << 20
+	minPackImageBytes = firmware.MinImageBytes
+	maxPackImageBytes = firmware.MaxImageBytes
 )
 
-// validatePackImage rejects images that cannot plausibly be firmware.
-// Structural oddities that are merely suspicious are written to `warn`
-// rather than failing the build.
 func validatePackImage(path string, image []byte, warn io.Writer) error {
-	switch {
-	case len(image) == 0:
-		return fmt.Errorf("%s is empty; refusing to pack a 0-byte firmware image "+
-			"(the usual cause is objcopy failing silently)", path)
-	case len(image) < minPackImageBytes:
-		return fmt.Errorf("%s is only %d bytes, below the %d-byte minimum for a plausible "+
-			"firmware image; refusing to pack what looks like a truncated build",
-			path, len(image), minPackImageBytes)
-	case len(image) > maxPackImageBytes:
-		return fmt.Errorf("%s is %d bytes, above the %d-byte sanity ceiling for a firmware "+
-			"image; refusing to pack (is this really core.bin?)",
-			path, len(image), maxPackImageBytes)
-	}
-	if b, uniform := uniformByte(image); uniform {
-		return fmt.Errorf("%s is %d bytes of nothing but %#02x; refusing to pack a blank image",
-			path, len(image), b)
-	}
-	// The reset vector of our image is a branch, but that is not a
-	// property of .ipod images in general: a stock rockbox.ipod starts
-	// with 0xE321F0D3 (MSR CPSR_c, ...), not a branch. So a non-branch
-	// first word is worth mentioning and nothing more.
-	if !looksLikeARMBranch(image) {
-		fmt.Fprintf(warn, "warning: %s does not begin with an ARM branch instruction "+
-			"(first word %#08x); packing anyway\n", path, firstWordLE(image))
-	}
-	return nil
+	return firmware.ValidateImage(path, "pack", image, warn)
 }
 
-// uniformByte reports whether every byte of b is identical (the shape of
-// an all-zero or erased-flash 0xFF buffer).
-func uniformByte(b []byte) (byte, bool) {
-	if len(b) == 0 {
-		return 0, false
-	}
-	for _, x := range b[1:] {
-		if x != b[0] {
-			return 0, false
-		}
-	}
-	return b[0], true
-}
-
-func firstWordLE(image []byte) uint32 {
-	if len(image) < 4 {
-		return 0
-	}
-	return uint32(image[0]) | uint32(image[1])<<8 | uint32(image[2])<<16 | uint32(image[3])<<24
-}
-
-// looksLikeARMBranch reports whether the first word decodes as an ARM
-// B/BL: bits 27:25 == 0b101, with any condition code other than 0b1111
-// (which is the unconditional-instruction space, not a branch).
-func looksLikeARMBranch(image []byte) bool {
-	w := firstWordLE(image)
-	if len(image) < 4 {
-		return false
-	}
-	return (w&0x0E000000) == 0x0A000000 && (w>>28) != 0xF
-}
+func uniformByte(b []byte) (byte, bool)    { return firmware.UniformByte(b) }
+func firstWordLE(image []byte) uint32      { return firmware.FirstWordLE(image) }
+func looksLikeARMBranch(image []byte) bool { return firmware.LooksLikeARMBranch(image) }
 
 func newFirmwarePackCmd() *cobra.Command {
 	var (
@@ -365,3 +308,235 @@ a loud warning and the result must not be flashed to a device.`,
 		"Write the image even if the embedded model name is unknown (recovery only)")
 	return cmd
 }
+
+// --- firmware inspect -------------------------------------------------
+
+// inspectKind is what a file handed to "firmware inspect" turned out to
+// be. The three are told apart by their first bytes, in this order.
+type inspectKind int
+
+const (
+	// kindPartition: the Apple preamble is present, so these bytes are
+	// (the start of) firmware partition 0 — a whole-partition dump
+	// from ipodpatcher -r or from "core backup".
+	kindPartition inspectKind = iota
+	// kindIPodFile: the 8-byte .ipod transport header, whose model
+	// name sits at bytes 4..8.
+	kindIPodFile
+	// kindRawImage: anything else. A flat core.bin is not
+	// self-identifying, so this is the fallback, not a positive match.
+	kindRawImage
+)
+
+// classify decides what kind of file this is from its leading bytes.
+//
+// Order matters: a partition dump also has bytes at 4..8, and a .ipod
+// file has no preamble, so the preamble is tested first and the .ipod
+// header second.
+//
+// A .ipod file is recognized by its model name alone, not by a matching
+// checksum. Detection and verification are different questions — a
+// corrupt .ipod is still a .ipod, and "this is a raw image" is a much
+// worse answer to give about one than "this .ipod's checksum is BAD".
+func classify(head []byte) inspectKind {
+	if fwpart.CheckPreamble(head) == nil {
+		return kindPartition
+	}
+	if len(head) >= firmware.IPodFileHeaderSize {
+		var name firmware.ModelName
+		copy(name[:], head[4:8])
+		if _, ok := firmware.ModelNumForName(name); ok {
+			return kindIPodFile
+		}
+	}
+	return kindRawImage
+}
+
+func newFirmwareInspectCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "inspect <partition.bin | image.ipod | core.bin>",
+		Short: "Describe a firmware partition dump, a .ipod file, or a raw image",
+		Long: `Reads a file and reports what it is.
+
+A whole-partition dump (ipodpatcher -r, or "core backup") prints the
+image directory the way ipodpatcher -l does — one row per image, with
+the body offset (devOffset + 0x800), the length, and the stored checksum
+next to a fresh sum of the body, so a corrupt or stale image shows up as
+BAD. Apple leaves its AUPD and HIBE entries stale on a shipping device,
+so BAD on those two is normal and means nothing about the OS image; OSOS
+and RSRC are the rows that must verify.
+
+A .ipod file prints its transport header: the big-endian checksum, the
+model name, and whether the checksum recomputes. Note the two checksums
+in play are different — the .ipod header is seeded with the model number
+(5 for the Video), the partition directory entry is a plain sum with no
+seed.
+
+A raw image prints its size, the plain sum a directory entry would have
+to carry for it, and the .ipod header it would be packed with.
+
+This command only reads. It never opens a device and never writes.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := args[0]
+			f, err := os.Open(path)
+			if err != nil {
+				return fmt.Errorf("open %s: %w", path, err)
+			}
+			defer f.Close()
+			st, err := f.Stat()
+			if err != nil {
+				return fmt.Errorf("stat %s: %w", path, err)
+			}
+			size := st.Size()
+			if size == 0 {
+				return fmt.Errorf("%s is empty", path)
+			}
+
+			headLen := int64(fwpart.PreambleWindow)
+			if size < headLen {
+				headLen = size
+			}
+			head := make([]byte, headLen)
+			if _, err := f.ReadAt(head, 0); err != nil && !errors.Is(err, io.EOF) {
+				return fmt.Errorf("read %s: %w", path, err)
+			}
+
+			out := cmd.OutOrStdout()
+			switch classify(head) {
+			case kindPartition:
+				return inspectPartition(out, path, fwpart.Partition{R: f, Size: size})
+			case kindIPodFile:
+				return inspectIPodFile(out, path, f, size)
+			default:
+				return inspectRawImage(out, path, f, size)
+			}
+		},
+	}
+	return cmd
+}
+
+func inspectPartition(out io.Writer, path string, p fwpart.Partition) error {
+	fmt.Fprintf(out, "%s: iPod firmware partition, %d bytes\n", path, p.Size)
+	_, err := printPartitionDirectory(out, p)
+	return err
+}
+
+// printPartitionDirectory is the shared directory printer: the table
+// "firmware inspect" prints for a dump on disk, and the one "core info"
+// prints for the partition on a connected device. One function because
+// they are the same table of the same thing — the first version of this
+// had two, and they had already drifted on whether AUPD/HIBE being BAD
+// deserved a warning.
+//
+// It returns the parsed directory so a caller that also wants to answer
+// questions about it (info --json) does not parse twice.
+func printPartitionDirectory(out io.Writer, p fwpart.Partition) (*fwpart.Directory, error) {
+	d, err := fwpart.Parse(p)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(out, "  preamble   OK (Apple banner, %q at %#x)\n",
+		firmware.DirectoryMarker[:], firmware.DirectoryMarkerOffset)
+	fmt.Fprintf(out, "  directory  version %d at %#x, %d images\n\n",
+		d.Version, d.Start, len(d.Entries))
+
+	const row = "  %-2s %-4s %-4s %9s %9s %9s %9s %10s %9s %7s %10s %10s %s\n"
+	fmt.Fprintf(out, row, "#", "type", "cont", "entryAt", "devOffset", "body",
+		"len", "addr", "entryOff", "vers", "chksum", "recomputed", "state")
+	for i, e := range d.Entries {
+		state := "OK"
+		recomputed := "-"
+		sum, err := fwpart.EntryChecksum(p, e)
+		switch {
+		case err != nil:
+			state = "UNREADABLE"
+		case sum != e.Checksum:
+			state, recomputed = "BAD", fmt.Sprintf("%#08x", sum)
+		default:
+			recomputed = fmt.Sprintf("%#08x", sum)
+		}
+		fmt.Fprintf(out, row,
+			strconv.Itoa(i),
+			strings.ToUpper(e.LogicalImageType()),
+			string(e.ContainerID[:]),
+			fmt.Sprintf("%#x", d.EntryOffset(i)),
+			fmt.Sprintf("%#x", e.DevOffset),
+			fmt.Sprintf("%#x", fwpart.BodyOffset(e)),
+			strconv.FormatUint(uint64(e.Length), 10),
+			fmt.Sprintf("%#08x", e.LoadAddr),
+			fmt.Sprintf("%#x", e.EntryOffset),
+			fmt.Sprintf("%#x", e.Version),
+			fmt.Sprintf("%#08x", e.Checksum),
+			recomputed, state)
+	}
+
+	idx, osos, ok := d.OSOS()
+	if !ok {
+		fmt.Fprintf(out, "\n  no OSOS image in this directory\n")
+		return d, nil
+	}
+	capacity := d.Capacity(idx)
+	limit := fwpart.BodyOffset(osos) + int64(capacity)
+	fmt.Fprintf(out, "\n  OSOS capacity %d bytes (body %#x .. %#x); image uses %d, %d free\n",
+		capacity, fwpart.BodyOffset(osos), limit, osos.Length, int64(capacity)-int64(osos.Length))
+	if err := fwpart.VerifyEntry(p, osos); err != nil {
+		fmt.Fprintf(out, "  OSOS checksum does NOT verify: %v\n", err)
+	}
+	return d, nil
+}
+
+func inspectIPodFile(out io.Writer, path string, r io.ReaderAt, size int64) error {
+	data := make([]byte, size)
+	if _, err := r.ReadAt(data, 0); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	name, image, err := firmware.ReadIPodFile(bytes.NewReader(data))
+	stored := binary.BigEndian.Uint32(data[0:4])
+	seed, _ := firmware.ModelNumForName(name)
+
+	fmt.Fprintf(out, "%s: .ipod transport file, %d bytes\n", path, size)
+	fmt.Fprintf(out, "  model      %q (checksum seed %d)\n", string(name[:]), seed)
+	fmt.Fprintf(out, "  image      %d bytes\n", len(image))
+	fmt.Fprintf(out, "  header sum %#08x stored", stored)
+	switch {
+	case err == nil:
+		fmt.Fprintf(out, ", recomputes — OK\n")
+	case errors.Is(err, firmware.ErrIPodChecksumMismatch):
+		fmt.Fprintf(out, ", %#08x computed — BAD\n", firmware.Checksum(seed, image))
+	default:
+		fmt.Fprintf(out, " — %v\n", err)
+	}
+	fmt.Fprintf(out, "  plain sum  %#08x (what a directory entry would carry; no seed)\n",
+		fwpart.ImageChecksum(image))
+	fmt.Fprintf(out, "  body write %d bytes once zero-padded to %#x\n",
+		padTo(len(image), fwpart.BodyAlign), fwpart.BodyAlign)
+	return nil
+}
+
+func inspectRawImage(out io.Writer, path string, r io.ReaderAt, size int64) error {
+	image := make([]byte, size)
+	if _, err := r.ReadAt(image, 0); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	sum := fwpart.ImageChecksum(image)
+	fmt.Fprintf(out, "%s: raw firmware image (no preamble, no .ipod header), %d bytes\n",
+		path, size)
+	fmt.Fprintf(out, "  plain sum  %#08x (what a directory entry's chksum must carry)\n", sum)
+	fmt.Fprintf(out, "  first word %#08x", firstWordLE(image))
+	if looksLikeARMBranch(image) {
+		fmt.Fprintf(out, " (ARM branch)\n")
+	} else {
+		fmt.Fprintf(out, " (not an ARM branch)\n")
+	}
+	fmt.Fprintf(out, "  .ipod      header would be %#08x big-endian + %q (sum + seed %d), file %d bytes\n",
+		firmware.Checksum(firmware.ModelIPodVideo, image),
+		string(firmware.ModelNameIPodVideo[:]), firmware.ModelIPodVideo,
+		int(size)+firmware.IPodFileHeaderSize)
+	fmt.Fprintf(out, "  body write %d bytes once zero-padded to %#x\n",
+		padTo(len(image), fwpart.BodyAlign), fwpart.BodyAlign)
+	return nil
+}
+
+// padTo rounds n up to a multiple of align.
+func padTo(n, align int) int { return (n + align - 1) &^ (align - 1) }

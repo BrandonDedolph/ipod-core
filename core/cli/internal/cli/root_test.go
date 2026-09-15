@@ -19,27 +19,35 @@ func findCmd(t *testing.T, path ...string) *cobra.Command {
 	return cmd
 }
 
-// TestNoUnimplementedSecurityFlags pins the removal of --verify and
-// --sign. Both defaulted to true on commands that return "not yet
-// implemented", which reads as a security guarantee: there is no
-// signing key, no embedded public key, and no verification code
-// anywhere in this module. A flag that claims to verify a signature
-// while verifying nothing is worse than no flag.
-func TestNoUnimplementedSecurityFlags(t *testing.T) {
-	for _, tc := range []struct{ cmd, flag string }{
-		{"update", "verify"},
-		{"release", "sign"},
-	} {
-		c := findCmd(t, tc.cmd)
-		if f := c.Flags().Lookup(tc.flag); f != nil {
-			t.Errorf("%s still defines --%s (default %q); the code it implies does not exist",
-				tc.cmd, tc.flag, f.DefValue)
+// TestRootRegistersOnlyRealCommands pins the rule that the command tree
+// advertises nothing it cannot do. There are no stubs left at all now:
+// `info` was the last one, and S6 filled it in along with `backup` and
+// `firmware read`; S8 added `update` and `doctor`. A command listed in --help reads, to anyone who did
+// not write it, as a command that works; the ones still to come are
+// tracked in core/cli/README.md.
+func TestRootRegistersOnlyRealCommands(t *testing.T) {
+	want := map[string]bool{
+		"build": true, "info": true, "backup": true,
+		"firmware": true, "index": true, "art": true,
+		"sync": true, "eject": true, "flash": true,
+		"update": true, "doctor": true,
+	}
+	for _, c := range Root().Commands() {
+		if c.Name() == "help" || c.Name() == "completion" {
+			continue
 		}
+		if !want[c.Name()] {
+			t.Errorf("root registers %q, which is not an implemented command", c.Name())
+		}
+		delete(want, c.Name())
+	}
+	for name := range want {
+		t.Errorf("root no longer registers %q", name)
 	}
 }
 
-// TestDeviceFlagExists: internal/ipod defines ErrMultipleDevices
-// ("specify which one") and there was no way to specify.
+// TestDeviceFlagExists: internal/disk defines ErrMultipleDevices
+// ("select one with --device") and this is the way to select.
 func TestDeviceFlagExists(t *testing.T) {
 	root := Root()
 	f := root.PersistentFlags().Lookup("device")
@@ -50,7 +58,8 @@ func TestDeviceFlagExists(t *testing.T) {
 		t.Errorf("--device default = %q, want empty", f.DefValue)
 	}
 	// Persistent root flags must be inherited by every subcommand.
-	for _, name := range []string{"install", "flash", "recover", "info"} {
+	for _, name := range []string{"build", "info", "backup", "firmware", "index", "art",
+		"sync", "eject", "flash", "update", "doctor"} {
 		c := findCmd(t, name)
 		if c.InheritedFlags().Lookup("device") == nil {
 			t.Errorf("%s cannot see the global --device flag", name)
@@ -60,13 +69,13 @@ func TestDeviceFlagExists(t *testing.T) {
 
 func TestDeviceFlagIsReadable(t *testing.T) {
 	root := Root()
-	root.SetArgs([]string{"install", "--device", "/dev/sdz"})
+	root.SetArgs([]string{"info", "--device", "/dev/sdz"})
 	var got string
-	install, _, err := root.Find([]string{"install"})
+	info, _, err := root.Find([]string{"info"})
 	if err != nil {
-		t.Fatalf("find install: %v", err)
+		t.Fatalf("find info: %v", err)
 	}
-	install.RunE = func(cmd *cobra.Command, args []string) error {
+	info.RunE = func(cmd *cobra.Command, args []string) error {
 		got = deviceFlag(cmd)
 		return nil
 	}
@@ -86,21 +95,29 @@ func TestDeviceFlagDefaultsEmpty(t *testing.T) {
 	}
 }
 
-// TestStubsStillReportThemselves: the commands that aren't implemented
-// must keep saying so rather than exiting 0 and looking like they did
-// something.
-func TestStubsStillReportThemselves(t *testing.T) {
-	stubs := []string{"flash", "install", "update", "recover", "info", "debug", "sim", "test", "release"}
-	for _, name := range stubs {
-		t.Run(name, func(t *testing.T) {
-			_, _, err := runCore(t, name)
-			if err == nil {
-				t.Fatalf("%s returned nil error; a stub must not look like success", name)
-			}
-			if !strings.Contains(err.Error(), "not yet implemented") {
-				t.Errorf("%s error = %q, want it to say it isn't implemented", name, err)
-			}
-		})
+// TestInfoWithoutADeviceExplainsItself: with nothing plugged in, info
+// must fail with the thing to try next, not with a bare "no iPod found"
+// and not with a stack of Go errors. The three lines it prints are the
+// three causes: not in disk mode, a charge-only cable, or (on Windows)
+// not elevated.
+//
+// This runs on the developer's own machine, which has real disks on it.
+// The assertion is therefore about the SHAPE of the failure, not about
+// a particular message: an ordinary user account cannot open
+// /dev/sd* or \\.\PhysicalDriveN, so either "no iPod" or "access
+// denied" is a correct answer here and both must be actionable.
+func TestInfoWithoutADeviceExplainsItself(t *testing.T) {
+	_, _, err := runCore(t, "info")
+	if err == nil {
+		t.Skip("this machine has something that identifies as an iPod attached")
+	}
+	msg := err.Error()
+	actionable := strings.Contains(msg, "disk mode") ||
+		strings.Contains(msg, "sudo ") ||
+		strings.Contains(msg, "RunAs") ||
+		strings.Contains(msg, "Administrator")
+	if !actionable {
+		t.Errorf("info failed without telling the user what to do:\n%s", msg)
 	}
 }
 
@@ -111,8 +128,6 @@ func TestLoadBearingCommandsExist(t *testing.T) {
 	for _, path := range [][]string{
 		{"firmware", "pack"},
 		{"firmware", "unpack"},
-		{"tagcache", "build"},
-		{"tagcache", "dump"},
 		{"build"},
 	} {
 		cmd := findCmd(t, path...)

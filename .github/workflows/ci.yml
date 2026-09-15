@@ -24,7 +24,9 @@
 #   boot-smoke        the linked ARM image booted in the clicky emulator,
 #                     its UART transcript held to a golden — the only job
 #                     that executes crt0.S / switch.S / the IRQ entry
-#   cli               the Go host CLI: build, vet, test, gofmt
+#   cli               the Go host CLI and core-app, the Gio desktop app:
+#                     build, vet, test, gofmt, the snapshot render, and
+#                     the cross-compiled release binaries as artifacts
 
 name: CI
 
@@ -362,6 +364,11 @@ jobs:
         working-directory: core/cli
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history and tags: scripts/build-all.sh stamps the binary from
+          # `git describe --tags`, and checkout's default depth-1 clone has no
+          # tags at all, so the stamp would silently degrade to a bare SHA.
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -369,24 +376,11 @@ jobs:
           go-version: "1.22.10"
           cache-dependency-path: core/cli/go.sum
 
-      # TEMPORARILY NON-BLOCKING. Nine files under core/cli are not gofmt-clean
-      # today — the const-block comment alignment gofmt produces changed between
-      # Go releases, and these were written by an older one:
-      #
-      #   internal/artistart/fetch.go     internal/tagcache/decode.go
-      #   internal/cli/tagcache.go        internal/tagcache/encode.go
-      #   internal/ipod/detect.go         internal/tagcache/format.go
-      #   internal/tagcache/scan.go       internal/tagcache/scan_test.go
-      #   internal/tagcache/roundtrip_test.go
-      #
-      # The whole diff is whitespace. Fixing it is one command —
-      # `cd core/cli && gofmt -w ./...` — but it belongs in a commit of its own
-      # rather than buried in a CI change, and a job that is red on arrival
-      # gates nothing: build/vet/test below are all green TODAY and are what
-      # would actually catch a regression. Run that command, then delete this
-      # comment and the continue-on-error line so drift starts failing again.
+      # Enforced. The gofmt-dirty files this step used to tolerate were in
+      # internal/tagcache, internal/artistart and the command stubs that went
+      # with them; those are deleted, `gofmt -l .` over the module is empty
+      # under the Go pinned above, so drift fails the job again.
       - name: gofmt
-        continue-on-error: true
         run: |
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
@@ -396,6 +390,22 @@ jobs:
             exit 1
           fi
 
+      # core-app is a Gio window, and Gio's Linux backend is cgo against
+      # the X11/Wayland/EGL/GLES headers. These are the -dev packages it
+      # needs; the runtime .so files are already on the image. Without
+      # them the app package still COMPILES (see the build tags in
+      # internal/app/gpu.go — the two GPU files drop out of a Linux
+      # build that has no Vulkan headers), so this step is what makes
+      # the difference between CI checking the model and CI checking the
+      # window.
+      - name: Install the Gio GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libx11-dev libx11-xcb-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libgles2-mesa-dev libegl1-mesa-dev \
+            libffi-dev libxcursor-dev libvulkan-dev pkg-config
+
       - name: Build
         run: go build ./...
 
@@ -404,3 +414,96 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      # The same three again WITH the GUI files in. -tags novulkan is
+      # the flag the whole arrangement turns on: it drops Gio's Vulkan
+      # path, which needs vulkan/vulkan.h and buys nothing here, and it
+      # is what a developer on a machine without those headers passes
+      # too. Passing it in CI as well means the tagged build is not a
+      # configuration only one laptop ever compiles.
+      #
+      # This run is also the one that executes TestSnapshot: it renders
+      # the window headless through Mesa's software EGL and writes the
+      # PNGs, so a layout change that overlaps or clips something fails
+      # here rather than on the user's desktop.
+      - name: Build, vet and test with the GUI in (-tags novulkan)
+        env:
+          CORE_SNAPSHOT_DIR: ${{ runner.temp }}/app-snapshots
+        run: |
+          go build -tags novulkan ./...
+          go vet -tags novulkan ./...
+          go test -tags novulkan ./...
+
+      - name: Upload the rendered window snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-app-snapshots
+          path: ${{ runner.temp }}/app-snapshots
+          if-no-files-found: ignore
+
+      # The binaries a user actually downloads. Building them on every
+      # push is how we find out that, say, a new dependency pulled in cgo or
+      # a syscall that does not exist on darwin BEFORE a tag is cut and the
+      # release workflow is the first thing to try it. Same script, same
+      # -ldflags, as .github/workflows/release.yml — see the header of
+      # core/cli/scripts/build-all.sh for why that is one file and not two.
+      #
+      # On this runner that is the five `core` binaries, core-app for
+      # Windows (pure Go, cross-built) and core-app-linux-amd64 (cgo,
+      # native). The script prints the darwin and linux/arm64 GUI builds
+      # it skipped; release.yml has jobs on their own runners for those.
+      - name: Cross-compile every shipped target
+        run: bash scripts/build-all.sh dist
+
+      - name: Show the version stamp the binaries carry
+        run: ./dist/core-linux-amd64 --version
+
+      - name: Upload core-linux-amd64
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-linux-amd64
+          path: core/cli/dist/core-linux-amd64
+          if-no-files-found: error
+
+      - name: Upload core-linux-arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-linux-arm64
+          path: core/cli/dist/core-linux-arm64
+          if-no-files-found: error
+
+      - name: Upload core-darwin-amd64
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-darwin-amd64
+          path: core/cli/dist/core-darwin-amd64
+          if-no-files-found: error
+
+      - name: Upload core-darwin-arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-darwin-arm64
+          path: core/cli/dist/core-darwin-arm64
+          if-no-files-found: error
+
+      - name: Upload core-windows-amd64.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-windows-amd64.exe
+          path: core/cli/dist/core-windows-amd64.exe
+          if-no-files-found: error
+
+      - name: Upload core-app-windows-amd64.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-app-windows-amd64.exe
+          path: core/cli/dist/core-app-windows-amd64.exe
+          if-no-files-found: error
+
+      - name: Upload core-app-linux-amd64
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-app-linux-amd64
+          path: core/cli/dist/core-app-linux-amd64
+          if-no-files-found: error

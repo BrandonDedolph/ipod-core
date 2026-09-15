@@ -6,6 +6,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -13,8 +14,21 @@ import (
 )
 
 func main() {
-	if err := cli.Root().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+	// Build the root first and report through ITS error writer rather
+	// than os.Stderr directly: --elevated-log retargets that writer, and
+	// the elevated child's console closes the instant it exits, so an
+	// error printed to the real stderr is an error nobody ever sees.
+	root := cli.Root()
+	if err := root.Execute(); err != nil {
+		fmt.Fprintln(root.ErrOrStderr(), "error:", err)
+		// `core flash` on Windows does its work in an elevated child
+		// process. That child's exit code has to reach the shell that
+		// ran the parent, or a script cannot tell a flash that failed
+		// inside the UAC window from one that succeeded.
+		var exit *cli.ExitError
+		if errors.As(err, &exit) && exit.Code != 0 {
+			os.Exit(exit.Code)
+		}
 		os.Exit(1)
 	}
 }
