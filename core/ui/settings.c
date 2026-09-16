@@ -262,11 +262,16 @@ void settings_defaults(settings_t *s)
      * the field to ui/sleeptimer.c after a reset). */
     s->sleep_timer_min   = 0;
     /* The clock. 12-hour and no clock in the title bar, which is what the
-     * device does today. Reset Settings routes through here, so it also
-     * forgets the host's stamp AND the mark — and the next boot therefore
-     * re-applies the stamp, which is the right reading of "reset": the rule
-     * that stops a stale stamp from being applied is the RTC's own position
-     * (kernel/timesync.h, rule 5), not the mark alone. */
+     * device does today.
+     *
+     * Every clock field is zeroed here, INCLUDING the host's stamp, because
+     * this function is also the state before config_load() has read anything:
+     * a non-zero host_epoch that no record put there would be a stamp invented
+     * out of nothing. Reset Settings routes through here too, and kernel/main.c
+     * puts the host's two fields back afterwards — they are the host's, not a
+     * preference of the user's, and a Reset that threw away a stamp the device
+     * had not acted on yet would leave it with no time at all until the next
+     * sync. */
     s->time_24h          = 0;
     s->time_in_title     = 0;
     s->utc_off_min       = 0;

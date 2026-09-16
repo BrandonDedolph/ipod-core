@@ -759,8 +759,11 @@ int main(void)
           settings_adjust(SETTINGS_DATETIME, &s, 1, +2) == 0 && s.time_24h == 0 &&
           settings_adjust(SETTINGS_DATETIME, &s, 0, +1) == 0);
 
-    /* Reset forgets the host's stamp AND the mark, deliberately: see
-     * settings_defaults(). */
+    /* settings_defaults() zeroes every clock field — it is the state before
+     * config_load() has read anything, so a host stamp surviving it would be a
+     * stamp nobody wrote. (kernel/main.c's Reset Settings puts the HOST's two
+     * fields back afterwards, so a Reset costs the mark and not the clock; that
+     * half is wiring and lives there.) */
     s.host_epoch = 1789555320u; s.host_off_min = 120;
     s.applied_epoch = 1789555320u; s.utc_off_min = 120;
     settings_defaults(&s);

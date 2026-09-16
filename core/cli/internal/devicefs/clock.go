@@ -111,13 +111,7 @@ func stampSlot(slot []byte, now time.Time) []byte {
 		binary.LittleEndian.PutUint16(rec[cfgOffLength:], cfgPayloadTime)
 	}
 
-	_, offSec := now.Zone()
-	offMin := offSec / 60
-	if offMin < utcOffMinMinutes {
-		offMin = utcOffMinMinutes
-	} else if offMin > utcOffMaxMinutes {
-		offMin = utcOffMaxMinutes
-	}
+	offMin := zoneOffsetMinutes(now)
 
 	p := rec[cfgOffPayload:]
 	binary.LittleEndian.PutUint32(p[pHostEpoch:], uint32(now.UTC().Unix()))
@@ -176,13 +170,29 @@ func StampConfigTime(volumeRoot string, now time.Time) (Stamped, error) {
 		return Stamped{}, err
 	}
 
-	_, offSec := now.Zone()
 	return Stamped{
 		When:   now,
-		OffMin: offSec / 60,
+		OffMin: zoneOffsetMinutes(now), // what was WRITTEN, clamp included
 		Slot:   dst,
 		Seq:    have + 1,
 	}, nil
+}
+
+// zoneOffsetMinutes is the offset as it goes into the record: whole minutes,
+// clamped to the real-world zone range. One function because the value the
+// report PRINTS and the value the device READS have to be the same number —
+// they were not, and a zone outside the range would have been reported as
+// something the firmware never saw.
+func zoneOffsetMinutes(t time.Time) int {
+	_, offSec := t.Zone()
+	off := offSec / 60
+	if off < utcOffMinMinutes {
+		return utcOffMinMinutes
+	}
+	if off > utcOffMaxMinutes {
+		return utcOffMaxMinutes
+	}
+	return off
 }
 
 // writeSlotThrough rewrites one slot of an existing file in place and gets it

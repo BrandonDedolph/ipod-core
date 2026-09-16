@@ -176,7 +176,10 @@ typedef struct {
      * that survives a power cut, so everything that has to persist rides in
      * settings_t whether or not a row shows it.
      *
-     * time_24h / time_in_title ARE rows (Settings > Date & Time).
+     * time_24h / time_in_title ARE rows (Settings > Date & Time), and they
+     * are the only two of the six a Reset returns to their defaults:
+     * settings_defaults() zeroes all six (it is also the pre-load state), and
+     * kernel/main.c's Reset puts the host's two fields back.
      *
      * utc_off_min is the display offset: the RTC holds UTC and local time is
      * RTC + utc_off_min minutes. A device that has never met the host app has

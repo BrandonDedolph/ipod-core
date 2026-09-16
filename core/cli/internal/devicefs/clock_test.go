@@ -333,3 +333,22 @@ func TestStampMatchesMakeConfig(t *testing.T) {
 		}
 	}
 }
+
+// A zone outside the range the record can hold is clamped — and the number the
+// caller is told is the number that was written, not the one it asked for.
+func TestStampClampsAnImpossibleZone(t *testing.T) {
+	dir := t.TempDir()
+	src := EncodeConfigSlot(DefaultSettings(), 1)
+	path := writeTestConfig(t, dir, src[:], nil)
+
+	now := time.Unix(1789555320, 0).In(time.FixedZone("Nowhere", 20*3600))
+	got := mustStamp(t, dir, now)
+	if got.OffMin != utcOffMaxMinutes {
+		t.Errorf("report says offset %d, want the clamped %d", got.OffMin, utcOffMaxMinutes)
+	}
+	b, _ := os.ReadFile(path)
+	ts, ok := DecodeConfigTime(b[ConfigSlotBytes : 2*ConfigSlotBytes])
+	if !ok || int(ts.HostOffMin) != got.OffMin {
+		t.Errorf("record holds %d, the report said %d", ts.HostOffMin, got.OffMin)
+	}
+}

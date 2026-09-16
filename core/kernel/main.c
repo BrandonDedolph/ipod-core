@@ -714,11 +714,16 @@ static settime_t   g_settime;
 static uint32_t    g_clock_min;          /* last painted minute; 0 = none yet */
 static uint32_t    g_clock_tick_us;      /* when the software clock last ticked */
 static uint32_t    g_clock_resync_us;    /* when it was last anchored from the chip */
+static int         g_clock_retry;        /* the last read got no answer: ask again soon */
 
 /* Half an hour between RTC reads. Long enough that the bus is effectively
  * untouched, short enough that the USEC_TIMER's ~71.6-minute wrap cannot be
  * missed even if the 5 s cadence stalls (wallclock.h's feed contract). */
 #define RTC_RESYNC_S    1800u
+/* ...but a read that got no answer is retried in a minute rather than in half
+ * an hour: the bus is shared with the codec and a single collision should not
+ * cost the clock its correction for a whole cadence. */
+#define RTC_RETRY_S     60u
 #define CLOCK_TICK_US   5000000u         /* fold the elapsed µs in every 5 s   */
 
 /*
@@ -1217,19 +1222,24 @@ static int clock_local_now(datetime_t *out)
 
 /*
  * The clock as the strip and the main menu's header draw it ("10:42 AM" /
- * "22:42"), or "" when Time in Title is off or no time is known. The buffer is
- * static because both callers draw straight out of it and neither keeps it.
+ * "22:42"), into the CALLER's buffer — `buf` must hold DATETIME_TIME_MAX bytes.
+ * Writes "" when Time in Title is off or no time is known.
+ *
+ * The caller owns the buffer because both users of this string appear in one
+ * paint: main_menu_render passes the header's clock into menu_render_list,
+ * which paints the strip (and formats the clock again) BEFORE ui_header reads
+ * it. Off one shared static that is a reader of a buffer someone else has
+ * already rewritten — today with identical bytes, which is exactly the kind of
+ * bug that waits for the two call sites to diverge.
  */
-static const char *clock_title_text(void)
+static void clock_title_text(char *buf, int buf_sz)
 {
-    static char buf[DATETIME_TIME_MAX];
     buf[0] = '\0';
     datetime_t now;
     if (!g_settings.time_in_title || !clock_local_now(&now)) {
-        return buf;
+        return;
     }
-    datetime_fmt_time(buf, (int)sizeof buf, &now, g_settings.time_24h);
-    return buf;
+    datetime_fmt_time(buf, buf_sz, &now, g_settings.time_24h);
 }
 
 /*
@@ -1251,10 +1261,31 @@ static void clock_resync(const char *why)
     uint32_t now   = mmio_read32(USEC_TIMER_ADDR);
     int32_t  drift = 0;
 
+    /*
+     * -1 and 0 are the same answer to the BOOT question ("do we know the
+     * time?", hal.h) and different answers to this one. 0 means the chip says
+     * it has no time, and a software clock running on top of that is a fiction
+     * to be dropped. -1 means the bus did not answer — a transient on the bus
+     * the codec shares — and the clock we are already carrying is still the
+     * best information in the device. Keeping it costs nothing and losing it
+     * costs the user their clock for half an hour.
+     */
+    if (rc < 0 && g_wclock.valid) {
+        wallclock_tick(&g_wclock, now);        /* carry on from the timer */
+        g_clock_tick_us   = now;
+        g_clock_resync_us = now;
+        g_clock_retry     = 1;                 /* ...and ask again shortly */
+        uart_puts("core: rtc ");
+        uart_puts(why);
+        uart_puts(" no answer, keeping the software clock\n");
+        return;
+    }
+
     wallclock_resync_t r = wallclock_resync(&g_wclock, rc == 1, epoch, now,
                                             &drift);
     g_clock_resync_us = now;
     g_clock_tick_us   = now;
+    g_clock_retry     = 0;
 
     uart_puts("core: rtc ");
     uart_puts(why);
@@ -1281,12 +1312,13 @@ static void clock_resync(const char *why)
  * showing both would take a third of every title away permanently in exchange
  * for a readout the main menu's header already carries.
  */
-static const char *strip_left_text(void)
+static const char *strip_left_text(char *buf, int buf_sz)
 {
     if (player_active()) {
         return track_display(player_track_name());
     }
-    return clock_title_text();
+    clock_title_text(buf, buf_sz);
+    return buf;
 }
 
 /* The top status strip: the now-playing track name on the left (so you always
@@ -1299,7 +1331,8 @@ static void status_strip_render(void)
      * NOTHING — the strip is a now-playing readout, not a wordmark (the main
      * menu's own header already says "Core"). Clipped by the right cluster,
      * which is painted over it. */
-    const char *left = strip_left_text();
+    char clock[DATETIME_TIME_MAX];
+    const char *left = strip_left_text(clock, (int)sizeof clock);
 
     int bx = LCD_WIDTH - 12 - 24;             /* battery block (22 + 2 nub)        */
 
@@ -4151,7 +4184,9 @@ static void main_menu_render(void)
      * clock cannot collide however wide the clock gets. This is the one place
      * the time is shown while a track is playing: the strip keeps the track
      * name (strip_left_text). */
-    menu_render_list("Core", clock_title_text(), g_main_menu, n, g_main_sel, 0);
+    char clock[DATETIME_TIME_MAX];
+    clock_title_text(clock, (int)sizeof clock);
+    menu_render_list("Core", clock, g_main_menu, n, g_main_sel, 0);
 }
 
 static void music_menu_render(void)
@@ -6040,7 +6075,8 @@ static void top_banner_render(int inverted, const uint16_t *bm, int bn, int bm_d
      * line as the announcement, then the divider in the band's own secondary
      * colour so the inverted block ends where the header does. */
     {
-        const char *left = strip_left_text();
+        char clock[DATETIME_TIME_MAX];
+        const char *left = strip_left_text(clock, (int)sizeof clock);
         /* The banner owns the whole strip row for its second, so it has to
          * redraw the SLEEP token too (in the band's own secondary colour) or
          * the Hold banner would blink the countdown off. No padlock is drawn
@@ -6764,6 +6800,7 @@ _Noreturn static void run_ui(fat32_t *fs)
      * minus the named phases — absorbs this read either way; g_lib_load_ms is
      * measured inside library_ensure and is unaffected.
      */
+    int clock_mark_unsaved = 0;           /* see the timesync block below */
     settings_defaults(&g_settings);
     int cfg_ok = config_load(fs, &g_settings);
     uart_puts("core: cfg load ");
@@ -6860,6 +6897,14 @@ _Noreturn static void run_ui(fat32_t *fs)
             g_settings.utc_off_min   = ts.utc_off_min;
             settings_touch();
             settings_commit(CFG_COMMIT_FORCE);
+            /* FORCE is not a promise: the gate can still refuse (a cell below
+             * the disk-safe line) and a write can still fail, and either way
+             * the change stays PENDING — which cfg_commit_clear() at the end of
+             * this boot would then throw away with the load's own dirt. Carry
+             * the fact forward so the mark is re-armed instead of lost; a lost
+             * mark means this stamp is applied again on the next boot, and on
+             * the one after that, for as long as the writes keep failing. */
+            clock_mark_unsaved = g_cfg_commit.dirty;
         }
 
         uart_puts("core: timesync host ");
@@ -6946,6 +6991,14 @@ _Noreturn static void run_ui(fat32_t *fs)
      * number means "time until the device was ready", not "+1 frame". */
     g_boot_total_ms    = boot_ms_now();
     cfg_commit_clear(&g_cfg_commit);      /* loading is not a change to save back */
+    if (clock_mark_unsaved) {
+        /* ...but the clock's mark IS a change, and it did not reach the platter
+         * above. Re-arm it for the idle path rather than let the line above
+         * discard it (kernel/timesync.h: a stamp acted on but not marked is
+         * acted on again next boot). */
+        settings_touch();
+        uart_puts("core: timesync mark not saved yet — retrying\n");
+    }
     g_scr_n = 0;
     scr_push(SCR_MENU);
 
@@ -7145,22 +7198,26 @@ _Noreturn static void run_ui(fat32_t *fs)
                 wallclock_tick(&g_wclock, now_us);
                 g_clock_tick_us = now_us;
             }
-            if ((uint32_t)(now_us - g_clock_resync_us) >= RTC_RESYNC_S * 1000000u) {
+            uint32_t due = (g_clock_retry ? RTC_RETRY_S : RTC_RESYNC_S) * 1000000u;
+            if ((uint32_t)(now_us - g_clock_resync_us) >= due) {
                 clock_resync("resync");
             }
             uint32_t minute = 0;
-            if (g_settings.time_in_title &&
-                wallclock_minute(&g_wclock, now_us, &minute) &&
+            if (wallclock_minute(&g_wclock, now_us, &minute) &&
                 minute != g_clock_min) {
                 g_clock_min = minute;
-                /* Only screens that actually show a clock: the strip carries
-                 * one while nothing is playing, the main menu's header carries
-                 * one always, and Settings' Date & Time row shows the time it
-                 * would edit. */
-                int shows = !player_active() || scr_cur() == SCR_MENU ||
-                            (scr_cur() == SCR_SETTINGS &&
+                /*
+                 * Only screens that actually show a clock. Date & Time's first
+                 * row shows the time it would edit WHATEVER Time in Title says
+                 * — that row is how you read the clock with the setting off —
+                 * so it is outside the flag's test; the strip (idle) and the
+                 * main menu's header are inside it.
+                 */
+                int on_dt = (scr_cur() == SCR_SETTINGS &&
                              g_set_screen == SETTINGS_DATETIME);
-                if (shows) {
+                int in_title = g_settings.time_in_title &&
+                               (!player_active() || scr_cur() == SCR_MENU);
+                if (on_dt || in_title) {
                     dirty = 1;
                 }
             }
@@ -8271,7 +8328,21 @@ _Noreturn static void run_ui(fat32_t *fs)
                             lcd_present_fb(console_framebuffer());
                             power_enter_disk_mode();
                         } else if (act == SETTINGS_ACTION_RESET) {
+                            /* The HOST's stamp is not a setting: it is a
+                             * message the device may not have acted on yet, and
+                             * settings_defaults() zeroes it along with
+                             * everything else (it is the pre-load state too).
+                             * Put it back across the reset — with the MARK left
+                             * at its default, so the next boot applies that
+                             * stamp again and the clock survives a Reset.
+                             * Dropping it instead would leave a device that had
+                             * been synced but not yet booted with no time at
+                             * all, and `core doctor` saying "never stamped". */
+                            uint32_t host_epoch = g_settings.host_epoch;
+                            int      host_off   = g_settings.host_off_min;
                             settings_defaults(&g_settings);
+                            g_settings.host_epoch   = host_epoch;
+                            g_settings.host_off_min = host_off;
                             settings_apply();
                             sleep_timer_apply();           /* defaults() zeroed
                                                             * the row: disarm  */

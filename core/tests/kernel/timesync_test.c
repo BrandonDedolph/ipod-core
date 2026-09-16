@@ -313,6 +313,19 @@ static void check_resync(xfail_ctx *c)
           wallclock_resync(&w, 0, 0, SEC_US, &drift) == WALLCLOCK_RESYNC_OK &&
           drift == 0 && wallclock_now(&w, SEC_US, &got) == 0);
 
+    /* The module's contract is "no time" resets; keeping a running clock across
+     * a bus error is the CALLER's distinction (kernel/main.c clock_resync, which
+     * ticks the clock forward instead of resyncing when hal_rtc_get returns -1).
+     * What the module has to guarantee for that to work is this: a tick does not
+     * need the chip, and the clock it carries stays exact across one. */
+    wallclock_reset(&w);
+    wallclock_anchor(&w, 1, HOST_T, 0u);
+    for (int i = 0; i < 30; i++) {           /* half an hour of 60 s ticks */
+        wallclock_tick(&w, (uint32_t)(i + 1) * 60u * SEC_US);
+    }
+    xpect(c, "a clock carried without the chip for half an hour is still exact",
+          wallclock_now(&w, 1800u * SEC_US, &got) && got == HOST_T + 1800u);
+
     /* drift_s is optional. */
     wallclock_reset(&w);
     xpect(c, "resync: the drift is optional",
