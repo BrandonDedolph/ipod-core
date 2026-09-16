@@ -126,10 +126,11 @@ starts, the seek is dropped rather than carried into a track you have not heard.
 instead, and because the length of the press is what tells the two apart, the skip happens when you
 let go.
 
-**The queue.** Hold Select for about half a second. The queue view lists what is playing and what
-is next, with the playing row marked. Select a row to jump to it; Menu returns to Now Playing.
-Left and Right skip here as well, and a hold seeks; the queue has no time readout, so you see the
-result when you let go.
+**The queue.** Hold Select for about half a second. The queue view lists the tracks of the list you
+played from, in that list's own order, with the playing row marked — so with shuffle on, the next
+row is not what plays next. Select a row to jump to it; Menu returns to Now Playing. Left and
+Right skip here as well, and a hold seeks; the queue has no time readout, so you see the result
+when you let go.
 
 **Shuffle and repeat** are in Settings, Playback. They show as SHUF, SHUF·ALB, RPT or RPT1 in the
 top band, followed by SLEEP and the minutes left when the sleep timer is running.
@@ -161,10 +162,12 @@ ever lives in memory; if the drive happens to be asleep the save waits until it 
 until the device sleeps or powers off, so leaving Settings never makes you wait.
 
 - **Playback.** Shuffle Off, Songs or Albums. Songs shuffles the tracks of the list you played
-  from. Albums keeps each album whole: the album you are on plays to its end in track order, then
-  another album from that same list at random, and so on until every album in it has played.
-  Playing one album from the browser with Albums on simply plays it in order. Shuffle Songs on the
-  Music menu always shuffles songs, whichever setting is on, because that list IS the shuffle.
+  from. Albums keeps each album together: the tracks of the album you are on that are in that list
+  play in track order, wherever they sit in the list, then another album from the same list at
+  random, and so on until every album in it has played. It regroups the list, not the disk — tracks
+  the list does not hold are not fetched to complete an album. Playing one album from the browser
+  with Albums on simply plays it in order. Shuffle Songs on the Music menu always shuffles songs,
+  whichever setting is on, because that list IS the shuffle.
   Repeat Off, All, or One; with Albums on, Repeat All starts the whole list again in a new album
   order, and Repeat One still repeats the one track. Resume on or off: with Resume on, the
   next boot comes back on the track you were on, paused at the same position, in the same queue.

@@ -30,8 +30,8 @@ what works, what doesn't, and what to pick up next.
   (0 off, 1 songs, 2 albums). No version bump, no length change, no offset
   moved — a v0.1.3 record loads unchanged, and a v0.1.3 build reading an
   albums record sees "shuffle on", which is Songs. An unknown value reads as
-  Off (the theme-id precedent, not a clamp). Leaving a Settings row that
-  changed the record now also captures the resume context, so the saved
+  Off (the theme-id precedent, not a clamp). A SELECT that changes a Settings
+  row now also captures the resume context, so the saved
   (seed, keep) can never lag a mode change by a capture window.
 
   Now Playing shows `SHUF·ALB` instead of `SHUF` — except over a Shuffle Songs

@@ -6,9 +6,9 @@
  * touches nothing but settings_t + stdint, so the on-device path and this test
  * compile the SAME source. This proves the model contract main.c relies on:
  *   1. Defaults: the documented starting values.
- *   2. activate() SELECT: toggles Shuffle, cycles Repeat OFF->ALL->ONE->OFF,
- *      flips Crossfade / Resume, cycles the Sleep Timer's durations, sets a
- *      theme.
+ *   2. activate() SELECT: cycles Shuffle Off->Songs->Albums->Off, cycles
+ *      Repeat OFF->ALL->ONE->OFF, flips Crossfade / Resume, cycles the Sleep
+ *      Timer's durations, sets a theme.
  *   3. adjust() wheel: clamps Volume/Bass and Display Brightness to range.
  *   4. Navigation: Root rows return the right ENTER_* / RESET action codes;
  *      value/kind reporting for a toggle and a slider row.
