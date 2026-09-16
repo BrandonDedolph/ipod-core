@@ -3,6 +3,51 @@
 The README is the canonical public story; this doc is the running list of
 what works, what doesn't, and what to pick up next.
 
+## 2026-09-16 — Steering by letter, UNFLASHED
+
+Two changes to `ui/wheel.c`, one of which alters how an existing device
+behaviour feels.
+
+**The latch and the plate now share one clock.** `wheel_accel_step` treated
+any gap over `WHEEL_IDLE_US` (200 ms) as a new gesture and dropped letter
+mode, while the plate stayed up for `WHEEL_AZ_HOLD_LETTER` (1.2 s). So for a
+whole second the letter could be on screen with the wheel already back on
+rows, and the next detent both moved one row and took the plate down — the
+control changing meaning under a thumb that had only paused to read it. The
+latch now outlives a pause shorter than the plate's hold, which is the rule
+the guide already described ("the letter stays for just over a second"). The
+SPEED still resets at 200 ms, so a pause never leaves eight rows per detent
+armed: pause, and the next detent is exactly one letter.
+
+This is the one change here a user could dislike, and it is deliberately a
+single `if` so the rollback is a one-liner.
+
+**The detent is answered by the index, not by a walk.**
+`wheel_set_letter_step` is a fourth seam beside the clock, the row-initial
+source and the click; `kernel_main` registers `ui/letterindex.c`'s run index
+over it. The old `list_letter_step` walk is O(rows in this letter) — up to a
+few hundred `initial_at` calls per detent on a 6000-song library, each one a
+screen-stack lookup — and it stays as the fallback, so an unregistered seam is
+slower, never different. The suite proves which one runs, with what arguments,
+and that a screen with no letters never reaches either.
+
+`wheel` suite extended (§4 split three ways, new §9 over the seam); the
+`letterindex` step cases are deliberately §6's, because this is the swap.
+61 host suites green, ARM `-Werror` + `verify-hw` clean.
+
+**Nothing here has run on the device.** The bench:
+- Spin Songs fast, stop half a second, one detent → the NEXT letter, plate
+  still up.
+- Stop two seconds, one detent → one row, no plate.
+- Select while the plate is up opens the row under the bar, which is the run
+  head the last detent landed on.
+- A letter detent back from mid-letter lands on that letter's first row; a
+  second one goes to the previous letter.
+- At either end of the alphabet a further detent does nothing and does not
+  click.
+- A fast spin that ends in a SELECT does not carry the plate onto the screen
+  that SELECT opened.
+
 ## 2026-09-16 — The A-Z letter on every long list, UNFLASHED
 
 The locator plate and the letter-stepping wheel were **Songs only**, and the

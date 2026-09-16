@@ -40,6 +40,17 @@ static char initial_fn(int idx)
 static int  g_clicks;
 static void click_fn(void) { g_clicks++; }
 
+/* The letter-step seam (§9): what kernel_main registers over the run index. */
+static int g_step_calls, g_step_sel, g_step_count, g_step_dir, g_step_target;
+static int step_stub(int sel, int count, int dir)
+{
+    g_step_calls++;
+    g_step_sel   = sel;
+    g_step_count = count;
+    g_step_dir   = dir;
+    return g_step_target;
+}
+
 /* A list under the wheel: selection, size, sub-detent remainder. */
 typedef struct { int sel, count, accum; } list_t;
 
@@ -51,8 +62,13 @@ static int ev(list_t *l, int delta, uint32_t gap_us)
     return l->sel;
 }
 
-/* A gesture that is over: longer than WHEEL_IDLE_US since the last event. */
+/* A gesture that is over: longer than WHEEL_IDLE_US since the last event.
+ * It resets the SPEED; in letter mode it leaves the latch alone, because it
+ * is shorter than WHEEL_AZ_HOLD_LETTER (the plate is still up). */
 #define IDLE   (WHEEL_IDLE_US + 50000u)
+/* A gesture that is over for good: past the plate's hold, so letter mode has
+ * ended too and the next detent is one row. */
+#define GONE   (WHEEL_AZ_HOLD_LETTER + 50000u)
 /* A deliberate detent-by-detent pace: same gesture, but far too slow to
  * accelerate (4 ticks / 150 ms = 26 ticks/s, under WHEEL_TPS_ACCEL). */
 #define SLOW   150000u
@@ -153,8 +169,18 @@ int main(void)
      * and the wheel must fall through to row scrolling — not do nothing. */
     xpect(&c, "a letterless screen falls through to row scrolling in letter mode",
           ev(&l, 4, FAST) == 47 && g_clicks == 8);
-    xpect(&c, "an idle gap starts a new gesture at one row per detent",
-          ev(&l, 4, IDLE) == 48 && wheel_letter_mode() == 0);
+    /* A pause is not the end of the gesture while the PLATE is still up: the
+     * thing on screen and the thing the wheel does share one clock. Only the
+     * speed resets, so the next detent is one unit rather than eight rows. */
+    xpect(&c, "a pause under the plate's hold keeps letter mode, at velocity 1",
+          ev(&l, 4, IDLE) == 48 && wheel_letter_mode() == 1 && wheel_accelerating());
+    xpect(&c, "a pause past the plate's hold is a new gesture, one row a detent",
+          ev(&l, 4, GONE) == 49 && wheel_letter_mode() == 0 && !wheel_accelerating());
+    /* The same gap with no latch to keep is the plain reset it always was. */
+    fresh(&l, 1000, NULL);
+    ev(&l, 4, IDLE); ev(&l, 4, FAST);      /* vel 2: fast, but not letters   */
+    xpect(&c, "a pause with nothing latched is still a plain reset to velocity 1",
+          !wheel_letter_mode() && l.sel == 3 && ev(&l, 4, IDLE) == 4);
 
     fresh(&l, 200, NULL);
     l.sel = 100;
@@ -212,8 +238,12 @@ int main(void)
     for (int i = 0; i < 5; i++) ev(&l, 4, SLOW);
     xpect(&c, "letter mode is latched for the gesture even as speed drops",
           wheel_letter_mode() == 1 && l.sel == 8 + 5 * 4);
-    xpect(&c, "...until an idle gap: then one detent is one row again",
-          ev(&l, 4, IDLE) == 8 + 5 * 4 + 1 && wheel_letter_mode() == 0);
+    /* Lifting a thumb to read the plate is not "I am done": while the letter
+     * is on screen the next detent is still a letter. */
+    xpect(&c, "a pause the plate outlives still steps letters",
+          ev(&l, 4, IDLE) == 8 + 6 * 4 && wheel_letter_mode() == 1);
+    xpect(&c, "...until the plate goes down: then one detent is one row again",
+          ev(&l, 4, GONE) == 8 + 6 * 4 + 1 && wheel_letter_mode() == 0);
     /* At the end of the alphabet a letter step has nowhere to go: stays. */
     fresh(&l, 26 * 4, g_az);
     l.sel = 26 * 4 - 2;                   /* second-to-last Z             */
@@ -256,6 +286,42 @@ int main(void)
     ev(&l, 4, IDLE); ev(&l, 4, FAST); ev(&l, 4, FAST);
     wheel_accel_reset();
     xpect(&c, "a reset takes the plate down at once", !wheel_accelerating());
+
+    /* ---- 9. the letter-step seam ----------------------------------------- */
+    /* On the device the detent is answered by ui/letterindex.c's run index,
+     * registered through wheel_set_letter_step; the walk is the fallback for
+     * anything that does not register one. The stub proves WHICH one runs,
+     * with what arguments, and that its answer is the one honoured. */
+    fresh(&l, 26 * 4, g_az);
+    ev(&l, 4, IDLE); ev(&l, 4, FAST); ev(&l, 4, FAST);   /* latched, at 4 */
+    wheel_set_letter_step(step_stub);
+    g_step_calls  = 0;
+    g_step_target = 40;
+    int at9 = l.sel;
+    xpect(&c, "in letter mode the registered step decides where a detent lands",
+          ev(&l, 4, FAST) == 40 && g_step_calls == 1 && g_step_sel == at9 &&
+          g_step_count == 26 * 4 && g_step_dir == 1);
+    xpect(&c, "...and backwards it is asked for the other direction",
+          ev(&l, -4, FAST) == 40 && g_step_dir == -1);
+    /* An answer equal to `sel` means "no further letter": stop, and no click. */
+    g_step_calls = 0;
+    g_clicks     = 0;
+    xpect(&c, "a step that stays is the end of the list: no move, no click",
+          ev(&l, 4, FAST) == 40 && g_step_calls == 1 && g_clicks == 0);
+    /* Unset and the walk is back — the same wheel, its own answers. */
+    wheel_set_letter_step(0);
+    g_step_calls = 0;
+    xpect(&c, "unset falls back to the walk (row 40 is mid-K: next is L at 44)",
+          ev(&l, 4, FAST) == 44 && g_step_calls == 0);
+    /* The guard still comes first: a screen with no letters never asks. */
+    fresh(&l, 1000, NULL);
+    wheel_set_letter_step(step_stub);
+    g_step_calls  = 0;
+    g_step_target = 0;
+    ev(&l, 4, IDLE); ev(&l, 4, FAST); ev(&l, 4, FAST); ev(&l, 4, FAST);
+    xpect(&c, "a letterless screen never reaches the step at all",
+          wheel_letter_mode() && g_step_calls == 0 && l.sel == 15);
+    wheel_set_letter_step(0);
 
     return xfail_done(&c);
 }

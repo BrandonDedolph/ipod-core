@@ -4846,6 +4846,17 @@ static char list_sel_initial(void)
     return letteridx_letter_at(&g_letters, v.sel);
 }
 
+/* The ui/wheel.h letter-step seam: where one letter detent lands. `count` is
+ * the wheel's view of the list and the index's own is the same number (both
+ * come from list_view_current), so the index carries it. */
+static int list_letter_step_idx(int sel, int count, int dir)
+{
+    list_view_t v;
+    (void)count;
+    letters_ensure(&v);
+    return letteridx_step(&g_letters, sel, dir);
+}
+
 /* The wheel's clock (the ui/wheel.h seam): the free-running USEC_TIMER. */
 static uint32_t wheel_clock(void)
 {
@@ -8134,6 +8145,7 @@ _Noreturn void kernel_main(void) {
      */
     wheel_set_clock(wheel_clock);
     wheel_set_initial_at(list_initial_at);
+    wheel_set_letter_step(list_letter_step_idx);
     wheel_set_click(ui_click);
 
     /* Hex-path self-test: if this doesn't read 1234ABCD on the terminal,

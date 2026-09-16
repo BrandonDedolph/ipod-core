@@ -34,9 +34,11 @@ one screen.
 
 On any long alphabetical list — Songs, an artist's All Songs, a genre's songs, Artists, Albums,
 Playlists, Genres — spinning the wheel fast puts a big letter on screen so you can aim. The letter
-stays for just over a second after you stop. It is the letter the list is **sorted by**, which is
-not always the letter the row starts with: Artists ignore a leading "The", so The Kid LAROI is
-under K, and an album is under its own title, not its artist's. Short lists have no letter: aiming
+stays for just over a second after you stop, and while it is up the wheel moves a **letter** per
+click, not a row — so you can stop, read it, and keep going letter by letter. Lift for longer than
+that and the letter goes away; the next click is one row again. It is the letter the list is
+**sorted by**, which is not always the letter the row starts with: Artists ignore a leading
+"The", so The Kid LAROI is under K, and an album is under its own title, not its artist's. Short lists have no letter: aiming
 only beats scrolling once a list is longer than about six screens. A name that starts with a digit,
 a bracket or an accented letter shows `#` — accented names sort after Z, so Élan is at the bottom
 of the list rather than under E.

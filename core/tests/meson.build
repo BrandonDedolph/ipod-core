@@ -168,9 +168,11 @@ if target == 'sim'
   # is an exact (delta, gap) pair and the assertions are the exact selection
   # indices a spin lands on: the detent arithmetic (never 1,1,2), the flick
   # cap, the clamps, the velocity curve event by event (1,2,5,7,8), the
-  # letter-mode latch surviving a slowdown and clearing on the idle gap, the
-  # letterless-screen fall-through, letter stepping at both ends, the plate's
-  # hold window to the microsecond, and a gap across the 32-bit clock wrap.
+  # letter-mode latch surviving a slowdown AND a pause the plate outlives
+  # (while the same pause with nothing latched is still a plain reset), the
+  # letterless-screen fall-through, letter stepping at both ends, the letter-
+  # step seam standing in for the run index, the plate's hold window to the
+  # microsecond, and a gap across the 32-bit clock wrap.
   wheel_test = executable(
     'wheel_test',
     sources: ['ui/wheel_test.c', '../ui/wheel.c'],
