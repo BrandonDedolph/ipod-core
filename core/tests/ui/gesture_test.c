@@ -368,16 +368,44 @@ int main(void)
           step(&r, 0) == SEEKHOLD_SKIP);
     step_n(&r, 0, 5, SEEKHOLD_NONE, &c, "missed tap: exactly once");
 
-    /* A button still down at the drain is not a missed tap: that press is one
-     * the next feed picks up, and claiming it too would skip twice. */
+    /* A button still down at the drain is judged at the next feed, not at the
+     * drain. Still down there: the machine has the press and times it, and
+     * claiming it a second time would skip twice. */
     rig_init(&r, +1, 60u, 600u);
     seekhold_missed_tap(&r.s, 1);
-    xpect(&c, "missed tap: a press still down is not claimed",
+    xpect(&c, "missed tap: a press still down is left to the machine",
           step(&r, 1) == SEEKHOLD_NONE);
-    step_n(&r, 1, 10, SEEKHOLD_NONE, &c, "missed tap: nor once it is being timed");
+    step_n(&r, 1, 10, SEEKHOLD_NONE, &c, "missed tap: nor claimed once it is timed");
     xpect(&c, "missed tap: the press reports its own skip and no second one",
           step(&r, 0) == SEEKHOLD_SKIP);
     step_n(&r, 0, 5, SEEKHOLD_NONE, &c, "missed tap: and nothing follows it");
+
+    /* ...but already up there, the whole press fell into the gap between the
+     * drain and the feed — the per-screen switch, then a render and a present
+     * of the skip that came before it, tens of milliseconds. Nothing else will
+     * ever report it, so it was a tap. This is the narrow half of the same
+     * hole: the second tap of a double-skip beginning in the last moments of
+     * the first skip's blocking file open. */
+    rig_init(&r, +1, 60u, 600u);
+    seekhold_missed_tap(&r.s, 1);
+    r.now += 60000u;                      /* a repaint went by */
+    xpect(&c, "missed tap: a press that ended in the gap is still a skip",
+          step(&r, 0) == SEEKHOLD_SKIP);
+    step_n(&r, 0, 5, SEEKHOLD_NONE, &c, "missed tap: exactly once, again");
+
+    /* An edge still in the air belongs to a press, so a cancel takes it — the
+     * same rule as any other press in flight. A tap already settled does not
+     * go with it; that one is finished. */
+    rig_init(&r, +1, 60u, 600u);
+    seekhold_missed_tap(&r.s, 1);
+    (void)seekhold_cancel(&r.s);
+    step_n(&r, 0, 5, SEEKHOLD_NONE, &c,
+           "missed tap: an edge still in the air is cancelled with the press");
+    rig_init(&r, +1, 60u, 600u);
+    seekhold_missed_tap(&r.s, 0);
+    (void)seekhold_cancel(&r.s);
+    xpect(&c, "missed tap: one already settled survives a cancel",
+          step(&r, 0) == SEEKHOLD_SKIP);
 
     /* Claimed, then the screen went away before it could be reported: drop it
      * rather than skipping a track on a screen the user has already left. */

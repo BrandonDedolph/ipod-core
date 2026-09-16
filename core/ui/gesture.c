@@ -43,6 +43,7 @@ void seekhold_reset(seekhold_t *s)
     s->allowed_at_down = 0;
     s->active          = 0;
     s->moved           = 0;
+    s->edge_seen       = 0;
     s->pending_skip    = 0;
     s->hold_origin_us  = 0;
     s->ticks           = 0;
@@ -54,6 +55,7 @@ void seekhold_void(seekhold_t *s)
     keyhold_void(&s->key);
     s->active       = 0;                  /* nothing left to commit          */
     s->moved        = 0;
+    s->edge_seen    = 0;
     s->pending_skip = 0;
 }
 
@@ -62,6 +64,10 @@ seekhold_action_t seekhold_cancel(seekhold_t *s)
     int aiming = s->active;
     s->active = 0;
     s->moved  = 0;
+    /* A handed-over edge still in the air belongs to the press being killed,
+     * so it goes with it. A tap already settled (pending_skip) does not: that
+     * one is finished and the user did ask for it. */
+    s->edge_seen = 0;
     /* Clearing the latch is what kills the press: seekhold_feed only ever
      * sets it on a down-edge, so while the finger stays down the arbiter is
      * fed a released button and the press can produce nothing. Resetting the
@@ -75,8 +81,13 @@ seekhold_action_t seekhold_cancel(seekhold_t *s)
 
 void seekhold_missed_tap(seekhold_t *s, int is_down)
 {
-    if (!is_down && !s->was_down) {
-        s->pending_skip = 1;
+    if (s->was_down) {
+        return;                  /* the machine already has this press */
+    }
+    if (is_down) {
+        s->edge_seen = 1;        /* still in the air: the next feed settles it */
+    } else {
+        s->pending_skip = 1;     /* over before the drain: it was a tap */
     }
 }
 
@@ -126,8 +137,20 @@ seekhold_action_t seekhold_feed(seekhold_t *s, int is_down, uint32_t now_us,
 {
     int down     = is_down ? 1 : 0;
     int was_held = keyhold_held(&s->key);   /* the hold is in force right now */
-    if (down && !s->was_down) {
-        s->allowed_at_down = (uint8_t)(allowed ? 1 : 0);
+    if (down) {
+        if (!s->was_down) {
+            s->allowed_at_down = (uint8_t)(allowed ? 1 : 0);
+        }
+        /* A handed-over edge and a live press: they are the same press, and
+         * the machine has it now. */
+        s->edge_seen = 0;
+    } else if (s->edge_seen) {
+        /* The drain saw its down-edge with the button still down, and by this
+         * feed it is up again: the whole press fell into the gap — the
+         * per-screen switch, a render and a present of the skip before it —
+         * so nothing else will ever report it. It was a tap. */
+        s->edge_seen    = 0;
+        s->pending_skip = 1;
     }
     s->was_down = (uint8_t)down;
 

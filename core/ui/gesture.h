@@ -78,6 +78,7 @@ typedef struct {
     uint8_t   allowed_at_down; /* the press BEGAN somewhere it may seek       */
     uint8_t   active;          /* a hold fired and is aiming right now        */
     uint8_t   moved;           /* ...and the aim has since left where it began */
+    uint8_t   edge_seen;       /* a down-edge handed over that no feed has met yet */
     uint8_t   pending_skip;    /* a tap the sampler never saw (seekhold_missed_tap) */
     uint32_t  hold_origin_us;  /* when it fired: the ramp's and the ticks' 0  */
     uint32_t  ticks;           /* aim steps already applied since the origin  */
@@ -106,8 +107,10 @@ void seekhold_reset(seekhold_t *s);
  * Returns SEEKHOLD_CANCEL if there was an aim on screen (the caller repaints
  * the band so the live position comes back), SEEKHOLD_NONE otherwise, so a
  * caller can feed it through the same switch as seekhold_feed(). A tap
- * already claimed by seekhold_missed_tap() is NOT dropped: that is a finished
- * press of its own, and the user did ask for a skip.
+ * already SETTLED by seekhold_missed_tap() is NOT dropped: that is a finished
+ * press of its own, and the user did ask for a skip. One still in the air is,
+ * along with every other press in flight — a track ending under a finger
+ * takes the press with it, wherever in its life the press happens to be.
  *
  * THE CALLER MUST CALL THIS WHEN THE TRACK UNDER THE AIM CHANGES. The machine
  * is fed a position and a length, not an identity: an auto-advance hands it
@@ -119,18 +122,26 @@ void seekhold_reset(seekhold_t *s);
 seekhold_action_t seekhold_cancel(seekhold_t *s);
 
 /*
- * The latched down-edge of a press the live sampler NEVER SAW, because both
- * the press and the release fell inside one blocked main-loop pass (a track
- * open on a parked drive is seconds long). The button state is latched by the
- * tick and the event survives; only seekhold_feed's view of it is lost, so
- * without this the second RIGHT of a double-skip simply vanishes.
+ * The latched down-edge of a press the live sampler has not seen, because it
+ * began inside a blocked main-loop pass (a track open on a parked drive is
+ * seconds long). The button state is latched by the tick and the event
+ * survives; only seekhold_feed's view of it is lost, so without this the
+ * second RIGHT of a double-skip simply vanishes.
  *
- * `is_down` is the button's live state at the moment the event is drained: a
- * press that is still down is NOT a missed tap, it is a press the next feed
- * will pick up normally. A claimed edge is reported as SEEKHOLD_SKIP by the
- * next feed — not returned here — so the skip keeps exactly one
- * implementation in the caller, and it is dropped rather than fired if
- * `allowed` has gone by then.
+ * `is_down` is the button's live state at the moment the event is drained,
+ * and it decides WHEN the press is judged, not whether:
+ *
+ *   up   — the press is already over, so it was a tap;
+ *   down — it is still in the air. The next feed settles it: a sample still
+ *          down means the machine has the press and will time it normally; a
+ *          sample already up means the whole press fell between the drain and
+ *          that feed — the render and present of a skip are tens of
+ *          milliseconds — and it was a tap after all.
+ *
+ * A press the machine is ALREADY timing is not a missed tap and is ignored
+ * here. A tap settled either way is reported as SEEKHOLD_SKIP by a feed, not
+ * returned here, so the skip keeps exactly one implementation in the caller;
+ * it is dropped rather than fired if `allowed` has gone by then.
  */
 void seekhold_missed_tap(seekhold_t *s, int is_down);
 
