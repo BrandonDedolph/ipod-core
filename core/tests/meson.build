@@ -181,11 +181,15 @@ if target == 'sim'
 
   # keyhold: tap-vs-hold press-length arbitration (core/ui/keyhold.c) — the
   # SAME source the ARM build links into core.elf, driving PLAY (tap = pause,
-  # hold = sleep). Pure integer logic over (is_down, clock) samples. Asserts
-  # that a press yields exactly ONE action decided by its length: silent at
-  # the down-edge, TAP on release under the threshold, HOLD on the first pass
-  # at it, a silent release after a HOLD (the wake case), the swallowed-tap
-  # rule (a press that woke the backlight taps nothing but can still hold),
+  # hold = sleep), MENU (tap = back, hold = the main menu) and, through
+  # ui/gesture.c, RIGHT/LEFT (tap = skip, hold = seek). Pure integer logic
+  # over (is_down, clock) samples. Asserts that a press yields exactly ONE
+  # action decided by its length: silent at the down-edge, TAP on release
+  # under the threshold, HOLD on the first pass at it, a silent release after
+  # a HOLD (the wake case), the swallowed-tap rule (a press that woke the
+  # backlight taps nothing but can still hold), the VOID rule (a press that
+  # dismissed a modal produces neither action), keyhold_held() through a
+  # press, two instances with different thresholds not disturbing each other,
   # the mid-press reset, and a press across the 32-bit clock wrap.
   keyhold_test = executable(
     'keyhold_test',
@@ -194,6 +198,22 @@ if target == 'sim'
     override_options: test_opts,
   )
   test('keyhold', keyhold_test, suite: 'unit')
+
+  # gesture: the press-length GESTURES (core/ui/gesture.c) — the SAME source
+  # the ARM build links into core.elf. The RIGHT/LEFT skip-vs-seek machine
+  # (its latched "allowed" rule, the aim, the ramp table to the microsecond,
+  # the end-of-track clamps, the single commit on release, cancel and void)
+  # and the PLAY-tap policy (which screens start a queue and which pause).
+  # Every case is a sequence of (is_down, clock, allowed, elapsed, total)
+  # samples fed the way the main loop feeds it, and the assertions are the
+  # action and the exact aim target in seconds.
+  gesture_test = executable(
+    'gesture_test',
+    sources: ['ui/gesture_test.c', '../ui/gesture.c', '../ui/keyhold.c'],
+    include_directories: include_directories('../ui', '.'),
+    override_options: test_opts,
+  )
+  test('gesture', gesture_test, suite: 'unit')
 
   # sleeptimer: the sleep timer's countdown (core/ui/sleeptimer.c) — the SAME
   # source the ARM build links into core.elf. Pure integer arithmetic over
