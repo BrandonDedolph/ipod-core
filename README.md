@@ -147,7 +147,7 @@ and newlib for the device.
 cd core
 make hw                        # build-hw/core.elf, core.bin
 make ipod                      # build-hw/core.ipod
-make sim && meson test -C build-sim   # host tests, 60 suites
+make sim && meson test -C build-sim   # host tests, 62 suites
 make verify-hw                 # layout, header/doc and size checks on the ARM image
 ```
 
