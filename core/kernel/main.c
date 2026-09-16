@@ -52,6 +52,7 @@
 #include "../library/playlist.h"
 #include "../ui/wheel.h"
 #include "../ui/keyhold.h"
+#include "../ui/sleeptimer.h"
 #include "hw/volume.h"
 
 /* Host-findable version stamp: `core info` scans the OSOS body for this tag
@@ -546,6 +547,21 @@ static ui_window_t g_vol_show;
  * rendering that own it live in the Settings section further down. */
 static settings_t g_settings;
 
+/*
+ * The sleep timer's running countdown (ui/sleeptimer.h). Two sides, one
+ * truth: g_settings.sleep_timer_min is what the Settings row SHOWS, g_sleep
+ * is what RUNS, and the INVARIANT is
+ *
+ *     sleeptimer_total_min(&g_sleep) == g_settings.sleep_timer_min
+ *
+ * at every top of the main loop. Only sleep_timer_apply() below moves the
+ * right side to match the left, and the two places that disarm — the shared
+ * suspend block and the FIRE branch — zero both. .bss starts it disarmed, and
+ * nothing in the boot path arms it, so the invariant holds from the first
+ * pass (config_decode zeroes the field for exactly that reason).
+ */
+static sleeptimer_t g_sleep;
+
 /* fat32_readdir callback: collect music subdirectories + playable files into
  * g_browse. Directories named like iPod/OS system folders (or dotfolders) are
  * junk-filtered out; non-playable files are skipped. */
@@ -999,6 +1015,38 @@ static int battery_glyph_key(int pct)
     return ((18 * pct) / 100) | ((pct <= 20) ? 0x100 : 0);
 }
 
+/*
+ * Where the strip's right-hand cluster ends for anything drawn LEFT of the
+ * battery: past the padlock while Hold is on, so the token never sits on it.
+ * One function because BOTH strip painters — the real one and the Hold
+ * banner's recoloured copy — have to agree: the banner draws no padlock, but
+ * it is up precisely while Hold is flipping, and a token that moved 14 px
+ * when the banner faded would hop once per flip. The gap the missing padlock
+ * leaves for that second is the cheaper of the two.
+ */
+static int strip_cluster_left(void)
+{
+    int bx = LCD_WIDTH - 12 - 24;             /* battery block (22 + 2 nub)  */
+    return bx - (g_locked ? 14 + 6 : 6);      /* past the padlock at bx-14   */
+}
+
+/*
+ * The sleep timer's token ("SLEEP 45") right-aligned at `right_x`, in the
+ * strip's small font. Returns the LEFT edge of what it drew, so the caller
+ * can clip whatever sits to its left — or `right_x` untouched when the timer
+ * is off, which is the usual case and costs nothing.
+ */
+static int strip_sleep_token(int right_x, int y, uint16_t ink)
+{
+    char tok[12];
+    if (sleeptimer_token(&g_sleep, tok, (int)sizeof tok) <= 0) {
+        return right_x;
+    }
+    int w = text_width(tok, FONT_SMALL);
+    ui_text(right_x - w, y, tok, FONT_SMALL, ink);
+    return right_x - w;
+}
+
 /* The top status strip: the now-playing track name on the left (so you always
  * see what's playing while browsing), battery on the right. During bring-up the
  * right side also shows raw millivolts (to calibrate the %-curve; see
@@ -1010,16 +1058,29 @@ static void status_strip_render(void)
      * already says "Core"). Clipped by the right cluster, which is painted
      * over it. */
     const char *left = player_active() ? track_display(player_track_name()) : "";
+
+    int bx = LCD_WIDTH - 12 - 24;             /* battery block (22 + 2 nub)        */
+
+    /* The sleep timer's token goes LEFT of the padlock, which sits left of the
+     * battery — so neither of those two ever moves when the timer is armed;
+     * only the name gives ground. Drawn first, because the name's clip has to
+     * know where it starts. */
+    int tok_x = strip_sleep_token(strip_cluster_left(), STATUS_Y0 + 11,
+                                  LINEN_MUTED2);
+
     /* CLIP the name before the right-hand cluster rather than drawing it full
      * width and then painting a 70x15 rectangle back over its tail — same look,
      * without rasterising glyphs that are immediately overwritten (and without
      * dirtying that band for a partial present). */
     if (left[0]) {
+        int clip_r = LCD_WIDTH - 70;
+        if (tok_x - 8 < clip_r) {
+            clip_r = tok_x - 8;               /* a long name loses the room     */
+        }
         ui_text_clip(12, STATUS_Y0 + 11, left, FONT_SMALL, LINEN_MUTED2,
-                     12, LCD_WIDTH - 70);
+                     12, clip_r);
     }
 
-    int bx = LCD_WIDTH - 12 - 24;             /* battery block (22 + 2 nub)        */
     draw_battery(bx, STATUS_Y0 + 1, g_bat_pct);
 
     /* Persistent padlock while Hold is engaged (design keeps it in the strip). */
@@ -2879,6 +2940,35 @@ static void settings_apply(void)
     theme_set(g_settings.theme);           /* Linen / Onyx -> live palette swap */
 }
 
+/*
+ * Bring the running countdown in step with the Settings row (the invariant at
+ * g_sleep). Called after anything that MOVES g_settings.sleep_timer_min: the
+ * row's SELECT and Reset Settings. Deliberately NOT called from the boot path
+ * — .bss and config_decode both leave the field at 0, so there is nothing to
+ * arm, and calling it there would be the one place a stale record could.
+ *
+ * The guard is on the VALUE, so an apply that finds the two sides already in
+ * step does nothing and cannot restart a countdown by accident. The row's
+ * SELECT always moves the value (it cycles), so every press does re-arm —
+ * including the sixth, which lands back where it started and is plainly meant
+ * as a fresh start.
+ */
+static void sleep_timer_apply(void)
+{
+    if (g_settings.sleep_timer_min == sleeptimer_total_min(&g_sleep)) {
+        return;
+    }
+    sleeptimer_arm(&g_sleep, g_settings.sleep_timer_min,
+                   mmio_read32(USEC_TIMER_ADDR));
+    if (g_settings.sleep_timer_min > 0) {
+        uart_puts("core: sleep timer: armed ");
+        uart_dec(g_settings.sleep_timer_min);
+        uart_puts(" min\n");
+    } else {
+        uart_puts("core: sleep timer: off\n");
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Playlists (Music -> Playlists): the .m3u8 files under Music/Playlists,
  * listed by name, and one of them opened into a tracklist that plays as a
@@ -3463,14 +3553,25 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
     if (g_locked) {
         draw_lock_glyph(bx - 14, 3, LINEN_INK);
     }
-    /* Compact shuffle / repeat tokens, right-aligned before the battery. */
+    /* Compact shuffle / repeat / sleep tokens, right-aligned before the
+     * battery. Built as ONE string and measured once, so the spacing between
+     * them is the font's own kerning rather than three guessed offsets. Worst
+     * case "SHUF RPT1 SLEEP 120" is 107 px against the ~194 px of air this
+     * band has beside "Now Playing". */
     {
-        char st[16]; int p = 0;
+        char st[32]; int p = 0;
         if (g_settings.shuffle) { const char *s = "SHUF"; while (*s) st[p++] = *s++; }
         if (g_settings.repeat != REPEAT_OFF) {
             if (p) st[p++] = ' ';
             const char *s = (g_settings.repeat == REPEAT_ONE) ? "RPT1" : "RPT";
             while (*s) st[p++] = *s++;
+        }
+        {
+            char tok[12];                    /* "" while the timer is off */
+            if (sleeptimer_token(&g_sleep, tok, (int)sizeof tok) > 0) {
+                if (p) st[p++] = ' ';
+                const char *s = tok; while (*s) st[p++] = *s++;
+            }
         }
         st[p] = '\0';
         if (p) {
@@ -4066,6 +4167,10 @@ static uint32_t chrome_key(void)
     k = k * 31u + (uint32_t)(player_queue_current() + 1);
     k = k * 31u + (uint32_t)(g_locked ? 1 : 0);
     k = k * 31u + (uint32_t)(g_bat_pct + 1);
+    /* The strip's SLEEP token, for the same reason the battery percentage is
+     * here: a partial two-row repaint under a changed minute would leave a
+     * stale token on the panel. */
+    k = k * 31u + (uint32_t)sleeptimer_remaining_min(&g_sleep);
     return k;
 }
 
@@ -4851,8 +4956,19 @@ static void top_banner_render(int inverted, const uint16_t *bm, int bn, int bm_d
      * colour so the inverted block ends where the header does. */
     {
         const char *left = player_active() ? track_display(player_track_name()) : "";
+        /* The banner owns the whole strip row for its second, so it has to
+         * redraw the SLEEP token too (in the band's own secondary colour) or
+         * the Hold banner would blink the countdown off. No padlock is drawn
+         * here — the banner IS the padlock — but the token still takes the
+         * strip's own x (strip_cluster_left) so it does not hop when the
+         * banner fades. */
+        int tok_x = strip_sleep_token(strip_cluster_left(), STATUS_Y0 + 11, sub);
         if (left[0]) {
-            ui_text_clip(12, STATUS_Y0 + 11, left, FONT_SMALL, sub, 12, LCD_WIDTH - 70);
+            int clip_r = LCD_WIDTH - 70;
+            if (tok_x - 8 < clip_r) {
+                clip_r = tok_x - 8;
+            }
+            ui_text_clip(12, STATUS_Y0 + 11, left, FONT_SMALL, sub, 12, clip_r);
         }
         draw_battery_c(LCD_WIDTH - 12 - 24, STATUS_Y0 + 1, g_bat_pct, sub, fg);
     }
@@ -5842,12 +5958,9 @@ _Noreturn static void run_ui(fat32_t *fs)
             uint32_t nowp = mmio_read32(USEC_TIMER_ADDR);
             int      down = !g_locked &&
                             (clickwheel_buttons() & WHEEL_BTN_PLAY) != 0;
-            /* A hold does not suspend inline: it sets a flag and the stamp
-             * the escalation should be timed from, and ONE block below does
-             * the sleep and the bookkeeping after it. Nothing else can ask
-             * for a suspend yet — the sleep timer is what this is for — but
-             * the alternative was a second copy of the five-local re-seed,
-             * and the two would have drifted. */
+            /* Two things can put the device to sleep from here, and they must
+             * not each carry their own copy of the bookkeeping: they set the
+             * flag and the origin stamp, and ONE block below does the sleep. */
             int      want_suspend   = 0;
             uint32_t suspend_origin = nowp;
 
@@ -5870,7 +5983,58 @@ _Noreturn static void run_ui(fat32_t *fs)
                 break;
             }
 
+            /*
+             * The sleep timer, fed from the same stamp. It runs regardless of
+             * what the player is doing and regardless of the Hold switch — a
+             * locked, pocketed device is the case the feature is FOR — and it
+             * is not reset by input: it is a duration, not an idle timeout.
+             */
+            switch (sleeptimer_feed(&g_sleep, nowp)) {
+            case SLEEPTIMER_TICK:
+                dirty = 1;                      /* the token's minute changed */
+                break;
+            case SLEEPTIMER_FIRE:
+                uart_puts("core: sleep timer: expired, sleeping\n");
+                /* Pause BEFORE suspending rather than teaching suspend_to_ram
+                 * a new argument: with the player already paused its
+                 * `was_playing` is 0, so the wake comes back PAUSED — you fell
+                 * asleep, and the next press is "where was I", not "play" —
+                 * and the resume_capture() inside records the paused position.
+                 */
+                if (player_active() && !player_paused()) {
+                    player_pause();
+                }
+                /* If a PLAY hold reached its threshold on this same pass, its
+                 * down-edge is the EARLIER stamp and the one the 5 s
+                 * escalation is documented to be timed from; do not push it
+                 * forward to now. */
+                if (!want_suspend) {
+                    suspend_origin = nowp;
+                }
+                want_suspend = 1;
+                break;
+            case SLEEPTIMER_NONE:
+                break;
+            }
+
             if (want_suspend) {
+                /* ANY suspend leaves the timer Off — in one place, so a new
+                 * sleep site cannot forget one of the two sides (the FIRE
+                 * above has already disarmed g_sleep; this is what keeps the
+                 * ROW honest, and what disarms a running timer when PLAY is
+                 * held instead). */
+                sleeptimer_reset(&g_sleep);
+                g_settings.sleep_timer_min = 0;
+
+                /* Forget the transient windows too. Both are start-stamp +
+                 * elapsed compares against a counter that wraps every ~71.6
+                 * min (ui_window_t), and a sleep is the one thing here that
+                 * can last that long: a suspend entered under the Hold banner
+                 * or the volume plate could otherwise wake to a stale one for
+                 * up to its full span. The wake repaints the real screen. */
+                g_lock_flash.armed = 0;
+                g_vol_show.armed   = 0;
+
                 suspend_to_ram(suspend_origin);              /* returns on wake */
                 last_input   = mmio_read32(USEC_TIMER_ADDR);
                 last_present = last_input;      /* suspend just presented the wake
@@ -5885,6 +6049,21 @@ _Noreturn static void run_ui(fat32_t *fs)
                                                  * idle first (lcd_sleep is
                                                  * idempotent); don't wake it
                                                  * a second time below */
+                cpu_idled  = 0;                 /* suspend's wake cpu_boost()
+                                                 * re-established the ONE boost
+                                                 * this loop believes it holds.
+                                                 * The sleep timer is the first
+                                                 * thing that can suspend from
+                                                 * the dark, idled state (a
+                                                 * PLAY hold cannot: the press
+                                                 * relit the screen and
+                                                 * re-boosted a pass earlier),
+                                                 * and leaving this set would
+                                                 * make the idle block below
+                                                 * boost a SECOND time on this
+                                                 * same pass — g_boost stuck at
+                                                 * 2, so the core never drops
+                                                 * to 30 MHz at idle again */
                 dirty      = 1;                 /* repaint the current screen */
             }
         }
@@ -6471,7 +6650,18 @@ _Noreturn static void run_ui(fat32_t *fs)
                         } else if (act == SETTINGS_ACTION_RESET) {
                             settings_defaults(&g_settings);
                             settings_apply();
+                            sleep_timer_apply();           /* defaults() zeroed
+                                                            * the row: disarm  */
                             settings_touch();              /* persist the reset */
+                        } else if (act == SETTINGS_ACTION_SLEEPTIMER) {
+                            /* The record changed, but only its RUNTIME part:
+                             * re-arm the countdown and DO NOT touch. Nothing
+                             * on disk stores the duration (ui/settings.h), so
+                             * a touch here would spin the drive up three
+                             * seconds later to write a byte-identical record —
+                             * and it would do it at bedtime, which is the one
+                             * moment the drive is parked for the night. */
+                            sleep_timer_apply();
                         } else if (act == SETTINGS_ACTION_NONE) {
                             /* Only a row that actually CHANGED the record gets
                              * persisted. SELECT on About/Diagnostics, or on the
