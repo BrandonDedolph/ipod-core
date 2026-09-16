@@ -4,8 +4,9 @@
  *
  * The shim (codecs/readahead.c) sits between a decoder and its byte source to
  * collapse a decoder's many tiny reads into a few large backing reads — the
- * fix for the ~27 s on-device MP3 startup (dr_mp3's ID3v2 scan). This test
- * backs it with an in-RAM buffer that COUNTS how many times it is read/seeked,
+ * fix for the ~27 s on-device MP3 startup (a decoder scanning an ID3v2 tag a
+ * few bytes at a time). This test backs it with an in-RAM buffer that COUNTS
+ * how many times it is read/seeked,
  * then checks two things at once:
  *   1. Correctness: bytes returned through the shim are identical to the
  *      reference, across tiny/bulk reads and SET/CUR/END seeks.
