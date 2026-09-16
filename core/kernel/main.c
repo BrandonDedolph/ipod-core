@@ -6710,8 +6710,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                  * tick latched its down-edge and it is in this event. Hand it
                  * over; the machine reports it as a skip on the next feed, so
                  * the skip keeps exactly one implementation. A button still
-                 * down is not a missed tap — that press is simply one the next
-                 * feed will pick up. */
+                 * down is handed over too: the machine latches the edge and
+                 * judges it at that next feed — still down, it owns the press
+                 * as a normal hold; already up, the whole press fell in this
+                 * gap and it was a tap. */
                 uint32_t live = clickwheel_buttons();
                 if (ev.buttons & WHEEL_BTN_RIGHT) {
                     seekhold_missed_tap(&g_ff, (live & WHEEL_BTN_RIGHT) != 0);
