@@ -14,9 +14,15 @@
  *     window produces none; the first sample primes without waiting; a
  *     USEC_TIMER wrap mid-window does not break the compare.
  *
- *   hw-headphone-untrusted (defaults)
+ * Both non-probe binaries also pin headphone_pin_cfg() — the two-read, no-write
+ * accessor behind the About screen's on-screen probe.
+ *
+ *   hw-headphone-untrusted (-DHEADPHONE_DETECT_TRUSTED=0)
  *     Until the device transcript has confirmed the line, the driver must
- *     answer -1 and must not touch the bus at all.
+ *     answer -1 and must not touch the bus at all. The macro is spelled out
+ *     by tests/meson.build rather than inherited from the header, so the
+ *     bench flipping that default cannot silently turn this into a second
+ *     trusted binary.
  *
  *   hw-headphone-probe     (-DHEADPHONE_PROBE=1 -DHEADPHONE_DETECT_TRUSTED=1)
  *     The probe prints its config block once, then NOTHING while no input
@@ -64,13 +70,78 @@ static void clock_advance(uint32_t us)
     clock_set(g_now + us);
 }
 
-/* The probe binary scripts all twelve ports itself, so this helper is only
+/* The probe binary scripts all twelve ports itself, so these helpers are only
  * for the two single-pin shapes. */
 #if !HEADPHONE_PROBE
 static void pin_set(int seated)
 {
     mmio_mock_set_read(HEADPHONE_DETECT_ADDR,
                        seated ? HEADPHONE_DETECT_BIT : 0u);
+}
+
+/* GPIOA configuration registers, from the bank layout in
+ * 10-headphone-jack.md: A-D quad at 0x6000D000, port A at +0x00, ENABLE
+ * group +0x00 and OUTPUT_EN group +0x10. Hand-derived here rather than
+ * shared with the driver on purpose — a typo in the driver's copy is
+ * exactly what this is for. */
+#define GPIOA_ENABLE_ADDR     0x6000D000u
+#define GPIOA_OUTPUT_EN_ADDR  0x6000D010u
+
+/*
+ * headphone_pin_cfg() is what the About screen's JACK token shows when the
+ * level never moves: it answers "is A7 even a GPIO input?", and the answer
+ * decides whether the bench is looking at the wrong pin or at an unconfigured
+ * one. It must be TWO READS and NOTHING ELSE — this driver does not
+ * reconfigure a pin it has not been proven to own, and a stray write to a
+ * GPIO enable register on a board whose pin map is inferred is how you drive
+ * an output into something. Compiled into BOTH non-probe shapes: the token is
+ * drawn in the shipping (untrusted) image too, which is the whole point of it.
+ */
+static int test_pin_cfg_grammar(void)
+{
+    mmio_mock_reset();
+    trace_cursor tc = trace_begin("pin_cfg_grammar");
+
+    mmio_mock_set_read(GPIOA_ENABLE_ADDR, 0x80);      /* A7 is a GPIO...  */
+    mmio_mock_set_read(GPIOA_OUTPUT_EN_ADDR, 0x00);   /* ...and an input  */
+    int got = headphone_pin_cfg();
+
+    expect_r(&tc, 32, GPIOA_ENABLE_ADDR);
+    expect_r(&tc, 32, GPIOA_OUTPUT_EN_ADDR);
+    trace_expect_end(&tc);
+    if (got != HEADPHONE_PIN_ENABLED) {
+        fprintf(stderr, "[%s] enabled input: expected %d, got %d\n", tc.name,
+                HEADPHONE_PIN_ENABLED, got);
+        tc.fails++;
+    }
+
+    /* Bit 7 and only bit 7, in each register independently. */
+    struct { uint32_t en, oe; int want; } cases[] = {
+        { 0x00,       0x00,       0 },
+        { 0x80,       0x00,       HEADPHONE_PIN_ENABLED },
+        { 0x00,       0x80,       HEADPHONE_PIN_OUTPUT },
+        { 0xFF,       0xFF,       HEADPHONE_PIN_ENABLED | HEADPHONE_PIN_OUTPUT },
+        { 0x7F,       0x7F,       0 },
+        { 0xFFFFFF80, 0xFFFFFF7F, HEADPHONE_PIN_ENABLED },
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        mmio_mock_reset();
+        mmio_mock_set_read(GPIOA_ENABLE_ADDR, cases[i].en);
+        mmio_mock_set_read(GPIOA_OUTPUT_EN_ADDR, cases[i].oe);
+        int cfg = headphone_pin_cfg();
+        if (cfg != cases[i].want) {
+            fprintf(stderr, "[%s] en=%08X oe=%08X: expected %d, got %d\n",
+                    tc.name, cases[i].en, cases[i].oe, cases[i].want, cfg);
+            tc.fails++;
+        }
+        if (mmio_mock_count(MMIO_OP_WRITE, GPIOA_ENABLE_ADDR) != 0 ||
+            mmio_mock_count(MMIO_OP_WRITE, GPIOA_OUTPUT_EN_ADDR) != 0) {
+            fprintf(stderr, "[%s] the driver WROTE a GPIO config register\n",
+                    tc.name);
+            tc.fails++;
+        }
+    }
+    return trace_done(&tc);
 }
 #endif
 
@@ -318,6 +389,7 @@ int main(void)
     fails += test_replug();
     fails += test_timer_wrap();
     fails += test_pure_debouncer();
+    fails += test_pin_cfg_grammar();
     return fails == 0 ? 0 : 1;
 }
 
@@ -348,13 +420,23 @@ int main(void)
                 tc.name, (unsigned)mmio_mock_log_len());
         tc.fails++;
     }
-    /* The raw read is still available for the probe, and still decodes. */
+    /* The raw read is still available — it is the About screen's on-screen
+     * probe, which is drawn in THIS build, the one that ships — and it still
+     * decodes. One read, and with the two configuration reads asserted by
+     * test_pin_cfg_grammar below it is the whole bus cost of an untrusted
+     * build: nothing here polls, times or debounces anything. */
     if (headphone_raw() != 1) {
         fprintf(stderr, "[%s] headphone_raw() on a seated pin != 1\n",
                 tc.name);
         tc.fails++;
     }
+    if (mmio_mock_log_len() != 1) {
+        fprintf(stderr, "[%s] headphone_raw() cost %u bus events, expected "
+                        "1\n", tc.name, (unsigned)mmio_mock_log_len());
+        tc.fails++;
+    }
     fails += trace_done(&tc);
+    fails += test_pin_cfg_grammar();
     return fails == 0 ? 0 : 1;
 }
 

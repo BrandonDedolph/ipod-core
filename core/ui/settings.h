@@ -261,6 +261,31 @@ void settings_render(int screen, const settings_t *s, int sel);
 #define ABOUT_LOG_ERR 2     /* turned itself off after failed writes        */
 
 /*
+ * THE HEADPHONE-JACK PROBE, ON SCREEN.
+ *
+ * The detect line (GPIO A7) is documented but its polarity has never been
+ * observed on this device, and the probe that would settle it prints to the
+ * SER0 UART — a cable this device does not have and is not getting. So the
+ * probe is here instead: the About footer draws the live pin next to the ADC
+ * and LOG tokens, in EVERY build, trusted or not, because reading it is one
+ * 32-bit register read. Plug, unplug, read the digit; one flash, no cable.
+ * The bench procedure is core/docs/hw/10-headphone-jack.md.
+ *
+ * `pin_cfg` mirrors HEADPHONE_PIN_* from hal/hw/headphone.h, which this
+ * host-built file must not include; kernel/main.c passes headphone_pin_cfg()
+ * straight through and _Static_asserts the two sets agree.
+ */
+#define ABOUT_JACK_PIN_ENABLED 0x1  /* A7 is a GPIO (not its alternate fn)  */
+#define ABOUT_JACK_PIN_OUTPUT  0x2  /* A7 is driven as an output            */
+
+typedef struct {
+    int8_t   raw;        /* headphone_raw(): 0 absent, 1 seated             */
+    int8_t   debounced;  /* hal_headphones_present(): -1 untrusted, 0, 1    */
+    uint8_t  pin_cfg;    /* ABOUT_JACK_PIN_* of the detect pin              */
+    uint16_t edges;      /* raw transitions since boot (jackwatch raw_edges)*/
+} about_jack_t;
+
+/*
  * Render the About screen from live values (main.c owns these — do not
  * fabricate). free/total are whole megabytes; pct<0 or mv<=0 render as "--".
  * log_seq / log_state describe the event log (kernel/evlog.c): the footer
@@ -273,12 +298,16 @@ void settings_render(int screen, const settings_t *s, int sel);
  * meson-generated header that only the firmware build produces; main.c passes
  * CORE_VERSION, everything else passes "v0.0.0". NULL or "" renders the bare
  * "Core" chip. Long strings are fine — the chip is sized from text_width.
+ *
+ * `jack` adds the live jack token to that footer (above); NULL leaves the
+ * footer exactly as it was, which is what the placeholder path and anything
+ * without a GPIO to read pass.
  */
 void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
                            int n_songs, int n_albums, int n_artists,
                            uint32_t log_seq, int log_state, int lib_truncated,
-                           const char *version);
+                           const char *version, const about_jack_t *jack);
 
 /*
  * Render the Boot Details screen (SETTINGS_DIAG). All times are milliseconds
