@@ -270,11 +270,25 @@ if target == 'sim'
   # user's disk.
   settings_test = executable(
     'settings_test',
-    sources: ['ui/settings_test.c', '../ui/settings.c'],
+    sources: ['ui/settings_test.c', '../ui/settings.c', '../ui/eq.c'],
     include_directories: include_directories('../ui'),
     override_options: test_opts,
   )
   test('settings', settings_test, suite: 'unit')
+
+  # eq: the equaliser preset table (core/ui/eq.c) — the SAME source the ARM
+  # build links into core.elf. Pure: names, five band gains and five centre
+  # codes per preset. Asserts the gains against an independently typed fixture,
+  # the structural limits hal_eq_set's register encoder relies on (+/-12 dB,
+  # 2-bit centre codes, no bandwidth bit on either shelf), the pre-cut rule,
+  # and who owns the shelves when a preset is on.
+  eq_test = executable(
+    'eq_test',
+    sources: ['ui/eq_test.c', '../ui/eq.c'],
+    include_directories: include_directories('../ui'),
+    override_options: test_opts,
+  )
+  test('eq', eq_test, suite: 'unit')
 
   # palette: the seven theme tables + theme_set() (core/ui/palette.c) — the SAME
   # source the ARM build links into core.elf. Asserts every table is fully
