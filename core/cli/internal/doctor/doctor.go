@@ -582,13 +582,25 @@ func checkPlaylists(r *report, rep *VolumeReport, dir string) {
 		label := fmt.Sprintf("otg slot %d", n)
 		switch {
 		case err != nil:
-			r.line(Fail, label, "%v", err)
+			// An unreadable slot file is the same dead end as a foreign one:
+			// the device cannot look inside it, so it will never write to it.
+			r.line(Fail, label, "%s: %v — the device will never write to a slot "+
+				"it cannot read. If the file is not one of yours, delete "+
+				"%s/%s/%s and run `core sync` to put an empty one back",
+				name, err, devicefs.MusicDir, devicefs.PlaylistDir, name)
 		case info.State == devicefs.OTGSlotAbsent:
 			r.line(Warn, label, "%s is missing; Save has one fewer slot "+
 				"(run `core sync`)", name)
 		case info.State == devicefs.OTGSlotForeign:
-			r.line(Warn, label, "%s is a playlist of your own at a device slot "+
-				"name; the device lists and plays it and never writes to it", name)
+			// Two things look identical here and only the user can tell them
+			// apart: a playlist they made, and a slot whose save was
+			// interrupted inside its very last write. Neither will ever be
+			// written to again, so say what the way out is.
+			r.line(Warn, label, "%s carries no On-The-Go header, so the device "+
+				"lists and plays it and NEVER writes to it. If you did not put "+
+				"it there (an interrupted save can leave one looking like "+
+				"this), delete %s/%s/%s and run `core sync` to put an empty "+
+				"one back", name, devicefs.MusicDir, devicefs.PlaylistDir, name)
 		case info.State == devicefs.OTGSlotDamaged:
 			r.line(Fail, label, "%s is a torn save (header gen %d, trailer gen %d, "+
 				"%d entry line(s) against a count of %d); the device opens it to "+

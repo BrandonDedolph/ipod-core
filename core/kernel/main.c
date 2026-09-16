@@ -5635,7 +5635,14 @@ static int row_select_hold(fat32_t *fs)
         if (!otg_remove(&g_otg, sel - OTG_ROW_FIRST)) return 0;
         otg_bind_all();
         otg_touch();
-        if (g_otg_sel >= otg_row_count()) {
+        if (g_otg.n == 0) {
+            /* The last row went, and the screen is the empty state now: both
+             * action rows greyed, the wheel silent. Land on Clear, which is
+             * where every other way into that state lands (entry, Clear,
+             * Save) — otg_row_count() - 1 would leave the cursor on the
+             * greyed Save row with no way to move it off. */
+            g_otg_sel = OTG_ROW_CLEAR;
+        } else if (g_otg_sel >= otg_row_count()) {
             g_otg_sel = otg_row_count() - 1;             /* the last row went */
         }
         g_otg_accum = 0;

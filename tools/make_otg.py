@@ -35,7 +35,15 @@ WORKFLOW
      left alone unless you pass --force — a re-import must not silently throw
      away the list the user built. A slot .m3u8 that EXISTS is ALWAYS left
      alone, --force or not: it may hold a list they saved, or it may be their
-     own playlist that happens to use the name.
+     own playlist that happens to use the name. --create says which each one
+     is, because an ABSENT slot is the only thing it puts back and that is the
+     way out of the one state the device cannot recover from by itself: a save
+     interrupted inside its very last write leaves a file with no header, and
+     every writer on the device then refuses it for ever. Delete that file
+     yourself and re-run this. Deleting is yours to do because nothing but a
+     person looking at the file can tell a torn slot from a playlist somebody
+     made — the stale bytes a tear leaves parse as a perfectly good playlist,
+     and a real one is entitled to be empty.
 
   3. Flush and unmount properly (on WSL: `powershell.exe Write-VolumeCache D`),
      then boot the firmware. It prints, over UART:
@@ -326,8 +334,32 @@ def do_create(volume: str, size: int, slot_size: int, force: bool) -> int:
         p = os.path.join(pldir, slot_file_name(n))
         if os.path.exists(p):
             # ALWAYS left alone, --force or not: it may hold a list the user
-            # saved, or it may be their own playlist under that name.
-            print("  %-20s exists — left alone" % slot_file_name(n))
+            # saved, or it may be their own playlist under that name. Say
+            # WHICH, because a slot with no header is one the device will
+            # never write to again, and deleting it here is the only way back.
+            try:
+                with open(p, "rb") as f:
+                    info = parse_slot_playlist(f.read())
+            except OSError as e:
+                print("  %-20s exists but will not read (%s)"
+                      % (slot_file_name(n), e))
+                print("  %-20s   the device will never write to it; if it is "
+                      "not yours, delete it and re-run" % "")
+                continue
+            if not info["present"]:
+                print("  %-20s exists with NO On-The-Go header — a playlist of "
+                      "your own, or a save" % slot_file_name(n))
+                print("  %-20s   interrupted at its last write. The device will "
+                      "never write to it; if it" % "")
+                print("  %-20s   is not yours, delete it and re-run this." % "")
+            elif info["damaged"]:
+                print("  %-20s exists, torn save — left alone (Delete Playlist "
+                      "on the device frees it)" % slot_file_name(n))
+            elif info["count"]:
+                print("  %-20s exists, %d track(s) — left alone"
+                      % (slot_file_name(n), info["count"]))
+            else:
+                print("  %-20s exists, empty — left alone" % slot_file_name(n))
             continue
         _write_through(p, slot_playlist_bytes(slot_size))
         print("  %-20s created, %d B, empty" % (slot_file_name(n), slot_size))

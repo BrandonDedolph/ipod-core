@@ -127,7 +127,11 @@ Playlists, On-The-Go opens it: two rows at the top, then the tracks.
   "Playlist damaged — save again" with Delete under it.
 
 A playlist of your own that happens to be called `On-The-Go 3.m3u8` is just a playlist: the device
-lists it, plays it, and never writes to it — it has no Delete row, and Save skips it.
+lists it, plays it, and never writes to it — it has no Delete row, and Save skips it. The device
+decides that by looking INSIDE the file, not at its name, so the only way it can be wrong is in
+your favour: a slot whose save was interrupted at the very last moment can end up looking like a
+file of yours, and the device will then leave it alone for ever. `core doctor` says so, and the
+fix is below.
 
 A row that reads "Not on this iPod" is a track that was in the list when its file went away — a
 re-sync that renamed or removed it. It is kept rather than dropped, in case a later sync brings it
@@ -579,6 +583,12 @@ audio counters. If you report a problem, that dump is what explains it.
 - **The library is missing or stale.** Rebuild `CORELIB.IDX`: `core sync`, or `tools/build_index.py`.
 - **Settings do not stick.** `CORECFG.DAT` must exist in the volume root; `core sync` creates it, or
   `tools/make_config.py --create <iPod>`.
+- **Save says there is no free On-The-Go slot, but one of them looks empty.** `core doctor` names
+  each slot. A slot it calls "a playlist of your own" is one the device will never write to — which
+  is right if you put it there, and is also what the rarest interrupted save leaves behind. Look at
+  `Music/Playlists/On-The-Go N.m3u8` in disk mode; if it is not yours, **delete it** and run
+  `core sync` (or `tools/make_otg.py --create <iPod>`), which puts an empty one back. Neither ever
+  overwrites a file that is already there, which is why the deleting is yours to do.
 - **The clock says Not set, or is wrong.** A flat battery resets it — the clock runs off the same
   cell. Plug the iPod in and run `core sync` or `core eject` (either sets it), then boot the device
   once: the time arrives on that boot, not while it is on the cable. A clock running more than ten

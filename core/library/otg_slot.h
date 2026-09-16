@@ -270,13 +270,34 @@ typedef struct {
  * Returns 0 when the whole file is on the platter, OTG_SLOT_EFOREIGN when the
  * target is not a slot file, and other negatives when nothing was written (a
  * size the format cannot use, an unresolvable address, a read that failed) or
- * when a write failed part-way — in which case `st` says how far it got. A
- * part-way failure BEFORE the last write leaves a file the next reader calls
- * damaged (old header, new tail); a failure inside the LAST write, the one
- * that puts stage 0 down, can leave a first sector with no header at all,
- * which reads as foreign — listed and played, never written to again until a
- * host sync, and reported by `core doctor`. Both are honest about not being
- * a saved list; neither is believed.
+ * when a write failed part-way — in which case `st` says how far it got.
+ *
+ * WHAT A PART-WAY FAILURE LEAVES, AND HOW IT COMES BACK. A failure BEFORE the
+ * last write leaves a file the next reader calls damaged (old header, new
+ * tail); Delete Playlist rewrites it and the slot is usable again. A failure
+ * inside the LAST write, the one that puts stage 0 down, can instead leave a
+ * first sector with no header at all — and that file reads as FOREIGN, so
+ * every writer here refuses it for ever. So does an unreadable first sector
+ * (the probe fails and this returns -1). That is the correct failure
+ * direction and it is deliberate, but it is also a dead end on the device:
+ * the slot is listed, opens as whatever the bytes parse to, and Save skips it.
+ *
+ * THE RECOVERY IS ON THE HOST, and it is a human one: look at
+ * `Music/Playlists/On-The-Go N.m3u8`, and if it is not something you put
+ * there, DELETE IT and run `core sync` (or `tools/make_otg.py --create`),
+ * which recreates an absent slot empty. `core doctor` prints exactly that on
+ * the slot's line, because it is the only thing that will ever show a user
+ * this state.
+ *
+ * It is a human one on purpose. The obvious alternative — a host command that
+ * rewrites a slot file "when it is not a valid playlist" — needs a test that
+ * tells a torn slot from a playlist somebody made, and no such test exists:
+ * a torn slot's surviving bytes are stale ENTRY LINES that parse perfectly,
+ * while a real user's playlist is perfectly entitled to be empty, or to name
+ * files that are all missing. A heuristic that is wrong in both directions is
+ * not something to put in front of "never overwrite a file the user made";
+ * the person looking at the file is the only reliable discriminator, and the
+ * host already hands them the file.
  *
  * Calls fat32_cache_drop() before returning, so the parse that follows reads
  * the bytes that were just written rather than the ones that were there

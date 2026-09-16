@@ -217,11 +217,32 @@ call fails three checks in `tests/library/otg_slot_test.c`.
 | empty | `count=00000` | hidden | free |
 | used | `count>0`, gen and count agree | listed, opens | in use |
 | damaged | trailer gen or line count disagrees | listed, opens to "Playlist damaged — save again" | NOT free — Delete first |
-| foreign | an `.m3u8` at a slot name with no `#CORE-OTG` line | listed, plays | skipped |
+| foreign | an `.m3u8` at a slot name with no `#CORE-OTG` line — the user's own, or the rarest tear | listed, plays | skipped for ever; delete it on the host and re-sync |
 
-"Foreign" is a playlist of the user's own that happens to use the name. The
-device never writes to it, and that is enforced in two places rather than
-one: `otg_slot_of()` is what the UI asks before it offers **Delete Playlist**
+"Foreign" is a playlist of the user's own that happens to use the name — and
+it is also what the rarest tear leaves behind: a write that failed inside the
+LAST run, the one that puts stage 0 down, can leave a first sector with no
+header, and so can a first sector the drive will not read. The device cannot
+tell those apart from a file somebody made, so it refuses all of them: the
+slot is listed, opens as whatever its bytes parse to, and Save skips it, for
+ever.
+
+**The recovery is on the host and it is a human act:** look at
+`Music/Playlists/On-The-Go N.m3u8`, and if it is not something you put there,
+delete it — `core sync` and `make_otg.py --create` recreate an ABSENT slot
+empty (neither ever rewrites one that is there). `core doctor` prints that on
+the slot's line, because doctor is the only thing that will ever show a user
+this state.
+
+The alternative — a host command that resets a slot "when it is not a valid
+playlist" — was rejected because the test it needs does not exist. A torn
+slot's surviving bytes are stale entry lines that parse perfectly, and a real
+user's playlist is entitled to be empty or to name only missing files, so the
+heuristic is wrong in both directions. The person looking at the file is the
+only reliable discriminator, and the host already hands them the file.
+
+The device never writes to a foreign file, and that is enforced in two places
+rather than one: `otg_slot_of()` is what the UI asks before it offers **Delete Playlist**
 (a NAME says only which slot a file could be — the `#CORE-OTG` directive is
 what says it is one), and `otg_slot_save()` / `otg_slot_erase()` refuse a
 directive-less target themselves, so the promise does not depend on a caller

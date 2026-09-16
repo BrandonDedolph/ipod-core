@@ -1071,7 +1071,12 @@ log capturing the loop.
        unreachable. And a playlist of your OWN at a slot name must show no
        Delete row at all: drop an `On-The-Go 4.m3u8` of your own (8 KiB, no
        `#CORE-OTG` line) on the volume, open it, and confirm there is no
-       Delete row and that `--dump` shows it byte-identical afterwards.
+       Delete row and that `--dump` shows it byte-identical afterwards. That
+       state is a dead end by design — the device never writes to a slot with
+       no header, and the rarest tear (a failure inside the LAST write) leaves
+       one looking the same — so also check the way out: `core doctor` names
+       the slot and says to delete the file and re-sync, and `core sync` /
+       `make_otg.py --create` put an empty one back only when it is ABSENT.
     7. Power off (hold Play 5 s) and cold boot: the live list is back and
        resume lands in the OTG queue on the same track, paused. After a Save,
        the next resume lands in the saved playlist.

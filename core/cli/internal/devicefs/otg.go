@@ -514,6 +514,16 @@ func ReadOTGSlotFile(path string) (entries []string, info OTGSlotInfo, err error
 // That is stricter than EnsureConfig / EnsureLog, which rewrite a file the
 // device would refuse — here there is nothing the device refuses, because a
 // file with no directive is simply an ordinary playlist.
+//
+// Which means an absent slot is the ONLY thing this puts back, and that is
+// the escape hatch for the one state the device cannot recover from on its
+// own: a save interrupted inside its very last write can leave a file with no
+// header, which every writer on the device then refuses for ever. `core
+// doctor` names such a slot and says to DELETE it and re-sync — deleting is
+// the user's to do, because a torn slot and a playlist they made are not
+// distinguishable by anything but a person looking at the file (the stale
+// bytes a tear leaves parse as a perfectly good playlist, and a real one is
+// entitled to be empty). See core/library/otg_slot.h.
 func EnsureOTGSlots(musicDir string) (created []string, err error) {
 	dir := filepath.Join(musicDir, PlaylistDir)
 	if err := os.MkdirAll(dir, 0o777); err != nil {

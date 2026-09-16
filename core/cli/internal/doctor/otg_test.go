@@ -128,12 +128,43 @@ func TestCheckPlaylistsReportsEverySlotState(t *testing.T) {
 		{1, OK, "empty"},
 		{2, OK, "2 track(s)"},
 		{3, Fail, "torn save"},
-		{4, Warn, "playlist of your own"},
+		{4, Warn, "NEVER writes to it"},
 		{5, Warn, "missing"},
 	} {
 		c := find(t, checks, fmt.Sprintf("otg slot %d", tc.slot))
 		if c.State != tc.state || !strings.Contains(c.Text, tc.want) {
 			t.Errorf("slot %d: %+v, want %s containing %q", tc.slot, c, tc.state, tc.want)
+		}
+	}
+
+	// An UNREADABLE slot is the same dead end and gets the same way out.
+	t.Run("unreadable", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, err := devicefs.EnsureOTGSlots(dir); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, devicefs.PlaylistDir, devicefs.OTGSlotName(1))
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatal(err) // a directory at the path: os.ReadFile fails
+		}
+		c := find(t, CheckPlaylists(filepath.Join(dir, devicefs.PlaylistDir)),
+			"otg slot 1")
+		if c.State != Fail || !strings.Contains(c.Text, "core sync") {
+			t.Errorf("%+v", c)
+		}
+	})
+
+	// A slot the device will never write to has to say how to get it back:
+	// a foreign file and an interrupted save look identical, and only the
+	// person looking at the file can tell them apart. Nothing else the user
+	// ever sees mentions this state.
+	c4 := find(t, checks, "otg slot 4")
+	for _, want := range []string{"delete", "core sync", "On-The-Go 4.m3u8"} {
+		if !strings.Contains(c4.Text, want) {
+			t.Errorf("the foreign-slot line does not say %q:\n%s", want, c4.Text)
 		}
 	}
 
