@@ -349,6 +349,79 @@ What changed (see `git log 054c722..`):
   **UNFLASHED.** Bench: Albums (`F-1 Trillion`, `Taylor Swift`), the Now
   Playing title in bold 18, About — read `Fa`, `Ta`, `LT` at arm's length.
 
+- **Volume Limit and EQ presets (2026-09-16)** — Settings → Sound grew from
+  four rows to six. **Volume Limit** is a 10..100 ceiling (100 = no limit);
+  `settings_volume_clamp()` in `ui/settings.c` is the ONE statement of the
+  rule, called by both the Settings slider and the Now Playing wheel, so the
+  two cannot disagree, and lowering the ceiling under the current volume
+  pulls the volume down in the same call. The volume plate keeps its 0..100
+  scale and draws a 5x3 ink triangle over the bar at the limit (the 5G
+  Features Guide's own marker) — inside `VOL_PLATE_*`, so the pinned
+  3200-word present still covers it. A wheel tick that cannot move the
+  volume still raises the plate (the marker is the explanation) but no
+  longer earns a disk write, which also ends the rail-pinned touches the
+  old code did at 0 and 100. **EQ** is a SELECT cycling Off + 17 presets from
+  a new host-built table (`ui/eq.c`, 18 names, five band gains and five
+  centre codes each — ours, nothing copied). A preset is a full five-band
+  curve on the codec's own EQ through the new `hal_eq_set()`, which is now
+  the single register encoder: it pre-attenuates `LDACVOL/RDACVOL` by the
+  curve's largest boost BEFORE writing the gains, so a full-scale FLAC
+  cannot clip the digital path, and `hal_codec_restore()` replays the whole
+  cached curve after the per-track codec reset. The DACVOL pair and the band
+  gains are ordered by the SIGN of the pre-cut change — cut the DAC first
+  going up, take the gains off first coming down — so the attenuation is
+  never smaller than the boost that is live, including mid-call; both
+  directions are pinned as literal bus bytes. `hal_tone_set` is gone: at EQ
+  Off the curve `ui/eq.c` hands over IS the tone control (flat mids on centre
+  code 00, the shelves on 105 Hz / 6.9 kHz), so it emits the same words it
+  always did — plus that pre-cut, which means **Bass +6 now plays a touch
+  quieter overall than it did**. That is the correction, not a regression. While a preset is on, Bass and Treble are
+  locked: they render greyed showing the PRESET's shelf gains, the wheel is
+  refused and SELECT does not enter edit mode, while the user's own tone
+  sits untouched underneath and returns at Off. Record: payload 44 → 48
+  under the same version 2 (`volume_limit` u8 at 44, `eq` u8 at 45, u16
+  reserved) — `config.c`, `tools/make_config.py`, `core/cli`'s `config.go`
+  and all three goldens moved in one commit. A 44-byte record (every device
+  in the field) decodes as limit 100 / EQ Off with its volume untouched; a
+  limit byte of 0 means UNSET → 100, never the 10% floor. New host coverage:
+  `tests/ui/eq_test.c` (the whole table against an independently typed
+  fixture), the Sound half of `settings_test`, the sound tail in
+  `config_test`, and `volume_trace_test`'s mock-bus pins for the flat curve
+  (byte-identical to the shipped tone path), Bass Booster and the restore
+  replay. Gallery: `sound.png` redrawn with EQ Rock active, new
+  `volume_limit.png`, `settings.gif` regenerated. **UNFLASHED.**
+  **Device-only, not observed here:** the EQ2–EQ4 centre-frequency table and
+  the `EQxBW` polarity now in `wm8758.h` / `05-audio.md` were written down
+  from MEMORY of the WM8758B datasheet — not read out of the PDF and not
+  heard on the device — and both are marked "verify". A wrong centre code is
+  a band centred somewhere else; a wrong `EQ_BW_NARROW` polarity (this build
+  assumes 0 = wide) makes every preset's three peaks narrow instead of wide.
+  Either is a differently shaped preset, never a fault. The two SHELF corners
+  are not in doubt — the shipped tone control has been using them; whether the EQ saturates
+  before or after the DAC-volume stage (if the digital volume sits AFTER the
+  EQ, the pre-cut protects the DAC input but not the EQ accumulator); and
+  pop/zipper on the `EQ3DMODE` ADC→DAC flip, since none of these registers
+  has a zero-cross latch (fallback if it is audible: soft-mute around
+  `hal_eq_set`, `DACCTRL_SOFTMUTE`, already used by `wm8758_mute`).
+  Bench list:
+  (a) set Volume Limit 40 while playing at 70 — the volume drops to 40 at
+  once, the plate shows 40 with the triangle at 40%, the wheel cannot pass
+  it; Menu out and back, and a power cycle, keep the limit;
+  (b) limit back to 100 — triangle gone, the wheel reaches 100;
+  (c) EQ Bass Booster on a bass-heavy full-scale FLAC — audibly more bass,
+  **no clipping or crackle**, overall level a touch below Off; Bass/Treble
+  greyed at +6 / 0 and the wheel will not move them; Off restores the
+  user's own tone;
+  (d) cycle every preset while playing — no pop, no dropout at the path
+  switch; Bass Reducer and Treble Reducer are audibly cuts;
+  (e) track change and pause/resume keep the preset (the restore hook);
+  (f) Reset Settings — limit 100, EQ Off, saved;
+  (g) **datasheet check, off the device:** read R18–R22 in the WM8758B PDF and
+  confirm the EQ2/EQ3/EQ4 centre-frequency rows and that `EQxBW` is 0 = wide.
+  If the BW polarity is inverted, one constant (`EQ_BW_NARROW`) and nothing
+  else changes — every preset writes bit 8 clear, so the whole table flips
+  from wide peaks to narrow ones with no code change.
+
 **Device verdicts so far (2026-09-13 evening):** audio noise fixed
 (VMID); panel sleep white on wake (off); suspend wakes with the PLL park
 off; PMU power-off + wake OK; gauge, scrollbar, seven themes, white blank

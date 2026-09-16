@@ -88,6 +88,7 @@ scrolls while it is selected.
   <tr>
     <td><img src="screens/nowplaying.png" width="260" alt="Now Playing"></td>
     <td><img src="screens/volume.png" width="260" alt="Volume"></td>
+    <td><img src="screens/volume_limit.png" width="260" alt="Volume at the limit"></td>
   </tr>
 </table>
 
@@ -95,7 +96,9 @@ The cover, then the eyebrow `TRACK 3 OF 12` (your place in the queue), the title
 album. At the bottom the elapsed time, the time remaining, and the progress bar.
 
 **Volume.** Turn the wheel. A bar appears for a moment; the speaker icon grows sound waves as it
-goes up and shows a cross at zero.
+goes up and shows a cross at zero. If you have set a Volume Limit, a small triangle sits over the
+bar at the limit and the wheel stops there — the bar still runs to 100, so you can see how much
+you are giving up.
 
 **Scrubbing.** Tap Select. The wheel now moves the play position five seconds per click, more per
 click the faster you turn. The left time shows where you are aiming and the right time shows how
@@ -143,8 +146,32 @@ until the device sleeps or powers off, so leaving Settings never makes you wait.
   out, playback pauses and the device sleeps as if you had held Play; the next press wakes it
   paused, where you left off. It is not remembered across a restart, and any sleep or a Reset
   turns it off.
-- **Sound.** Volume, Bass and Treble (plus or minus 12 dB), and Balance. These drive the WM8758B
+- **Sound.** Volume, Volume Limit, EQ, Bass, Treble and Balance. These drive the WM8758B codec
   directly.
+  - **Volume Limit** is a ceiling on the volume, 10% to 100%, and 100% means no limit. Set it
+    below where the volume is now and the volume comes down with it at once. On Now Playing a
+    triangle marks it on the volume bar and the wheel will not go past it. There is no
+    combination or passcode: anyone who can reach Settings can move it back. It caps what the
+    firmware asks of the headphone amplifier — a different pair of headphones, or an EQ preset
+    that boosts, still changes how loud it actually is.
+  - **EQ** is Off or one of seventeen presets: Acoustic, Bass Booster, Bass Reducer, Classical,
+    Dance, Electronic, Hip-Hop, Jazz, Loudness, Pop, R&B, Rock, Small Speakers, Spoken Word,
+    Treble Booster, Treble Reducer, Vocal Booster. Select cycles through them. A preset is a full
+    five-band curve on the codec's own equaliser.
+  - **A boosting preset plays quieter overall, on purpose.** The whole track is turned down by
+    exactly the preset's largest boost, so a loud passage cannot distort where the curve lifts it.
+    The amount is not small: 3 dB for Jazz; 4 for Acoustic, Classical, Pop, Spoken Word and Vocal
+    Booster; 5 for Dance, Electronic, R&B, Rock and Small Speakers; 6 for Bass Booster, Hip-Hop and
+    Treble Booster; **7 for Loudness**, which makes Loudness the quietest setting on the list
+    despite its name — it shapes the curve for quiet listening, it does not add level. Bass Reducer
+    and Treble Reducer only cut, so they cost nothing. Turn the wheel up to make up the difference;
+    that is what the drop is there to leave room for.
+  - **Bass and Treble** are plus or minus 12 dB. While an EQ preset is on they are greyed and show
+    the preset's own bass and treble, because the codec has one bass control and one treble
+    control and the preset is using them; the wheel will not move them. Set EQ to Off and your own
+    values come straight back, exactly as you left them. They pay for a boost the same way a preset
+    does — Bass at +6 turns everything down 6 dB, and at +12 a full 12 dB, which is a large drop
+    (roughly half as loud). A cut costs nothing.
 - **Theme.** Seven palettes. The current one is marked; Select switches at once.
 - **Display.** Backlight: Never, or 5, 10, 15, 30 or 60 seconds after the last input. At the
   timeout the light drops to a quarter of your brightness, and fifteen seconds later it goes off.

@@ -93,8 +93,8 @@ Seven palettes, swapped live from Settings. Same layout, same type, different in
 
 ### Settings
 
-Playback, Sound, Theme, Display, Clicker, About, Boot Details, Disk Mode, Reset. Everything but
-the diagnostics is saved to the disk.
+Playback, Sound (volume limit, EQ presets, tone), Theme, Display, Clicker, About, Boot Details,
+Disk Mode, Reset. Everything but the diagnostics is saved to the disk.
 
 <p align="center"><img src="docs/screens/settings.gif" alt="a Sound slider, then the theme picker" width="360"></p>
 

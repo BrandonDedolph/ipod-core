@@ -3,6 +3,24 @@
 Each release lists what changed on the device since the previous one. Versions are git tags;
 the boot screen and Settings → About show the one the device runs.
 
+## Unreleased
+
+- **Volume Limit.** Settings → Sound has a ceiling on the volume, 10% to 100%, with 100% meaning
+  no limit. Lower it below where the volume is and the volume comes down with it at once. On Now
+  Playing a small triangle marks it on the volume bar and the wheel stops there; the bar keeps its
+  full 0–100 scale. No combination — anyone who can reach Settings can move it back.
+- **EQ presets.** Off plus seventeen: Acoustic, Bass Booster, Bass Reducer, Classical, Dance,
+  Electronic, Hip-Hop, Jazz, Loudness, Pop, R&B, Rock, Small Speakers, Spoken Word, Treble
+  Booster, Treble Reducer, Vocal Booster. Each is a full five-band curve on the WM8758B's own
+  equaliser. While a preset is on, Bass and Treble show its bass and treble greyed and the wheel
+  will not move them; set EQ to Off and your own values come straight back.
+- A boosting curve — a preset or Bass/Treble — is now played with the DAC turned down by exactly
+  the size of the boost, so a loud track cannot distort. That is 3 to 7 dB depending on the preset
+  (7 for Loudness, which is therefore the quietest of them), and up to 12 dB for Bass or Treble at
+  their maximum. Bass +6 is 6 dB quieter overall than it was.
+- The settings record grew from 44 to 48 payload bytes for those two fields, under the same
+  version: a record written by any earlier build still loads, and loads as "no limit, EQ off".
+
 ## v0.1.3 — 2026-09-15
 
 Since v0.1.2. The firmware change is one marker; the release is the host app.
