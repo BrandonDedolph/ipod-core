@@ -20,9 +20,9 @@
  *   2. RIGHT / LEFT held. A tap skips a track, a hold seeks inside it, at a
  *      rate that ramps the longer you hold. seekhold_t is that machine: a
  *      keyhold_t for the press length plus an AIM, because a seek per tick
- *      would stop the DAC, re-prime the ring and rewind the file twenty times
- *      a second. It aims silently while held and hands the caller one target
- *      on release — the same trade ui/wheel.c's scrubber makes.
+ *      would stop the DAC, re-prime the ring and rewind the file four times a
+ *      second. It aims silently while held and hands the caller one target on
+ *      release — the same trade ui/wheel.c's scrubber makes.
  *
  *   3. MENU held. Plain keyhold_t in the caller (GESTURE_MENU_HOLD_US lives
  *      here so all three thresholds are in one place); the jump home is a
@@ -60,8 +60,8 @@
  * Seconds of audio one GESTURE_SEEK_TICK_US step covers, by how long the hold
  * has lasted: 5 s a quarter-second to start (20x real time), then 15 (60x),
  * 30 (120x) and 60 (240x). The first tier is fine enough to land on a verse;
- * the last crosses a 70-minute recording in 17 s of holding. Exported so the
- * test pins the exact numbers rather than re-deriving them.
+ * holding from a standing start crosses a 70-minute recording in about 24 s.
+ * Exported so the test pins the exact numbers rather than re-deriving them.
  */
 uint32_t gesture_seek_step(uint32_t held_us);
 
@@ -77,6 +77,8 @@ typedef struct {
     uint8_t   was_down;        /* live state last feed, for the press edges   */
     uint8_t   allowed_at_down; /* the press BEGAN somewhere it may seek       */
     uint8_t   active;          /* a hold fired and is aiming right now        */
+    uint8_t   moved;           /* ...and the aim has since left where it began */
+    uint8_t   pending_skip;    /* a tap the sampler never saw (seekhold_missed_tap) */
     uint32_t  hold_origin_us;  /* when it fired: the ramp's and the ticks' 0  */
     uint32_t  ticks;           /* aim steps already applied since the origin  */
     uint32_t  target_s;        /* where the aim points                        */
@@ -87,12 +89,50 @@ typedef enum {
     SEEKHOLD_SKIP,      /* released under the threshold: next/previous track  */
     SEEKHOLD_AIM,       /* the target moved: repaint the transport band       */
     SEEKHOLD_COMMIT,    /* released after a hold: seek to seekhold_target()   */
-    SEEKHOLD_CANCEL,    /* the aim went away unseeked: repaint the band       */
+    SEEKHOLD_CANCEL,    /* an aim was DROPPED UNSEEKED: repaint the band      */
 } seekhold_action_t;
 
 /* Forget any press in flight, keeping `dir`. The Hold switch going on under
  * the finger is the case this exists for. */
 void seekhold_reset(seekhold_t *s);
+
+/*
+ * Abandon whatever this button is doing, WITHOUT acting on it: an aim in
+ * flight is dropped unseeked, and the press it belongs to is dead for the
+ * rest of its life — it can produce no skip, no hold and no commit however
+ * long it is held after this, and the finger coming off is silent. Idle, this
+ * is a no-op and leaves nothing behind that could claim a later press.
+ *
+ * Returns SEEKHOLD_CANCEL if there was an aim on screen (the caller repaints
+ * the band so the live position comes back), SEEKHOLD_NONE otherwise, so a
+ * caller can feed it through the same switch as seekhold_feed(). A tap
+ * already claimed by seekhold_missed_tap() is NOT dropped: that is a finished
+ * press of its own, and the user did ask for a skip.
+ *
+ * THE CALLER MUST CALL THIS WHEN THE TRACK UNDER THE AIM CHANGES. The machine
+ * is fed a position and a length, not an identity: an auto-advance hands it
+ * the NEXT track's elapsed and total while `allowed` stays 1, and the aim
+ * would go on stepping and then commit a position measured against a track
+ * nobody is playing any more (a rewind held through the end of a 4:00 track
+ * committing 3:23 into the next one). Only the caller can see that edge.
+ */
+seekhold_action_t seekhold_cancel(seekhold_t *s);
+
+/*
+ * The latched down-edge of a press the live sampler NEVER SAW, because both
+ * the press and the release fell inside one blocked main-loop pass (a track
+ * open on a parked drive is seconds long). The button state is latched by the
+ * tick and the event survives; only seekhold_feed's view of it is lost, so
+ * without this the second RIGHT of a double-skip simply vanishes.
+ *
+ * `is_down` is the button's live state at the moment the event is drained: a
+ * press that is still down is NOT a missed tap, it is a press the next feed
+ * will pick up normally. A claimed edge is reported as SEEKHOLD_SKIP by the
+ * next feed — not returned here — so the skip keeps exactly one
+ * implementation in the caller, and it is dropped rather than fired if
+ * `allowed` has gone by then.
+ */
+void seekhold_missed_tap(seekhold_t *s, int is_down);
 
 /*
  * This press does nothing at all — no skip, no seek. The press that jumps to
@@ -110,15 +150,22 @@ void seekhold_void(seekhold_t *s);
  *              track loaded. LATCHED at the down-edge — a press that began on
  *              a list (where RIGHT jumps to Now Playing instead) stays void
  *              for its whole life, even though `allowed` becomes 1 one pass
- *              later. A press that began allowed and LOSES it (the track
- *              ended, MENU popped the screen) is cancelled.
+ *              later. A press that began allowed and LOSES it (the queue
+ *              ended, MENU popped the screen) is cancelled on the spot and
+ *              stays dead even if `allowed` comes back under the same finger.
+ *              A track change is NOT visible here — see seekhold_cancel().
  *   elapsed_s  the live position; where a new aim starts from.
  *   total_s    the track length, the aim's upper clamp. 0 = unknown: no upper
  *              clamp here, player_seek_to() clamps to the last frame.
  *
  * Returns at most one action per pass. The aim never crosses a track
  * boundary: fast forward pins at total_s and rewind at 0, and reports NONE
- * once pinned.
+ * once pinned. A hold released before its aim has MOVED — the 500 ms
+ * threshold passed but the first 250 ms tick did not, or every tick was
+ * clamped at an end — reports SEEKHOLD_CANCEL rather than SEEKHOLD_COMMIT:
+ * seeking to where playback already is costs a DAC stop, a re-prime and an
+ * audible rewind of up to a buffer, for a gesture that moved nothing. The
+ * wheel scrubber refuses the same commit for the same reason (g_scrub_dirty).
  */
 seekhold_action_t seekhold_feed(seekhold_t *s, int is_down, uint32_t now_us,
                                 int allowed, uint32_t elapsed_s,

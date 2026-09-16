@@ -11,9 +11,19 @@
  *
  * WHY THIS FILE EXISTS
  *
- * PLAY is exactly such a button — a tap toggles pause, a ~2 s hold sleeps the
- * device — and until this existed kernel/main.c decided the two halves in two
- * different places: the hold was timed from live state, but the pause toggle
+ * FOUR of this device's five buttons are press-length buttons, and all four
+ * are arbitrated here: PLAY (tap = pause, ~2 s hold = sleep), MENU (tap =
+ * back one screen, 1 s hold = the main menu) and RIGHT/LEFT (tap = skip a
+ * track, 0.5 s hold = seek inside it, through the seekhold machine in
+ * ui/gesture.c, which is a keyhold plus an aim). Nothing in this file assumes
+ * one threshold or one instance: `hold_us` is an argument of every feed and
+ * all the state is per-instance, so a caller keeps as many instances as it
+ * has such buttons.
+ *
+ * PLAY was the first, and is why this file exists. It is exactly such a
+ * button — a tap toggles pause, a ~2 s hold sleeps the device — and until
+ * this existed kernel/main.c decided the two halves in two different places:
+ * the hold was timed from live state, but the pause toggle
  * fired on the DOWN-EDGE EVENT, unconditionally. So a hold-to-sleep paused the
  * music first and the wake did not resume it; and a hold while already paused
  * played for two seconds, went to sleep, and then resumed on wake. SELECT on

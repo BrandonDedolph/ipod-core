@@ -42,6 +42,8 @@ void seekhold_reset(seekhold_t *s)
     s->was_down        = 0;
     s->allowed_at_down = 0;
     s->active          = 0;
+    s->moved           = 0;
+    s->pending_skip    = 0;
     s->hold_origin_us  = 0;
     s->ticks           = 0;
     s->target_s        = 0;
@@ -50,7 +52,32 @@ void seekhold_reset(seekhold_t *s)
 void seekhold_void(seekhold_t *s)
 {
     keyhold_void(&s->key);
-    s->active = 0;                        /* nothing left to commit          */
+    s->active       = 0;                  /* nothing left to commit          */
+    s->moved        = 0;
+    s->pending_skip = 0;
+}
+
+seekhold_action_t seekhold_cancel(seekhold_t *s)
+{
+    int aiming = s->active;
+    s->active = 0;
+    s->moved  = 0;
+    /* Clearing the latch is what kills the press: seekhold_feed only ever
+     * sets it on a down-edge, so while the finger stays down the arbiter is
+     * fed a released button and the press can produce nothing. Resetting the
+     * arbiter with it stops that fed release reading as a TAP — and, unlike
+     * keyhold_void(), arms no pre-press grace, so a cancel with nothing down
+     * cannot eat the next press. */
+    s->allowed_at_down = 0;
+    keyhold_reset(&s->key);
+    return aiming ? SEEKHOLD_CANCEL : SEEKHOLD_NONE;
+}
+
+void seekhold_missed_tap(seekhold_t *s, int is_down)
+{
+    if (!is_down && !s->was_down) {
+        s->pending_skip = 1;
+    }
 }
 
 /*
@@ -89,6 +116,7 @@ static seekhold_action_t seek_aim(seekhold_t *s, uint32_t now_us,
         return SEEKHOLD_NONE;             /* pinned at an end of the track   */
     }
     s->target_s = t;
+    s->moved    = 1;                      /* ...so the release is worth a seek */
     return SEEKHOLD_AIM;
 }
 
@@ -110,15 +138,21 @@ seekhold_action_t seekhold_feed(seekhold_t *s, int is_down, uint32_t now_us,
                                       now_us, GESTURE_SEEK_HOLD_US);
 
     if (!allowed) {
-        /* The track ended or the screen went away under the press. An aim in
-         * flight is dropped unseeked; the caller repaints the band so the
-         * live position comes back. The release is silent either way: the
-         * arbiter has already fired for this press, or never saw it. */
-        if (s->active) {
-            s->active = 0;
-            return SEEKHOLD_CANCEL;
-        }
-        return SEEKHOLD_NONE;
+        /* The queue ended or the screen went away under the press. Kill it:
+         * an aim in flight is dropped unseeked and the press is dead for the
+         * rest of its life, which is what the header promises. (`a` is
+         * discarded deliberately — the arbiter may have read this pass's
+         * withheld sample as a release and offered a TAP.) */
+        s->pending_skip = 0;
+        return seekhold_cancel(s);
+    }
+
+    /* A tap the sampler missed entirely, handed over by the drain. Reported
+     * only on a pass with nothing else to say, so a real action landing in
+     * the same pass is not displaced — the missed one follows 10 ms later. */
+    if (s->pending_skip && a == KEYHOLD_NONE && !s->active) {
+        s->pending_skip = 0;
+        return SEEKHOLD_SKIP;
     }
 
     if (a == KEYHOLD_TAP) {
@@ -128,6 +162,7 @@ seekhold_action_t seekhold_feed(seekhold_t *s, int is_down, uint32_t now_us,
         /* The band flips to the aim display at once, before any step: what
          * confirms the gesture is the readout changing under the thumb. */
         s->active         = 1;
+        s->moved          = 0;
         s->hold_origin_us = now_us;
         s->ticks          = 0;
         s->target_s       = elapsed_s;
@@ -136,8 +171,16 @@ seekhold_action_t seekhold_feed(seekhold_t *s, int is_down, uint32_t now_us,
 
     if (s->active) {
         if (was_held && !down) {          /* the hold's own release          */
+            int moved = s->moved;
             s->active = 0;
-            return SEEKHOLD_COMMIT;       /* one seek for the whole hold     */
+            s->moved  = 0;
+            /* One seek for the whole hold — but only if the aim actually
+             * went somewhere. A hold let go between the 500 ms fire and the
+             * first 250 ms tick, or one that spent its whole life pinned at
+             * an end, would otherwise seek to where playback already is: a
+             * DAC stop and a re-prime, heard as a hiccup and a small jump
+             * backwards, for nothing. */
+            return moved ? SEEKHOLD_COMMIT : SEEKHOLD_CANCEL;
         }
         return seek_aim(s, now_us, total_s);
     }

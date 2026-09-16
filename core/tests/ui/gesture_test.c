@@ -302,6 +302,118 @@ int main(void)
         xpect(&c, "wrap: a hold across 2^32 us aims and commits correctly", ok);
     }
 
+    /* ---- a hold that moved nothing does not seek ------------------------- *
+     * Released between the 500 ms fire and the first 250 ms tick. Committing
+     * there costs a DAC stop, a re-prime and an audible rewind to land
+     * exactly where playback already was — and 500-750 ms is what a slightly
+     * slow "tap" measures, so it is the likeliest mis-press on the device. */
+    rig_init(&r, +1, 60u, 600u);
+    hold_until_aim(&r, &c, "zero-tick: the hold fires and the band flips");
+    step_n(&r, 1, 10, SEEKHOLD_NONE, &c, "zero-tick: still before the first tick");
+    xpect(&c, "zero-tick: the release is a cancel, not a seek to where we are",
+          step(&r, 0) == SEEKHOLD_CANCEL && seekhold_active(&r.s) == 0);
+    step_n(&r, 0, 5, SEEKHOLD_NONE, &c, "zero-tick: and only once");
+
+    /* The same rule for a hold that spent its whole life pinned: fast forward
+     * begun with the playhead already at the end never moves. */
+    rig_init(&r, +1, 600u, 600u);
+    hold_until_aim(&r, &c, "pinned from the start: the hold fires");
+    step_n(&r, 1, 200, SEEKHOLD_NONE, &c, "pinned from the start: no tick moves it");
+    xpect(&c, "pinned from the start: the release seeks nothing",
+          step(&r, 0) == SEEKHOLD_CANCEL);
+
+    /* ---- seekhold_cancel: the track changed under the aim ----------------- *
+     * An auto-advance keeps the player active and the screen put, so the
+     * machine sees only a new elapsed and a new total — indistinguishable
+     * from the old track's. The caller owns that edge; this is what it buys.
+     * Without it, a rewind held through the end of a 4:00 track committed
+     * ~3:23 into the next one, which the listener has heard none of. */
+    rig_init(&r, -1, 238u, 240u);
+    hold_until_aim(&r, &c, "track change: a rewind aim in flight");
+    (void)step_to_aim(&r, 40);
+    xpect(&c, "track change: the aim had moved before the track ended",
+          seekhold_target(&r.s) == 233u);
+    xpect(&c, "track change: cancelling an aim reports it once",
+          seekhold_cancel(&r.s) == SEEKHOLD_CANCEL && seekhold_active(&r.s) == 0);
+    /* The next track is playing now: a new elapsed, a new (longer) total. */
+    r.elapsed = 0u;
+    r.total   = 300u;
+    step_n(&r, 1, 300, SEEKHOLD_NONE, &c,
+           "track change: three more seconds of holding aim at nothing");
+    xpect(&c, "track change: and the release commits nothing",
+          step(&r, 0) == SEEKHOLD_NONE && seekhold_active(&r.s) == 0);
+    xpect(&c, "track change: the press after it is a normal skip",
+          step(&r, 1) == SEEKHOLD_NONE && step(&r, 0) == SEEKHOLD_SKIP);
+
+    /* Cancelling with nothing down must be a true no-op — in particular it
+     * must not arm keyhold's pre-press grace and eat the next press, which is
+     * why it clears the latch rather than voiding the key. */
+    rig_init(&r, +1, 60u, 600u);
+    xpect(&c, "cancel when idle: nothing to report",
+          seekhold_cancel(&r.s) == SEEKHOLD_NONE);
+    xpect(&c, "cancel when idle: the next press still skips",
+          step(&r, 1) == SEEKHOLD_NONE && step(&r, 0) == SEEKHOLD_SKIP);
+    hold_until_aim(&r, &c, "cancel when idle: and the press after that holds");
+    (void)step_to_aim(&r, 40);
+    xpect(&c, "cancel when idle: which still commits",
+          step(&r, 0) == SEEKHOLD_COMMIT);
+
+    /* ---- seekhold_missed_tap: a press that fell inside a blocked pass ----- *
+     * The tick latched the down-edge, so the event survives a two-second disk
+     * read; the live state the machine is fed does not. Handing the edge over
+     * keeps the latch's "no tap is ever lost" promise for the transport. */
+    rig_init(&r, +1, 60u, 600u);
+    seekhold_missed_tap(&r.s, 0);
+    xpect(&c, "missed tap: the next feed reports it as a skip",
+          step(&r, 0) == SEEKHOLD_SKIP);
+    step_n(&r, 0, 5, SEEKHOLD_NONE, &c, "missed tap: exactly once");
+
+    /* A button still down at the drain is not a missed tap: that press is one
+     * the next feed picks up, and claiming it too would skip twice. */
+    rig_init(&r, +1, 60u, 600u);
+    seekhold_missed_tap(&r.s, 1);
+    xpect(&c, "missed tap: a press still down is not claimed",
+          step(&r, 1) == SEEKHOLD_NONE);
+    step_n(&r, 1, 10, SEEKHOLD_NONE, &c, "missed tap: nor once it is being timed");
+    xpect(&c, "missed tap: the press reports its own skip and no second one",
+          step(&r, 0) == SEEKHOLD_SKIP);
+    step_n(&r, 0, 5, SEEKHOLD_NONE, &c, "missed tap: and nothing follows it");
+
+    /* Claimed, then the screen went away before it could be reported: drop it
+     * rather than skipping a track on a screen the user has already left. */
+    rig_init(&r, +1, 60u, 600u);
+    seekhold_missed_tap(&r.s, 0);
+    r.allowed = 0;
+    xpect(&c, "missed tap: dropped if the player screen went away first",
+          step(&r, 0) == SEEKHOLD_NONE);
+    r.allowed = 1;
+    step_n(&r, 0, 5, SEEKHOLD_NONE, &c, "missed tap: and it does not come back");
+
+    /* A real action landing in the same pass wins; the missed one follows on
+     * the next, so a genuine double-tap produces two skips. */
+    rig_init(&r, +1, 60u, 600u);
+    (void)step(&r, 1);
+    seekhold_missed_tap(&r.s, 0);         /* ignored: a press is in flight */
+    xpect(&c, "missed tap: not claimed while a press is being timed",
+          step(&r, 0) == SEEKHOLD_SKIP);
+    step_n(&r, 0, 5, SEEKHOLD_NONE, &c, "missed tap: so there is no second skip");
+
+    /* ---- allowed lost and regained under one finger ----------------------- *
+     * The header says a press that loses `allowed` is dead for the rest of
+     * its life. Unreachable on the device (the player cannot come back under
+     * a held RIGHT), but the sentence has to be true or it is not a contract. */
+    rig_init(&r, +1, 60u, 600u);
+    step_n(&r, 1, 20, SEEKHOLD_NONE, &c, "regain: 200 ms down, allowed");
+    r.allowed = 0;
+    step_n(&r, 1, 10, SEEKHOLD_NONE, &c, "regain: allowed drops before the fire");
+    r.allowed = 1;
+    r.elapsed = 5u;
+    step_n(&r, 1, 100, SEEKHOLD_NONE, &c,
+           "regain: a second of holding after it comes back aims at nothing");
+    xpect(&c, "regain: and the release is silent", step(&r, 0) == SEEKHOLD_NONE);
+    xpect(&c, "regain: the next press is a fresh one",
+          step(&r, 1) == SEEKHOLD_NONE && step(&r, 0) == SEEKHOLD_SKIP);
+
     /* ---- the PLAY-tap policy, screen by screen --------------------------- *
      * The manual's rule: Play on a highlighted list title plays that list.
      * Everywhere there is no title under the cursor it stays pause/resume —
