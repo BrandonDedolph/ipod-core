@@ -1091,12 +1091,19 @@ def fmt_gb(mb):
 #   │ ▓▓▓▓▓▓▓▓▓░░░       │  │ [▓▓▓▓▓▓▓░░]▏       │
 #   │ 53.5 of 74.5 GB    │  │ 3912 mV            │
 #   └────────────────────┘  └────────────────────┘
-#              ADC 2731 · LOG 6 on
+#          ADC 2731 · LOG 6 on · JACK 1 n0
 AB_SONGS, AB_ALBUMS, AB_ARTISTS = 4127, 318, 142
 AB_TOTAL_MB, AB_FREE_MB = 76288, 21504          # -> "74.5 GB" total, "21.0 GB" free
 AB_BATT_PCT, AB_BATT_MV, AB_BATT_RAW = 73, 3912, 2731
 AB_LOG_SEQ, AB_LOG_ON = 6, True
 AB_LIB_TRUNCATED = False
+# The headphone jack's on-screen probe (core/ui/settings.h about_jack_t): the
+# raw detect level and how many times it has moved since power-on. The SHIPPING
+# image is what this gallery shows, so there is no debounced half and no
+# en=/oe= tail — hal_headphones_present() answers -1 while
+# HEADPHONE_DETECT_TRUSTED is 0, and the footer drops the token it has no
+# answer for. Plug seated, untouched since boot.
+AB_JACK_RAW, AB_JACK_EDGES = 1, 0
 
 AB_CARD_Y, AB_CARD_H, AB_CARD_W, AB_CARD_PAD = 142, 80, 140, 10   # 16|140|8|140|16=320
 
@@ -1163,9 +1170,13 @@ def screen_about(lib_truncated=AB_LIB_TRUNCATED):
     sc.fill_round_rect(gx + 2, gy + 2, fw2, gh - 4, 2, INK)
     sc.text(ix, AB_CARD_Y + 72, str(AB_BATT_MV) + " mV", FONT_SMALL, MUTED_D)
 
-    # --- diagnostics footer: raw ADC code + the event log sequence ---
-    v = "ADC " + str(AB_BATT_RAW) + " " + MIDDOT + " "
-    v += ("LOG " + str(AB_LOG_SEQ) + " on") if AB_LOG_ON else "LOG off"
+    # --- diagnostics footer: raw ADC code, the event log, the jack ---
+    adc = "ADC " + str(AB_BATT_RAW) + " " + MIDDOT + " "
+    log = ("LOG " + str(AB_LOG_SEQ) + " on") if AB_LOG_ON else "LOG off"
+    jk = " " + MIDDOT + " JACK " + str(AB_JACK_RAW) + " n" + str(AB_JACK_EDGES)
+    v = adc + log + jk
+    if text_width(v, FONT_SMALL) > W - 32:      # the firmware drops ADC first
+        v = log + jk
     sc.text_centered(236, v, FONT_SMALL, MUTED)
     return sc.img
 

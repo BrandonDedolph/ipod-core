@@ -67,7 +67,7 @@ make sim        # configures + builds the HOST TEST SUITE (see note below)
 make verify-hw  # static checks against a fresh `make hw` (see below)
 make help       # all targets
 
-meson test -C build-sim     # 58 host unit + MMIO golden-trace suites
+meson test -C build-sim     # 59 host unit + MMIO golden-trace suites
 ```
 
 `make verify-hw` is the static half of the safety net — the checks that
