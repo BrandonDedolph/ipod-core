@@ -668,7 +668,7 @@ static uint32_t       g_pl_last_us;       /* USEC_TIMER at the last fold        
 static uint32_t       g_pl_pause_us;       /* USEC_TIMER when paused (codec timer)  */
 static uint32_t       g_pl_total_s;       /* current track length, seconds        */
 static uint32_t       g_pl_low_fill;      /* ring low-water since last NP repaint  */
-static int            g_shuffle;          /* walk g_order instead of the queue     */
+static int            g_shuffle;          /* PLAYER_SHUFFLE_* (0 = walk the queue) */
 static int            g_repeat;           /* 0 off, 1 all (loop queue), 2 one       */
 static flac_meta_t    g_cur_meta;         /* tags/duration of the current track     */
 static uint32_t       g_rng = 0x2545F491u;/* LCG state for shuffle (see rng_next)  */
@@ -706,6 +706,21 @@ static int            g_order_n;          /* playable entries in g_order (0 = no
  */
 static uint32_t       g_order_seed;
 static int            g_order_keep = PLAYER_KEEP_NONE;
+/*
+ * Scratch for the ALBUMS deal: the playable indices sorted by
+ * (album, order_key, index), i.e. every album's tracks contiguous and in
+ * tracklist order. g_order then holds the START POSITIONS of the groups in
+ * it while they are being shuffled, and is overwritten with the expanded
+ * order in place. g_groups is how many groups that last deal found — 0 after
+ * a SONGS deal, which is what tells the Repeat All wrap whether "a different
+ * first album" is even a thing it can ask for.
+ *
+ * 12 KB of .bss that only Shuffle Albums uses, for the same reason g_order is
+ * a uint16_t array: sorting the queue's indices costs a second array, and
+ * sorting g_order itself would destroy the permutation it is being dealt into.
+ */
+static uint16_t       g_sorted[QUEUE_MAX];
+static int            g_groups;
 static int            g_last_err;         /* why the last open/skip failed          */
 
 /* Format the DAC is currently clocked at. hal_audio_init is only re-issued
@@ -774,9 +789,12 @@ void player_set_repeat(int mode)  { g_repeat  = mode; }
  * g_shuffle selects. Nothing else in the player knows shuffle exists.
  *
  * Invariant: whenever g_shuffle is set and the queue is non-empty, g_order is
- * a permutation of exactly the playable queue indices. It is dealt at every
- * queue (re)start (player_play_queue / player_queue_commit) and on every
- * off->on toggle, so it can never be stale against the queue it indexes.
+ * a permutation of exactly the playable queue indices. Under
+ * PLAYER_SHUFFLE_ALBUMS it is a permutation with a shape: the concatenation
+ * of album groups, each group's entries contiguous and in (order_key, queue
+ * index) order, the groups themselves in seeded random order. It is dealt
+ * at every queue (re)start (player_play_queue / player_queue_commit) and on
+ * every change of mode, so it can never be stale against the queue it indexes.
  * Every deal records the (seed, keep) pair it came from, and the same pair
  * over the same queue deals the same order (player_reshuffle_with_seed).
  * ------------------------------------------------------------------------- */
@@ -845,6 +863,155 @@ static void order_swap(int a, int b)
     g_order[b] = t;
 }
 
+/* ---------------------------------------------------------------------------
+ * Shuffle Albums
+ *
+ * The same deal, one level up: the unit shuffled is an ALBUM, not a track.
+ * Every playable index is sorted into (album, order_key, index) order — which
+ * puts each album's tracks together and in the order the tracklist shows them
+ * — the resulting runs are permuted with the same LCG from the same seed, and
+ * the runs are then expanded back into g_order. Pure in (queue, seed, keep)
+ * exactly like the track deal, so the resume record's existing (seed, keep)
+ * pair brings an album order back across a power cut with no new field.
+ *
+ * album == 0 ("the index does not know which album this is") is a SINGLETON
+ * rather than one giant group of strays: those entries are unrelated to each
+ * other, and gluing them into a run would play them as if they were an album.
+ * ------------------------------------------------------------------------- */
+
+/* Total order over queue indices: album, then place within it, then the
+ * queue's own order for entries the index cannot tell apart. */
+static int album_cmp(uint16_t a, uint16_t b)
+{
+    const browse_entry_t *ea = &g_queue[a], *eb = &g_queue[b];
+    if (ea->album != eb->album) return (ea->album < eb->album) ? -1 : 1;
+    if (ea->order_key != eb->order_key) {
+        return (ea->order_key < eb->order_key) ? -1 : 1;
+    }
+    return (a > b) - (a < b);
+}
+
+/* Sift g_sorted[root] down through a heap of `n`. */
+static void album_sift(int root, int n)
+{
+    for (;;) {
+        int big = root, l = 2 * root + 1, r = l + 1;
+        if (l < n && album_cmp(g_sorted[l], g_sorted[big]) > 0) big = l;
+        if (r < n && album_cmp(g_sorted[r], g_sorted[big]) > 0) big = r;
+        if (big == root) return;
+        uint16_t t = g_sorted[root];
+        g_sorted[root] = g_sorted[big];
+        g_sorted[big]  = t;
+        root = big;
+    }
+}
+
+/*
+ * Heapsort, not the library's merge sort: library/sort.c wants a scratch
+ * array of its own and belongs to the UI side, while the player must stay
+ * free of both. The key is a total order, so stability buys nothing. O(n log
+ * n) and allocation-free, which matters because a Repeat All re-deal happens
+ * inside the prefetch, on the audio path.
+ */
+static void album_sort(int n)
+{
+    for (int i = n / 2 - 1; i >= 0; i--) album_sift(i, n);
+    for (int end = n - 1; end > 0; end--) {
+        uint16_t t = g_sorted[0];
+        g_sorted[0] = g_sorted[end];
+        g_sorted[end] = t;
+        album_sift(0, end);
+    }
+}
+
+/* Does position `q` of g_sorted begin an album group? */
+static int album_group_start(int q)
+{
+    if (q == 0) return 1;
+    uint16_t al = g_queue[g_sorted[q]].album;
+    return al == 0 || al != g_queue[g_sorted[q - 1]].album;
+}
+
+/* How many entries the group starting at `q` holds (always >= 1 — the
+ * expansion below depends on it). */
+static int album_run_len(int q, int n)
+{
+    uint16_t al = g_queue[g_sorted[q]].album;
+    if (al == 0) return 1;                /* strays are their own group */
+    int len = 1;
+    while (q + len < n && g_queue[g_sorted[q + len]].album == al) len++;
+    return len;
+}
+
+/* Two queue entries in the same album? Strays (album 0) share one only with
+ * themselves. -1 (nothing was playing) matches nothing. */
+static int same_album(int a, int b)
+{
+    if (a < 0 || b < 0) return 0;
+    uint16_t ga = g_queue[a].album, gb = g_queue[b].album;
+    if (ga == 0 || gb == 0) return a == b;
+    return ga == gb;
+}
+
+/*
+ * The ALBUMS branch of shuffle_deal: g_order arrives holding the `n` playable
+ * indices in queue order and leaves holding them grouped by album, the groups
+ * in seeded random order. `keep` (a playable queue index, or PLAYER_KEEP_NONE)
+ * pins the album it belongs to at the FRONT — the album you are listening to
+ * finishes before a random one starts, and the track itself does not move.
+ */
+static void album_deal(uint32_t seed, int keep, int n)
+{
+    for (int i = 0; i < n; i++) g_sorted[i] = g_order[i];
+    album_sort(n);
+
+    /* g_order is reused as the group list while the groups are shuffled: one
+     * start position per group, in sorted (i.e. album id) order. */
+    int groups = 0;
+    for (int q = 0; q < n; q++) {
+        if (album_group_start(q)) g_order[groups++] = (uint16_t)q;
+    }
+
+    g_rng = seed;
+    for (int i = groups - 1; i > 0; i--) {
+        int j = (int)(rng_next() % (uint32_t)(i + 1));
+        order_swap(i, j);
+    }
+
+    if (keep >= 0) {
+        /* The group `keep` fell into: find it in g_sorted, walk back to the
+         * run's start, then find that start among the shuffled group list.
+         * Swapping two starts swaps two whole groups, and moving one element
+         * of a uniform permutation to the front leaves the rest uniform. */
+        int p = -1;
+        for (int q = 0; q < n; q++) {
+            if (g_sorted[q] == (uint16_t)keep) { p = q; break; }
+        }
+        if (p >= 0) {
+            while (!album_group_start(p)) p--;
+            for (int g = 1; g < groups; g++) {
+                if (g_order[g] == (uint16_t)p) { order_swap(0, g); break; }
+            }
+        }
+    }
+
+    /*
+     * Expand the groups back into g_order, BACK TO FRONT and in place. After
+     * the groups at g_order[g..groups) have been written, the write cursor
+     * sits at the sum of the lengths of the groups still listed at
+     * g_order[0..g), which is at least g because no group is empty — so it
+     * never lands on a start position that has yet to be read.
+     */
+    int out = n;
+    for (int g = groups - 1; g >= 0; g--) {
+        int q   = g_order[g];
+        int len = album_run_len(q, n);
+        out -= len;
+        for (int k = 0; k < len; k++) g_order[out + k] = g_sorted[q + k];
+    }
+    g_groups = groups;
+}
+
 /*
  * Deal an order from `seed`: every playable index, Fisher-Yates shuffled by
  * the LCG started at `seed`. When `keep` is a playable index it is moved to
@@ -855,8 +1022,13 @@ static void order_swap(int a, int b)
  * nothing is biased by it. PLAYER_KEEP_QUEUE skips the shuffle: the order is
  * the queue's own (for a queue that was enqueued already shuffled).
  *
- * Deterministic: the same (seed, keep) over the same queue deals the same
- * order, and both are recorded so it can be asked for again.
+ * Under PLAYER_SHUFFLE_ALBUMS the shuffled unit is an album instead of a
+ * track — see album_deal above — and `keep` pins the album rather than the
+ * one entry. Everything else here is common to both.
+ *
+ * Deterministic: the same (seed, keep) over the same queue IN THE SAME MODE
+ * deals the same order, and the pair is recorded so it can be asked for
+ * again (the mode rides the settings record, which boot pushes first).
  */
 static void shuffle_deal(uint32_t seed, int keep)
 {
@@ -867,8 +1039,16 @@ static void shuffle_deal(uint32_t seed, int keep)
     g_order_n    = n;
     g_order_seed = seed;
     g_order_keep = keep;
+    g_groups     = 0;
     if (keep == PLAYER_KEEP_QUEUE) {
         return;                           /* queue order IS the order */
+    }
+    /* KEEP_QUEUE above is mode-independent on purpose: a queue that was
+     * enqueued already shuffled (Shuffle Songs) is a song order, and the
+     * Albums setting must not regroup it behind the Queue view's back. */
+    if (g_shuffle == PLAYER_SHUFFLE_ALBUMS) {
+        album_deal(seed, keep, n);
+        return;
     }
     g_rng = seed;
     for (int i = n - 1; i > 0; i--) {
@@ -900,7 +1080,9 @@ static void shuffle_build(int keep)
  * Under Repeat All a used-up order is re-dealt, so the loop is a new
  * sequence each time round instead of the same one forever; the only
  * constraint carried across is that the new first track isn't the one that
- * just finished, which would sound like Repeat One for a moment.
+ * just finished, which would sound like Repeat One for a moment. Under
+ * ALBUMS the constraint moves up with the unit: the new first ALBUM is not
+ * the album that just finished.
  *
  * Known edge: the re-deal happens when the successor is ASKED for, and the
  * prefetch asks up to ~6 s before the last track of a pass is audibly over
@@ -914,17 +1096,29 @@ static int shuffle_next(int from)
     int pos = order_pos_of(from);         /* -1 (not in the order) starts at the top */
     if (pos + 1 < g_order_n) return g_order[pos + 1];
     if (g_repeat != 1) return -1;
+    int albums = (g_shuffle == PLAYER_SHUFFLE_ALBUMS);
     /* Re-deal until the new first track isn't the one that just finished.
      * Dealing again rather than swapping keeps the order exactly what its
      * (seed, keep) says it is. Each try is a fresh seed and the chance of
      * the same first track is 1/n per try, so the bound only ever matters
      * on a two-track queue, where the swap fallback costs that one order
-     * its replayability and nothing else. */
+     * its replayability and nothing else. A one-group ALBUMS queue — the
+     * album you opened from the browser — accepts the first re-deal and
+     * simply loops in tracklist order, which is what Repeat All on one
+     * album has to mean. */
     for (int tries = 0; tries < 8; tries++) {
         shuffle_build(PLAYER_KEEP_NONE);
-        if (g_order_n == 1 || g_order[0] != from) break;
+        if (g_order_n == 1) break;
+        if (albums ? (g_groups <= 1 || !same_album(g_order[0], from))
+                   : (g_order[0] != from)) {
+            break;
+        }
     }
-    if (g_order_n > 1 && g_order[0] == from) {
+    /* No fallback swap under ALBUMS: moving one track to the front of a
+     * dealt order would break the album it belongs to, and hearing the same
+     * album twice in a row after eight independent draws (chance (1/G)^8) is
+     * a coincidence, not a bug. */
+    if (!albums && g_order_n > 1 && g_order[0] == from) {
         order_swap(0, 1 + (int)(rng_next() % (uint32_t)(g_order_n - 1)));
     }
     return g_order[0];
@@ -954,19 +1148,28 @@ static int predecessor(int from)
 }
 
 /*
- * Toggle shuffle. Only an off->on transition deals a new order, and it keeps
- * the current track current: settings_apply() in the UI re-pushes this on
- * EVERY settings change (volume included), so "on while already on" must be
- * a no-op or adjusting the volume would silently re-deal the album. Turning
- * it off needs nothing beyond the flag — the queue order is always there.
+ * Set the shuffle mode. Any CHANGE to a shuffling mode deals a new order —
+ * off->songs, off->albums and songs<->albums alike — and every one of them
+ * keeps the current track current: settings_apply() in the UI re-pushes this
+ * on EVERY settings change (volume included), so "the mode already in force"
+ * must be a no-op or adjusting the volume would silently re-deal the album.
+ * Turning it off needs nothing beyond the mode — the queue order is always
+ * there.
+ *
+ * g_shuffle is assigned BEFORE the deal because the deal reads it: which
+ * branch of shuffle_deal runs is the difference between a track order and an
+ * album order.
  */
-void player_set_shuffle(int on)
+void player_set_shuffle(int mode)
 {
-    on = on ? 1 : 0;
-    if (on && !g_shuffle) {
+    if (mode < 0 || mode > PLAYER_SHUFFLE_ALBUMS) {
+        mode = PLAYER_SHUFFLE_SONGS;      /* an unknown mode is still "on" */
+    }
+    int deal = (mode != PLAYER_SHUFFLE_OFF && mode != g_shuffle);
+    g_shuffle = mode;
+    if (deal) {
         shuffle_build(g_queue_n > 0 ? g_queue_idx : PLAYER_KEEP_NONE);
     }
-    g_shuffle = on;
 }
 
 uint32_t player_order_seed(void) { return g_order_n ? g_order_seed : 0u; }
