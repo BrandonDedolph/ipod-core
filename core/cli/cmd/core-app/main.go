@@ -22,6 +22,13 @@
 // --screenshot is the review channel: a `-H windowsgui` process cannot
 // show anyone anything from a shell, and this writes the exact frame
 // the window would draw to a file that can be looked at.
+// Windows: cmd/core-app/rsrc_windows_*.syso carries the application manifest
+// (cmd/core-app/winres/winres.json): requireAdministrator, so the window asks
+// for elevation at launch through UAC and then reads the disk and flashes
+// in-process — no second process, no console. Regenerate after editing the
+// JSON (pure Go, no mingw):
+//
+//go:generate go run github.com/tc-hib/go-winres@v0.3.3 make --in winres/winres.json --out rsrc
 package main
 
 import (

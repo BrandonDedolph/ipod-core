@@ -727,6 +727,9 @@ func (u *UI) flashNote() string {
 		}
 		return name + " is not beside this app. Run:  " + name + " flash " + file
 	}
+	if u.st.Device.Elevated {
+		return "This window has Administrator rights: the write runs here. The whole partition is backed up first and the write is read back."
+	}
 	if runtime.GOOS == "windows" {
 		return "Runs " + name + " elevated (a UAC prompt appears). The whole partition is backed up first and the write is read back."
 	}

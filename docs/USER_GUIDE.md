@@ -183,9 +183,11 @@ The examples below call it `core`.
 a Music card (folder, Dry run, Sync, Sync + prune), a Firmware card (Check, Update, Flash file,
 Backup), Eject, and a log. It ships beside the command line from v0.1.3 as
 `core-app-windows-amd64.exe`, `core-app-darwin-arm64`, `core-app-darwin-amd64`,
-`core-app-linux-amd64` and `core-app-linux-arm64`. Keep `core` in the same folder: on Windows the
-window runs `core.exe` under Administrator for the flash, and without it the Firmware card prints
-the command to run instead. The confirmations are the ones the command line asks for — the device
+`core-app-linux-amd64` and `core-app-linux-arm64`. On Windows it asks for Administrator when it
+opens (one UAC prompt), because reading the iPod's raw disk needs it; that is also what lets it
+flash from the window with no second prompt. Keep `core` in the same folder anyway: a window that
+is somehow not elevated runs `core.exe` under Administrator for the flash, and without it the
+Firmware card prints the command to run instead. The confirmations are the ones the command line asks for — the device
 path typed exactly before a flash, the word `prune` before anything is deleted. It has not been on
 a device yet; it drives the same code the commands below do.
 

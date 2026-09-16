@@ -3,7 +3,9 @@
 Each release lists what changed on the device since the previous one. Versions are git tags;
 the boot screen and Settings → About show the one the device runs.
 
-## Unreleased
+## v0.1.3 — 2026-09-15
+
+Since v0.1.2. The firmware change is one marker; the release is the host app.
 
 - The image carries a `CORE-FW-VERSION:` marker so `core info` / `core update` can read the
   version off the device.
@@ -17,6 +19,8 @@ the boot screen and Settings → About show the one the device runs.
   by both tools, a sync that left the index byte-identical to the Python one.
 - The artist genre map is compiled into the binary, so a sync run away from the repository still
   applies it (the first on-device sync had written 919 empty genre fields).
+- On Windows `core-app` asks for Administrator when it opens (an embedded manifest), so the
+  window reads the iPod's disk and flashes in-process with no second prompt.
 
 ## v0.1.2 — 2026-09-14
 
