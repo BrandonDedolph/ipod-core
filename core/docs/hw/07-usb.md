@@ -153,6 +153,14 @@ struct command_status_wrapper {
 | `ALLOW_MEDIUM_REMOVAL` | `0x1E` | Tracked but not enforced |
 | `REPORT_LUNS`       | `0xA0`| List LUNs |
 
+> **`WRITE_BUFFER 0x3B` is not how our clock gets set.** That path needs the
+> DEVICE's own USB mass-storage stack answering the host — Apple's, or one we
+> wrote. We run neither: on the cable the boot ROM's disk mode is what answers,
+> and our firmware is not executing at all. So the host writes the time into
+> `CORECFG.DAT` instead and the firmware picks it up at its next boot; see
+> [06-power.md](06-power.md) "Real-time clock" and
+> `core/kernel/timesync.h`.
+
 ### Sense data layout
 
 ```c
