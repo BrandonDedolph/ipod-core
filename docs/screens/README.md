@@ -136,6 +136,7 @@ A screenshot here is a claim about what the device draws. So:
 | `nowplaying.png` `volume.png` `volume_limit.png` | Now Playing, volume plate, the plate at a Volume Limit (triangle marker) | `screen_nowplaying`, `screen_volume`, `screen_volume_limit` |
 | `hold_unlocked.png` `hold_locked.png` `hold_locked_list.png` | Hold-switch banners (Now Playing row / list chrome) | `screen_lock`, `screen_locked`, `screen_locked_list` |
 | `settings.png` `playback.png` `sound.png` `clicker.png` `theme.png` | Settings (the Playback still carries the strip's `SLEEP` token) | `screen_settings`, `screen_playback`, `screen_sound`, `screen_clicker`, `screen_theme` |
+| `datetime.png` `settime.png` `mainmenu_clock.png` | Settings > Date & Time, its field editor, and the main menu with Time in Title on (the clock is in the HEADER; the strip only carries it while nothing plays) | `screen_datetime`, `screen_settime`, `screen_mainmenu_clock` |
 | `about.png` `bootdetails.png` | About dashboard, Boot Details | `screen_about`, `screen_diag` |
 | `nowplaying_onyx.png` `albums_onyx.png` | the Onyx theme | `with_palette(ONYX, …)` |
 | `nowplaying_sage.png` | the Sage theme | `screen_nowplaying_sage` |
@@ -149,7 +150,7 @@ A screenshot here is a claim about what the device draws. So:
 Indexed here, not referenced by the top-level README: `demo.gif`, `hold.gif`,
 `volume.gif`, `music.png`, `songs.png`, `genres.png`, `sound.png`,
 `clicker.png`, `theme.png`, `hold_unlocked.png`, `hold_locked_list.png`, `loading_onyx.png`,
-`albums_onyx.png`. They stay in the gallery; the README shows a smaller set.
+`albums_onyx.png`, `datetime.png`, `mainmenu_clock.png`. They stay in the gallery; the README shows a smaller set.
 
 ## Keeping it honest
 

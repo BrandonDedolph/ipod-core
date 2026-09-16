@@ -172,7 +172,7 @@ version bump**: a build that predates Shuffle Albums reads a 2 as "shuffle on"
 nothing grew — the only kind of change an existing field is allowed to make.
 
 Everything after byte 11 was APPENDED under the same version 2, `length`
-growing each time (12 → 24 → 44 → 48) so that every record already written
+growing each time (12 → 24 → 44 → 48 → 64) so that every record already written
 still reads and every older build still reads a newer record. As shipped:
 
 ```
@@ -192,15 +192,73 @@ still reads and every older build still reads a newer record. As shipped:
 44  volume_limit       u8   10..100 (100 = no limit); 0 = UNSET -> 100
 45  eq                 u8   ui/eq.c preset id, 0 = Off (unknown -> Off)
 46  (reserved)         u16  0
-                            -- length 48, what this build writes --
+                            -- length 48 --
+48  host_epoch         u32  the HOST's UTC stamp; 0 = never stamped
+52  host_off_min       i16  the host's UTC offset then (-720..840)
+54  time_flags         u8   bit0 24-hour, bit1 clock in the title bar
+55  (reserved)         u8   0
+56  applied_epoch      u32  the host_epoch the firmware acted on; 0 = none
+60  utc_off_min        i16  the device's display offset (-720..840)
+62  (reserved)         u16  0
+                            -- length 64, what this build writes --
 ```
+
+### The time block is the one tail the HOST also writes
+
+Everything above is the device's. `host_epoch` / `host_off_min` are not: the
+iPod cannot be told the time over the cable (in disk mode it is Apple's boot
+ROM answering the host, not our firmware), so `core sync`, `core install` and
+`core eject` leave the time here and the firmware picks it up at its next boot.
+`applied_epoch` is the firmware's record of which stamp it has acted on, and
+the pair of them is what makes "apply a stamp AT MOST ONCE" expressible at all
+(`core/kernel/timesync.h` has the rules).
+
+**The boot write that marks a stamp is PRE-POLICY.** Every other save meets
+the commit gate's battery test with a real verdict; this one cannot. The
+low-battery policy answers from a level it only moves once its median ring
+holds five samples taken 5 s apart (`hal/hw/battery.c`), which is about twenty
+seconds into a boot that is still spinning the drive up — and sampling harder
+at boot would not help, because five conversions microseconds apart are one
+spin-up-sagged reading with a quorum rather than a median over time. So the
+mark is written against the policy's default. That is acceptable for this write
+specifically: the platters are already up from the mount and stay up for the index load, it
+is one sector, and the shut-off line cannot have been crossed yet because
+nothing has been able to judge the cell. It is not a licence for any other
+early write.
+
+Why a field in this record rather than a second file: the mark has to live
+somewhere the firmware can write, and this is the only such place; a second
+file would put the two halves of one state machine in two places, cost a second
+root-directory walk at boot and need its own pre-allocation path in three host
+tools.
+
+**How the host writes it safely.** It never creates, resizes or truncates the
+file. It reads both slots, copies the NEWEST one **verbatim**, patches
+`host_epoch` / `host_off_min` / `seq`+1 / the CRC, and writes those 1024 bytes
+into the OTHER slot through a handle opened without truncation. So: the device's
+own slot is untouched (it is the one the firmware would load if the host's write
+were lost), every field the host does not own survives byte for byte — including
+fields a newer firmware added that the host has never heard of — and the file's
+size, cluster chain and directory entry do not change, which is the same
+argument the firmware's own writes rest on. A record shorter than 64 bytes has
+its declared length grown, and the bytes between the old length and the block
+are zeroed rather than promoted: a 48-byte record has no `applied_epoch`, and
+inventing one out of padding would claim a stamp had been acted on when it had
+not. The three implementations are `StampConfigTime`
+(`core/cli/internal/devicefs/clock.go`), `make_config.py --stamp` (the
+reference) and the decoder in `config.c`; a Go test diffs the first two byte for
+byte.
 
 The resume fields are zeroed together with the locator (no track, no
 position and no context, enforced on BOTH sides of the codec). The sound
 tail carries one cross-field rule: `volume` is clamped to `volume_limit` on
 decode, so a record cannot bring the device up louder than the ceiling the
 user set — and a 44-byte record, which is what every device in the field
-holds, decodes as "no limit, EQ off" with its volume untouched.
+holds, decodes as "no limit, EQ off" with its volume untouched. The time block
+is gated the same way (a 48-byte record reads as "never stamped, 12-hour, no
+clock in the title"); its two offsets are clamped to the real-world zone range
+and its epochs are NOT clamped, because clamping an epoch would manufacture a
+date and judging one is `timesync_decide()`'s job.
 
 Loader validates magic + version + length + crc32. Any mismatch → defaults
 (writes stay enabled if the *file* resolved — writing slot 0 is how we

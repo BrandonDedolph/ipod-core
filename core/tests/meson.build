@@ -411,11 +411,13 @@ if target == 'sim'
   # Root rows return the right ENTER_*/RESET action codes plus value/kind report,
   # and that Sleep Timer cycles Off/15/30/60/90/120 reporting the SLEEPTIMER
   # action — "changed, but runtime-only", the code that keeps arming it off the
-  # user's disk.
+  # user's disk. kernel/datetime.c is linked because Date & Time's first row
+  # formats the injected clock through it.
   settings_test = executable(
     'settings_test',
-    sources: ['ui/settings_test.c', '../ui/settings.c', '../ui/eq.c'],
-    include_directories: include_directories('../ui'),
+    sources: ['ui/settings_test.c', '../ui/settings.c', '../ui/eq.c',
+              '../kernel/datetime.c'],
+    include_directories: include_directories('../ui', '.'),
     override_options: test_opts,
   )
   test('settings', settings_test, suite: 'unit')
@@ -433,6 +435,22 @@ if target == 'sim'
     override_options: test_opts,
   )
   test('eq', eq_test, suite: 'unit')
+
+  # settime: the Set Date & Time field editor's model (core/ui/settime.c) — the
+  # SAME source the ARM build links into core.elf. A field editor is nothing
+  # but edge cases and the only way to find them at the bench is to stand there
+  # turning a wheel, so: 31 January stepped into February (and into a leap
+  # February), the year clamping where every other field wraps, midnight and
+  # noon both reading 12, an AM/PM plate that moves the hour by exactly twelve
+  # without dragging the hour plate with it, and Select reporting "done"
+  # exactly once, on the last plate, in both 12- and 24-hour mode.
+  settime_test = executable(
+    'settime_test',
+    sources: ['ui/settime_test.c', '../ui/settime.c', '../kernel/datetime.c'],
+    include_directories: include_directories('../ui', '.'),
+    override_options: test_opts,
+  )
+  test('settime', settime_test, suite: 'unit')
 
   # palette: the seven theme tables + theme_set() (core/ui/palette.c) — the SAME
   # source the ARM build links into core.elf. Asserts every table is fully
@@ -853,6 +871,29 @@ if target == 'sim'
   )
   test('hw-battery', battery_trace_test, suite: 'unit')
 
+  # hw-rtc: the PCF50605 real-time clock (hal/hw/rtc.c over the same I2C
+  # register-pointer path the gauge uses), host-side under -DMMIO_MOCK. The RTC
+  # register map is NOT in docs/hw/ — it is datasheet-derived and unconfirmed
+  # on hardware — so this suite pins everything around that uncertainty: the
+  # exact read and write grammar (SC..WD, DT..YR, SC again; seven single-register
+  # writes seconds-first), the torn-read retry at a second boundary, and that
+  # every shape of wrong answer (bad BCD, the year-00 reset value, the NACK
+  # shape where i2c_read hands back the DATA registers' own last bytes) decodes
+  # as "unset" rather than as a plausible wrong date. kernel/datetime.c is
+  # linked because the driver converts through it.
+  rtc_trace_test = executable(
+    'rtc_trace_test',
+    sources: ['hw_mmio/rtc_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/rtc.c',
+              '../hal/hw/i2c.c',
+              '../kernel/datetime.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+    override_options: test_opts,
+  )
+  test('hw-rtc', rtc_trace_test, suite: 'unit')
+
   # hw-headphone-*: the headphone-jack insertion-detect driver
   # (hal/hw/headphone.c) — the SAME source the ARM build links — host-side
   # under -DMMIO_MOCK. The driver has three compile-time shapes and each
@@ -1136,6 +1177,40 @@ if target == 'sim'
     override_options: test_opts,
   )
   test('cfg-commit', cfg_commit_test, suite: 'unit')
+
+  # datetime: the civil<->epoch calendar (core/kernel/datetime.c) — the SAME
+  # source the ARM build links into core.elf. The clock's only purely
+  # arithmetic part, and the only one that can be settled COMPLETELY off the
+  # device, so it is: a hand table of dates derived outside this codebase (the
+  # epoch origin, both sides of 29 February in 2000 and 2004, the signed
+  # 32-bit roll, the last second of 2099) and then an EXHAUSTIVE walk of all
+  # 36 525 days from 2000-01-01 to 2099-12-31 in both directions, at both ends
+  # of each day, against an independently accumulated epoch and weekday. Plus
+  # the 12/24-hour formatter's edge hours and the local-offset conversion.
+  datetime_test = executable(
+    'datetime_test',
+    sources: ['kernel/datetime_test.c', '../kernel/datetime.c'],
+    include_directories: include_directories('../kernel', '.'),
+    override_options: test_opts,
+  )
+  test('datetime', datetime_test, suite: 'unit')
+
+  # timesync: what the firmware does at boot with the clock stamp the host
+  # leaves in CORECFG.DAT (core/kernel/timesync.c), and the software clock that
+  # carries the time between the rare RTC reads (core/kernel/wallclock.c) —
+  # both the SAME sources the ARM build links. Neither is testable on the
+  # device: the decision's two failure modes (applying a stale stamp on every
+  # boot, a lost mark making a stamp immortal) only appear across boots days
+  # apart, and the wallclock's whole difficulty is the 1 MHz counter's ~71.6
+  # minute wrap, which a two-hour run here crosses twice in milliseconds.
+  timesync_test = executable(
+    'timesync_test',
+    sources: ['kernel/timesync_test.c', '../kernel/timesync.c',
+              '../kernel/wallclock.c'],
+    include_directories: include_directories('../kernel', '.'),
+    override_options: test_opts,
+  )
+  test('timesync', timesync_test, suite: 'unit')
 
   # sort: the stable index-array merge sort (core/library/sort.c) every
   # alphabetised list is built with — the SAME source the ARM build links.

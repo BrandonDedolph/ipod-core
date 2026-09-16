@@ -360,6 +360,82 @@ bss +456 B, text +1.2 KB.
   (g) PLAY on an artist / genre / album row (the gesture) with Albums on:
       the queue it builds groups by album too — it goes through the same four
       builders, which is the whole reason the keys live on the entry.
+- **The iPod knows what time it is.** The PMIC has had a real-time clock in its
+  always-on domain since 2005 — it keeps counting through a suspend, a standby
+  and a power-off — and nothing in this firmware had ever read it. Now:
+  `hal/hw/rtc.c` reads and writes it over the I²C path the battery gauge
+  already uses, `kernel/datetime.c` does the calendar arithmetic (integer,
+  2000..2099), `kernel/wallclock.c` carries the time between reads over the
+  same µs counter the sleep timer counts on, and Settings > Date & Time sets
+  it, picks 12- or 24-hour and can put the clock in the title bar (the top band
+  while nothing plays, the main menu's header always — the track name always
+  wins the band; the width budget is in the commit).
+
+  **The host sets it, and it cannot do so directly.** On the cable it is
+  Apple's ROM disk mode answering the computer, not us, so `core sync`,
+  `core install` and `core eject` write the host's epoch and zone into a new
+  16-byte tail of `CORECFG.DAT` (payload 48..63, length 48 → 64, version still
+  2) and the firmware takes it at the next boot. `kernel/timesync.c` decides
+  once per stamp: apply it, or judge it stale because the running clock is
+  already more than ten minutes past it, and mark the record either way —
+  force-committed before the library loads, because a mark that never reached
+  the platter is a clock that walks backwards every boot. The host's write is
+  one slot, the one the device is NOT about to load, through a handle opened
+  without truncation, with every other byte copied verbatim;
+  `make_config.py --stamp` is the reference implementation and a Go test diffs
+  the two byte for byte.
+
+  Six new host suites in total (`datetime`, `timesync`, `settime`, `hw-rtc`
+  plus the extended `config`/`settings`), one of which walks all 36 525 days of
+  2000..2099. `make sim && meson test -C build-sim` green, `make hw && make
+  verify-hw` clean under gcc-16 `-Werror`, `go test ./...` green including the
+  Python parity test.
+
+  **THE REGISTER MAP IS NOT CONFIRMED.** Every RTC address is derived from the
+  public NXP PCF50606 datasheet and cross-checked against the six PMU registers
+  `core/docs/hw/06-power.md` already documented; the doc now carries the table
+  with a confidence column per register, the `RTCWAK` conflict (this doc says
+  bit 7, the datasheet map says bit 4 — unresolved, which is why there is no
+  alarm code) and the bench below. What makes it safe to ship unconfirmed is
+  the validity gate: strict BCD, a real calendar date, and year 00 — the
+  register file's reset value — read as "no time known". A wrong map reads as
+  unset, never as a plausible wrong date.
+
+  **Nothing here has been on a device.** The bench, in order:
+
+  1. Flash, boot, and read the UART/`CORELOG.BIN` line
+     `core: rtc raw SC MN HR WD DT MT YR valid N epoch XXXXXXXX` — one pass
+     over the chip, so those bytes are also the ones the boot decided from.
+     Every nibble ≤ 9 confirms BCD and
+     the block placement; whatever Apple's firmware left there also says
+     whether the OF used the same registers. If the bytes are not BCD, STOP:
+     the map is wrong, and the doc's table is where to fix it.
+  2. `core: timesync host … -> none` on that first boot (nothing has stamped
+     it yet), and Settings > Date & Time reads `Not set`.
+  3. Set 2026-… by hand from the editor. Check the `core: rtc set … rc 0`
+     line, that the row now reads the time, and that Time in Title puts it on
+     the band and in the main menu's header. `rc -2` means the write did not
+     take (a write-enable we do not know about); `rc -1` means the bus.
+  4. Power off with PLAY (PMU standby), wait an hour, boot: the clock must
+     have advanced by the wall-clock hour. That is the always-on-domain claim,
+     and it is the whole feature.
+  5. Suspend (hold PLAY) and wake: the `core: rtc wake` line, and a clock that
+     did not jump. This is the re-anchor the parked PLL makes necessary — and
+     that line is EXPECTED to report a drift roughly equal to the sleep, because
+     the µs timer does not run at 1 MHz through the park. A drift on the
+     half-hourly `core: rtc resync` line is the one that means something is
+     wrong. A `no answer` on the wake line means the clock went unknown until
+     the retry a minute later, by design (an untrustworthy delta is not folded
+     into a clock).
+  6. `core sync` from the host, then `core eject`, then boot the device: the
+     boot line should read `-> set` and the clock should be within a minute of
+     the computer's. Boot it a second time: `-> none` (the mark), and the clock
+     must NOT move backwards.
+  7. `core doctor --volume <iPod>` before and after that boot: `WARN clock …
+     pending` then `OK clock … applied by the device`.
+  8. Leave it a week and compare against a phone: drift, informational.
+  9. Drain or disconnect the cell once and read the raw bytes again: that is
+     the reset value, and it settles the "year 00 = unset" row in the doc.
 
 - **Pause on headphone unplug — the policy, and a probe that needs no cable.**
   The pause decision moved out of `kernel/main.c` (five untested inline lines
@@ -1349,6 +1425,14 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
    bench list. What is still not there: searching by genre or composer, art
    chips on album hits, and any narrowing of the scan (a full library walk
    per keystroke, timed onto the UART).
+2b. **Alarm.** The PCF50605 has a second calendar at `0x11..0x17`, an interrupt
+   bit and a wake-from-standby bit, and `docs/hw/06-power.md` now tables all
+   three. It is not implemented and there is no UI, for one reason: the doc and
+   the datasheet map disagree about where `RTCWAK` lives in `OOCC1` (bit 7 vs
+   bit 4), and `OOCC1` is the register that triggers standby — writing the
+   wrong bit into it is the one mistake on this chip that can leave an iPod
+   that will not wake. Settle it on the bench first (step 9 of the clock bench
+   above is the same session).
 3. **A screen-tuned font face.** Advances, kerning and tracking are all
    fixed and measured, and the type still reads wrong at 9–13 px. Nunito
    ships no hinting bytecode, so the next lever is swapping the face for

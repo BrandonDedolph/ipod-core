@@ -241,7 +241,13 @@ static int settings_eq(const settings_t *a, const settings_t *b)
            a->resume_seed == b->resume_seed &&
            a->resume_order_seed == b->resume_order_seed &&
            a->resume_order_keep == b->resume_order_keep &&
-           a->resume_ctx_hash == b->resume_ctx_hash;
+           a->resume_ctx_hash == b->resume_ctx_hash &&
+           a->time_24h == b->time_24h &&
+           a->time_in_title == b->time_in_title &&
+           a->utc_off_min == b->utc_off_min &&
+           a->host_epoch == b->host_epoch &&
+           a->host_off_min == b->host_off_min &&
+           a->applied_epoch == b->applied_epoch;
     /* sleep_timer_min is deliberately NOT compared: it is runtime-only and
      * never rides the record (settings.h), so decode always writes 0 into it
      * whatever the encoded struct held. test_codec pins that directly. */
@@ -270,6 +276,12 @@ static void spicy(settings_t *s)
      * limit that leaves the spicy volume (100) alone so the round trip is a
      * round trip. The limit-vs-volume coupling gets its own test. */
     s->volume_limit = 100; s->eq = 17;
+    /* The time block: both flags on, both offsets at opposite rails of the
+     * real-world range, and two DIFFERENT epochs so a codec that wrote one
+     * into both fields is caught. */
+    s->time_24h = 1; s->time_in_title = 1;
+    s->utc_off_min = 840; s->host_off_min = -720;
+    s->host_epoch = 1789555320u; s->applied_epoch = 1789555000u;
 }
 
 /* ---- mock-bus programming ---------------------------------------------- */
@@ -519,9 +531,11 @@ static void test_codec(void)
 #define T_LEN_V2      24u          /* + resume hash/secs/total, 4 bytes ea. */
 #define T_LEN_V2Q     44u          /* + the resume queue context (same ver) */
 #define T_LEN_V2S     48u          /* + the sound tail (limit, EQ; same ver) */
+#define T_LEN_V2T     64u          /* + the time block (host stamp + mark)  */
 #define T_OFF_RES     (T_OFF_PAYLOAD + T_LEN_V1)   /* 24: resume_hash      */
 #define T_OFF_CTX     (T_OFF_PAYLOAD + T_LEN_V2)   /* 36: resume_kind      */
 #define T_OFF_SND     (T_OFF_PAYLOAD + T_LEN_V2Q)  /* 56: volume_limit     */
+#define T_OFF_TIME    (T_OFF_PAYLOAD + T_LEN_V2S)  /* 60: host_epoch       */
 #define T_RESUME_MAX  86400u       /* the decoder's ceiling on both counts  */
 
 static void put32le(uint8_t *p, uint32_t v)
@@ -562,8 +576,8 @@ static void test_resume_record(void)
     config_encode(rec, &in, 7);
     check("record is version 2", rec[T_OFF_VERSION] == 2 &&
                                  rec[T_OFF_VERSION + 1] == 0);
-    check("record declares the v2 payload length, sound tail included",
-          rec[T_OFF_LENGTH] == T_LEN_V2S && rec[T_OFF_LENGTH + 1] == 0);
+    check("record declares the v2 payload length, time block included",
+          rec[T_OFF_LENGTH] == T_LEN_V2T && rec[T_OFF_LENGTH + 1] == 0);
     check("resume fields land at the documented offsets",
           get32le(&rec[T_OFF_RES])     == 0xDEADBEEFu &&
           get32le(&rec[T_OFF_RES + 4]) == 1234u &&
@@ -1398,6 +1412,134 @@ static void test_probe(void)
           config_probe_lba(CONFIG_SLOTS, &bad) != 0 && bad == 0);
 }
 
+/* ---- the time block ----------------------------------------------------
+ *
+ * This is the only tail in the record the HOST writes, which makes it the only
+ * one where "a record written by something that is not this firmware" is the
+ * NORMAL case rather than the corruption case. So: the fields land where the
+ * three independent encoders (config.c, tools/make_config.py,
+ * cli/internal/devicefs/config.go) all say they do, a record from before the
+ * clock reads as "never stamped", and the clamps hold.
+ */
+static void test_time_block(void)
+{
+    uint8_t rec[CONFIG_SLOT_BYTES];
+    settings_t in, out;
+    uint32_t seq = 0;
+
+    defaults(&in);
+    spicy(&in);
+    config_encode(rec, &in, 3);
+
+    check("time fields land at the documented offsets",
+          get32le(&rec[T_OFF_TIME])     == 1789555320u &&   /* 48 host_epoch  */
+          rec[T_OFF_TIME + 4] == 0x30 && rec[T_OFF_TIME + 5] == 0xFD &&
+                                                            /* 52 -720 as i16 */
+          rec[T_OFF_TIME + 6] == 0x03 &&                    /* 54 both flags  */
+          rec[T_OFF_TIME + 7] == 0 &&                       /* 55 reserved    */
+          get32le(&rec[T_OFF_TIME + 8]) == 1789555000u &&   /* 56 applied     */
+          rec[T_OFF_TIME + 12] == 0x48 && rec[T_OFF_TIME + 13] == 0x03 &&
+                                                            /* 60 +840 as i16 */
+          rec[T_OFF_TIME + 14] == 0 && rec[T_OFF_TIME + 15] == 0);
+
+    memset(&out, 0xA5, sizeof out);
+    check("the time block round-trips",
+          config_decode(rec, &out, &seq) == 1 && settings_eq(&in, &out));
+
+    /* A record from before the clock existed — 48 bytes, which is what every
+     * device that has taken the volume/EQ build is writing right now. */
+    config_encode(rec, &in, 4);
+    rec[T_OFF_LENGTH] = (uint8_t)T_LEN_V2S;
+    recrc(rec);
+    memset(&out, 0x5A, sizeof out);
+    check("a 48-byte record reads as never stamped, 12-hour, no title clock",
+          config_decode(rec, &out, &seq) == 1 &&
+          out.host_epoch == 0 && out.host_off_min == 0 &&
+          out.applied_epoch == 0 && out.utc_off_min == 0 &&
+          out.time_24h == 0 && out.time_in_title == 0 &&
+          out.volume_limit == in.volume_limit && out.eq == in.eq);
+
+    /* ...and so does a record one byte short of the block, for the same reason
+     * the resume tail is gated: `length` decides, not the bytes present. */
+    config_encode(rec, &in, 4);
+    rec[T_OFF_LENGTH] = (uint8_t)(T_LEN_V2T - 1u);
+    recrc(rec);
+    check("a length one byte short of the time block suppresses it",
+          config_decode(rec, &out, &seq) == 1 && out.host_epoch == 0 &&
+          out.applied_epoch == 0);
+
+    /* Clamps. The offsets are clamped to the real-world zone range; the epochs
+     * are NOT — judging an epoch is kernel/timesync.c's job, and clamping one
+     * would manufacture a date. */
+    config_encode(rec, &in, 5);
+    rec[T_OFF_TIME + 4] = 0x00;  rec[T_OFF_TIME + 5] = 0x80;   /* -32768 */
+    rec[T_OFF_TIME + 12] = 0xFF; rec[T_OFF_TIME + 13] = 0x7F;  /* +32767 */
+    rec[T_OFF_TIME + 6] = 0xFF;                                /* junk flags */
+    put32le(&rec[T_OFF_TIME], 0xFFFFFFFFu);                    /* absurd epoch */
+    recrc(rec);
+    check("offsets clamp to the real-world zone range, flags mask to two bits,"
+          " and the epoch comes through verbatim",
+          config_decode(rec, &out, &seq) == 1 &&
+          out.host_off_min == -720 && out.utc_off_min == 840 &&
+          out.time_24h == 1 && out.time_in_title == 1 &&
+          out.host_epoch == 0xFFFFFFFFu);
+
+    /*
+     * THE HOST'S PATCH, performed here exactly as StampConfigTime() and
+     * make_config.py --stamp perform it — copy the record verbatim, grow the
+     * declared length to 64, write host_epoch/host_off_min, bump seq,
+     * recompute the CRC — and then decoded by the FIRMWARE.
+     *
+     * This is the one edit to this file made by something that is not this
+     * firmware, and the thing it must not do is cost the device anything it
+     * had: the record being patched here carries a resume locator and a queue
+     * context, and both have to come back out the other side.
+     */
+    defaults(&in);
+    spicy(&in);
+    in.host_epoch = 0; in.host_off_min = 0;   /* a device that was never stamped */
+    config_encode(rec, &in, 11);
+    {
+        uint8_t patched[CONFIG_SLOT_BYTES];
+        memcpy(patched, rec, sizeof patched);
+        patched[T_OFF_LENGTH]     = (uint8_t)T_LEN_V2T;
+        patched[T_OFF_LENGTH + 1] = 0;
+        put32le(&patched[T_OFF_TIME], 1789555320u);          /* host_epoch */
+        patched[T_OFF_TIME + 4] = 0x4A;                      /* +330 min   */
+        patched[T_OFF_TIME + 5] = 0x01;
+        put32le(&patched[T_OFF_SEQ], 12u);
+        recrc(patched);
+
+        memset(&out, 0x5A, sizeof out);
+        check("the host's patched slot decodes on the device",
+              config_decode(patched, &out, &seq) == 1 && seq == 12u);
+        check("the host's stamp arrives intact",
+              out.host_epoch == 1789555320u && out.host_off_min == 330);
+        check("and the patch costs the device nothing it had",
+              out.resume_hash == in.resume_hash &&
+              out.resume_secs == in.resume_secs &&
+              out.resume_kind == in.resume_kind &&
+              out.resume_qidx == in.resume_qidx &&
+              out.resume_ctx_hash == in.resume_ctx_hash &&
+              out.volume_limit == in.volume_limit && out.eq == in.eq &&
+              out.applied_epoch == in.applied_epoch &&
+              out.utc_off_min == in.utc_off_min &&
+              out.time_24h == in.time_24h &&
+              out.time_in_title == in.time_in_title);
+    }
+
+    /* The host's two fields ride through a FIRMWARE save unchanged — that is
+     * what makes "applied == host" a stable comparison instead of a race. */
+    defaults(&in);
+    in.host_epoch = 1789555320u; in.host_off_min = 60;
+    in.applied_epoch = 0; in.utc_off_min = 0;
+    config_encode(rec, &in, 6);
+    check("a firmware save carries the host stamp through untouched",
+          config_decode(rec, &out, &seq) == 1 &&
+          out.host_epoch == 1789555320u && out.host_off_min == 60 &&
+          out.applied_epoch == 0 && out.utc_off_min == 0);
+}
+
 /* ---- 5. host/device format agreement ----------------------------------- */
 
 /*
@@ -1467,6 +1609,9 @@ static void test_host_fixture(const char *path)
           s.resume_hash == 0 && s.resume_secs == 0 && s.resume_total == 0 &&
           s.resume_kind == 0 && s.resume_qidx == 0 && s.resume_seed == 0 &&
           s.resume_order_seed == 0 && s.resume_order_keep == 0);
+    check("host record has no clock stamp: 48 bytes is short of the time block",
+          s.host_epoch == 0 && s.host_off_min == 0 && s.applied_epoch == 0 &&
+          s.utc_off_min == 0 && s.time_24h == 0 && s.time_in_title == 0);
     check("host tool leaves slot 1 empty for the first device write",
           config_decode(&blob[CONFIG_SLOT_BYTES], &s, &seq) == 0);
 }
@@ -1478,6 +1623,7 @@ int main(int argc, char **argv)
     test_resume_record();
     test_resume_context();
     test_sound_tail();
+    test_time_block();
     test_seq_order();
     test_two_slot();
     test_write_trace();

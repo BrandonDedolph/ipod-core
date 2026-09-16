@@ -52,6 +52,19 @@ the boot screen and Settings → About show the one the device runs.
   reads SHUF·ALB while albums are being shuffled. The setting rides the byte the old on/off flag
   used, so a record written by an earlier build loads unchanged and an earlier build reads Albums
   as Songs.
+- **The iPod knows what time it is.** The PMIC has always had a real-time clock in its always-on
+  domain — it keeps counting while the device is off — and nothing read it. Settings → Date & Time
+  sets it, chooses 12- or 24-hour, and can put the time in the title bar: on the top band while
+  nothing is playing, and in the main menu's header always. The track name always wins the top
+  band.
+- **The computer sets the clock.** `core sync`, `core install` and `core eject` write your
+  computer's time and time zone into `CORECFG.DAT`, and the iPod takes it at its next boot — it
+  cannot be told the time while it is plugged in, because on the cable it is Apple's disk mode
+  answering, not this firmware. `eject` stamps last, so the normal flow hands the device a time
+  seconds old. A clock already running more than ten minutes ahead is left alone rather than
+  dragged backwards by a stamp that might be days old; set that one by hand. `core doctor` prints
+  the stamp and whether the device has taken it.
+
 - **Volume Limit.** Settings → Sound has a ceiling on the volume, 10% to 100%, with 100% meaning
   no limit. Lower it below where the volume is and the volume comes down with it at once. On Now
   Playing a small triangle marks it on the volume bar and the wheel stops there; the bar keeps its

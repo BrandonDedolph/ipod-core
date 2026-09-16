@@ -23,6 +23,7 @@
 #include "hw/power.h"
 #include "hw/audio.h"
 #include "hw/piezo.h"
+#include "hw/rtc.h"
 #include "hal.h"
 #include "../fs/fat32.h"
 #include "../player/player.h"
@@ -59,6 +60,10 @@
 #include "../ui/gesture.h"
 #include "../ui/sleeptimer.h"
 #include "../ui/jackwatch.h"
+#include "../ui/settime.h"
+#include "datetime.h"
+#include "timesync.h"
+#include "wallclock.h"
 #include "hw/volume.h"
 
 /*
@@ -694,6 +699,34 @@ static jackwatch_t g_jack;
 static ui_window_t g_lock_flash;
 
 /*
+ * THE CLOCK (kernel/wallclock.h, kernel/datetime.h, hal/hw/rtc.h).
+ *
+ * g_wclock is the software clock: anchored from the PMIC's RTC at boot, after
+ * a manual set, after a suspend wake and every RTC_RESYNC_S, and carried in
+ * between on the same USEC_TIMER everything else here is timed by — so the
+ * displayed time costs no I2C traffic per frame. g_clock_min is the last
+ * minute painted, which is the whole repaint rule: one comparison per pass.
+ *
+ * g_settime is the Date & Time editor's model while that screen is up.
+ */
+static wallclock_t g_wclock;
+static settime_t   g_settime;
+static uint32_t    g_clock_min;          /* last painted minute; 0 = none yet */
+static uint32_t    g_clock_tick_us;      /* when the software clock last ticked */
+static uint32_t    g_clock_resync_us;    /* when it was last anchored from the chip */
+static int         g_clock_retry;        /* the last read got no answer: ask again soon */
+
+/* Half an hour between RTC reads. Long enough that the bus is effectively
+ * untouched, short enough that the USEC_TIMER's ~71.6-minute wrap cannot be
+ * missed even if the 5 s cadence stalls (wallclock.h's feed contract). */
+#define RTC_RESYNC_S    1800u
+/* ...but a read that got no answer is retried in a minute rather than in half
+ * an hour: the bus is shared with the codec and a single collision should not
+ * cost the clock its correction for a whole cadence. */
+#define RTC_RETRY_S     60u
+#define CLOCK_TICK_US   5000000u         /* fold the elapsed µs in every 5 s   */
+
+/*
  * Now-Playing scrub (seek) state.
  *
  * The decoders and the player have supported seeking all along
@@ -1152,17 +1185,174 @@ static int strip_sleep_token(int right_x, int y, uint16_t ink)
     return right_x - w;
 }
 
+/* ---------------------------------------------------------------------------
+ * The clock, as the UI reads it
+ * ------------------------------------------------------------------------- */
+
+/* The device's LOCAL epoch right now (the software clock plus the stored UTC
+ * offset). 1 when a time is known, 0 when it is not. */
+static int clock_local_epoch(uint32_t *local)
+{
+    uint32_t utc;
+    if (!wallclock_now(&g_wclock, mmio_read32(USEC_TIMER_ADDR), &utc)) {
+        return 0;
+    }
+    int off = g_settings.utc_off_min;
+    if (off < DATETIME_OFF_MIN || off > DATETIME_OFF_MAX) {
+        off = 0;                          /* a record from somewhere else */
+    }
+    if (off >= 0) {
+        *local = utc + (uint32_t)off * 60u;
+    } else {
+        uint32_t back = (uint32_t)(-off) * 60u;
+        if (back > utc) {
+            return 0;
+        }
+        *local = utc - back;
+    }
+    return 1;
+}
+
+/* The local time as a civil date; 0 when no time is known. */
+static int clock_local_now(datetime_t *out)
+{
+    uint32_t local;
+    return clock_local_epoch(&local) && datetime_from_epoch(local, out);
+}
+
+/*
+ * The clock as the strip and the main menu's header draw it ("10:42 AM" /
+ * "22:42"), into the CALLER's buffer — `buf` must hold DATETIME_TIME_MAX bytes.
+ * Writes "" when Time in Title is off or no time is known.
+ *
+ * The caller owns the buffer because both users of this string appear in one
+ * paint: main_menu_render passes the header's clock into menu_render_list,
+ * which paints the strip (and formats the clock again) BEFORE ui_header reads
+ * it. Off one shared static that is a reader of a buffer someone else has
+ * already rewritten — today with identical bytes, which is exactly the kind of
+ * bug that waits for the two call sites to diverge.
+ */
+static void clock_title_text(char *buf, int buf_sz)
+{
+    buf[0] = '\0';
+    datetime_t now;
+    if (!g_settings.time_in_title || !clock_local_now(&now)) {
+        return;
+    }
+    datetime_fmt_time(buf, buf_sz, &now, g_settings.time_24h);
+}
+
+/*
+ * Re-anchor the software clock from the chip, and narrate what the chip was
+ * doing. Called at boot, after a manual set, after a suspend wake and every
+ * RTC_RESYNC_S — never per frame: each call is three I2C transactions on the
+ * bus the codec shares.
+ *
+ * The two interesting answers are DEVICE items to read off the log: a drift
+ * bigger than a few seconds over half an hour means one of the two clocks is
+ * not what we think it is, and a chip that has not moved at all is the shape
+ * an absent PMU produces (hal/hw/rtc.c), which is declared "no time" rather
+ * than shown as a frozen plausible clock.
+ */
+/*
+ * `trust_timer` says whether the µs counter's delta since the last tick is
+ * meaningful. It is on the 30-minute cadence (the loop has been running) and
+ * OFF at a wake: the PLL was parked and the tick ran at 10 Hz, so the delta
+ * across a suspend is the one number in this module nobody should add to
+ * anything. That is why a wake whose RTC read gets no answer drops the clock
+ * instead of carrying it — the alternative is a clock wrong by the length of
+ * the sleep until the retry lands.
+ */
+static void clock_resync(const char *why, int trust_timer)
+{
+    uint32_t epoch = 0;
+    int      rc    = hal_rtc_get(&epoch);
+    uint32_t now   = mmio_read32(USEC_TIMER_ADDR);
+    int32_t  drift = 0;
+
+    /*
+     * -1 and 0 are the same answer to the BOOT question ("do we know the
+     * time?", hal.h) and different answers to this one. 0 means the chip says
+     * it has no time, and a software clock running on top of that is a fiction
+     * to be dropped. -1 means the bus did not answer — a transient on the bus
+     * the codec shares — and the clock we are already carrying is still the
+     * best information in the device. Keeping it costs nothing and losing it
+     * costs the user their clock for half an hour.
+     */
+    if (rc < 0 && g_wclock.valid && trust_timer) {
+        wallclock_tick(&g_wclock, now);        /* carry on from the timer */
+        g_clock_tick_us   = now;
+        g_clock_resync_us = now;
+        g_clock_retry     = 1;                 /* ...and ask again shortly */
+        uart_puts("core: rtc ");
+        uart_puts(why);
+        uart_puts(" no answer, keeping the software clock\n");
+        return;
+    }
+
+    wallclock_resync_t r = wallclock_resync(&g_wclock, rc == 1, epoch, now,
+                                            &drift);
+    g_clock_resync_us = now;
+    g_clock_tick_us   = now;
+    /* A bus that did not answer is asked again in a minute whatever else this
+     * call decided — including the wake, where the clock was just dropped
+     * because the park's delta could not be carried. Thirty minutes without a
+     * time, after a wake, for one I2C collision is not a cadence, it is an
+     * outage (STATUS.md, bench step 5). A chip that answered "no time" is not
+     * a retry: it will say the same thing in a minute. */
+    g_clock_retry     = (rc < 0) ? 1 : 0;
+
+    uart_puts("core: rtc ");
+    uart_puts(why);
+    uart_puts(" rc ");
+    uart_put_hex32((uint32_t)rc);
+    uart_puts(" epoch ");
+    uart_put_hex32(epoch);
+    if (r == WALLCLOCK_RESYNC_DRIFT) {
+        /* On the cadence a drift means one of the two clocks is not what we
+         * think it is. At a WAKE it means the obvious thing instead: the µs
+         * timer did not run at 1 MHz through the park, so the difference is
+         * roughly the length of the sleep. Both print the same way; the `why`
+         * on the line is what tells them apart. */
+        uart_puts(" drift ");
+        uart_put_hex32((uint32_t)drift);
+    } else if (r == WALLCLOCK_RESYNC_STOPPED) {
+        uart_puts(" stopped");
+    }
+    uart_putc('\n');
+}
+
+/*
+ * The STRIP's left slot, shared by the real strip and the Hold banner's
+ * recoloured copy of it.
+ *
+ * The track name wins whenever something is playing. That is the 2026-09-14
+ * decision — the strip is a now-playing readout — and it is also arithmetic:
+ * the left slot clips at 238 px and a 12-hour clock costs ~38 of them, so
+ * showing both would take a third of every title away permanently in exchange
+ * for a readout the main menu's header already carries.
+ */
+static const char *strip_left_text(char *buf, int buf_sz)
+{
+    if (player_active()) {
+        return track_display(player_track_name());
+    }
+    clock_title_text(buf, buf_sz);
+    return buf;
+}
+
 /* The top status strip: the now-playing track name on the left (so you always
  * see what's playing while browsing), battery on the right. During bring-up the
  * right side also shows raw millivolts (to calibrate the %-curve; see
  * battery.h "DEVICE-GATED CALIBRATION"). */
 static void status_strip_render(void)
 {
-    /* Left: the playing track, and NOTHING when nothing is playing — the strip
-     * is a now-playing readout, not a wordmark (the main menu's own header
-     * already says "Core"). Clipped by the right cluster, which is painted
-     * over it. */
-    const char *left = player_active() ? track_display(player_track_name()) : "";
+    /* Left: the playing track, else the clock when Time in Title is on, else
+     * NOTHING — the strip is a now-playing readout, not a wordmark (the main
+     * menu's own header already says "Core"). Clipped by the right cluster,
+     * which is painted over it. */
+    char clock[DATETIME_TIME_MAX];
+    const char *left = strip_left_text(clock, (int)sizeof clock);
 
     int bx = LCD_WIDTH - 12 - 24;             /* battery block (22 + 2 nub)        */
 
@@ -3563,6 +3753,14 @@ static void evlog_commit(int mode)
  * after the painter returns. */
 static void settings_render_cur(void)
 {
+    /* Date & Time's first row shows the time it would edit, and ui/settings.c
+     * is pure — it has no clock. Injected once per paint, the way the marquee's
+     * clock is injected into ui/chrome.c. */
+    {
+        uint32_t local = 0;
+        settings_set_now(clock_local_epoch(&local), local);
+    }
+
     if (g_set_screen == SETTINGS_ABOUT) {
         /* The counts are capped (LIB_MAX_SONGS/ALBUMS, ARTISTS_MAX,
          * LIB_MAX_GENRES). When a load actually hit one of those caps the
@@ -3627,6 +3825,8 @@ static void settings_render_cur(void)
                              g_diag_cfg_lba[0], g_diag_cfg_lba[1],
                              g_diag_log_lba[0], g_diag_log_lba[1],
                              CORE_BUILD_ID);
+    } else if (g_set_screen == SETTINGS_SETTIME) {
+        settime_render(&g_settime);
     } else {
         settings_render(g_set_screen, &g_settings, g_set_sel);
     }
@@ -3970,14 +4170,15 @@ static void menu_row_draw(int r, int idx)
              !g_menu_items[idx].active /*greyed*/, 0);
 }
 
-static void menu_render_list(const char *title, const menu_item_t *items,
+static void menu_render_list(const char *title, const char *right,
+                             const menu_item_t *items,
                              int n, int sel, int back)
 {
     g_menu_items = items;
     g_menu_sel   = sel;
     console_clear(LINEN_SURFACE);
     status_strip_render();
-    ui_header(title, "", back);
+    ui_header(title, right ? right : "", back);
     int top = ui_scroll_window(sel, n, LIST_ROWS);
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
@@ -3998,12 +4199,19 @@ static void main_menu_render(void)
 {
     int n = main_menu_count();
     if (g_main_sel >= n) g_main_sel = n - 1;   /* cursor was on a now-gone row */
-    menu_render_list("Core", g_main_menu, n, g_main_sel, 0);
+    /* The clock lives in the main menu's header slot, which is empty today and
+     * which ui_header measures BEFORE the title — so "Core" (30 px) and a
+     * clock cannot collide however wide the clock gets. This is the one place
+     * the time is shown while a track is playing: the strip keeps the track
+     * name (strip_left_text). */
+    char clock[DATETIME_TIME_MAX];
+    clock_title_text(clock, (int)sizeof clock);
+    menu_render_list("Core", clock, g_main_menu, n, g_main_sel, 0);
 }
 
 static void music_menu_render(void)
 {
-    menu_render_list("Music", g_music_menu, MU_COUNT, g_music_sel, 1);
+    menu_render_list("Music", NULL, g_music_menu, MU_COUNT, g_music_sel, 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -5887,7 +6095,8 @@ static void top_banner_render(int inverted, const uint16_t *bm, int bn, int bm_d
      * line as the announcement, then the divider in the band's own secondary
      * colour so the inverted block ends where the header does. */
     {
-        const char *left = player_active() ? track_display(player_track_name()) : "";
+        char clock[DATETIME_TIME_MAX];
+        const char *left = strip_left_text(clock, (int)sizeof clock);
         /* The banner owns the whole strip row for its second, so it has to
          * redraw the SLEEP token too (in the band's own secondary colour) or
          * the Hold banner would blink the countdown off. No padlock is drawn
@@ -6470,6 +6679,15 @@ static void suspend_to_ram(uint32_t play_down_us)
     uart_puts(standby_refused ? "core: suspend: wake (standby refused)\n"
                               : "core: suspend: wake\n");
     /*
+     * The clock, before anything paints one. The USEC_TIMER cannot be trusted
+     * across a suspend — the PLL was parked and the tick dropped to 10 Hz — so
+     * the software clock is RE-ANCHORED from the chip rather than carried over
+     * a gap it has no way to measure. The RTC itself kept counting: it is in
+     * the PMIC's always-on domain (docs/hw/06-power.md).
+     */
+    clock_resync("wake", 0);
+    g_clock_min = 0;                      /* the strip repaints with the screen */
+    /*
      * Panel back, in the only order that is safe: wake the panel driver,
      * render the real screen while everything is still dark, present it —
      * this present carries the BCM's ~500 ms panel init and does not return
@@ -6602,6 +6820,7 @@ _Noreturn static void run_ui(fat32_t *fs)
      * minus the named phases — absorbs this read either way; g_lib_load_ms is
      * measured inside library_ensure and is unaffected.
      */
+    int clock_mark_unsaved = 0;           /* see the timesync block below */
     settings_defaults(&g_settings);
     int cfg_ok = config_load(fs, &g_settings);
     uart_puts("core: cfg load ");
@@ -6625,6 +6844,120 @@ _Noreturn static void run_ui(fat32_t *fs)
     uart_putc('\n');
     g_diag_cfg_lba[0] = cfg_lba0;         /* Boot Details, without a spin-up      */
     g_diag_cfg_lba[1] = cfg_lba1;
+
+    /*
+     * THE CLOCK, decided once, here, while the drive is still spinning from
+     * the mount and before anything else can go wrong.
+     *
+     * The host cannot tell us the time — on the cable it is Apple's ROM disk
+     * mode answering, not us — so `core sync` / `core eject` / `core install`
+     * leave a stamp in the record we just loaded, and this is where it is
+     * judged. kernel/timesync.c owns the rules (one action per stamp, and a
+     * stamp the RTC has already run ten minutes past is inert); main.c owns
+     * only the wiring: read the chip, ask, act, record.
+     *
+     * The mark is FORCE-committed immediately rather than left to the debounce
+     * because the boot's own cfg_commit_clear() is a few lines below, and a
+     * mark that never reached the platter would let the same stamp be applied
+     * again on the next boot.
+     */
+    {
+        /* ONE pass over the chip: the raw bytes are logged and the decision is
+         * made from exactly those bytes. Reading twice would cost three more
+         * I2C transactions and, worse, let the log line and the decision
+         * disagree — and that line is the only evidence the register map is
+         * right at all (docs/hw/06-power.md, "Bench procedure"). */
+        uint32_t   now_us = mmio_read32(USEC_TIMER_ADDR);
+        uint8_t    raw[RTC_REG_COUNT];
+        datetime_t rtc_civil;
+        uint32_t   rtc_epoch = 0;
+        int        rtc_rc    = -1;            /* the bus did not answer */
+
+        if (rtc_read_raw(raw) == 0) {
+            uart_puts("core: rtc raw");
+            for (int i = 0; i < RTC_REG_COUNT; i++) {
+                uart_putc(' ');
+                uart_put_hex32(raw[i]);
+            }
+            rtc_rc = rtc_decode(raw, &rtc_civil);
+            if (rtc_rc == 1) {
+                rtc_epoch = datetime_to_epoch(&rtc_civil);
+            }
+            uart_puts(" valid ");
+            uart_put_hex32((uint32_t)rtc_rc);
+            uart_puts(" epoch ");
+            uart_put_hex32(rtc_epoch);
+            uart_putc('\n');
+        }
+
+        wallclock_anchor(&g_wclock, rtc_rc == 1, rtc_epoch, now_us);
+        g_clock_tick_us   = now_us;
+        g_clock_resync_us = now_us;
+        g_clock_retry     = (rtc_rc < 0);   /* no answer: ask again in a minute */
+
+        timesync_state_t ts = {
+            g_settings.host_epoch, g_settings.host_off_min,
+            g_settings.applied_epoch, g_settings.utc_off_min,
+        };
+        timesync_action_t act = timesync_decide(&ts, config_writable(),
+                                                rtc_rc == 1, rtc_epoch);
+        int set_rc = 0;
+        if (act == TIMESYNC_SET) {
+            set_rc = hal_rtc_set(ts.host_epoch);
+            if (set_rc == 0) {
+                wallclock_anchor(&g_wclock, 1, ts.host_epoch, now_us);
+            } else {
+                /* The write did not take. Leave the mark alone so the next
+                 * boot retries the same stamp; rule 5 bounds how far back
+                 * that can ever pull the clock. */
+                act = TIMESYNC_NONE;
+            }
+        }
+        if (timesync_apply(&ts, act)) {
+            g_settings.applied_epoch = ts.applied_epoch;
+            g_settings.utc_off_min   = ts.utc_off_min;
+            settings_touch();
+            settings_commit(CFG_COMMIT_FORCE);
+            /*
+             * THIS WRITE IS PRE-POLICY, deliberately. battery_disk_writes_
+             * allowed() answers from `bat_level`, and the policy cannot move
+             * that until its median ring holds BATTERY_FILTER_N samples — five
+             * of them, 5 s apart, so roughly 20 s into a boot that is still
+             * spinning the drive up (hal/hw/battery.c). Sampling the cell here
+             * would not change that: five conversions microseconds apart are
+             * not a median over time, they are one spin-up-sagged reading with
+             * a quorum, which is the decision the filter exists to refuse.
+             *
+             * That is acceptable for exactly this write: the platters are
+             * already up from the mount (the index load follows), it is one sector,
+             * and SHUTOFF cannot have fired yet (nothing has been able to
+             * judge the cell). Every later save meets the armed gate.
+             *
+             * What CAN still happen is a refusal for another reason, or a
+             * failed write — and either leaves the change PENDING, which
+             * cfg_commit_clear() at the end of this boot would throw away with
+             * the load's own dirt. Carry the fact forward so the mark is
+             * re-armed instead of lost; a lost mark means this stamp is
+             * applied again on the next boot, and on the one after that, for
+             * as long as the writes keep failing.
+             */
+            clock_mark_unsaved = g_cfg_commit.dirty;
+        }
+
+        uart_puts("core: timesync host ");
+        uart_put_hex32(g_settings.host_epoch);
+        uart_puts(" off ");
+        uart_put_hex32((uint32_t)(int32_t)g_settings.host_off_min);
+        uart_puts(" applied ");
+        uart_put_hex32(g_settings.applied_epoch);
+        uart_puts(" rtc ");
+        uart_put_hex32(rtc_epoch);
+        uart_puts(act == TIMESYNC_SET   ? " -> set"   :
+                  act == TIMESYNC_STALE ? " -> stale" : " -> none");
+        uart_puts(" rc ");
+        uart_put_hex32((uint32_t)set_rc);
+        uart_putc('\n');
+    }
 
     /* The saved theme is known now. Apply it BEFORE the library load so the
      * loading screen (and the album-chip placeholders below) come up in the
@@ -6695,6 +7028,14 @@ _Noreturn static void run_ui(fat32_t *fs)
      * number means "time until the device was ready", not "+1 frame". */
     g_boot_total_ms    = boot_ms_now();
     cfg_commit_clear(&g_cfg_commit);      /* loading is not a change to save back */
+    if (clock_mark_unsaved) {
+        /* ...but the clock's mark IS a change, and it did not reach the platter
+         * above. Re-arm it for the idle path rather than let the line above
+         * discard it (kernel/timesync.h: a stamp acted on but not marked is
+         * acted on again next boot). */
+        settings_touch();
+        uart_puts("core: timesync mark not saved yet — retrying\n");
+    }
     g_scr_n = 0;
     scr_push(SCR_MENU);
 
@@ -6873,6 +7214,53 @@ _Noreturn static void run_ui(fat32_t *fs)
             if (key != bat_glyph_prev || scr_cur() == SCR_CHARGING) {
                 bat_glyph_prev = key;
                 dirty = 1;
+            }
+        }
+
+        /*
+         * The clock. Three things, all of them cheap, none of them per frame:
+         *
+         *   - fold the elapsed microseconds into the software clock every 5 s.
+         *     The USEC_TIMER wraps every ~71.6 minutes and an unsigned delta
+         *     cannot tell one wrap from none (kernel/wallclock.h);
+         *   - re-anchor from the chip every half hour — three I2C transactions
+         *     an hour, and the only thing that corrects the timer's drift;
+         *   - repaint on the MINUTE EDGE, and only where a clock is drawn.
+         *     One comparison per pass, and then an ordinary `dirty` — a full
+         *     paint and present, once a minute, on a screen that is idle by
+         *     definition (a playing device repaints far more often than that).
+         *     A band-only present would be the cheaper thing to reach for, but
+         *     the clock sits in the header on the main menu and in a list row
+         *     under Settings, neither of which is the strip's band.
+         */
+        {
+            uint32_t now_us = mmio_read32(USEC_TIMER_ADDR);
+            if ((uint32_t)(now_us - g_clock_tick_us) >= CLOCK_TICK_US) {
+                wallclock_tick(&g_wclock, now_us);
+                g_clock_tick_us = now_us;
+            }
+            uint32_t due = (g_clock_retry ? RTC_RETRY_S : RTC_RESYNC_S) * 1000000u;
+            if ((uint32_t)(now_us - g_clock_resync_us) >= due) {
+                clock_resync("resync", 1);
+            }
+            uint32_t minute = 0;
+            if (wallclock_minute(&g_wclock, now_us, &minute) &&
+                minute != g_clock_min) {
+                g_clock_min = minute;
+                /*
+                 * Only screens that actually show a clock. Date & Time's first
+                 * row shows the time it would edit WHATEVER Time in Title says
+                 * — that row is how you read the clock with the setting off —
+                 * so it is outside the flag's test; the strip (idle) and the
+                 * main menu's header are inside it.
+                 */
+                int on_dt = (scr_cur() == SCR_SETTINGS &&
+                             g_set_screen == SETTINGS_DATETIME);
+                int in_title = g_settings.time_in_title &&
+                               (!player_active() || scr_cur() == SCR_MENU);
+                if (on_dt || in_title) {
+                    dirty = 1;
+                }
             }
         }
 
@@ -7808,6 +8196,64 @@ _Noreturn static void run_ui(fat32_t *fs)
                 break;
 
             case SCR_SETTINGS: {
+                /*
+                 * The Date & Time EDITOR is not a list: the wheel moves a
+                 * field's value, SELECT confirms a field and the last one
+                 * commits, MENU writes nothing at all. ui/settime.c owns every
+                 * one of those decisions (and every calendar edge case in
+                 * them); this arm is the wiring.
+                 */
+                if (g_set_screen == SETTINGS_SETTIME) {
+                    if (ev.wheel_delta) {
+                        settime_adjust(&g_settime, ev.wheel_delta);
+                        dirty = 1;
+                    }
+                    if (ev.buttons & WHEEL_BTN_SELECT) {
+                        if (settime_next(&g_settime)) {
+                            /* The last field: write the clock. The editor
+                             * shows LOCAL time and the chip holds UTC, so the
+                             * device's stored offset comes back off here. */
+                            datetime_t civil;
+                            settime_civil(&g_settime, &civil);
+                            uint32_t local = datetime_to_epoch(&civil);
+                            uint32_t utc   = 0;
+                            /* The editor clamps the YEAR to 2001..2099; the
+                             * zone can still push the UTC epoch off either end
+                             * (2001-01-01 00:30 at UTC+02:00 is 2000 in UTC).
+                             * datetime_utc_from_local refuses that rather than
+                             * wrapping, and the refusal takes the same path as
+                             * a failed write: the old time stands and the log
+                             * says so. */
+                            int rc = datetime_utc_from_local(
+                                         local, g_settings.utc_off_min, &utc)
+                                     ? hal_rtc_set(utc) : -3;
+                            uart_puts("core: rtc set ");
+                            uart_put_hex32(utc);
+                            uart_puts(" rc ");
+                            uart_put_hex32((uint32_t)rc);
+                            uart_putc('\n');
+                            if (rc == 0) {
+                                wallclock_anchor(&g_wclock, 1, utc,
+                                                 mmio_read32(USEC_TIMER_ADDR));
+                                g_clock_tick_us   = mmio_read32(USEC_TIMER_ADDR);
+                                g_clock_resync_us = g_clock_tick_us;
+                                g_clock_min       = 0;   /* repaint the strip */
+                            }
+                            /* A manual set NEVER touches applied_epoch: a
+                             * later host stamp is still news (timesync.h). */
+                            g_set_screen = SETTINGS_DATETIME;
+                            g_set_sel = g_set_accum = 0;
+                        }
+                        dirty = 1;
+                    }
+                    if (ev.buttons & WHEEL_BTN_MENU) {
+                        g_set_screen = SETTINGS_DATETIME;   /* nothing written */
+                        g_set_sel = g_set_accum = 0;
+                        dirty = 1;
+                    }
+                    break;
+                }
+
                 int scount = settings_count(g_set_screen);
                 int slider = (settings_kind(g_set_screen, g_set_sel)
                               == SETTINGS_KIND_SLIDER);
@@ -7868,6 +8314,29 @@ _Noreturn static void run_ui(fat32_t *fs)
                         case SETTINGS_ENTER_THEME:    target = SETTINGS_THEME;    break;
                         case SETTINGS_ENTER_CLICKER:  target = SETTINGS_CLICKER;  break;
                         case SETTINGS_ENTER_DIAG:     target = SETTINGS_DIAG;     break;
+                        case SETTINGS_ENTER_DATETIME: target = SETTINGS_DATETIME; break;
+                        case SETTINGS_ENTER_SETTIME:
+                            /* Seed the editor from the best time we have —
+                             * the running clock, else the host's stamp, else
+                             * ui/settime.c's own fixed default — and enter it
+                             * WITHOUT touching g_set_root_sel: the root's
+                             * remembered row belongs to Date & Time, which is
+                             * where MENU comes back to. */
+                            {
+                                datetime_t seed;
+                                int have = clock_local_now(&seed);
+                                if (!have && g_settings.host_epoch != 0) {
+                                    have = datetime_local(g_settings.host_epoch,
+                                                          g_settings.host_off_min,
+                                                          &seed);
+                                }
+                                settime_begin(&g_settime, have, &seed,
+                                              !g_settings.time_24h);
+                            }
+                            g_set_screen = SETTINGS_SETTIME;
+                            g_set_sel = g_set_accum = 0;
+                            g_set_editing = 0;
+                            break;
                         default: break;
                         }
                         if (target >= 0) {                 /* descend a screen  */
@@ -7903,7 +8372,32 @@ _Noreturn static void run_ui(fat32_t *fs)
                             lcd_present_fb(console_framebuffer());
                             power_enter_disk_mode();
                         } else if (act == SETTINGS_ACTION_RESET) {
+                            /* THE CLOCK IS NOT A SETTING. settings_defaults()
+                             * zeroes all six of its fields (it is also the
+                             * pre-load state, where a non-zero stamp would be
+                             * one nobody wrote), so the reset puts back the
+                             * three that are facts rather than preferences:
+                             * the host's stamp and offset, which the device may
+                             * not have acted on yet, and the DISPLAY OFFSET,
+                             * without which the clock on the strip, in the
+                             * header and in the editor would read UTC for the
+                             * rest of the session — and a manual set made in
+                             * that window would write local-as-UTC to the chip
+                             * and jump by the zone at the next boot.
+                             *
+                             * The MARK is deliberately not restored: the next
+                             * boot then re-examines the stamp (rule 5 decides
+                             * whether it is still worth applying), which is
+                             * what makes "a Reset does not cost you the clock"
+                             * true rather than a hope. What DOES reset are the
+                             * two rows: 12-hour, no clock in the title. */
+                            uint32_t host_epoch = g_settings.host_epoch;
+                            int      host_off   = g_settings.host_off_min;
+                            int      disp_off   = g_settings.utc_off_min;
                             settings_defaults(&g_settings);
+                            g_settings.host_epoch   = host_epoch;
+                            g_settings.host_off_min = host_off;
+                            g_settings.utc_off_min  = disp_off;
                             settings_apply();
                             sleep_timer_apply();           /* defaults() zeroed
                                                             * the row: disarm  */
@@ -8706,8 +9200,10 @@ _Noreturn void kernel_main(void) {
         cpu_boost();
 
         /* Bring up the I2C control bus now (not just at first-song hal_audio_init)
-         * so the status strip can read the PCF50605 battery gauge from the menu.
-         * Bounded/idempotent — hal_audio_init re-inits it harmlessly per track. */
+         * so the status strip can read the PCF50605 battery gauge from the menu
+         * — and so run_ui's boot block can read the same chip's clock, which it
+         * does before anything paints a time. Bounded/idempotent —
+         * hal_audio_init re-inits it harmlessly per track. */
         i2c_init();
         battery_init();
         hal_volume_init();               /* codec output gain -> safe default      */

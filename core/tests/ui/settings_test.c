@@ -215,29 +215,33 @@ int main(void)
           settings_activate(SETTINGS_ROOT, &s, 2) == SETTINGS_ENTER_THEME);
     check("enter-display",
           settings_activate(SETTINGS_ROOT, &s, 3) == SETTINGS_ENTER_DISPLAY);
+    check("enter-datetime",
+          settings_activate(SETTINGS_ROOT, &s, 5) == SETTINGS_ENTER_DATETIME);
     check("enter-about",
-          settings_activate(SETTINGS_ROOT, &s, 5) == SETTINGS_ENTER_ABOUT);
+          settings_activate(SETTINGS_ROOT, &s, 6) == SETTINGS_ENTER_ABOUT);
     check("enter-diag",
-          settings_activate(SETTINGS_ROOT, &s, 6) == SETTINGS_ENTER_DIAG);
+          settings_activate(SETTINGS_ROOT, &s, 7) == SETTINGS_ENTER_DIAG);
     check("diskmode-action",
-          settings_activate(SETTINGS_ROOT, &s, 7) == SETTINGS_ACTION_DISKMODE);
+          settings_activate(SETTINGS_ROOT, &s, 8) == SETTINGS_ACTION_DISKMODE);
     check("reset-action",
-          settings_activate(SETTINGS_ROOT, &s, 8) == SETTINGS_ACTION_RESET);
+          settings_activate(SETTINGS_ROOT, &s, 9) == SETTINGS_ACTION_RESET);
     /* Both fire on SELECT rather than descending — a SUBMENU kind here would
      * make the UI push a screen that does not exist. Boot Details, by
      * contrast, IS a screen, so it must stay a SUBMENU: the two action rows
      * are pinned by index, and inserting a row above them is exactly the edit
      * that would silently turn "Reset Settings" into "Disk Mode". */
     check("diag-is-submenu",
-          settings_kind(SETTINGS_ROOT, 6) == SETTINGS_KIND_SUBMENU);
+          settings_kind(SETTINGS_ROOT, 7) == SETTINGS_KIND_SUBMENU);
     check("diskmode-is-action",
-          settings_kind(SETTINGS_ROOT, 7) == SETTINGS_KIND_ACTION);
-    check("reset-is-action",
           settings_kind(SETTINGS_ROOT, 8) == SETTINGS_KIND_ACTION);
+    check("reset-is-action",
+          settings_kind(SETTINGS_ROOT, 9) == SETTINGS_KIND_ACTION);
     /* The labels, so an index shift cannot pass by renumbering alone. */
-    check("diag-label",     strcmp(settings_label(SETTINGS_ROOT, 6), "Boot Details") == 0);
-    check("diskmode-label", strcmp(settings_label(SETTINGS_ROOT, 7), "Disk Mode") == 0);
-    check("reset-label",    strcmp(settings_label(SETTINGS_ROOT, 8), "Reset Settings") == 0);
+    check("datetime-label", strcmp(settings_label(SETTINGS_ROOT, 5), "Date & Time") == 0);
+    check("about-label",    strcmp(settings_label(SETTINGS_ROOT, 6), "About") == 0);
+    check("diag-label",     strcmp(settings_label(SETTINGS_ROOT, 7), "Boot Details") == 0);
+    check("diskmode-label", strcmp(settings_label(SETTINGS_ROOT, 8), "Disk Mode") == 0);
+    check("reset-label",    strcmp(settings_label(SETTINGS_ROOT, 9), "Reset Settings") == 0);
     check("enter-clicker",
           settings_activate(SETTINGS_ROOT, &s, 4) == SETTINGS_ENTER_CLICKER);
     check("count-clicker", settings_count(SETTINGS_CLICKER) == 8);
@@ -247,7 +251,7 @@ int main(void)
     check("clicker-off", s.clicker == 0);
 
     /* --- Test 11: counts + generic value/kind reporting --- */
-    check("count-root",  settings_count(SETTINGS_ROOT) == 9);
+    check("count-root",  settings_count(SETTINGS_ROOT) == 10);
     check("count-play",  settings_count(SETTINGS_PLAYBACK) == 4);
     check("count-sound", settings_count(SETTINGS_SOUND) == 6);
     /* Addressed BY LABEL, so re-ordering the screen cannot pass by
@@ -684,6 +688,123 @@ int main(void)
               settings_activate(SETTINGS_SOUND, &s, 2) == SETTINGS_ACTION_NONE);
         check("none-eq-changed", memcmp(&copy, &s, sizeof s) != 0);
     }
+
+    /* --- Test 13: Date & Time ---------------------------------------------
+     * The screen is three rows, and the first one's VALUE is a clock this
+     * module cannot compute — main.c injects it. The injection seam is worth
+     * pinning because the failure it prevents is silent: with no clock, the
+     * row must say "Not set" rather than a plausible 1970 date. */
+    settings_defaults(&s);
+    check("dt-defaults", s.time_24h == 0 && s.time_in_title == 0 &&
+                         s.utc_off_min == 0 && s.host_epoch == 0 &&
+                         s.host_off_min == 0 && s.applied_epoch == 0);
+    check("dt-count", settings_count(SETTINGS_DATETIME) == 3);
+    /* The TITLE, for every screen. This is here because it was wrong: the
+     * renderer's own switch had no Date & Time case and titled the screen
+     * "Settings", while the committed gallery still (docs/screens/datetime.png)
+     * said "Date & Time". Asserting the model's answer for every screen is what
+     * stops the code and the picture saying different things again. */
+    check("titles",
+          strcmp(settings_title(SETTINGS_ROOT), "Settings") == 0 &&
+          strcmp(settings_title(SETTINGS_PLAYBACK), "Playback") == 0 &&
+          strcmp(settings_title(SETTINGS_SOUND), "Sound") == 0 &&
+          strcmp(settings_title(SETTINGS_DISPLAY), "Display") == 0 &&
+          strcmp(settings_title(SETTINGS_THEME), "Theme") == 0 &&
+          strcmp(settings_title(SETTINGS_CLICKER), "Clicker") == 0 &&
+          strcmp(settings_title(SETTINGS_DATETIME), "Date & Time") == 0 &&
+          strcmp(settings_title(SETTINGS_SETTIME), "Set Date & Time") == 0 &&
+          strcmp(settings_title(SETTINGS_ABOUT), "About") == 0 &&
+          strcmp(settings_title(SETTINGS_DIAG), "Boot Details") == 0);
+    check("titles: every screen in the enum has one, and nothing else does",
+          settings_title(SETTINGS_SCREEN_COUNT)[0] == '\0' &&
+          settings_title(-1)[0] == '\0');
+    {
+        /* No screen may fall through to a title that belongs to another one:
+         * the bug was exactly a missing case answering with the root's. */
+        int titled = 1;
+        for (int sc = 0; sc < SETTINGS_SCREEN_COUNT; sc++) {
+            const char *t = settings_title(sc);
+            if (t[0] == '\0') {
+                titled = 0;
+            }
+            if (sc != SETTINGS_ROOT && strcmp(t, "Settings") == 0) {
+                titled = 0;                 /* the fall-through shape */
+            }
+        }
+        check("titles: every screen has its own, none inherits the root's",
+              titled);
+    }
+    check("dt-labels",
+          strcmp(settings_label(SETTINGS_DATETIME, 0), "Set Date & Time") == 0 &&
+          strcmp(settings_label(SETTINGS_DATETIME, 1), "Time Format") == 0 &&
+          strcmp(settings_label(SETTINGS_DATETIME, 2), "Time in Title") == 0);
+    check("dt-kinds",
+          settings_kind(SETTINGS_DATETIME, 0) == SETTINGS_KIND_SUBMENU &&
+          settings_kind(SETTINGS_DATETIME, 1) == SETTINGS_KIND_SELECT &&
+          settings_kind(SETTINGS_DATETIME, 2) == SETTINGS_KIND_SELECT);
+    check("dt-enter-editor",
+          settings_activate(SETTINGS_DATETIME, &s, 0) == SETTINGS_ENTER_SETTIME);
+    {
+        char buf[SETTINGS_VALUE_MAX];
+        int tg = 0, on = 0, num = 0, den = 0;
+
+        /* No clock: the row says so. */
+        settings_set_now(0, 0);
+        settings_value(SETTINGS_DATETIME, &s, 0, buf, &tg, &on, &num, &den);
+        check("dt-now-unset", strcmp(buf, "Not set") == 0);
+
+        /* An epoch this device cannot hold is also "Not set" — a 1970 date on
+         * the row would look like a working clock. */
+        settings_set_now(1, 1000u);
+        settings_value(SETTINGS_DATETIME, &s, 0, buf, &tg, &on, &num, &den);
+        check("dt-now-out-of-range", strcmp(buf, "Not set") == 0);
+
+        /* 2026-09-16 10:42:00 local, in both formats. */
+        settings_set_now(1, 1789555320u);
+        settings_value(SETTINGS_DATETIME, &s, 0, buf, &tg, &on, &num, &den);
+        check("dt-now-12h", strcmp(buf, "10:42 AM") == 0);
+        settings_value(SETTINGS_DATETIME, &s, 1, buf, &tg, &on, &num, &den);
+        check("dt-format-12h", strcmp(buf, "12-hour") == 0);
+
+        check("dt-format-select",
+              settings_activate(SETTINGS_DATETIME, &s, 1) == SETTINGS_ACTION_NONE
+              && s.time_24h == 1);
+        settings_value(SETTINGS_DATETIME, &s, 0, buf, &tg, &on, &num, &den);
+        check("dt-now-24h", strcmp(buf, "10:42") == 0);
+        settings_value(SETTINGS_DATETIME, &s, 1, buf, &tg, &on, &num, &den);
+        check("dt-format-24h", strcmp(buf, "24-hour") == 0);
+
+        settings_value(SETTINGS_DATETIME, &s, 2, buf, &tg, &on, &num, &den);
+        check("dt-in-title-off", strcmp(buf, "Off") == 0);
+        check("dt-in-title-select",
+              settings_activate(SETTINGS_DATETIME, &s, 2) == SETTINGS_ACTION_NONE
+              && s.time_in_title == 1);
+        settings_value(SETTINGS_DATETIME, &s, 2, buf, &tg, &on, &num, &den);
+        check("dt-in-title-on", strcmp(buf, "On") == 0);
+    }
+    /* The wheel steps the two-valued rows and reports honestly: an even number
+     * of detents is not a change, so it earns no disk write. */
+    settings_defaults(&s);
+    check("dt-wheel",
+          settings_adjust(SETTINGS_DATETIME, &s, 1, +1) == 1 && s.time_24h == 1 &&
+          settings_adjust(SETTINGS_DATETIME, &s, 1, -1) == 1 && s.time_24h == 0 &&
+          settings_adjust(SETTINGS_DATETIME, &s, 2, +3) == 1 &&
+          s.time_in_title == 1);
+    check("dt-wheel-even-detents-are-not-a-change",
+          settings_adjust(SETTINGS_DATETIME, &s, 1, +2) == 0 && s.time_24h == 0 &&
+          settings_adjust(SETTINGS_DATETIME, &s, 0, +1) == 0);
+
+    /* settings_defaults() zeroes every clock field — it is the state before
+     * config_load() has read anything, so a host stamp surviving it would be a
+     * stamp nobody wrote. (kernel/main.c's Reset Settings puts the HOST's two
+     * fields back afterwards, so a Reset costs the mark and not the clock; that
+     * half is wiring and lives there.) */
+    s.host_epoch = 1789555320u; s.host_off_min = 120;
+    s.applied_epoch = 1789555320u; s.utc_off_min = 120;
+    settings_defaults(&s);
+    check("dt-reset-forgets-the-stamp",
+          s.host_epoch == 0 && s.applied_epoch == 0 && s.utc_off_min == 0 &&
+          s.host_off_min == 0);
 
     printf("settings_test: %s\n", g_fail ? "FAIL" : "OK");
     return g_fail ? 1 : 0;

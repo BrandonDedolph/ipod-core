@@ -495,12 +495,15 @@ if target == 'hw'
   # host settings_test compiles); eq.c is the equaliser preset table it and
   # kernel/main.c read; screen_settings.c draws it via the Nunito text
   # renderer + console fill_rect. main.c owns the settings_t state + navigation
-  # and calls these generically. No libc/libm/malloc; relative includes only
+  # and calls these generically. settime.c is the Date & Time field editor's
+  # model, pure the way settings.c is (the host settime_test compiles the SAME
+  # source); its painter sits beside the other Settings painters in
+  # screen_settings.c. No libc/libm/malloc; relative includes only
   # (settings.h, ui/text.h, ../kernel/console.h, ../hal/hal.h); stays -Werror.
   settings_hw_lib = static_library(
     'core_settings_hw',
     sources: ['ui/settings.c', 'ui/screen_settings.c', 'ui/palette.c',
-              'ui/eq.c'],
+              'ui/eq.c', 'ui/settime.c'],
     c_args: ['-DCORE_FREESTANDING'],
   )
 

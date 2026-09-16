@@ -191,6 +191,15 @@ type Plan struct {
 	// settings and their event log.
 	Config bool `json:"config"`
 	Log    bool `json:"log"`
+	// Clock says a run of this plan stamps the host's time into CORECFG.DAT
+	// for the device to pick up at its next boot. It is always true — the
+	// iPod cannot be told the time any other way (internal/devicefs/
+	// clock.go) and a stamp costs one 1024-byte write into a file that is
+	// being touched anyway — and it is true on a DRY RUN too, because a plan
+	// says what a real run would do. (A plan is only ever printed for a dry
+	// run, so making this false there made the line unprintable, which is
+	// how a user ended up with no way to learn that a sync sets the clock.)
+	Clock bool `json:"clock"`
 
 	Warnings []string `json:"warnings"`
 
@@ -440,6 +449,7 @@ func MakePlan(o Options, scan *library.Scan) (*Plan, error) {
 	// Device files.
 	p.Config = !configValid(o.Dst)
 	p.Log = !logValid(o.Dst)
+	p.Clock = true
 
 	// Prune: the device, minus the plan.
 	prune, bytes := planPrune(musicDir, keep)

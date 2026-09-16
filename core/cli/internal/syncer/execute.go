@@ -44,6 +44,10 @@ type Report struct {
 
 	ConfigCreated bool `json:"config_created"`
 	LogCreated    bool `json:"log_created"`
+	// ClockStamped is the moment written into CORECFG.DAT for the device to
+	// take at its next boot; the zero time means no stamp was written (a dry
+	// run, or a destination that turned out not to be a volume).
+	ClockStamped time.Time `json:"clock_stamped,omitzero"`
 
 	IndexWritten bool `json:"index_written"`
 	IndexBytes   int  `json:"index_bytes"`
@@ -268,6 +272,22 @@ func Execute(ctx context.Context, p *Plan, o Options) (*Report, error) {
 	rep.LogCreated = created
 	if created {
 		rep.Written = append(rep.Written, filepath.Join(o.Dst, devicefs.LogName))
+	}
+
+	// The clock. It goes here, right after the two device files and before the
+	// index, because CORECFG.DAT has just been guaranteed to exist — a fresh
+	// install therefore gets a clock on its very first boot. `core eject`
+	// stamps again on the way out, which is the one that actually matters
+	// (the error the device sees is the time between the stamp and the boot),
+	// but a sync the user never ejects from should not leave the iPod with no
+	// time at all.
+	if stamped, err := devicefs.StampConfigTime(o.Dst, time.Now()); err != nil {
+		// A clock is not worth failing a sync over: the music is already on
+		// the device and a missing stamp costs the user a wrong clock, not
+		// their library.
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("clock not stamped: %v", err))
+	} else {
+		rep.ClockStamped = stamped.When
 	}
 
 	// --- the index, last ---------------------------------------------------

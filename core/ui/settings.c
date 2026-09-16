@@ -15,6 +15,7 @@
 #include "settings.h"
 #include "palette.h"                   /* THEME_* ids + THEME_COUNT (header only) */
 #include "eq.h"                       /* EQ preset names + the locked shelves   */
+#include "../kernel/datetime.h"       /* the Date & Time row's clock formatter  */
 
 /* ---------------------------------------------------------------------------
  * Small freestanding helpers
@@ -186,9 +187,9 @@ static int sleep_step(int mins)
 /* Only rows that actually do something are listed — the cosmetic placeholders
  * (Crossfade, Replaygain, Skip Length, Stereo Width, Shortcuts, Language) were
  * removed so the menu never presents a control that has no effect. */
-static const char *const ROOT_L[9] = {
-    "Playback", "Sound", "Theme", "Display", "Clicker", "About",
-    "Boot Details", "Disk Mode", "Reset Settings",
+static const char *const ROOT_L[10] = {
+    "Playback", "Sound", "Theme", "Display", "Clicker", "Date & Time",
+    "About", "Boot Details", "Disk Mode", "Reset Settings",
 };
 /* Resume is back on this list: it was pulled with the other placeholders while
  * nothing could persist it, and it is now the switch that decides whether boot
@@ -203,6 +204,11 @@ static const char *const SOUND_L[6] = {
     "Volume", "Volume Limit", "EQ", "Bass", "Treble", "Balance",
 };
 static const char *const DISP_L[2] = { "Backlight", "Brightness" };
+/* Date & Time. The editor is behind the first row rather than being the screen
+ * itself because the other two are ordinary rows and a screen that is half a
+ * list and half a widget reads as neither. */
+static const char *const DT_L[3] = { "Set Date & Time", "Time Format",
+                                     "Time in Title" };
 /* Theme picker rows, in THEME_* id order (ui/palette.h) — the id IS the row. */
 static const char *const THEME_L[THEME_COUNT] = {
     [THEME_LINEN]    = "Linen",
@@ -255,17 +261,48 @@ void settings_defaults(settings_t *s)
      * Settings routes through here too, so it also disarms (main.c re-applies
      * the field to ui/sleeptimer.c after a reset). */
     s->sleep_timer_min   = 0;
+    /* The clock. 12-hour and no clock in the title bar, which is what the
+     * device does today.
+     *
+     * Every clock field is zeroed here, INCLUDING the host's stamp, because
+     * this function is also the state before config_load() has read anything:
+     * a non-zero host_epoch that no record put there would be a stamp invented
+     * out of nothing. Reset Settings routes through here too, and kernel/main.c
+     * puts the host's two fields back afterwards — they are the host's, not a
+     * preference of the user's, and a Reset that threw away a stamp the device
+     * had not acted on yet would leave it with no time at all until the next
+     * sync. */
+    s->time_24h          = 0;
+    s->time_in_title     = 0;
+    s->utc_off_min       = 0;
+    s->host_epoch        = 0;
+    s->host_off_min      = 0;
+    s->applied_epoch     = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * The injected clock (settings.h, settings_set_now)
+ * ------------------------------------------------------------------------- */
+static int      g_now_valid;
+static uint32_t g_now_local;
+
+void settings_set_now(int valid, uint32_t local_epoch)
+{
+    g_now_valid = valid ? 1 : 0;
+    g_now_local = local_epoch;
 }
 
 int settings_count(int screen)
 {
     switch (screen) {
-    case SETTINGS_ROOT:     return 9;
+    case SETTINGS_ROOT:     return 10;
     case SETTINGS_PLAYBACK: return 4;
     case SETTINGS_SOUND:    return 6;
     case SETTINGS_DISPLAY:  return 2;
     case SETTINGS_ABOUT:    return 1;   /* non-interactive info page */
     case SETTINGS_DIAG:     return 1;   /* non-interactive info page */
+    case SETTINGS_DATETIME: return 3;
+    case SETTINGS_SETTIME:  return 1;   /* the editor; main.c drives it */
     case SETTINGS_THEME:    return THEME_COUNT;
     case SETTINGS_CLICKER:  return CLICK_N;   /* Off + sound profiles */
     default:                return 0;
@@ -282,6 +319,7 @@ const char *settings_label(int screen, int idx)
     case SETTINGS_PLAYBACK: return PLAY_L[idx];
     case SETTINGS_SOUND:    return SOUND_L[idx];
     case SETTINGS_DISPLAY:  return DISP_L[idx];
+    case SETTINGS_DATETIME: return DT_L[idx];
     case SETTINGS_THEME:    return THEME_L[idx];
     case SETTINGS_CLICKER:  return CLICK_L[idx];
     default:                return "";
@@ -304,12 +342,29 @@ const char *settings_clicker_name(int profile)
     return CLICK_L[profile];
 }
 
+const char *settings_title(int screen)
+{
+    switch (screen) {
+    case SETTINGS_ROOT:     return "Settings";
+    case SETTINGS_PLAYBACK: return "Playback";
+    case SETTINGS_SOUND:    return "Sound";
+    case SETTINGS_DISPLAY:  return "Display";
+    case SETTINGS_THEME:    return "Theme";
+    case SETTINGS_CLICKER:  return "Clicker";
+    case SETTINGS_DATETIME: return "Date & Time";
+    case SETTINGS_SETTIME:  return "Set Date & Time";
+    case SETTINGS_ABOUT:    return "About";
+    case SETTINGS_DIAG:     return "Boot Details";
+    default:                return "";
+    }
+}
+
 int settings_kind(int screen, int idx)
 {
     switch (screen) {
     case SETTINGS_ROOT:
         /* Disk Mode + Reset Settings both fire on SELECT; the rest descend. */
-        if (idx == 7 || idx == 8) return SETTINGS_KIND_ACTION;
+        if (idx == 8 || idx == 9) return SETTINGS_KIND_ACTION;
         return SETTINGS_KIND_SUBMENU;                 /* incl. Clicker submenu */
     case SETTINGS_CLICKER:
         return SETTINGS_KIND_SELECT;                  /* radio pick, marked active */
@@ -322,8 +377,12 @@ int settings_kind(int screen, int idx)
         return (idx == 1) ? SETTINGS_KIND_SLIDER : SETTINGS_KIND_SELECT;
     case SETTINGS_THEME:
         return SETTINGS_KIND_THEME;
+    case SETTINGS_DATETIME:
+        /* Set Date & Time descends into the editor; the other two cycle. */
+        return (idx == 0) ? SETTINGS_KIND_SUBMENU : SETTINGS_KIND_SELECT;
     case SETTINGS_ABOUT:
     case SETTINGS_DIAG:
+    case SETTINGS_SETTIME:
         return SETTINGS_KIND_INFO;
     default:
         return SETTINGS_KIND_SELECT;
@@ -400,6 +459,26 @@ void settings_value(int screen, const settings_t *s, int idx,
         }
         break;
 
+    case SETTINGS_DATETIME:
+        switch (idx) {
+        /* The clock as it is right now, in the format the row below selects —
+         * injected by main.c (settings_set_now), because this module has no
+         * idea what time it is. */
+        case 0: {
+            datetime_t now;
+            if (!g_now_valid || !datetime_from_epoch(g_now_local, &now) ||
+                datetime_fmt_time(buf, SETTINGS_VALUE_MAX, &now,
+                                  s->time_24h) == 0) {
+                scopy(buf, "Not set");
+            }
+            break;
+        }
+        case 1: scopy(buf, s->time_24h ? "24-hour" : "12-hour"); break;
+        case 2: scopy(buf, s->time_in_title ? "On" : "Off"); break;
+        default: break;
+        }
+        break;
+
     case SETTINGS_DISPLAY:
         if (idx == 0) {
             if (s->backlight_secs == 0) {
@@ -442,10 +521,23 @@ int settings_activate(int screen, settings_t *s, int idx)
         case 2: return SETTINGS_ENTER_THEME;
         case 3: return SETTINGS_ENTER_DISPLAY;
         case 4: return SETTINGS_ENTER_CLICKER;
-        case 5: return SETTINGS_ENTER_ABOUT;
-        case 6: return SETTINGS_ENTER_DIAG;
-        case 7: return SETTINGS_ACTION_DISKMODE;
-        case 8: return SETTINGS_ACTION_RESET;
+        case 5: return SETTINGS_ENTER_DATETIME;
+        case 6: return SETTINGS_ENTER_ABOUT;
+        case 7: return SETTINGS_ENTER_DIAG;
+        case 8: return SETTINGS_ACTION_DISKMODE;
+        case 9: return SETTINGS_ACTION_RESET;
+        default: return SETTINGS_ACTION_NOOP;
+        }
+
+    case SETTINGS_DATETIME:
+        switch (idx) {
+        case 0: return SETTINGS_ENTER_SETTIME;
+        /* Both rows are two-valued, so SELECT always changes something. The
+         * format is a display preference and the clock in the title bar is a
+         * display preference; neither touches the RTC. */
+        case 1: s->time_24h = !s->time_24h; return SETTINGS_ACTION_NONE;
+        case 2: s->time_in_title = !s->time_in_title;
+                return SETTINGS_ACTION_NONE;
         default: return SETTINGS_ACTION_NOOP;
         }
 
@@ -547,6 +639,20 @@ int settings_adjust(int screen, settings_t *s, int idx, int delta)
                 s->balance = nv; return nv != old;
         default: return 0;
         }
+
+    case SETTINGS_DATETIME:
+        /* The wheel steps the two-valued rows the way it steps Backlight: any
+         * detent lands on the other value, and an even count lands back where
+         * it started, so the record only moves when the value does. */
+        if (idx == 1 || idx == 2) {
+            int *field = (idx == 1) ? &s->time_24h : &s->time_in_title;
+            if ((delta & 1) == 0) {
+                return 0;
+            }
+            *field = !*field;
+            return 1;
+        }
+        return 0;
 
     case SETTINGS_DISPLAY:
         if (idx == 1) {

@@ -9,10 +9,10 @@ import (
 	"strings"
 )
 
-// Eject on macOS is diskutil, which flushes, unmounts every volume on
+// ejectVolume on macOS is diskutil, which flushes, unmounts every volume on
 // the disk and powers it down in one step. It accepts a mount point, a volume
 // node or a whole-disk node, so whatever the user typed goes straight through.
-func Eject(w io.Writer, target string) error {
+func ejectVolume(w io.Writer, target string) error {
 	if p, err := exec.LookPath("sync"); err == nil {
 		if err := exec.Command(p).Run(); err != nil {
 			fmt.Fprintf(w, "warning: sync failed (%v)\n", err)

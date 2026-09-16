@@ -20,10 +20,12 @@
 #define _DEFAULT_SOURCE   /* clock_gettime, struct timespec on glibc */
 
 #include "../hal.h"
+#include "../../kernel/datetime.h"   /* the supported epoch range, shared with hal/hw/rtc.c */
 
 #include <SDL2/SDL.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -261,6 +263,54 @@ uint32_t clock_us(void) {
 
 void sleep_ms(uint32_t ms) {
     SDL_Delay(ms);
+}
+
+/* ---------- Real-time clock ----------------------------------------
+ *
+ * The host has a perfectly good clock, so the sim's RTC is that clock plus an
+ * offset hal_rtc_set() moves — setting the time in the sim's Date & Time
+ * editor behaves like setting it on the device (the reading changes and keeps
+ * running) without touching the machine's own clock.
+ *
+ *   CORE_SIM_RTC_UNSET=1   answer "unset", the way a device whose cell has
+ *                          been flat since the factory does. The one state
+ *                          that is otherwise unreachable on a host.
+ */
+static int32_t g_rtc_off_s;    /* seconds added to the host's wall clock */
+
+static int sim_rtc_unset(void) {
+    static int cached = -1;    /* -1: environment not consulted yet */
+    if (cached < 0) {
+        const char *e = getenv("CORE_SIM_RTC_UNSET");
+        cached = (e != NULL && atoi(e) != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+int hal_rtc_get(uint32_t *epoch) {
+    if (epoch == NULL) {
+        return 0;
+    }
+    if (sim_rtc_unset()) {
+        return 0;
+    }
+    int64_t now = (int64_t)time(NULL) + (int64_t)g_rtc_off_s;
+    if (now < 0) {
+        return 0;
+    }
+    *epoch = (uint32_t)now;
+    return 1;
+}
+
+int hal_rtc_set(uint32_t epoch) {
+    /* Same range gate as the hw driver (hal/hw/rtc.c): the sim must refuse
+     * exactly what the device refuses, or a screen that works here fails
+     * there. */
+    if (epoch < DATETIME_EPOCH_2001 || epoch >= DATETIME_EPOCH_2100) {
+        return -3;
+    }
+    g_rtc_off_s = (int32_t)((int64_t)epoch - (int64_t)time(NULL));
+    return 0;
 }
 
 /* ---------- Audio (SDL2 callback) ---------------------------------- */

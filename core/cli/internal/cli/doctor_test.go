@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/cidx"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/devicefs"
@@ -247,5 +250,64 @@ func TestDoctorHasItsFlags(t *testing.T) {
 	}
 	if cmd.InheritedFlags().Lookup("device") == nil {
 		t.Error("core doctor cannot see the global --device flag")
+	}
+}
+
+// The clock line. A wrong clock on the iPod has exactly three causes and
+// doctor has to tell them apart: nothing ever stamped it, a stamp is waiting
+// for the device to boot, or the device has already taken the stamp and the
+// clock is simply what it is.
+func TestDoctorReportsTheClock(t *testing.T) {
+	vol := syntheticVolume(t, 10, nil)
+
+	out, _, err := runCore(t, "doctor", "--volume", vol)
+	if err != nil {
+		t.Fatalf("doctor: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "WARN  clock        never stamped") {
+		t.Errorf("a volume that has never been stamped does not say so:\n%s", out)
+	}
+
+	// After a sync-style stamp: pending, because the device has not booted.
+	now := time.Unix(1789555320, 0).In(time.FixedZone("CEST", 2*3600))
+	if _, err := devicefs.StampConfigTime(vol, now); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err = runCore(t, "doctor", "--volume", vol)
+	if err != nil {
+		t.Fatalf("doctor: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "WARN  clock") || !strings.Contains(out, "pending") ||
+		!strings.Contains(out, "2026-09-16 10:42 UTC (UTC+02:00)") {
+		t.Errorf("a pending stamp is not reported with its time and zone:\n%s", out)
+	}
+
+	// Now pretend the device booted and marked it: applied_epoch := host_epoch.
+	cfg := filepath.Join(vol, devicefs.ConfigName)
+	b, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newest, _ := devicefs.ConfigFileValid(b)
+	for i := 0; i < devicefs.ConfigSlots; i++ {
+		off := i * devicefs.ConfigSlotBytes
+		slot := b[off : off+devicefs.ConfigSlotBytes]
+		if seq, _, ok := devicefs.DecodeConfigSlot(slot); !ok || seq != newest {
+			continue
+		}
+		// payload offset 48 = host_epoch, 56 = applied_epoch (the record
+		// layout in core/kernel/config.c).
+		copy(slot[12+56:12+60], slot[12+48:12+52])
+		binary.LittleEndian.PutUint32(slot[1020:], crc32.ChecksumIEEE(slot[:1020]))
+	}
+	if err := os.WriteFile(cfg, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err = runCore(t, "doctor", "--volume", vol)
+	if err != nil {
+		t.Fatalf("doctor: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "OK    clock") || !strings.Contains(out, "applied by the device") {
+		t.Errorf("an applied stamp is not reported as done:\n%s", out)
 	}
 }

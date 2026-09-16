@@ -82,6 +82,12 @@
  *         the same way, length 44 -> 48. A 44-byte record (every device in
  *         the field today) reads as "no volume limit, EQ off", which is what
  *         those devices already do.
+ *       + the time block (the host's clock stamp and the firmware's mark, 16
+ *         more bytes) — appended the same way again, length 48 -> 64. A
+ *         48-byte record reads as "never stamped", and this is the one tail
+ *         the HOST also writes: see the P_HOST_EPOCH block in config.c for
+ *         why the host patches a slot of this file instead of shipping a
+ *         second one, and kernel/timesync.h for what boot does with it.
  *
  * Payload byte 0 (shuffle) widened from a 0/1 flag to the three-way
  * shuffle_mode_t (0 off, 1 songs, 2 albums) WITHOUT a version bump: an older

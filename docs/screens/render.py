@@ -300,6 +300,7 @@ class Face:
         self.name = "%s@%d" % (ttf, size)
         self.tracking = _atlas_field(header, "tracking")     # 26.6
         self.ascent = _atlas_field(header, "ascent")
+        self.descent = _atlas_field(header, "descent")
         self.line_height = _atlas_field(header, "line_height")
         self._adv = {" ": _atlas_space_advance(header)}   # the device's space, not PIL's
         self._kern = _atlas_kern(header)          # (left idx, right idx) -> 1/32 px
@@ -1501,6 +1502,20 @@ MAIN_MENU_FULL = [  # full menu, a track is loaded so "Now Playing" shows active
 def screen_mainmenu():
     return screen_menu("Core", MAIN_MENU_FULL, 0, back=False)
 
+def screen_mainmenu_clock():
+    """The main menu with Time in Title on: the clock lives in the HEADER's
+    right slot (main.c main_menu_render), not on the strip — the strip keeps
+    the playing track. Nothing is playing here, so the strip carries the clock
+    too, which is the other half of the same setting."""
+    sc = Screen()
+    status_strip(sc, "10:42 AM")
+    header(sc, "Core", "10:42 AM", back=False)
+    for i, (label, active) in enumerate(MAIN_MENU_FULL[:-1]):   # nothing playing
+        list_row(sc, LIST_Y0, i, label, chevron=True, selected=(i == 0),
+                 greyed=not active)
+    return sc.img
+
+
 def screen_music():
     return screen_menu("Music", MUSIC_MENU, 2, back=True)   # Albums selected
 
@@ -1802,11 +1817,11 @@ def screen_search_results(sel=0):
 def _sel_bar(sc, y0, rowh, r):
     sc.fill_round_rect(6, y0 + r * rowh + 1, W - 16, rowh - 2, 4, SEL_BG)
 
-# The root Settings list — core/ui/settings.c ROOT_L, all nine rows. Nine rows
+# The root Settings list — core/ui/settings.c ROOT_L, all ten rows. Ten rows
 # do not fit in the eight the panel has room for, so this list SCROLLS and
 # carries a scrollbar (core/ui/screen_settings.c list_render / st_scrollbar).
-ROOT_L = ["Playback", "Sound", "Theme", "Display", "Clicker", "About",
-          "Boot Details", "Disk Mode", "Reset Settings"]
+ROOT_L = ["Playback", "Sound", "Theme", "Display", "Clicker", "Date & Time",
+          "About", "Boot Details", "Disk Mode", "Reset Settings"]
 ROOT_SEL = 1   # Sound
 
 def scroll_window(sel, total, visible):
@@ -1839,6 +1854,73 @@ def screen_settings(sel=ROOT_SEL):
         else:
             sc.text(W - 18, ry + 15, RAQUO, FONT_ROW, chevc)
     scrollbar(sc, LIST_Y0, top, LIST_ROWS, len(ROOT_L))
+    return sc.img
+
+
+# ---------------------------------------------------------------------------
+# Settings > Date & Time — core/ui/settings.c DT_L, and the field editor behind
+# its first row (core/ui/screen_settings.c settime_render).
+# ---------------------------------------------------------------------------
+DT_L = [("Set Date & Time", "10:42 AM"), ("Time Format", "12-hour"),
+        ("Time in Title", "On")]
+DT_SEL = 0
+
+def screen_datetime(sel=DT_SEL):
+    sc = Screen()
+    header(sc, "Date & Time", back=True)
+    status_strip(sc)                 # main.c settings_render_cur
+    for r, (label, val) in enumerate(DT_L):
+        ry = LIST_Y0 + r * ROW_H
+        is_sel = (r == sel)
+        if is_sel:
+            _sel_bar(sc, LIST_Y0, ROW_H, r)
+        fg = SEL_FG if is_sel else INK
+        rightc = SEL_SUB if is_sel else MUTED_D
+        sc.text(14, ry + 15, label, FONT_HEADER if is_sel else FONT_ROW, fg)
+        sc.text_right(W - 16, ry + 15, val, regular_11, rightc)
+    return sc.img
+
+
+# The editor's plates: (text, width). The gaps are the ones settime_render
+# uses — 10 between plates, 22 between the date and the time, 8 for the colon —
+# so this still is the same 282 px row, centred, that the device draws.
+ST_PLATES = [("2026", 52, "YEAR"), ("Sep", 34, "MONTH"), ("16", 34, "DAY"),
+             ("10", 34, "HOUR"), ("42", 34, "MINUTE"), ("AM", 34, "")]
+ST_GAPS = [0, 10, 10, 22, 8, 10]
+ST_SEL = 1        # MONTH, so the still shows the inversion on a plate
+ST_PLATE_Y, ST_PLATE_H, ST_PLATE_R = 100, 34, 6
+
+def screen_settime(sel=ST_SEL):
+    sc = Screen()
+    header(sc, "Set Date & Time", back=True)
+    status_strip(sc)
+    sc.text_centered(72, "Wednesday 16 September 2026", regular_11, MUTED2)
+
+    total = sum(g + w for (_t, w, _c), g in zip(ST_PLATES, ST_GAPS))
+    x = (W - total) // 2
+    base = ST_PLATE_Y + (ST_PLATE_H - (bold_18.ascent + bold_18.descent)) // 2 \
+           + bold_18.ascent
+    for i, ((text, w, cap), gap) in enumerate(zip(ST_PLATES, ST_GAPS)):
+        x += gap
+        is_sel = (i == sel)
+        if is_sel:
+            sc.fill_round_rect(x, ST_PLATE_Y, w, ST_PLATE_H, ST_PLATE_R, SEL_BG)
+        else:
+            sc.fill_round_rect(x, ST_PLATE_Y, w, ST_PLATE_H, ST_PLATE_R, BORDER)
+            sc.fill_round_rect(x + 1, ST_PLATE_Y + 1, w - 2, ST_PLATE_H - 2,
+                               ST_PLATE_R - 1, SURFACE)
+        tw = text_width(text, FONT_TITLE)
+        sc.text(x + (w - tw) // 2, base, text, FONT_TITLE,
+                SEL_FG if is_sel else INK)
+        if cap:
+            cw = text_width(cap, FONT_SMALL)
+            sc.text(x + (w - cw) // 2, 150, cap, FONT_SMALL, MUTED)
+        if i == 4:                                   # the colon in the gap
+            colon_w = text_width(":", FONT_TITLE)
+            sc.text(x - gap + (gap - colon_w) // 2, base, ":", FONT_TITLE, INK)
+        x += w
+    sc.text_centered(224, "Wheel changes " + MIDDOT + " Select next " + MIDDOT +
+                     " Menu cancels", FONT_SMALL, MUTED2)
     return sc.img
 
 
@@ -2301,6 +2383,9 @@ def main():
     outputs.append(save_png(screen_search_results(), "search_results.png"))
     # --- new: settings ---
     outputs.append(save_png(screen_settings(), "settings.png"))
+    outputs.append(save_png(screen_datetime(), "datetime.png"))
+    outputs.append(save_png(screen_settime(), "settime.png"))
+    outputs.append(save_png(screen_mainmenu_clock(), "mainmenu_clock.png"))
     outputs.append(save_png(screen_diag(), "bootdetails.png"))
     outputs.append(save_png(screen_sound(), "sound.png"))
     outputs.append(save_png(screen_playback(), "playback.png"))

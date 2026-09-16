@@ -62,6 +62,7 @@ the host half of it and the two must agree byte for byte.
 """
 
 import argparse
+import datetime
 import binascii
 import os
 import struct
@@ -145,6 +146,34 @@ SOUND_FIELDS = [
 SOUND_DEFAULTS = {"volume_limit": 100, "eq": 0}
 PAYLOAD_LEN = PAYLOAD_V2Q_LEN + 4                          # 48
 
+# The TIME BLOCK, appended the same way once more (length 48 -> 64, version
+# still 2). Mirrors P_HOST_EPOCH.. in config.c. This is the only tail the HOST
+# writes: the iPod cannot be told the time over the cable (in disk mode it is
+# Apple's ROM answering, not our firmware), so `core sync` / `core eject` /
+# `core install` — and --stamp below, which is the reference implementation of
+# what they do — patch the host's clock into a slot of this file and the
+# firmware picks it up at the next boot.
+#
+#   host_epoch     UTC seconds when the host stamped; 0 = never
+#   host_off_min   the host's UTC offset then, in minutes (-720..840)
+#   time_flags     bit0 24-hour clock, bit1 clock in the title bar (firmware's)
+#   applied_epoch  the host_epoch the firmware last acted on (firmware's)
+#   utc_off_min    the device's display offset (firmware's)
+#
+# --emit and --create deliberately still write PAYLOAD_LEN (48): a fresh file
+# has no stamp, and keeping the emitted record byte-identical is what lets the
+# C fixture test and the Go golden stay pinned to one another.
+TIME_FIELDS = [
+    ("host_epoch",        "<I", 48),
+    ("host_off_min",      "<h", 52),
+    ("time_flags",        "<B", 54),
+    ("time_pad",          "<B", 55),   # reserved, 0
+    ("applied_epoch",     "<I", 56),
+    ("utc_off_min",       "<h", 60),
+    ("time_pad2",         "<H", 62),   # reserved, 0
+]
+PAYLOAD_TIME_LEN = PAYLOAD_LEN + 16                        # 64
+
 SIGNED = {"bass", "treble", "balance"}
 
 FILENAME = "CORECFG.DAT"
@@ -212,6 +241,9 @@ def decode(rec: bytes):
             out[name] = struct.unpack_from(fmt, rec, OFF_PAYLOAD + off)[0]
     if length >= PAYLOAD_LEN:
         for name, fmt, off in SOUND_FIELDS:
+            out[name] = struct.unpack_from(fmt, rec, OFF_PAYLOAD + off)[0]
+    if length >= PAYLOAD_TIME_LEN:
+        for name, fmt, off in TIME_FIELDS:
             out[name] = struct.unpack_from(fmt, rec, OFF_PAYLOAD + off)[0]
     return seq, out
 
@@ -288,6 +320,97 @@ def do_emit(path: str) -> int:
     blob[0:SLOT_BYTES] = encode({}, 1)
     with open(path, "wb") as f:
         f.write(bytes(blob))
+    return 0
+
+
+# ---- stamp (set the device's clock) ---------------------------------------
+
+def seq_newer(a: int, b: int) -> bool:
+    """Is `a` strictly newer than `b` in the wrapping 32-bit sequence space?
+    The same signed-difference rule config_seq_newer() uses, so the host and
+    the firmware always agree on which slot is the live one."""
+    return ((a - b) & 0xFFFFFFFF) != 0 and ((a - b) & 0xFFFFFFFF) < 0x80000000
+
+
+def stamp_slot(slot: bytes, epoch: int, off_min: int) -> bytes:
+    """The patch itself, pure so it can be reasoned about (and matched by
+    cli/internal/devicefs/config.go byte for byte).
+
+    Copies the record VERBATIM — the resume locator, the queue context, the
+    sound tail, the firmware's own applied_epoch/utc_off_min/time_flags and
+    anything a newer firmware appended are the DEVICE's and must survive a
+    stamp — then changes exactly four things: host_epoch, host_off_min, the
+    sequence number and the CRC. The declared length grows to cover the time
+    block if it did not already.
+    """
+    rec = bytearray(slot)
+    length = struct.unpack_from("<H", rec, OFF_LENGTH)[0]
+    if length < PAYLOAD_TIME_LEN:
+        # Everything between the old length and the time block is not a field
+        # yet, so it is zeroed rather than promoted: a record that was 48 bytes
+        # has no applied_epoch, and inventing one out of padding would tell the
+        # firmware a stamp had been acted on when it had not.
+        for o in range(OFF_PAYLOAD + length, OFF_PAYLOAD + PAYLOAD_TIME_LEN):
+            rec[o] = 0
+        struct.pack_into("<H", rec, OFF_LENGTH, PAYLOAD_TIME_LEN)
+    struct.pack_into("<I", rec, OFF_PAYLOAD + 48, epoch & 0xFFFFFFFF)
+    struct.pack_into("<h", rec, OFF_PAYLOAD + 52, max(-720, min(840, off_min)))
+    seq = struct.unpack_from("<I", rec, OFF_SEQ)[0]
+    struct.pack_into("<I", rec, OFF_SEQ, (seq + 1) & 0xFFFFFFFF)
+    struct.pack_into("<I", rec, OFF_CRC, crc32(bytes(rec[:OFF_CRC])))
+    return bytes(rec)
+
+
+def do_stamp(target: str, epoch, utc_offset) -> int:
+    """Write the host's current time into CORECFG.DAT's OTHER slot.
+
+    `target` is a mounted volume's root (the usual case) or the file itself.
+    The file is opened WITHOUT truncation and only the 1024 bytes of one slot
+    are rewritten: its size, its cluster chain and its directory entry do not
+    change, which is the same argument the firmware's own writes rest on.
+    """
+    path = os.path.join(target, FILENAME) if os.path.isdir(target) else target
+    if not os.path.isfile(path):
+        print(f"error: {path} does not exist — run --create first",
+              file=sys.stderr)
+        return 2
+
+    now = datetime.datetime.now().astimezone()
+    if epoch is None:
+        epoch = int(now.timestamp())
+    off_min = (int(now.utcoffset().total_seconds()) // 60
+               if utc_offset is None else int(utc_offset))
+
+    with open(path, "r+b") as f:                 # r+b: no truncation, ever
+        head = f.read(MIN_BYTES)
+        if len(head) < MIN_BYTES:
+            print(f"error: {path} is only {len(head)} B, need {MIN_BYTES}",
+                  file=sys.stderr)
+            return 1
+        newest = None
+        for i in range(SLOTS):
+            d = decode(head[i * SLOT_BYTES:(i + 1) * SLOT_BYTES])
+            if d and (newest is None or seq_newer(d[0], newest[0])):
+                newest = (d[0], i)
+        if newest is None:
+            print(f"error: {path} holds no valid record — run --create first",
+                  file=sys.stderr)
+            return 1
+
+        src = newest[1]
+        dst = 1 - src
+        rec = stamp_slot(head[src * SLOT_BYTES:(src + 1) * SLOT_BYTES],
+                         epoch, off_min)
+        f.seek(dst * SLOT_BYTES)
+        f.write(rec)
+        f.flush()
+        os.fsync(f.fileno())
+
+    sign = "+" if off_min >= 0 else "-"
+    print(f"stamped {path}: slot {dst} seq {(newest[0] + 1) & 0xFFFFFFFF}, "
+          f"epoch {epoch} ({sign}{abs(off_min) // 60:02d}:"
+          f"{abs(off_min) % 60:02d})")
+    print("The device takes the stamp at its next boot.")
     return 0
 
 
@@ -468,6 +591,10 @@ def main():
     g.add_argument("--verify", metavar="DEVICE",
                    help="read-only: resolve CORECFG.DAT's absolute LBA from a "
                         "raw disk/image and dump both slots")
+    g.add_argument("--stamp", metavar="MOUNTPOINT",
+                   help="write the host's current time into an EXISTING "
+                        "CORECFG.DAT's other slot (the reference "
+                        "implementation of what `core sync` does)")
     g.add_argument("--emit", metavar="FILE",
                    help="write just the %d-byte two-slot region to FILE "
                         "(test fixture: the firmware's decoder must accept "
@@ -475,6 +602,12 @@ def main():
     ap.add_argument("--size", type=int, default=32 * 1024,
                     help="file size in bytes (default 32768 = one cluster on "
                          "a stock 80 GB volume; minimum %d)" % MIN_BYTES)
+    ap.add_argument("--epoch", type=int, default=None,
+                    help="with --stamp: the UTC epoch to write instead of now "
+                         "(for reproducible tests)")
+    ap.add_argument("--utc-offset", type=int, default=None,
+                    help="with --stamp: the UTC offset in minutes to write "
+                         "instead of this machine's")
     ap.add_argument("--force", action="store_true",
                     help="overwrite an existing CORECFG.DAT even if it holds "
                          "a valid record (resets saved settings)")
@@ -482,6 +615,8 @@ def main():
 
     if args.create:
         return do_create(args.create, args.size, args.force)
+    if args.stamp:
+        return do_stamp(args.stamp, args.epoch, args.utc_offset)
     if args.emit:
         return do_emit(args.emit)
     return do_verify(args.verify)
