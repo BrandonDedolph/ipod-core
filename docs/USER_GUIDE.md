@@ -114,11 +114,13 @@ tenths of a second. Leave it alone for four seconds and the wheel goes back to v
 heading and the right time how far that is, as a signed figure. It moves five seconds a quarter
 second at first, then fifteen after two seconds of holding, thirty after five and sixty after ten,
 so a long recording is crossable without letting go. It stops at the ends of the track and goes no
-further. Let go and it seeks there, once — the audio does not move while you hold. Let go before it
-has moved anywhere, or while it is sitting against an end, and nothing happens at all. If the track
-ends under your thumb and the next one starts, the seek is dropped rather than carried into a track
-you have not heard. A quick tap skips instead, and because the length of the press is what tells the
-two apart, the skip happens when you let go.
+further. Let go and it seeks there, once — the audio does not move while you hold: a hold walked to
+the end lands at the end, and the track then finishes normally. Let go before it has moved anywhere
+at all — a press only just longer than a tap, or a hold that had nowhere to go because you were
+already at the end — and nothing happens. If the track ends under your thumb and the next one
+starts, the seek is dropped rather than carried into a track you have not heard. A quick tap skips
+instead, and because the length of the press is what tells the two apart, the skip happens when you
+let go.
 
 **The queue.** Hold Select for about half a second. The queue view lists what is playing and what
 is next, with the playing row marked. Select a row to jump to it; Menu returns to Now Playing.
