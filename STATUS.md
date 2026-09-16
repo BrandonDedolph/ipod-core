@@ -175,6 +175,51 @@ was suspend-to-RAM, which never escalated to PMU standby and drained the
 cell; the resulting cold boot then rebuilt the queue as the album.
 
 What changed (see `git log 054c722..`):
+- **Three iPod gestures: Play a list, hold to seek, hold for home
+  (2026-09-16)** — the button model grew the three press-length gestures the
+  original has and this did not. (a) **PLAY on a list title starts it**: on
+  Albums (an album row or the artist's All Songs row), Artists, Genres,
+  Playlists, Songs, inside an album or a playlist, and on Shuffle Songs, a
+  PLAY *tap* builds the queue the row names and pushes Now Playing exactly as
+  SELECT would, replacing whatever was playing; a playlist that cannot be
+  played shows its tracklist screen with the reason instead of silently
+  pausing. Elsewhere PLAY is still pause/resume. (b) **Hold RIGHT/LEFT seeks**
+  on Now Playing and the queue view, aiming the way the wheel scrubber does
+  (target on the left, signed delta on the right, playhead on the bar) at 5 s
+  a quarter-second, then 15 / 30 / 60 as the hold passes 2 s / 5 s / 10 s,
+  clamped to the track; one `player_seek_to()` on release, so a long
+  fast-forward costs one seek. A tap still skips — now decided on the release,
+  like PLAY's pause. (c) **Hold MENU one second jumps to the main menu** from
+  anywhere; the tap still backs one screen at the down-edge, and a jump out of
+  Settings runs the same SOFT commit the tap exit does. The logic is a new
+  host-testable `ui/gesture.c` (the skip-vs-seek machine, the ramp, the
+  per-screen PLAY policy) plus `keyhold_void()` / `keyhold_held()`;
+  `kernel/main.c` only wires it. 59 host suites green (new `gesture` suite,
+  `keyhold` extended), ARM `-Werror` + `verify-hw` clean. **UNFLASHED.**
+  Bench list: (a) Albums: PLAY on an album row → Now Playing at track 1, MENU
+  → the same album row, not the tracklist; (b) Artists → PLAY on an artist →
+  its All Songs queue, `TRACK 1 OF n`, and the resume kind after a reboot is
+  the artist's songs; (c) the artist's All Songs row, a genre, a playlist, a
+  track inside an album and inside a playlist all play from PLAY; a playlist
+  whose files are all gone shows "No tracks found on disk" and the music keeps
+  playing; (d) Music menu: PLAY on Shuffle Songs deals and plays, PLAY on
+  Artists/Albums pauses; (e) main menu / Settings / Now Playing / queue: PLAY
+  still pauses, hold still sleeps at 2 s and powers off past 5 s; (f) from a
+  dark backlight one PLAY press on a list only lights the screen; (g) Now
+  Playing: RIGHT tap → next on release, hold → the band advances and speeds up
+  at 2/5/10 s, release lands one seek there, a hold to the end pins and ends
+  the track normally, LEFT hold pins at 0; (h) while paused a RIGHT hold moves
+  the position and stays paused; (i) scrubber on, then RIGHT hold → the wheel
+  goes back to volume; (j) queue view: taps skip, a hold seeks (visible after
+  MENU back to Now Playing); (k) Albums list: RIGHT tap jumps to Now Playing,
+  RIGHT held 3 s from the list does NOT skip or seek, LEFT hold does nothing;
+  (l) MENU hold from inside an album → one pop at the press, main menu at 1 s;
+  from Settings → Sound mid-edit the edit closes, then home, and the changed
+  value survives a power-off; (m) MENU hold at the main menu does nothing,
+  MENU hold with Hold switched on mid-press does nothing, MENU from a dark
+  screen only lights it; (n) charging screen: MENU/RIGHT/LEFT dismiss it and,
+  held, do nothing more, while PLAY held from it still sleeps; (o) Hold on,
+  then RIGHT/LEFT/MENU: banner only.
 - **Power-down** — PLAY is arbitrated by press length (`ui/keyhold.c`: tap
   = pause on release, hold = sleep; the down-edge no longer pauses).
   Suspend now: FLUSH + STANDBY + **SLEEP** on the drive (reset-to-wake),
