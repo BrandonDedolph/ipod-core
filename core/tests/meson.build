@@ -853,6 +853,29 @@ if target == 'sim'
   )
   test('hw-battery', battery_trace_test, suite: 'unit')
 
+  # hw-rtc: the PCF50605 real-time clock (hal/hw/rtc.c over the same I2C
+  # register-pointer path the gauge uses), host-side under -DMMIO_MOCK. The RTC
+  # register map is NOT in docs/hw/ — it is datasheet-derived and unconfirmed
+  # on hardware — so this suite pins everything around that uncertainty: the
+  # exact read and write grammar (SC..WD, DT..YR, SC again; seven single-register
+  # writes seconds-first), the torn-read retry at a second boundary, and that
+  # every shape of wrong answer (bad BCD, the year-00 reset value, the NACK
+  # shape where i2c_read hands back the DATA registers' own last bytes) decodes
+  # as "unset" rather than as a plausible wrong date. kernel/datetime.c is
+  # linked because the driver converts through it.
+  rtc_trace_test = executable(
+    'rtc_trace_test',
+    sources: ['hw_mmio/rtc_trace_test.c',
+              'hw_mmio/mmio_mock.c',
+              '../hal/hw/rtc.c',
+              '../hal/hw/i2c.c',
+              '../kernel/datetime.c'],
+    include_directories: hw_mmio_inc,
+    c_args: ['-DMMIO_MOCK'],
+    override_options: test_opts,
+  )
+  test('hw-rtc', rtc_trace_test, suite: 'unit')
+
   # hw-headphone-*: the headphone-jack insertion-detect driver
   # (hal/hw/headphone.c) — the SAME source the ARM build links — host-side
   # under -DMMIO_MOCK. The driver has three compile-time shapes and each
@@ -1136,6 +1159,23 @@ if target == 'sim'
     override_options: test_opts,
   )
   test('cfg-commit', cfg_commit_test, suite: 'unit')
+
+  # datetime: the civil<->epoch calendar (core/kernel/datetime.c) — the SAME
+  # source the ARM build links into core.elf. The clock's only purely
+  # arithmetic part, and the only one that can be settled COMPLETELY off the
+  # device, so it is: a hand table of dates derived outside this codebase (the
+  # epoch origin, both sides of 29 February in 2000 and 2004, the signed
+  # 32-bit roll, the last second of 2099) and then an EXHAUSTIVE walk of all
+  # 36 525 days from 2000-01-01 to 2099-12-31 in both directions, at both ends
+  # of each day, against an independently accumulated epoch and weekday. Plus
+  # the 12/24-hour formatter's edge hours and the local-offset conversion.
+  datetime_test = executable(
+    'datetime_test',
+    sources: ['kernel/datetime_test.c', '../kernel/datetime.c'],
+    include_directories: include_directories('../kernel', '.'),
+    override_options: test_opts,
+  )
+  test('datetime', datetime_test, suite: 'unit')
 
   # sort: the stable index-array merge sort (core/library/sort.c) every
   # alphabetised list is built with — the SAME source the ARM build links.

@@ -30,4 +30,11 @@
 # write and wake are injected from main.c — so tests/kernel/evlog_test.c
 # drives the whole ring, the boot scan and the flush policy on the host.
 
-kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c')
+#
+# datetime.c is the integer civil<->epoch calendar for 2000..2099 that
+# hal/hw/rtc.c decodes its BCD into and every screen will format from — the one
+# piece of the clock that can be proved exhaustively, which
+# tests/kernel/datetime_test.c does day by day across the whole century. It
+# touches no hardware and is host-built by tests/ rather than being reachable
+# only through main.c.
+kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c', 'datetime.c')

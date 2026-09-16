@@ -126,6 +126,39 @@ uint32_t clock_us(void);
  */
 void sleep_ms(uint32_t ms);
 
+/* ---------- Real-time clock ------------------------------------------ */
+
+/*
+ * TIME OF DAY, as opposed to the monotonic counters above. On the device this
+ * is the PCF50605 PMIC's always-on RTC over I²C (hal/hw/rtc.h,
+ * docs/hw/06-power.md); it counts through a suspend and through a PMU standby,
+ * and it is the only clock on the hardware that survives a power-off.
+ *
+ * The unit is UTC seconds since 1970-01-01 in a uint32_t, and the range that
+ * can be represented on this chip is 2001..2099 (kernel/datetime.h).
+ *
+ * hal_rtc_get: 1 = *epoch written, the clock is running and holds a plausible
+ * date; 0 = UNSET (never set, or reset by a drained cell — the year register
+ * reads 00, or the bytes are not a date); -1 = the bus did not answer (*epoch
+ * untouched). A CALLER MUST TREAT 0 AND -1 ALIKE: no time is known. The
+ * distinction exists for the log line, not for policy.
+ *
+ * hal_rtc_set: writes the calendar, reads it back, and returns 0 when the
+ * read-back agrees within 1 s; -1 on a bus error, -2 when the read-back
+ * disagrees (the write did not take — a DEVICE item), -3 for an epoch outside
+ * 2001..2099. The sub-second phase restarts at the write, so a caller that
+ * cares about the exact second sets seconds to 0.
+ *
+ * Neither call is cheap enough for a per-frame readout: each is three or more
+ * I²C transactions on the bus the codec shares. kernel/wallclock.h carries the
+ * time between reads.
+ *
+ * Sim: the host's wall clock plus an offset that hal_rtc_set moves;
+ * CORE_SIM_RTC_UNSET=1 in the environment forces the "unset" answer.
+ */
+int hal_rtc_get(uint32_t *epoch);
+int hal_rtc_set(uint32_t epoch);
+
 /*
  * Sim-only: dump the current framebuffer to a 24-bit BMP at `path`.
  * Returns 0 on success, negative on I/O failure. Stub on hw target.

@@ -199,9 +199,115 @@ void pcf50605_standby_mode(void) {
 - RTC alarm (if `RTCWAK` was set in `wakeup_flags`).
 
 ### State across sleep
-- RTC and PMIC config: preserved (always-on domain).
+- RTC and PMIC config: preserved (always-on domain) — **and the RTC keeps
+  counting**, which is why the firmware reads it at every boot and after every
+  wake rather than carrying a time across the gap (see "Real-time clock").
 - IRAM: zeroed by us before sleep.
 - CPU registers, GPIO, SoC peripherals: lost — full re-init on wake.
+
+## Real-time clock
+
+The PCF50605 keeps a BCD calendar in the same always-on domain the standby
+state machine lives in, so it counts through a suspend-to-RAM and through a PMU
+standby, and it is the only clock on this hardware that survives a power-off.
+It is the device's **only** time-of-day source: there is no network, and on the
+cable it is Apple's ROM disk-mode stack answering, not ours, so the host cannot
+tell the running firmware the time (it leaves a stamp in `CORECFG.DAT`
+instead).
+
+Driver: `hal/hw/rtc.c`, over the register-pointer read path in
+[09-i2c.md](09-i2c.md). Calendar maths: `kernel/datetime.c` (2000..2099,
+integer only).
+
+### Register map — DERIVED, NOT CONFIRMED
+
+**No RTC register appears anywhere else in `docs/hw/`.** The addresses below
+are taken from the public NXP **PCF50606** datasheet's register map (the 50605
+is the same family) and cross-checked against the six PCF50605 registers this
+doc already lists — `OOCC1 0x08`, `DCDC1 0x1B`, `IOREGC 0x23`, `MBCS1 0x2C`,
+`ADCC1 0x2F`, `ADCS1/2 0x30/0x31` — every one of which sits at its datasheet
+address. That is evidence the RTC block is where the datasheet puts it too; it
+is not proof. Nothing here was taken from GPL source.
+
+| Addr | Name | Meaning | Encoding | Confidence |
+|------|------|---------|----------|------------|
+| `0x0A` | `RTCSC` | seconds 00..59 | BCD: bits 6:4 tens, 3:0 units | high (map cross-check) |
+| `0x0B` | `RTCMN` | minutes 00..59 | BCD | high |
+| `0x0C` | `RTCHR` | hours 00..23 | BCD, 24-hour | high for the address; **medium for 24-hour** — confirm there is no 12-hour/AM-PM select bit |
+| `0x0D` | `RTCWD` | weekday 0..6 | plain binary | medium — the base day is unknown. We WRITE Sunday=0 and IGNORE it on read |
+| `0x0E` | `RTCDT` | day 01..31 | BCD | high |
+| `0x0F` | `RTCMT` | month 01..12 | BCD | high |
+| `0x10` | `RTCYR` | year 00..99 = 2000..2099 | BCD | high for the address; **reset value 00 → "unset": to confirm** |
+| `0x11`..`0x17` | `RTCSCA`..`RTCYRA` | alarm, same order and encoding | same | medium (alarm only; not used) |
+| `0x02` / `0x05` | `INT1` / `INT1M` | bit 7 = alarm interrupt / its mask | | medium (alarm only) |
+| `0x08` | `OOCC1` bit `RTCWAK` | wake from standby on the alarm | this doc's standby table says `0x80`; the datasheet map puts RTCWAK at bit 4 (`0x10`) with bit 7 reserved | **CONFLICT — settle on the bench before any alarm work** |
+
+Not assumed anywhere: auto-increment across multi-byte *writes* (every write is
+its own two-byte transaction), a stop-the-clock bit (the datasheet has none;
+handled by write order below), or a backup cell — the 5G has none we know of, so
+a fully drained main cell resets the register file, which is exactly the "unset"
+case.
+
+**The year 2000 is not representable.** `RTCYR` 00 is the reset value, so a
+clock that has lost its cell reads as the year 2000 and cannot be told apart
+from one that was deliberately set there. The firmware's range is therefore
+**2001..2099**, and year 00 means "no time known".
+
+### Read: two chunks, and a tear check
+
+The controller carries at most four payload bytes per transaction (09-i2c.md),
+so the calendar takes two reads — and a second boundary landing between them
+would pair a time from before the carry with a date from after it (at 23:59:59,
+a whole day wrong). Hence three transactions:
+
+1. `i2c_read(0x08, 0x0A, buf, 4)` → SC MN HR WD
+2. `i2c_read(0x08, 0x0E, buf, 3)` → DT MT YR
+3. `i2c_read(0x08, 0x0A, buf, 1)` → SC again
+
+If the second seconds reading is **lower** than the first, a carry happened in
+the middle: re-read once and use the second pass.
+
+Every byte is then checked as strict BCD (any nibble > 9 invalidates the whole
+reading), and the assembled date is range-checked including the month's length.
+This gate is what makes a wrong register map safe: it reads as "unset", never as
+a plausible wrong date. It also catches the **NACK shape** — `i2c_read` cannot
+see a missing ack (09-i2c.md), so an absent PMU hands back the DATA registers'
+last written bytes, i.e. the register pointer `0x0A` in DATA0, which is not BCD.
+The weekday register is never trusted; the weekday is computed from the date.
+
+### Write: seconds first
+
+Seven single-register writes, in the order **SC, MN, HR, WD, DT, MT, YR**.
+Seconds first restarts the second counter, so the next minute carry is a whole
+second away while the remaining six registers are written (microseconds) — which
+is what makes the date safe to write without a stop-the-clock bit. Then a
+one-byte read of `RTCYR` flushes the lazily-completed write path, and the caller
+re-reads the whole calendar and compares (±1 s is agreement — the seconds may
+carry while we look).
+
+### Alarm
+
+Tabled above, deliberately not implemented: two functions would do it, but
+`RTCWAK` is in dispute and writing the wrong bit into `OOCC1` — the register
+that triggers standby — is the one mistake on this chip that can leave an iPod
+that will not wake.
+
+### Bench procedure (DEVICE — none of the above is confirmed)
+
+In order, on the first flash that carries the driver:
+
+a. Read the raw bytes. The boot prints `core: rtc raw SC MN HR WD DT MT YR
+   valid N epoch XXXXXXXX` (seven bytes exactly as read). Every nibble ≤ 9
+   confirms BCD and the block placement; whatever Apple's firmware left behind
+   also says whether the OF used the same registers.
+b. Set a known time from Settings > Date & Time, read it back (the `rtc set`
+   line), then power off with PLAY (PMU standby), wait an hour, boot: the clock
+   must have advanced by the wall-clock hour. That is the always-on-domain
+   claim.
+c. Same across a suspend-to-RAM (PLL parked) — that proves the wake re-anchor.
+d. Leave it a week and compare against a phone: drift.
+e. Disconnect or fully drain the cell once and read the raw bytes back: that is
+   the reset value, and it settles the "year 00 = unset" row.
 
 ## Brown-out / low-battery shutdown
 
@@ -232,8 +338,10 @@ hope" is the strategy.
 | `MBCS1`  | `0x2C`| Charge status (read-only) |
 | `DCDC1`  | `0x1B`| Core voltage 1.2 V (`0xEC`); always on during standby |
 | `IOREGC` | `0x23`| I/O voltage 3.0 V (`0xF5`) — GPIO + GPO supply |
+| `RTCSC`..`RTCYR` | `0x0A`..`0x10` | Real-time clock — see "Real-time clock" above (datasheet-derived, unconfirmed) |
 
-Source: `firmware/export/pcf5060x.h`.
+Source: `firmware/export/pcf5060x.h`; the RTC rows are from the public NXP
+PCF50606 datasheet.
 
 ## Temperature monitoring
 
