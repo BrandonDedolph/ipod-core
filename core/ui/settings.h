@@ -176,10 +176,13 @@ typedef struct {
      * that survives a power cut, so everything that has to persist rides in
      * settings_t whether or not a row shows it.
      *
-     * time_24h / time_in_title ARE rows (Settings > Date & Time), and they
-     * are the only two of the six a Reset returns to their defaults:
-     * settings_defaults() zeroes all six (it is also the pre-load state), and
-     * kernel/main.c's Reset puts the host's two fields back.
+     * time_24h / time_in_title ARE rows (Settings > Date & Time). A Reset
+     * returns THREE of the six to their defaults — those two and
+     * applied_epoch, the mark, so the next boot looks at the stamp again:
+     * settings_defaults() zeroes all six (it is also the pre-load state, where
+     * a stamp nobody wrote would be an invention), and kernel/main.c's Reset
+     * puts host_epoch, host_off_min and utc_off_min back, because those three
+     * are facts about the world rather than preferences of the user's.
      *
      * utc_off_min is the display offset: the RTC holds UTC and local time is
      * RTC + utc_off_min minutes. A device that has never met the host app has
@@ -330,6 +333,18 @@ int settings_count(int screen);
 
 /* The row label for (screen, idx), or "" if out of range. Stable .rodata. */
 const char *settings_label(int screen, int idx);
+
+/*
+ * The SCREEN's own title — what ui_header draws at the top of it.
+ *
+ * Model data rather than a switch in the renderer, because that switch had no
+ * case for Date & Time and fell through to "Settings" while the committed
+ * gallery still said "Date & Time". A title that lives here is one the host
+ * suite can assert for every screen, so the code and the still cannot say
+ * different things again. A screen with no title of its own answers
+ * "Settings"; an out-of-range screen answers "" (there is nothing to draw).
+ */
+const char *settings_title(int screen);
 
 /* The display name of theme id `theme` ("Linen", "Onyx", "Sage", "Plaster",
  * "Olive", "Umber", "Mushroom" — ui/palette.h THEME_* order). An id outside

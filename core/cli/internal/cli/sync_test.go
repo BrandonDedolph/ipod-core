@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/devicefs"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/flac"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/syncer"
 )
@@ -191,5 +193,77 @@ func TestEjectRejectsNonsense(t *testing.T) {
 	}
 	if _, _, err := runCore(t, "eject"); err == nil {
 		t.Fatal("eject with no argument exited 0")
+	}
+}
+
+// The clock lines. The stamp is the one thing a sync does that the user cannot
+// see on the device until the NEXT BOOT, so the printing is the only feedback
+// there is: the plan has to say it will happen, the report has to say it did
+// and when, and a dry run has to say neither (it writes nothing).
+func TestSyncPrintsTheClock(t *testing.T) {
+	src, dst := syncFixture(t), t.TempDir()
+
+	out, _, err := runCore(t, "sync", "--src", src, "--dst", dst, "--genre-map", "", "--dry-run")
+	if err != nil {
+		t.Fatalf("sync --dry-run: %v", err)
+	}
+	if !strings.Contains(out, "CORECFG.DAT: clock will be stamped") {
+		t.Errorf("the plan does not say the clock will be stamped:\n%s", out)
+	}
+	if strings.Contains(out, "clock: stamped") {
+		t.Errorf("a dry run reported a stamp it did not write:\n%s", out)
+	}
+
+	out, errOut, err := runCore(t, "sync", "--src", src, "--dst", dst, "--genre-map", "")
+	if err != nil {
+		t.Fatalf("sync: %v\n%s", err, errOut)
+	}
+	// "clock: stamped 2026-09-16 08:42 UTC (UTC+02:00)" — the zone is printed
+	// because the epoch alone cannot tell the user whether the device will show
+	// the time they expect.
+	line := ""
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "clock: stamped ") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("the report does not mention the stamp:\n%s", out)
+	}
+	if !strings.Contains(line, " UTC (UTC") {
+		t.Errorf("the clock line names no time zone: %q", line)
+	}
+	stamp := strings.TrimPrefix(line, "clock: stamped ")
+	when, err := time.Parse("2006-01-02 15:04", strings.SplitN(stamp, " UTC", 2)[0])
+	if err != nil {
+		t.Fatalf("the clock line is not a readable time: %q (%v)", line, err)
+	}
+	if d := time.Since(when.UTC()); d > time.Hour || d < -time.Hour {
+		t.Errorf("the reported stamp is %v away from now: %q", d, line)
+	}
+
+	// And the file really carries it, pending, for the device's next boot.
+	b, err := os.ReadFile(filepath.Join(dst, devicefs.ConfigName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newest, ok := devicefs.ConfigFileValid(b)
+	if !ok {
+		t.Fatal("the config the sync wrote does not validate")
+	}
+	found := false
+	for i := 0; i < devicefs.ConfigSlots; i++ {
+		slot := b[i*devicefs.ConfigSlotBytes : (i+1)*devicefs.ConfigSlotBytes]
+		if seq, _, valid := devicefs.DecodeConfigSlot(slot); !valid || seq != newest {
+			continue
+		}
+		ts, okTime := devicefs.DecodeConfigTime(slot)
+		if !okTime || !ts.Pending() {
+			t.Errorf("the newest slot carries no pending stamp: %+v", ts)
+		}
+		found = true
+	}
+	if !found {
+		t.Error("no slot holds the newest record")
 	}
 }

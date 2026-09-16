@@ -420,7 +420,13 @@ bss +456 B, text +1.2 KB.
      have advanced by the wall-clock hour. That is the always-on-domain claim,
      and it is the whole feature.
   5. Suspend (hold PLAY) and wake: the `core: rtc wake` line, and a clock that
-     did not jump. This is the re-anchor the parked PLL makes necessary.
+     did not jump. This is the re-anchor the parked PLL makes necessary — and
+     that line is EXPECTED to report a drift roughly equal to the sleep, because
+     the µs timer does not run at 1 MHz through the park. A drift on the
+     half-hourly `core: rtc resync` line is the one that means something is
+     wrong. A `no answer` on the wake line means the clock went unknown until
+     the retry a minute later, by design (an untrustworthy delta is not folded
+     into a clock).
   6. `core sync` from the host, then `core eject`, then boot the device: the
      boot line should read `-> set` and the clock should be within a minute of
      the computer's. Boot it a second time: `-> none` (the mark), and the clock

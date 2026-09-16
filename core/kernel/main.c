@@ -1254,7 +1254,16 @@ static void clock_title_text(char *buf, int buf_sz)
  * an absent PMU produces (hal/hw/rtc.c), which is declared "no time" rather
  * than shown as a frozen plausible clock.
  */
-static void clock_resync(const char *why)
+/*
+ * `trust_timer` says whether the µs counter's delta since the last tick is
+ * meaningful. It is on the 30-minute cadence (the loop has been running) and
+ * OFF at a wake: the PLL was parked and the tick ran at 10 Hz, so the delta
+ * across a suspend is the one number in this module nobody should add to
+ * anything. That is why a wake whose RTC read gets no answer drops the clock
+ * instead of carrying it — the alternative is a clock wrong by the length of
+ * the sleep until the retry lands.
+ */
+static void clock_resync(const char *why, int trust_timer)
 {
     uint32_t epoch = 0;
     int      rc    = hal_rtc_get(&epoch);
@@ -1270,7 +1279,7 @@ static void clock_resync(const char *why)
      * best information in the device. Keeping it costs nothing and losing it
      * costs the user their clock for half an hour.
      */
-    if (rc < 0 && g_wclock.valid) {
+    if (rc < 0 && g_wclock.valid && trust_timer) {
         wallclock_tick(&g_wclock, now);        /* carry on from the timer */
         g_clock_tick_us   = now;
         g_clock_resync_us = now;
@@ -1294,6 +1303,11 @@ static void clock_resync(const char *why)
     uart_puts(" epoch ");
     uart_put_hex32(epoch);
     if (r == WALLCLOCK_RESYNC_DRIFT) {
+        /* On the cadence a drift means one of the two clocks is not what we
+         * think it is. At a WAKE it means the obvious thing instead: the µs
+         * timer did not run at 1 MHz through the park, so the difference is
+         * roughly the length of the sleep. Both print the same way; the `why`
+         * on the line is what tells them apart. */
         uart_puts(" drift ");
         uart_put_hex32((uint32_t)drift);
     } else if (r == WALLCLOCK_RESYNC_STOPPED) {
@@ -6665,7 +6679,7 @@ static void suspend_to_ram(uint32_t play_down_us)
      * a gap it has no way to measure. The RTC itself kept counting: it is in
      * the PMIC's always-on domain (docs/hw/06-power.md).
      */
-    clock_resync("wake");
+    clock_resync("wake", 0);
     g_clock_min = 0;                      /* the strip repaints with the screen */
     /*
      * Panel back, in the only order that is safe: wake the panel driver,
@@ -6826,6 +6840,20 @@ _Noreturn static void run_ui(fat32_t *fs)
     g_diag_cfg_lba[1] = cfg_lba1;
 
     /*
+     * The cell, BEFORE the clock block below can ask for a disk write.
+     *
+     * It primes the status-strip gauge, which is why it used to sit after the
+     * library load — but it is also the only thing that gives
+     * battery_disk_writes_allowed() a reading to answer with: `bat_level`
+     * starts at BATTERY_LEVEL_OK and battery_init() takes no sample, so a
+     * commit gated "below the disk-safe line" would have been gated on a
+     * default. One ADC conversion (a 2 ms settle and two I2C transactions) on
+     * a bus that is already up; a read failure leaves the level alone, so the
+     * worst case is exactly the behaviour this replaces.
+     */
+    battery_refresh(1);
+
+    /*
      * THE CLOCK, decided once, here, while the drive is still spinning from
      * the mount and before anything else can go wrong.
      *
@@ -6898,8 +6926,9 @@ _Noreturn static void run_ui(fat32_t *fs)
             settings_touch();
             settings_commit(CFG_COMMIT_FORCE);
             /* FORCE is not a promise: the gate can still refuse (a cell below
-             * the disk-safe line) and a write can still fail, and either way
-             * the change stays PENDING — which cfg_commit_clear() at the end of
+             * the disk-safe line — a real verdict here, since the sample above
+             * precedes this) and a write can still fail, and either way the
+             * change stays PENDING — which cfg_commit_clear() at the end of
              * this boot would then throw away with the load's own dirt. Carry
              * the fact forward so the mark is re-armed instead of lost; a lost
              * mark means this stamp is applied again on the next boot, and on
@@ -6938,7 +6967,6 @@ _Noreturn static void run_ui(fat32_t *fs)
                                            * spinning) so Songs/Albums/Artists/
                                            * Genres open INSTANTLY, like Apple —
                                            * not a multi-second stall on first use */
-    battery_refresh(1);                   /* prime the status-strip gauge         */
     g_volume = hal_volume_get();          /* reflect the codec's default gain      */
     g_dir_depth = 0;
     g_browse_n  = 0;
@@ -7189,8 +7217,12 @@ _Noreturn static void run_ui(fat32_t *fs)
          *   - re-anchor from the chip every half hour — three I2C transactions
          *     an hour, and the only thing that corrects the timer's drift;
          *   - repaint on the MINUTE EDGE, and only where a clock is drawn.
-         *     One comparison per pass; the band-only present the battery gauge
-         *     already uses does the rest.
+         *     One comparison per pass, and then an ordinary `dirty` — a full
+         *     paint and present, once a minute, on a screen that is idle by
+         *     definition (a playing device repaints far more often than that).
+         *     A band-only present would be the cheaper thing to reach for, but
+         *     the clock sits in the header on the main menu and in a list row
+         *     under Settings, neither of which is the strip's band.
          */
         {
             uint32_t now_us = mmio_read32(USEC_TIMER_ADDR);
@@ -7200,7 +7232,7 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
             uint32_t due = (g_clock_retry ? RTC_RETRY_S : RTC_RESYNC_S) * 1000000u;
             if ((uint32_t)(now_us - g_clock_resync_us) >= due) {
-                clock_resync("resync");
+                clock_resync("resync", 1);
             }
             uint32_t minute = 0;
             if (wallclock_minute(&g_wclock, now_us, &minute) &&
@@ -8175,14 +8207,17 @@ _Noreturn static void run_ui(fat32_t *fs)
                             datetime_t civil;
                             settime_civil(&g_settime, &civil);
                             uint32_t local = datetime_to_epoch(&civil);
-                            int      off   = g_settings.utc_off_min;
-                            uint32_t utc   = local;
-                            if (off > 0 && local >= (uint32_t)off * 60u) {
-                                utc = local - (uint32_t)off * 60u;
-                            } else if (off < 0) {
-                                utc = local + (uint32_t)(-off) * 60u;
-                            }
-                            int rc = hal_rtc_set(utc);
+                            uint32_t utc   = 0;
+                            /* The editor clamps the YEAR to 2001..2099; the
+                             * zone can still push the UTC epoch off either end
+                             * (2001-01-01 00:30 at UTC+02:00 is 2000 in UTC).
+                             * datetime_utc_from_local refuses that rather than
+                             * wrapping, and the refusal takes the same path as
+                             * a failed write: the old time stands and the log
+                             * says so. */
+                            int rc = datetime_utc_from_local(
+                                         local, g_settings.utc_off_min, &utc)
+                                     ? hal_rtc_set(utc) : -3;
                             uart_puts("core: rtc set ");
                             uart_put_hex32(utc);
                             uart_puts(" rc ");
@@ -8328,21 +8363,32 @@ _Noreturn static void run_ui(fat32_t *fs)
                             lcd_present_fb(console_framebuffer());
                             power_enter_disk_mode();
                         } else if (act == SETTINGS_ACTION_RESET) {
-                            /* The HOST's stamp is not a setting: it is a
-                             * message the device may not have acted on yet, and
-                             * settings_defaults() zeroes it along with
-                             * everything else (it is the pre-load state too).
-                             * Put it back across the reset — with the MARK left
-                             * at its default, so the next boot applies that
-                             * stamp again and the clock survives a Reset.
-                             * Dropping it instead would leave a device that had
-                             * been synced but not yet booted with no time at
-                             * all, and `core doctor` saying "never stamped". */
+                            /* THE CLOCK IS NOT A SETTING. settings_defaults()
+                             * zeroes all six of its fields (it is also the
+                             * pre-load state, where a non-zero stamp would be
+                             * one nobody wrote), so the reset puts back the
+                             * three that are facts rather than preferences:
+                             * the host's stamp and offset, which the device may
+                             * not have acted on yet, and the DISPLAY OFFSET,
+                             * without which the clock on the strip, in the
+                             * header and in the editor would read UTC for the
+                             * rest of the session — and a manual set made in
+                             * that window would write local-as-UTC to the chip
+                             * and jump by the zone at the next boot.
+                             *
+                             * The MARK is deliberately not restored: the next
+                             * boot then re-examines the stamp (rule 5 decides
+                             * whether it is still worth applying), which is
+                             * what makes "a Reset does not cost you the clock"
+                             * true rather than a hope. What DOES reset are the
+                             * two rows: 12-hour, no clock in the title. */
                             uint32_t host_epoch = g_settings.host_epoch;
                             int      host_off   = g_settings.host_off_min;
+                            int      disp_off   = g_settings.utc_off_min;
                             settings_defaults(&g_settings);
                             g_settings.host_epoch   = host_epoch;
                             g_settings.host_off_min = host_off;
+                            g_settings.utc_off_min  = disp_off;
                             settings_apply();
                             sleep_timer_apply();           /* defaults() zeroed
                                                             * the row: disarm  */

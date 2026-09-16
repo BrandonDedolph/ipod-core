@@ -291,6 +291,43 @@ static void check_local(xfail_ctx *c)
     xpect(c, "local: a shift that would leave the supported range is refused",
           !datetime_local(DATETIME_EPOCH_2100 - 60u, 840, &d) &&
           !datetime_local(DATETIME_EPOCH_2000 + 60u, -720, &d));
+
+    /*
+     * The inverse, which is what the Date & Time editor commits through. The
+     * interesting cases are the ZONE BOUNDARIES: the editor clamps its year to
+     * 2001..2099, and a zone can still push the UTC epoch off either end. Those
+     * must be refused rather than wrapped, because the next thing that happens
+     * to the number is a write to the chip's calendar.
+     */
+    uint32_t back = 0;
+    xpect(c, "utc_from_local: the plan's moment round-trips through both zones",
+          datetime_utc_from_local(utc + 330u * 60u, 330, &back) && back == utc &&
+          datetime_utc_from_local(utc - 480u * 60u, -480, &back) && back == utc);
+    xpect(c, "utc_from_local: offset 0 is the identity inside the range",
+          datetime_utc_from_local(utc, 0, &back) && back == utc);
+
+    /* 2001-01-01 00:30 local at UTC+02:00 is 2000-12-31 22:30 UTC — a year the
+     * RTC reads as "unset", so it is refused. Half an hour later is fine. */
+    datetime_t rail = { 2001, 1, 1, 0, 30, 0, 0 };
+    uint32_t   rail_local = datetime_to_epoch(&rail);
+    xpect(c, "utc_from_local: a positive zone at the start of 2001 is refused, "
+             "not wrapped into the year the chip cannot hold",
+          !datetime_utc_from_local(rail_local, 120, &back) &&
+          datetime_utc_from_local(rail_local, 0, &back) &&
+          back == rail_local);
+
+    /* ...and the far rail: 2099-12-31 23:30 local at UTC-08:00 is 2100. */
+    datetime_t rail2 = { 2099, 12, 31, 23, 30, 0, 0 };
+    uint32_t   rail2_local = datetime_to_epoch(&rail2);
+    xpect(c, "utc_from_local: a negative zone at the end of 2099 is refused",
+          !datetime_utc_from_local(rail2_local, -480, &back) &&
+          datetime_utc_from_local(rail2_local, 0, &back));
+
+    xpect(c, "utc_from_local: an impossible zone is refused like its inverse's",
+          !datetime_utc_from_local(utc, 841, &back) &&
+          !datetime_utc_from_local(utc, -721, &back));
+    xpect(c, "utc_from_local: a local epoch below the zone's own shift cannot "
+             "underflow", !datetime_utc_from_local(60u, 120, &back));
 }
 
 int main(void)

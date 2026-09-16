@@ -102,6 +102,21 @@ int datetime_from_epoch(uint32_t t, datetime_t *d);
 int datetime_local(uint32_t utc, int off_min, datetime_t *d);
 
 /*
+ * The inverse: the UTC epoch for a LOCAL one, `off_min` east of UTC. Returns 0
+ * (leaving *utc alone) when the offset is out of range or the result leaves
+ * 2001..2099 — which is a reachable case at the ends of the editor's own year
+ * range, not a theoretical one: 2001-01-01 00:30 local at UTC+02:00 is
+ * 2000-12-31 22:30 UTC, a year the RTC cannot hold (hal/hw/rtc.h), and
+ * 2099-12-31 23:30 at UTC-08:00 runs off the other end. A caller that ignored
+ * this would hand hal_rtc_set() an epoch it refuses with -3 and, worse, would
+ * have computed it by wrapping a uint32.
+ *
+ * 2001, not 2000, because that is what the chip can represent: year 00 is its
+ * "unset" reset value.
+ */
+int datetime_utc_from_local(uint32_t local, int off_min, uint32_t *utc);
+
+/*
  * "10:42 AM" / "12:05 PM" / "12:00 AM" (hour 0 reads 12), or "22:42" with
  * use_24h. Writes at most DATETIME_TIME_MAX bytes and returns the length; a
  * buffer too small writes "" and returns 0 — a truncated clock would be a

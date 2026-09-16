@@ -167,6 +167,30 @@ int datetime_local(uint32_t utc, int off_min, datetime_t *d)
     return datetime_from_epoch(local, d);
 }
 
+int datetime_utc_from_local(uint32_t local, int off_min, uint32_t *utc)
+{
+    if (utc == 0 || off_min < DATETIME_OFF_MIN || off_min > DATETIME_OFF_MAX) {
+        return 0;
+    }
+    uint32_t got;
+    if (off_min >= 0) {
+        uint32_t back = (uint32_t)off_min * 60u;
+        if (back > local) {
+            return 0;                        /* would underflow below 1970 */
+        }
+        got = local - back;
+    } else {
+        got = local + (uint32_t)(-off_min) * 60u;
+    }
+    /* The chip's range, not this module's: a UTC epoch in the year 2000 is the
+     * register file's "unset" value and must not be written as a time. */
+    if (got < DATETIME_EPOCH_2001 || got >= DATETIME_EPOCH_2100) {
+        return 0;
+    }
+    *utc = got;
+    return 1;
+}
+
 /* Write `v` (0..99) as exactly two zero-padded digits. Returns the number of
  * bytes written. */
 static int put_pad2(char *buf, int v)

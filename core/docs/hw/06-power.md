@@ -225,9 +225,16 @@ integer only).
 are taken from the public NXP **PCF50606** datasheet's register map (the 50605
 is the same family) and cross-checked against the six PCF50605 registers this
 doc already lists — `OOCC1 0x08`, `DCDC1 0x1B`, `IOREGC 0x23`, `MBCS1 0x2C`,
-`ADCC1 0x2F`, `ADCS1/2 0x30/0x31` — every one of which sits at its datasheet
-address. That is evidence the RTC block is where the datasheet puts it too; it
-is not proof. Nothing here was taken from GPL source.
+`ADCC1 0x2F`, `ADCS1/2 0x30/0x31` — every one of which is a register the
+datasheet map has at that address. That is evidence the RTC block is where the
+datasheet puts it too; it is not proof. Nothing here was taken from GPL source.
+
+**The cross-check is by ADDRESS AND FUNCTION, not by name.** One row is named
+differently in the datasheet: there `0x2E` is `ADCC1` and `0x2F` is `ADCC2`,
+the mux-and-start register — which is the register the firmware actually pokes
+(`hal/hw/battery.c` writes channel|start to `0x2F` and the conversion happens),
+under this doc's older name. So the agreement to read off that row is "the
+register at `0x2F` does what we use it for", not "the name matches".
 
 | Addr | Name | Meaning | Encoding | Confidence |
 |------|------|---------|----------|------------|
@@ -239,8 +246,8 @@ is not proof. Nothing here was taken from GPL source.
 | `0x0F` | `RTCMT` | month 01..12 | BCD | high |
 | `0x10` | `RTCYR` | year 00..99 = 2000..2099 | BCD | high for the address; **reset value 00 → "unset": to confirm** |
 | `0x11`..`0x17` | `RTCSCA`..`RTCYRA` | alarm, same order and encoding | same | medium (alarm only; not used) |
-| `0x02` / `0x05` | `INT1` / `INT1M` | bit 7 = alarm interrupt / its mask | | medium (alarm only) |
-| `0x08` | `OOCC1` bit `RTCWAK` | wake from standby on the alarm | this doc's standby table says `0x80`; the datasheet map puts RTCWAK at bit 4 (`0x10`) with bit 7 reserved | **CONFLICT — settle on the bench before any alarm work** |
+| `0x02` / `0x05` | `INT1` / `INT1M` | the alarm interrupt and its mask | the BIT is **unsettled**: the datasheet's INT1 map (ONKEYR 0x01, ONKEYF 0x02, ONKEY1S 0x04, EXTONR 0x08, EXTONF 0x10, SECOND 0x20, ALARM 0x40, bit 7 unused) puts it at `0x40`; an earlier reading of the same map put it at `0x80` | **to confirm** — no constant is defined for it (`hal/hw/rtc.h`) |
+| `0x08` | `OOCC1` bit `RTCWAK` | wake from standby on the alarm | this doc's standby table says `0x80`; the datasheet map puts RTCWAK at bit 4 (`0x10`) and reads `0x40`/`0x80` as EXTONWAK's two bits — so the doc's value would set EXTONWAK-low, not RTCWAK | **CONFLICT — settle on the bench before any alarm work.** Nothing writes it today |
 
 Not assumed anywhere: auto-increment across multi-byte *writes* (every write is
 its own two-byte transaction), a stop-the-clock bit (the datasheet has none;

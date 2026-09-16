@@ -342,6 +342,23 @@ const char *settings_clicker_name(int profile)
     return CLICK_L[profile];
 }
 
+const char *settings_title(int screen)
+{
+    switch (screen) {
+    case SETTINGS_ROOT:     return "Settings";
+    case SETTINGS_PLAYBACK: return "Playback";
+    case SETTINGS_SOUND:    return "Sound";
+    case SETTINGS_DISPLAY:  return "Display";
+    case SETTINGS_THEME:    return "Theme";
+    case SETTINGS_CLICKER:  return "Clicker";
+    case SETTINGS_DATETIME: return "Date & Time";
+    case SETTINGS_SETTIME:  return "Set Date & Time";
+    case SETTINGS_ABOUT:    return "About";
+    case SETTINGS_DIAG:     return "Boot Details";
+    default:                return "";
+    }
+}
+
 int settings_kind(int screen, int idx)
 {
     switch (screen) {

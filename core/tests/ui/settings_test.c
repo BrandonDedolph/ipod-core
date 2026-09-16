@@ -699,6 +699,41 @@ int main(void)
                          s.utc_off_min == 0 && s.host_epoch == 0 &&
                          s.host_off_min == 0 && s.applied_epoch == 0);
     check("dt-count", settings_count(SETTINGS_DATETIME) == 3);
+    /* The TITLE, for every screen. This is here because it was wrong: the
+     * renderer's own switch had no Date & Time case and titled the screen
+     * "Settings", while the committed gallery still (docs/screens/datetime.png)
+     * said "Date & Time". Asserting the model's answer for every screen is what
+     * stops the code and the picture saying different things again. */
+    check("titles",
+          strcmp(settings_title(SETTINGS_ROOT), "Settings") == 0 &&
+          strcmp(settings_title(SETTINGS_PLAYBACK), "Playback") == 0 &&
+          strcmp(settings_title(SETTINGS_SOUND), "Sound") == 0 &&
+          strcmp(settings_title(SETTINGS_DISPLAY), "Display") == 0 &&
+          strcmp(settings_title(SETTINGS_THEME), "Theme") == 0 &&
+          strcmp(settings_title(SETTINGS_CLICKER), "Clicker") == 0 &&
+          strcmp(settings_title(SETTINGS_DATETIME), "Date & Time") == 0 &&
+          strcmp(settings_title(SETTINGS_SETTIME), "Set Date & Time") == 0 &&
+          strcmp(settings_title(SETTINGS_ABOUT), "About") == 0 &&
+          strcmp(settings_title(SETTINGS_DIAG), "Boot Details") == 0);
+    check("titles: every screen in the enum has one, and nothing else does",
+          settings_title(SETTINGS_SCREEN_COUNT)[0] == '\0' &&
+          settings_title(-1)[0] == '\0');
+    {
+        /* No screen may fall through to a title that belongs to another one:
+         * the bug was exactly a missing case answering with the root's. */
+        int titled = 1;
+        for (int sc = 0; sc < SETTINGS_SCREEN_COUNT; sc++) {
+            const char *t = settings_title(sc);
+            if (t[0] == '\0') {
+                titled = 0;
+            }
+            if (sc != SETTINGS_ROOT && strcmp(t, "Settings") == 0) {
+                titled = 0;                 /* the fall-through shape */
+            }
+        }
+        check("titles: every screen has its own, none inherits the root's",
+              titled);
+    }
     check("dt-labels",
           strcmp(settings_label(SETTINGS_DATETIME, 0), "Set Date & Time") == 0 &&
           strcmp(settings_label(SETTINGS_DATETIME, 1), "Time Format") == 0 &&

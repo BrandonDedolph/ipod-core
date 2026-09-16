@@ -358,8 +358,11 @@ func TestSyncStampsTheClock(t *testing.T) {
 	od := opts(src, dry)
 	od.DryRun = true
 	p, repDry := syncOnce(t, od)
-	if p.Clock {
-		t.Error("a dry run planned a clock stamp")
+	if !p.Clock {
+		// The plan says what a REAL run would do, dry or not — and a plan is
+		// only ever printed for a dry run, so a false here is a user who never
+		// learns that a sync sets the clock.
+		t.Error("a dry run's plan does not mention the clock a real run stamps")
 	}
 	if !repDry.ClockStamped.IsZero() {
 		t.Error("a dry run stamped the clock")

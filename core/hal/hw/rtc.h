@@ -86,18 +86,29 @@ int rtc_read(datetime_t *d);
 int rtc_write(const datetime_t *d);
 
 /*
- * ALARM — tabled, not implemented. The chip carries a second calendar at
- * 0x11..0x17 (RTCSCA..RTCYRA, same order and encoding), raises INT1 bit 7 and
- * can wake the PMU from standby. Two functions (hal_rtc_alarm_set / _clear)
- * would be the whole of it, but the standby wake bit is in dispute —
- * 06-power.md says RTCWAK is 0x80 in OOCC1 while the datasheet map puts it at
- * bit 4 — and writing the wrong bit into the register that triggers standby is
- * the one mistake on this chip that can leave an iPod that will not wake. It
- * gets settled on the bench before any alarm code is written.
+ * ALARM — tabled, not implemented, and two of its bits are NOT KNOWN.
+ *
+ * The chip carries a second calendar at 0x11..0x17 (RTCSCA..RTCYRA, same order
+ * and encoding), raises an alarm bit in INT1 (masked by INT1M) and can wake the
+ * PMU from standby through a bit in OOCC1. Two functions would be the whole of
+ * it — and neither bit is settled:
+ *
+ *   INT1's alarm bit: 0x40 and 0x80 are both on the table. The bit positions
+ *   recalled from the datasheet's INT1 map (ONKEYR/ONKEYF/ONKEY1S/EXTONR/
+ *   EXTONF/SECOND/ALARM, bit 7 unused) put it at 0x40; an earlier reading of
+ *   the same map put it at 0x80. Nothing here picks one, because nothing here
+ *   needs to yet — a define would only be a number the next person trusts.
+ *
+ *   OOCC1's RTCWAK: docs/hw/06-power.md's standby table says 0x80, the
+ *   datasheet map says 0x10, and 0x80 is very likely EXTONWAK's high bit.
+ *   Writing the wrong bit into the register that TRIGGERS STANDBY is the one
+ *   mistake on this chip that can leave an iPod that will not wake.
+ *
+ * Both get settled on the bench (06-power.md, "Bench procedure") before a line
+ * of alarm code is written. Only the register addresses are defined here.
  */
 #define PMU_RTCSCA 0x11
 #define PMU_INT1   0x02
 #define PMU_INT1M  0x05
-#define INT1_ALARM 0x80
 
 #endif /* CORE_HAL_HW_RTC_H */

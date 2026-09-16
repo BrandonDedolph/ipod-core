@@ -312,17 +312,11 @@ void settings_render(int screen, const settings_t *s, int sel)
 
     console_clear(S_SURFACE);
 
-    const char *title;
-    const char *right = "";
-    switch (screen) {
-    case SETTINGS_PLAYBACK: title = "Playback"; break;
-    case SETTINGS_SOUND:    title = "Sound";    break;
-    case SETTINGS_DISPLAY:  title = "Display";  break;
-    case SETTINGS_THEME:    title = "Theme"; right = TH_COUNT_STR; break;
-    case SETTINGS_CLICKER:  title = "Clicker"; break;
-    default:                title = "Settings"; break;
-    }
-    ui_header(title, right, 1);
+    /* The title is settings.c's (settings_title): a switch here had no case
+     * for Date & Time and silently titled it "Settings". Only the Theme
+     * picker's right-hand count is the renderer's own. */
+    const char *right = (screen == SETTINGS_THEME) ? TH_COUNT_STR : "";
+    ui_header(settings_title(screen), right, 1);
 
     if (screen == SETTINGS_THEME) {
         theme_render(s, sel);
@@ -851,7 +845,7 @@ static const uint8_t ST_GAP[ST_FIELDS] = {  0, 10, 10, 22,  8, 10 };
 void settime_render(const settime_t *t)
 {
     console_clear(S_SURFACE);
-    ui_header("Set Date & Time", "", 1);
+    ui_header(settings_title(SETTINGS_SETTIME), "", 1);
 
     int nf = settime_field_count(t);
 

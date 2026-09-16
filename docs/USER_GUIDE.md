@@ -297,8 +297,9 @@ until the device sleeps or powers off, so leaving Settings never makes you wait.
   audible gap. It is the number to watch on an MP3: the MP3 decoder is new and costs about 1.7x
   what FLAC does.
 - **Disk Mode.** Saves everything and reboots into Apple's USB disk mode.
-- **Reset Settings.** Back to the defaults, saved. The clock keeps running: the time the computer
-  last wrote is kept across a reset and applied again at the next boot.
+- **Reset Settings.** Back to the defaults, saved. The clock is not a setting and survives: the time
+  on screen keeps reading correctly, and the time the computer last wrote is kept and looked at again
+  at the next boot. The two Date & Time rows do reset, to 12-hour with no clock in the title.
 
 ## Themes
 
