@@ -1,0 +1,386 @@
+--- a/pv_mp3dec_fxd_op_arm_gcc.h
++++ b/pv_mp3dec_fxd_op_arm_gcc.h
+@@ -225,7 +225,7 @@
+     }
+ 
+ 
+-    __inline int32 pv_abs(int32 x)
++    static __inline int32 pv_abs(int32 x)
+ {
+         register int32 z;
+         register int32 y;
+--- a/pv_mp3dec_fxd_op_c_equivalent.h
++++ b/pv_mp3dec_fxd_op_c_equivalent.h
+@@ -50,8 +50,8 @@
+ 
+ 
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline int32 pv_abs(int32 a)
++    PV_NO_SANITIZE_INTEGER
++    static __inline int32 pv_abs(int32 a)
+     {
+         int32 b = (a < 0) ? -a : a;
+         return b;
+@@ -60,59 +60,59 @@
+ 
+ 
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline Int32 fxp_mul32_Q30(const Int32 a, const Int32 b)
++    PV_NO_SANITIZE_INTEGER
++    static __inline Int32 fxp_mul32_Q30(const Int32 a, const Int32 b)
+     {
+         return (Int32)(((int64)(a) * b) >> 30);
+     }
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline Int32 fxp_mac32_Q30(const Int32 a, const Int32 b, Int32 L_add)
++    PV_NO_SANITIZE_INTEGER
++    static __inline Int32 fxp_mac32_Q30(const Int32 a, const Int32 b, Int32 L_add)
+     {
+         return (L_add + (Int32)(((int64)(a) * b) >> 30));
+     }
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline Int32 fxp_mul32_Q32(const Int32 a, const Int32 b)
++    PV_NO_SANITIZE_INTEGER
++    static __inline Int32 fxp_mul32_Q32(const Int32 a, const Int32 b)
+     {
+         return (Int32)(((int64)(a) * b) >> 32);
+     }
+ 
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline Int32 fxp_mul32_Q28(const Int32 a, const Int32 b)
++    PV_NO_SANITIZE_INTEGER
++    static __inline Int32 fxp_mul32_Q28(const Int32 a, const Int32 b)
+     {
+         return (Int32)(((int64)(a) * b) >> 28);
+     }
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline Int32 fxp_mul32_Q27(const Int32 a, const Int32 b)
++    PV_NO_SANITIZE_INTEGER
++    static __inline Int32 fxp_mul32_Q27(const Int32 a, const Int32 b)
+     {
+         return (Int32)(((int64)(a) * b) >> 27);
+     }
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline Int32 fxp_mul32_Q26(const Int32 a, const Int32 b)
++    PV_NO_SANITIZE_INTEGER
++    static __inline Int32 fxp_mul32_Q26(const Int32 a, const Int32 b)
+     {
+         return (Int32)(((int64)(a) * b) >> 26);
+     }
+ 
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline Int32 fxp_mac32_Q32(Int32 L_add, const Int32 a, const Int32 b)
++    PV_NO_SANITIZE_INTEGER
++    static __inline Int32 fxp_mac32_Q32(Int32 L_add, const Int32 a, const Int32 b)
+     {
+         return (L_add + (Int32)(((int64)(a) * b) >> 32));
+     }
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline Int32 fxp_msb32_Q32(Int32 L_sub, const Int32 a, const Int32 b)
++    PV_NO_SANITIZE_INTEGER
++    static __inline Int32 fxp_msb32_Q32(Int32 L_sub, const Int32 a, const Int32 b)
+     {
+         return (L_sub - ((Int32)(((int64)(a) * b) >> 32)));
+     }
+ 
+ 
+-    __attribute__((no_sanitize("integer")))
+-    __inline Int32 fxp_mul32_Q29(const Int32 a, const Int32 b)
++    PV_NO_SANITIZE_INTEGER
++    static __inline Int32 fxp_mul32_Q29(const Int32 a, const Int32 b)
+     {
+         return (Int32)(((int64)(a) * b) >> 29);
+     }
+--- a/pvmp3_alias_reduction.c
++++ b/pvmp3_alias_reduction.c
+@@ -109,7 +109,7 @@
+ ----------------------------------------------------------------------------*/
+ #define NUM_BUTTERFLIES 8
+ 
+-#define Q31_fmt(a)    (int32(double(0x7FFFFFFF)*(a)))
++#define Q31_fmt(a)    (((int32)((double)(0x7FFFFFFF)*(a))))
+ 
+ /*----------------------------------------------------------------------------
+ ; LOCAL FUNCTION DEFINITIONS
+--- a/pvmp3_audio_type_defs.h
++++ b/pvmp3_audio_type_defs.h
+@@ -62,6 +62,11 @@
+ #define PVMP3_AUDIO_TYPE_DEFS_H
+ 
+ #include <stdint.h>
++#if defined(__clang__)
++#define PV_NO_SANITIZE_INTEGER __attribute__((no_sanitize("integer")))
++#else
++#define PV_NO_SANITIZE_INTEGER
++#endif
+ 
+ typedef int8_t int8;
+ typedef uint8_t uint8;
+--- a/pvmp3_dct_16.c
++++ b/pvmp3_dct_16.c
+@@ -149,7 +149,7 @@
+ ; FUNCTION CODE
+ ----------------------------------------------------------------------------*/
+ 
+-__attribute__((no_sanitize("integer")))
++PV_NO_SANITIZE_INTEGER
+ void pvmp3_dct_16(int32 vec[], int32 flag)
+ {
+     int32 tmp0;
+@@ -309,7 +309,7 @@
+ /*----------------------------------------------------------------------------
+ ; FUNCTION CODE
+ ----------------------------------------------------------------------------*/
+-__attribute__((no_sanitize("integer")))
++PV_NO_SANITIZE_INTEGER
+ void pvmp3_merge_in_place_N32(int32 vec[])
+ {
+ 
+@@ -368,7 +368,7 @@
+ 
+ 
+ 
+-__attribute__((no_sanitize("integer")))
++PV_NO_SANITIZE_INTEGER
+ void pvmp3_split(int32 *vect)
+ {
+ 
+--- a/pvmp3_dct_6.c
++++ b/pvmp3_dct_6.c
+@@ -111,7 +111,7 @@
+ ; FUNCTION CODE
+ ----------------------------------------------------------------------------*/
+ 
+-__attribute__((no_sanitize("integer")))
++PV_NO_SANITIZE_INTEGER
+ void pvmp3_dct_6(int32 vec[])
+ {
+ 
+--- a/pvmp3_dct_9.c
++++ b/pvmp3_dct_9.c
+@@ -117,7 +117,7 @@
+ ; FUNCTION CODE
+ ----------------------------------------------------------------------------*/
+ 
+-__attribute__((no_sanitize("integer")))
++PV_NO_SANITIZE_INTEGER
+ void pvmp3_dct_9(int32 vec[])
+ {
+ 
+--- a/pvmp3_decode_huff_cw.c
++++ b/pvmp3_decode_huff_cw.c
+@@ -139,7 +139,7 @@
+ 
+ uint16 pvmp3_decode_huff_cw_tab0(tmp3Bits *pMainData)
+ {
+-    OSCL_UNUSED_ARG(pMainData);
++    (void)pMainData;
+     return(0);
+ 
+ }
+--- a/pvmp3_dequantize_sample.c
++++ b/pvmp3_dequantize_sample.c
+@@ -108,8 +108,8 @@
+ ; Include all pre-processor statements here. Include conditional
+ ; compile variables also.
+ ----------------------------------------------------------------------------*/
+-#define Q30_fmt(a)(int32(double(0x40000000)*(a)))
+-#define Q29_fmt(a)(int32(double(0x20000000)*(a)))
++#define Q30_fmt(a)(((int32)((double)(0x40000000)*(a))))
++#define Q29_fmt(a)(((int32)((double)(0x20000000)*(a))))
+ 
+ /*----------------------------------------------------------------------------
+ ; LOCAL FUNCTION DEFINITIONS
+--- a/pvmp3_framedecoder.c
++++ b/pvmp3_framedecoder.c
+@@ -99,6 +99,7 @@
+ 
+ 
+ #include "pvmp3_framedecoder.h"
++#include <stdbool.h>
+ #include "pvmp3_dec_defs.h"
+ #include "pvmp3_poly_phase_synthesis.h"
+ #include "pvmp3_tables.h"
+@@ -157,8 +158,8 @@
+ /* The below code is borrowed from ./test/mp3reader.cpp */
+ static bool parseHeader(
+         uint32_t header, size_t *frame_size,
+-        uint32_t *out_sampling_rate = NULL, uint32_t *out_channels = NULL ,
+-        uint32_t *out_bitrate = NULL, uint32_t *out_num_samples = NULL) {
++        uint32_t *out_sampling_rate, uint32_t *out_channels,
++        uint32_t *out_bitrate, uint32_t *out_num_samples) {
+     *frame_size = 0;
+ 
+     if (out_sampling_rate) {
+@@ -324,7 +325,7 @@
+     size_t totalInSize = 0;
+     size_t frameSize = 0;
+     while (totalInSize <= (inSize - 4)) {
+-        if (!parseHeader(U32_AT(buf + totalInSize), &frameSize)) {
++        if (!parseHeader(U32_AT(buf + totalInSize), &frameSize, NULL, NULL, NULL, NULL)) {
+             return SYNCH_LOST_ERROR;
+         }
+         // Buffer needs to be large enough to include complete frame
+@@ -755,7 +756,7 @@
+ ; FUNCTION CODE
+ ----------------------------------------------------------------------------*/
+ 
+-__inline void fillDataBuf(tmp3Bits *pMainData,
++static __inline void fillDataBuf(tmp3Bits *pMainData,
+                           uint32 val)       /* val to write into the buffer */
+ {
+     pMainData->pBuffer[module(pMainData->offset++, BUFSIZE)] = (uint8)val;
+--- a/pvmp3_get_scale_factors.c
++++ b/pvmp3_get_scale_factors.c
+@@ -86,7 +86,7 @@
+ ; Include all pre-processor statements here. Include conditional
+ ; compile variables also.
+ ----------------------------------------------------------------------------*/
+-#define Qfmt_28(a)(int32(double(0x10000000)*(a)))
++#define Qfmt_28(a)(((int32)((double)(0x10000000)*(a))))
+ 
+ /*----------------------------------------------------------------------------
+ ; LOCAL FUNCTION DEFINITIONS
+--- a/pvmp3_getbits.c
++++ b/pvmp3_getbits.c
+@@ -136,13 +136,13 @@
+     {
+     case 4:
+         Elem3 = *(ptBitStream->pBuffer + module(offset + 3, BUFSIZE));
+-        [[fallthrough]];
++        __attribute__((fallthrough));
+     case 3:
+         Elem2 = *(ptBitStream->pBuffer + module(offset + 2, BUFSIZE));
+-        [[fallthrough]];
++        __attribute__((fallthrough));
+     case 2:
+         Elem1 = *(ptBitStream->pBuffer + module(offset + 1, BUFSIZE));
+-        [[fallthrough]];
++        __attribute__((fallthrough));
+     case 1:
+         Elem = *(ptBitStream->pBuffer + module(offset, BUFSIZE));
+     }
+--- a/pvmp3_getbits.h
++++ b/pvmp3_getbits.h
+@@ -48,6 +48,7 @@
+ #include "pvmp3_dec_defs.h"
+ #include "s_mp3bits.h"
+ #include "pvmp3_audio_type_defs.h"
++#include <stdbool.h>
+ 
+ /*----------------------------------------------------------------------------
+ ; MACROS
+--- a/pvmp3_mdct_18.c
++++ b/pvmp3_mdct_18.c
+@@ -129,7 +129,7 @@
+ 
+ 
+ 
+-__attribute__((no_sanitize("integer")))
++PV_NO_SANITIZE_INTEGER
+ void pvmp3_mdct_18(int32 vec[], int32 *history, const int32 *window)
+ {
+     int32 i;
+--- a/pvmp3_mdct_6.c
++++ b/pvmp3_mdct_6.c
+@@ -118,7 +118,7 @@
+ ; FUNCTION CODE
+ ----------------------------------------------------------------------------*/
+ 
+-__attribute__((no_sanitize("integer")))
++PV_NO_SANITIZE_INTEGER
+ void pvmp3_mdct_6(int32 vec[], int32 *history)
+ {
+     int32 i;
+--- a/pvmp3_mpeg2_stereo_proc.c
++++ b/pvmp3_mpeg2_stereo_proc.c
+@@ -123,7 +123,7 @@
+ ; compile variables also.
+ ----------------------------------------------------------------------------*/
+ 
+-#define Q31_fmt(a)    (int32(double(0x7FFFFFFF)*(a)))
++#define Q31_fmt(a)    (((int32)((double)(0x7FFFFFFF)*(a))))
+ 
+ /*----------------------------------------------------------------------------
+ ; LOCAL FUNCTION DEFINITIONS
+--- a/pvmp3_polyphase_filter_window.h
++++ b/pvmp3_polyphase_filter_window.h
+@@ -105,7 +105,7 @@
+ 
+ #else
+ 
+-    inline int16 saturate16(int32 sample)
++    static inline int16 saturate16(int32 sample)
+     {
+ 
+         if ((sample >> 15) ^(sample >> 31))
+--- a/pvmp3_stereo_proc.c
++++ b/pvmp3_stereo_proc.c
+@@ -140,7 +140,7 @@
+ ----------------------------------------------------------------------------*/
+ #define N31 31
+ 
+-#define Q31_fmt(a)    (int32(double(0x7FFFFFFF)*(a)))
++#define Q31_fmt(a)    (((int32)((double)(0x7FFFFFFF)*(a))))
+ 
+ /*----------------------------------------------------------------------------
+ ; LOCAL FUNCTION DEFINITIONS
+@@ -180,7 +180,7 @@
+ 
+ #if __has_attribute(no_sanitize)
+ // deliberately playing near overflow points of int32
+-__attribute__((no_sanitize("integer")))
++PV_NO_SANITIZE_INTEGER
+ #endif
+ void pvmp3_st_mid_side(int32 xr[SUBBANDS_NUMBER*FILTERBANK_BANDS],
+                        int32 xl[SUBBANDS_NUMBER*FILTERBANK_BANDS],
+@@ -221,7 +221,7 @@
+ 
+ // deliberately plays near overflow points of int32
+ #if __has_attribute(no_sanitize)
+-__attribute__((no_sanitize("integer")))
++PV_NO_SANITIZE_INTEGER
+ #endif
+ void pvmp3_st_intensity(int32 xr[SUBBANDS_NUMBER*FILTERBANK_BANDS],
+                         int32 xl[SUBBANDS_NUMBER*FILTERBANK_BANDS],
+--- a/pvmp3_tables.c
++++ b/pvmp3_tables.c
+@@ -161,7 +161,7 @@
+ };
+ 
+ 
+-#define Q30_fmt(a)    (int32((0x40000000)*(a)))
++#define Q30_fmt(a)    (((int32)((0x40000000)*(a))))
+ 
+ const int32 pqmfSynthWin[(HAN_SIZE/2) + 8] =
+ {
+--- a/pvmp3_tables.h
++++ b/pvmp3_tables.h
+@@ -52,7 +52,7 @@
+ /*----------------------------------------------------------------------------
+ ; DEFINES AND SIMPLE TYPEDEF'S
+ ----------------------------------------------------------------------------*/
+-#define Qfmt_28(a) (int32(double(0x10000000)*(a)))
++#define Qfmt_28(a) (((int32)((double)(0x10000000)*(a))))
+ 
+ /*----------------------------------------------------------------------------
+ ; SIMPLE TYPEDEF'S
+--- a/s_huffcodetab.h
++++ b/s_huffcodetab.h
+@@ -79,6 +79,7 @@
+ ; STRUCTURES TYPEDEF'S
+ ----------------------------------------------------------------------------*/
+ 
++typedef struct huffcodetab huffcodetab;
+ struct huffcodetab
+ {
+     uint32 linbits;                  /*number of linbits  */

@@ -215,9 +215,7 @@ int classify_ext(const char *name)
 
     if (n == 3 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A') return 0;
     if (n == 4 && ext[0] == 'F' && ext[1] == 'L' && ext[2] == 'A' && ext[3] == 'C') return 0;
-#if CORE_ENABLE_MP3
     if (n == 3 && ext[0] == 'M' && ext[1] == 'P' && ext[2] == '3') return 1;
-#endif
     return -1;
 }
 

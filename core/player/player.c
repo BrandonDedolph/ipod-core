@@ -3,7 +3,7 @@
  *
  * Moved verbatim out of core/kernel/main.c (see player.h). Streaming FLAC/MP3
  * decode into an SPSC PCM ring feeding the DMA-driven DAC, decoupled from the
- * UI so audio keeps running while the user navigates menus. dr_flac / dr_mp3
+ * UI so audio keeps running while the user navigates menus. dr_flac / pvmp3
  * run freestanding on a static arena — no libc.
  *
  * CRITICAL device-proven invariants preserved here (regressing any = a hard
@@ -30,14 +30,15 @@
 #include "../codecs/diskbuf.h"
 #include "../codecs/flac_meta.h"
 #include "../codecs/dr_flac/flac.h"
-#include "../codecs/dr_mp3/mp3.h"
+#include "../codecs/pvmp3/mp3.h"
+#include "../codecs/pvmp3/id3_meta.h"
 
 /*
  * Streaming playback. The drive can't sustain uncompressed PCM over PIO
  * (~172 KB/s needed, ~173 KB/s ceiling), so we stream the COMPRESSED file
  * (FLAC ~40 KB/s, MP3 less) and decode on the fly. An SPSC ring decouples the
  * producer (decode_pump, foreground) from the consumer (the DMA-completion
- * ISR). dr_flac / dr_mp3 run freestanding on a static arena — no libc.
+ * ISR). dr_flac / pvmp3 run freestanding on a static arena — no libc.
  */
 #define RING_FRAMES   (1u << 18)         /* 262144 frames = 1 MB ~ 5.94 s. Big
                                           * enough that the (blocking) HDD spin-up
@@ -50,8 +51,12 @@
                                          /* loop: small so the loop returns to   */
                                          /* poll the wheel ~every 18ms (a 4096    */
                                          /* chunk blocked ~74ms, missing MENU).  */
-#define ARENA_BYTES   (128u * 1024u)     /* MP3 arena high-water ~96 KB; FLAC   */
-                                         /* ~40 KB. Sized for the larger.       */
+#define ARENA_BYTES   (128u * 1024u)     /* FLAC high-water ~40 KB; MP3 ~28 KB  */
+                                         /* (pvmp3's state + one staged frame). */
+                                         /* Sized for the larger, with room for  */
+                                         /* a codec that wants more later —      */
+                                         /* player_stats().arena_high_water is   */
+                                         /* what reports the real number.        */
 #define RA_BYTES      (32u * 1024u)      /* read-ahead block buffer (see below) */
 
 /*
@@ -134,8 +139,9 @@ typedef struct {
 static fat_src_t g_fsrc;
 
 /* Long-lived source structs: the decoder borrows a POINTER to the source it is
- * opened on (dr_flac/dr_mp3 stash it for their whole life), so these must
- * outlive the decode loop — hence file statics, not play_file locals. The
+ * opened on (dr_flac and the MP3 wrapper stash it for their whole life), so
+ * these must outlive the decode loop — hence file statics, not play_file
+ * locals. The
  * source chain (each layer wraps the one before, decoder reads through the last):
  *   g_file_src  raw fat_src bytes off the disk
  *   g_dbuf      MB-scale anti-skip buffer (bursty read-ahead; g_disk_src)
@@ -376,10 +382,12 @@ static int decode_chunk(uint32_t max_frames)
     }
     g_dec_frames_acc += (uint32_t)got;
     if (g_dec_frames_acc >= STATS_ROLLUP_FRAMES) {
-        /* Microseconds of CPU spent decoding 1000 frames. At 44.1 kHz the
-         * real-time budget is 22676 us/kframe — anything approaching that is
-         * the codec running out of headroom. */
+        /* Microseconds of CPU spent decoding 1000 frames. The real-time budget
+         * is 1e9 / rate us/kframe (22676 at 44.1 kHz, 20833 at 48 kHz), so the
+         * readout is only meaningful against the STREAM's rate — which is why
+         * player_stats() carries it and Boot Details divides by it. */
         g_stats.decode_us_per_kframe = (g_dec_us_acc * 1000u) / g_dec_frames_acc;
+        g_stats.decode_rate          = g_dec.sample_rate;
         g_dec_us_acc     = 0;
         g_dec_frames_acc = 0;
     }
@@ -1235,7 +1243,12 @@ static int track_open(int idx, flac_meta_t *meta)
         decoder_source_t meta_src;
         readahead_init(&meta_ra, &g_file_src, ra_buf, sizeof ra_buf);
         readahead_as_source(&meta_ra, &meta_src);
-        flac_meta_read(&meta_src, meta);
+        if (flac_meta_read(&meta_src, meta) != 0) {
+            /* Not a FLAC — read it as an MP3 instead (ID3 tags + the Xing
+             * duration, into the same struct). Either reader leaving have=0
+             * is what makes Now Playing fall back to the filename. */
+            id3_meta_read(&meta_src, meta);
+        }
     }
     /* Anti-skip buffer over the raw disk, then the read-ahead shim over that. */
     diskbuf_init(&g_dbuf, &g_file_src, disk_buf, DISK_BUF_BYTES,
@@ -2035,7 +2048,7 @@ const flac_meta_t *player_meta(void) { return &g_cur_meta; }
 
 /* Probe a file's tags/duration WITHOUT disturbing playback — a throwaway
  * fat-source on the stack (used by the library scan for Songs/Genres). Returns
- * 0 on success (out->have==1), -1 on not-a-FLAC. */
+ * 0 on success (out->have==1), -1 when the file is neither a FLAC nor an MP3. */
 static uint8_t     probe_ra_buf[16 * 1024];      /* buffers the metadata header  */
 static readahead_t probe_ra;
 
@@ -2053,7 +2066,10 @@ int player_probe_meta(uint32_t clus, uint32_t size, flac_meta_t *out)
      * a minutes-long library scan over slow PIO. */
     readahead_init(&probe_ra, &raw, probe_ra_buf, sizeof probe_ra_buf);
     readahead_as_source(&probe_ra, &buf);
-    return flac_meta_read(&buf, out);
+    if (flac_meta_read(&buf, out) == 0) {
+        return 0;
+    }
+    return id3_meta_read(&buf, out);        /* not a FLAC: try it as an MP3 */
 }
 
 uint32_t player_elapsed_s(void)
@@ -2214,8 +2230,12 @@ void player_prev(void)
  *     on request) binary-searches the frame stream, O(log n) probes plus one
  *     frame decode. dr_flac only offers that search when CRC checking is
  *     compiled IN; with DR_FLAC_NO_CRC it silently degrades to a linear scan,
- *     which is why flac.c leaves CRC on. MP3 has no seek table either and
- *     falls back to dr_mp3's brute-force scan — see the note in mp3.c.
+ *     which is why flac.c leaves CRC on. MP3 maps the target straight to a
+ *     byte offset — the Xing TOC when the file has one, proportional by byte
+ *     otherwise — then backs off a few frames, resyncs, and decodes and
+ *     discards everything up to the landing so the bit reservoir is filled
+ *     before anything is heard. A couple of reads either way
+ *     (codecs/pvmp3/mp3.c).
  *
  * The DAC is stopped across the seek so the ISR can't drain PCM belonging to
  * the old position, hal_audio_flush() drops what the HAL had already buffered
@@ -2316,13 +2336,12 @@ int player_seek_to(uint32_t sec)
     uint64_t limit  = g_dec.total_frames;
     if (limit == 0 && g_queue[g_queue_idx].fmt == 1) {
         /*
-         * An MP3 of unknown length (no Xing/Info tag and the open-time frame
-         * count failed) had no clamp at all: a scrub past the end sent
-         * dr_mp3 brute-forcing through the whole file, only to fail at EOF.
-         * The file size still bounds it — MPEG audio is never below 8 kbps,
-         * so a file of N bytes cannot hold more than N/1000 seconds. Coarse,
-         * but it is a true upper bound, and a seek clamped to it that still
-         * overshoots is caught by the restart below instead of running wild.
+         * An MP3 whose length could not be read at all (no Xing/Info tag and
+         * an unreadable first header) has nothing to clamp against. The file
+         * size still bounds it — MPEG audio is never below 8 kbps, so a file
+         * of N bytes cannot hold more than N/1000 seconds. Coarse, but it is
+         * a true upper bound, and a seek clamped to it that still overshoots
+         * simply lands at the end of the track.
          */
         limit = (uint64_t)(g_queue[g_queue_idx].size / 1000u) * rate;
     }
@@ -2333,9 +2352,9 @@ int player_seek_to(uint32_t sec)
 
     if (g_dec.ops->seek(&g_dec, target) != DECODER_OK) {
         /*
-         * A failed seek is not a no-op. dr_flac's binary search and dr_mp3's
-         * brute-force scan both move the byte cursor as they go, so on
-         * failure the decoder is sitting at some unrelated point in the
+         * A failed seek is not a no-op. dr_flac's binary search and the MP3
+         * resync both move the byte cursor as they go, so on failure the
+         * decoder is sitting at some unrelated point in the
          * stream — and the old resume-as-we-were path simply restarted the
          * DAC into it: the ring's tail of the OLD position, then whatever the
          * decoder produced from wherever it had got to. The only position

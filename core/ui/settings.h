@@ -423,6 +423,11 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
  * its next flush would write (both 0 when the log is off) — the same
  * cross-check against tools/make_log.py --verify.
  *
+ * decode_rate is the sample rate the decode statistics were measured at; the
+ * DECODE percentage is against 1e9/decode_rate microseconds per 1000 frames,
+ * which is what real time means for THAT stream. 0 falls back to 44.1 kHz's
+ * budget, which is what the readout shows before anything has played.
+ *
  * `build_id` is the full build stamp ("v0.1.0-3-g1234567-dirty"), drawn in
  * the header's right-hand slot — the one place on this page with a free text
  * row, since every pixel between the phase bar and the LOG line is spoken
@@ -434,7 +439,8 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                           uint32_t lib_ms, uint32_t resume_ms,
                           uint32_t res_dir_ms, uint32_t res_open_ms,
                           uint32_t res_seek_ms,
-                          uint32_t decode_us_kframe, uint32_t underruns,
+                          uint32_t decode_us_kframe, uint32_t decode_rate,
+                          uint32_t underruns,
                           int cfg_writable, uint32_t cfg_seq,
                           uint32_t lba0, uint32_t lba1,
                           uint32_t log_hdr_lba, uint32_t log_next_lba,

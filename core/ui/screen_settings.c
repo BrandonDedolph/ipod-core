@@ -648,7 +648,8 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                           uint32_t lib_ms, uint32_t resume_ms,
                           uint32_t res_dir_ms, uint32_t res_open_ms,
                           uint32_t res_seek_ms,
-                          uint32_t decode_us_kframe, uint32_t underruns,
+                          uint32_t decode_us_kframe, uint32_t decode_rate,
+                          uint32_t underruns,
                           int cfg_writable, uint32_t cfg_seq,
                           uint32_t lba0, uint32_t lba1,
                           uint32_t log_hdr_lba, uint32_t log_next_lba,
@@ -725,16 +726,24 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                 st_text_at_right(cx + colw, y, v, F_SUB, S_INK);
             } else {
                 /*
-                 * Decode headroom against the 22676 us/kframe that 44.1 kHz
-                 * real time allows — the number that says whether re-enabling
-                 * FLAC CRC (which is what buys O(log n) seeks) cost us
-                 * margin. Red inside 20% of the budget: past that a slow disk
-                 * refill becomes an audible underrun instead of a near miss.
+                 * Decode headroom against real time: 1000 frames must decode
+                 * in under 1e9/rate microseconds (22676 at 44.1 kHz, 20833 at
+                 * 48). The divisor is the STREAM's rate, not a constant —
+                 * hard-coding 44.1 kHz under-reported a 48 kHz track by 8 %,
+                 * and MP3 arrives at rates FLAC albums rarely use.
+                 *
+                 * This is THE number for MP3: pvmp3 is fixed-point and costs
+                 * about 1.7x the FLAC decoder on the same music, and whether
+                 * that fits on an 80 MHz ARM7TDMI has never been measured on
+                 * the device. Red inside 20 % of the budget: past that a slow
+                 * disk refill becomes an audible underrun, not a near miss.
                  */
+                uint32_t budget = (decode_rate > 0u) ? 1000000000u / decode_rate
+                                                     : 22676u;
                 if (decode_us_kframe == 0) {
                     st_text_at_right(cx + colw, y, "--", F_SUB, S_MUTED_D);
                 } else {
-                    int pct = (int)((decode_us_kframe * 100u) / 22676u);
+                    int pct = (int)((decode_us_kframe * 100u) / budget);
                     su_to_str(v, (unsigned)pct);
                     su_append(v, "%");
                     st_text_at_right(cx + colw, y, v, F_SUB,

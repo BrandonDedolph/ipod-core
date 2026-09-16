@@ -78,14 +78,11 @@ void split_artist_album(const char *name, char *artist, char *album);
  * pointer INTO `name`. */
 const char *track_display(const char *name);
 
-/* MP3 playback is parked: dr_mp3's float synthesis can't hit real-time on this
- * FPU-less CPU (buffer starves -> stutter), and FLAC is lossless so there's no
- * quality reason to prefer it. The device is FLAC-only; a companion loader app
- * ensures music lands as FLAC. Flip to 1 to re-surface MP3 files (they'll open
- * but stutter) once a fixed-point/COP decoder exists. */
-#define CORE_ENABLE_MP3 0
-
-/* Classify by extension: 0 = FLAC (.fla/.flac), 1 = MP3 (.mp3), -1 = skip. */
+/* Classify by extension: 0 = FLAC (.fla/.flac), 1 = MP3 (.mp3), -1 = skip.
+ * MP3 used to be behind a CORE_ENABLE_MP3 switch because dr_mp3's float
+ * synthesis could not hit real time on this FPU-less CPU. The decoder is
+ * fixed-point now (codecs/pvmp3), so the switch is gone: a shipped format
+ * does not get a build flag. */
 int classify_ext(const char *name);
 
 /* Drop a RECOGNISED audio extension in place; anything else is left alone. */

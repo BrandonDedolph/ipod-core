@@ -57,17 +57,98 @@ if target == 'sim'
   # mp3-freestanding: the STREAMING MP3 decode path used on hw — mirror of
   # flac-freestanding. Open the MP3 through mp3_open_stream (a decoder_source_t
   # pull source) with the static arena instead of libc malloc, decode every
-  # frame, bit-compare to the reference PCM (dr_mp3's own captured output, the
-  # KAT truth for a lossy codec), and assert the arena never OOM'd. Same mp3.c +
-  # arena.c the ARM build compiles; only the byte source differs (memory vs disk).
+  # frame, bit-compare to the reference PCM (pvmp3's own captured output, the
+  # KAT truth for a lossy codec), and assert the arena stayed inside the budget
+  # player.c sizes for and never OOM'd. Same mp3.c + arena.c the ARM build
+  # compiles; only the byte source differs (memory vs disk).
   mp3_fs_test = executable(
     'mp3_freestanding_test',
     sources: ['codecs/mp3_freestanding_test.c', '../codecs/arena.c'],
     dependencies: [mp3_dep],
-    include_directories: include_directories('../codecs', '../codecs/dr_mp3'),
+    include_directories: include_directories('../codecs', '../codecs/pvmp3'),
     override_options: test_opts,
   )
   test('mp3-freestanding', mp3_fs_test, args: [vectors_dir], suite: 'unit')
+
+  # mp3-frame: the framing layer (codecs/pvmp3/mp3_frame.c) on its own — the
+  # 4-byte header across every version/layer/bitrate/rate/padding combination,
+  # the ID3v2 prefix in all three versions with footers and chained tags, the
+  # ID3v1/APE tail, Xing vs Info vs VBRI with every flag combination, the LAME
+  # delay/padding fields, the TOC interpolation and the CBR estimate, plus a
+  # streaming scan over a synthetic file with a junk prefix (two-header
+  # validation). Pure functions over bytes: no vectors, no decoder.
+  mp3_frame_test = executable(
+    'mp3_frame_test',
+    sources: ['codecs/mp3_frame_test.c', '../codecs/pvmp3/mp3_frame.c'],
+    include_directories: include_directories('../codecs', '../codecs/pvmp3'),
+    override_options: test_opts,
+  )
+  test('mp3-frame', mp3_frame_test, suite: 'unit')
+
+  # id3-meta: the ID3 reader (codecs/pvmp3/id3_meta.c) — the SAME source the
+  # ARM build links into core.elf. Builds tags in RAM and asserts the text
+  # frames land in flac_meta_t: v2.2/v2.3/v2.4 layouts, all four encodings
+  # (including real UTF-16 to UTF-8 in both endiannesses, with and without a
+  # BOM, and a surrogate pair), TCON's numeric forms against the ID3v1 genre
+  # table, "7/12" track numbers, an extended header, an APIC skipped by size,
+  # an unsynchronised tag, and sizes that run off the end.
+  id3_meta_test = executable(
+    'id3_meta_test',
+    sources: ['codecs/id3_meta_test.c',
+              '../codecs/pvmp3/id3_meta.c',
+              '../codecs/pvmp3/mp3_frame.c',
+              '../codecs/meta_text.c'],
+    include_directories: include_directories('../codecs', '../codecs/pvmp3'),
+    override_options: test_opts,
+  )
+  test('id3-meta', id3_meta_test, suite: 'unit')
+
+  # mp3-accuracy: is the decode RIGHT? The KAT only pins it against itself, so
+  # this one compares pvmp3 against ffmpeg's decoder on real music — CBR, VBR
+  # with a Xing TOC, and an MPEG-2 mono file — to the ISO 11172-4 full-accuracy
+  # bounds (PSNR >= 96 dB, peak error <= 2 LSB after alignment). The reference
+  # PCM is stored as FLAC and decoded here with the tree's own dr_flac, which
+  # is lossless and half the size. See codec-vectors/README.md for provenance.
+  mp3_accuracy_test = executable(
+    'mp3_accuracy_test',
+    sources: ['codecs/mp3_accuracy_test.c'],
+    dependencies: [mp3_dep, flac_dep, m_dep],
+    include_directories: include_directories('../codecs', '../codecs/pvmp3',
+                                             '../codecs/dr_flac'),
+    override_options: test_opts,
+  )
+  test('mp3-accuracy', mp3_accuracy_test, args: [vectors_dir], suite: 'unit')
+
+  # mp3-seek: seeking by the Xing TOC. Seeks the VBR vector to a set of
+  # targets, decodes a slice at each, and finds where that slice actually sits
+  # in the reference by correlation — so the assertion is about the audio the
+  # listener would hear, not about arithmetic agreeing with itself. Landing
+  # error is held to one frame plus the TOC's 1 %-of-file granularity, and a
+  # seek past the end must leave the decoder at a clean EOS.
+  mp3_seek_test = executable(
+    'mp3_seek_test',
+    sources: ['codecs/mp3_seek_test.c'],
+    dependencies: [mp3_dep, flac_dep, m_dep],
+    include_directories: include_directories('../codecs', '../codecs/pvmp3',
+                                             '../codecs/dr_flac'),
+    override_options: test_opts,
+  )
+  test('mp3-seek', mp3_seek_test, args: [vectors_dir], suite: 'unit')
+
+  # mp3-robust: the inputs a user's library actually contains. A truncated
+  # tail, a bit flipped inside a frame, junk spliced between frames, a Layer II
+  # file, an 8 kHz MPEG-2.5 file (refused: the DAC cannot clock it), an ID3 tag
+  # claiming more bytes than the file holds, and a file that is not MPEG at
+  # all. Every case must terminate with a defined answer and never read out of
+  # bounds — run under the ASan/UBSan job like every other suite.
+  mp3_robust_test = executable(
+    'mp3_robust_test',
+    sources: ['codecs/mp3_robust_test.c'],
+    dependencies: [mp3_dep],
+    include_directories: include_directories('../codecs', '../codecs/pvmp3'),
+    override_options: test_opts,
+  )
+  test('mp3-robust', mp3_robust_test, args: [vectors_dir], suite: 'unit')
 
   # readahead: the block-buffering shim (codecs/readahead.c) that collapses a
   # decoder's many tiny reads into a few large backing reads — the fix for the
@@ -92,7 +173,8 @@ if target == 'sim'
   # as argv[1] to find the KAT flac.
   flac_meta_test = executable(
     'flac_meta_test',
-    sources: ['codecs/flac_meta_test.c', '../codecs/flac_meta.c'],
+    sources: ['codecs/flac_meta_test.c', '../codecs/flac_meta.c',
+              '../codecs/meta_text.c'],
     include_directories: include_directories('../codecs'),
     override_options: test_opts,
   )
@@ -365,14 +447,6 @@ if target == 'sim'
     override_options: test_opts,
   )
   test('palette', palette_test, suite: 'unit')
-
-  tag_mp3_test = executable(
-    'tag_mp3_test',
-    sources: ['tag_mp3_test.c'],
-    dependencies: [codecs_dep],
-    override_options: test_opts,
-  )
-  test('tag-mp3', tag_mp3_test, suite: 'unit')
 
   # hw-mmio golden-trace tests: compile the freestanding hw drivers
   # host-side with -DMMIO_MOCK so the recording fake bus
@@ -1099,7 +1173,7 @@ if target == 'sim'
               '../kernel/pcm_ring.c'],
     include_directories: include_directories(
       '../player', '../hal', '../hal/hw', '../fs', '../kernel',
-      '../codecs', '../codecs/dr_flac', '../codecs/dr_mp3',
+      '../codecs', '../codecs/dr_flac', '../codecs/pvmp3',
       'hw_mmio', 'player', '.'),
     c_args: ['-DMMIO_MOCK', '-DCORE_FREESTANDING'],
     override_options: test_opts,
@@ -1120,7 +1194,7 @@ if target == 'sim'
               '../kernel/pcm_ring.c'],
     include_directories: include_directories(
       '../player', '../hal', '../hal/hw', '../fs', '../kernel',
-      '../codecs', '../codecs/dr_flac', '../codecs/dr_mp3',
+      '../codecs', '../codecs/dr_flac', '../codecs/pvmp3',
       'hw_mmio', 'player', '.'),
     c_args: ['-DMMIO_MOCK', '-DCORE_FREESTANDING'],
     override_options: test_opts,
@@ -1141,7 +1215,7 @@ if target == 'sim'
               '../kernel/pcm_ring.c'],
     include_directories: include_directories(
       '../player', '../hal', '../hal/hw', '../fs', '../kernel',
-      '../codecs', '../codecs/dr_flac', '../codecs/dr_mp3',
+      '../codecs', '../codecs/dr_flac', '../codecs/pvmp3',
       'hw_mmio', 'player', '.'),
     c_args: ['-DMMIO_MOCK', '-DCORE_FREESTANDING'],
     override_options: test_opts,
@@ -1163,7 +1237,7 @@ if target == 'sim'
               '../kernel/pcm_ring.c'],
     include_directories: include_directories(
       '../player', '../hal', '../hal/hw', '../fs', '../kernel',
-      '../codecs', '../codecs/dr_flac', '../codecs/dr_mp3',
+      '../codecs', '../codecs/dr_flac', '../codecs/pvmp3',
       'hw_mmio', 'player', '.'),
     c_args: ['-DMMIO_MOCK', '-DCORE_FREESTANDING'],
     override_options: test_opts,
