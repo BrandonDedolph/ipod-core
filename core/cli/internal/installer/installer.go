@@ -160,6 +160,9 @@ type Result struct {
 	// Created records whether each of the three things the firmware
 	// cannot make for itself had to be made.
 	ConfigCreated, LogCreated, MusicCreated bool
+	// ClockStamped is the host time written into CORECFG.DAT for the
+	// device's first boot to pick up; zero when no stamp was written.
+	ClockStamped time.Time
 }
 
 // Installed reports what to believe about the device after this run:
@@ -312,6 +315,20 @@ func volumeFiles(out io.Writer, volume string, res *Result) error {
 	}
 	res.ConfigCreated = created
 	fmt.Fprintf(out, "  %-12s %s\n", devicefs.ConfigName, createdText(created))
+
+	// The clock, into the file we have just guaranteed exists. A freshly
+	// installed iPod has no time at all (the RTC reads its reset value until
+	// something sets it), so the first boot after an install should not be the
+	// one that shows "Not set". `core sync` and `core eject` stamp again, and
+	// a failed stamp is never worth failing an install over — the device works
+	// fine with a wrong clock.
+	if stamped, err := devicefs.StampConfigTime(volume, time.Now()); err != nil {
+		fmt.Fprintf(out, "  %-12s clock not stamped: %v\n", "", err)
+	} else {
+		res.ClockStamped = stamped.When
+		fmt.Fprintf(out, "  %-12s clock stamped %s\n", "",
+			stamped.When.Format("2006-01-02 15:04"))
+	}
 
 	created, err = devicefs.EnsureLog(volume, 0)
 	if err != nil {

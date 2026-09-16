@@ -261,8 +261,18 @@ func TestInstallKeepsExistingDeviceFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(before) != string(after) {
-		t.Error("the install rewrote an existing, valid CORECFG.DAT")
+	// The install stamps the clock, which rewrites the OTHER slot and nothing
+	// else: the record the device saved — slot 0 here — must come back byte
+	// for byte, and the file must not have changed size.
+	if len(after) != len(before) {
+		t.Fatalf("CORECFG.DAT is now %d bytes, was %d", len(after), len(before))
+	}
+	if string(before[:devicefs.ConfigSlotBytes]) != string(after[:devicefs.ConfigSlotBytes]) {
+		t.Error("the install rewrote the valid record in CORECFG.DAT")
+	}
+	if ts, ok := devicefs.DecodeConfigTime(after[devicefs.ConfigSlotBytes:]); !ok ||
+		ts.HostEpoch == 0 || !ts.Pending() {
+		t.Error("the install did not leave a pending clock stamp in the other slot")
 	}
 	if res.ConfigCreated {
 		t.Error("the result claims it created a file that was already there")

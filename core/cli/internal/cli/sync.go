@@ -199,6 +199,9 @@ func printPlan(w io.Writer, p *syncer.Plan, listSkips bool) {
 	}
 	fmt.Fprintf(w, "  art     %4d to render, %d already valid\n", artWrite, len(p.Art)-artWrite)
 	fmt.Fprintf(w, "  %s: %s\n", devicefs.ConfigName, created(p.Config))
+	if p.Clock {
+		fmt.Fprintf(w, "  %s: clock will be stamped\n", devicefs.ConfigName)
+	}
 	fmt.Fprintf(w, "  %s: %s\n", devicefs.LogName, created(p.Log))
 	state := "write"
 	if p.Index.Unchanged {
@@ -244,6 +247,13 @@ func printReport(w io.Writer, r *syncer.Report) {
 	if r.LogCreated {
 		fmt.Fprintf(w, "%s: created\n", devicefs.LogName)
 	}
+	if !r.ClockStamped.IsZero() {
+		// The device takes this at its next boot — it cannot be told the time
+		// while it is on the cable (internal/devicefs/clock.go).
+		_, off := r.ClockStamped.Zone()
+		fmt.Fprintf(w, "clock: stamped %s UTC (%s)\n",
+			r.ClockStamped.UTC().Format("2006-01-02 15:04"), offsetText(off/60))
+	}
 	idx := "unchanged"
 	if r.IndexWritten {
 		idx = "written"
@@ -251,6 +261,15 @@ func printReport(w io.Writer, r *syncer.Report) {
 	fmt.Fprintf(w, "%s/%s: %s, %d bytes, %d record(s)\n",
 		devicefs.MusicDir, devicefs.IndexName, idx, r.IndexBytes, r.IndexRecords)
 	fmt.Fprintf(w, "done in %s\n", r.Elapsed.Round(1e6))
+}
+
+// offsetText renders a minutes offset the way a user reads a time zone.
+func offsetText(min int) string {
+	sign := "+"
+	if min < 0 {
+		sign, min = "-", -min
+	}
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, min/60, min%60)
 }
 
 func printWarnings(w io.Writer, warns []string) {

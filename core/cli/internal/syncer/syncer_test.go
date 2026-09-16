@@ -315,6 +315,60 @@ func TestSecondRunIsQuiet(t *testing.T) {
 	}
 }
 
+// The clock. A sync leaves the host's time in CORECFG.DAT for the device to
+// take at its next boot — the iPod cannot be told the time any other way — and
+// a dry run writes nothing at all, clock included.
+func TestSyncStampsTheClock(t *testing.T) {
+	src, dst := srcTree(t), t.TempDir()
+	o := opts(src, dst)
+	before := time.Now().Add(-time.Second)
+	_, rep := syncOnce(t, o)
+
+	if rep.ClockStamped.Before(before) {
+		t.Errorf("report says the clock was stamped at %v, before the sync started", rep.ClockStamped)
+	}
+	b, err := os.ReadFile(filepath.Join(dst, devicefs.ConfigName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newest, ok := devicefs.ConfigFileValid(b)
+	if !ok {
+		t.Fatal("the config the sync created does not validate")
+	}
+	found := false
+	for i := 0; i < devicefs.ConfigSlots; i++ {
+		slot := b[i*devicefs.ConfigSlotBytes : (i+1)*devicefs.ConfigSlotBytes]
+		seq, _, valid := devicefs.DecodeConfigSlot(slot)
+		if !valid || seq != newest {
+			continue
+		}
+		ts, ok := devicefs.DecodeConfigTime(slot)
+		if !ok || ts.HostEpoch == 0 || !ts.Pending() {
+			t.Errorf("the newest slot carries no pending stamp: %+v (ok=%v)", ts, ok)
+		}
+		found = true
+	}
+	if !found {
+		t.Error("no slot holds the newest record")
+	}
+
+	// A dry run against a device that has never been synced writes nothing —
+	// so there is nothing to stamp, and the report says so.
+	dry := t.TempDir()
+	od := opts(src, dry)
+	od.DryRun = true
+	p, repDry := syncOnce(t, od)
+	if p.Clock {
+		t.Error("a dry run planned a clock stamp")
+	}
+	if !repDry.ClockStamped.IsZero() {
+		t.Error("a dry run stamped the clock")
+	}
+	if _, err := os.Stat(filepath.Join(dry, devicefs.ConfigName)); !os.IsNotExist(err) {
+		t.Error("a dry run created CORECFG.DAT")
+	}
+}
+
 // TestChangedFileIsCopiedAgain: size and time are the whole skip rule, so
 // both halves of it have to work.
 func TestChangedFileIsCopiedAgain(t *testing.T) {
@@ -869,12 +923,28 @@ func TestConfigAndLogAreNotResetWhenValid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(b, after) {
-		t.Error("CORECFG.DAT was rewritten; the device's saved settings are gone")
+	if len(after) != len(b) {
+		t.Fatalf("CORECFG.DAT is now %d bytes, was %d", len(after), len(b))
+	}
+	// The device's own slot is untouched...
+	if !bytes.Equal(b[devicefs.ConfigSlotBytes:], after[devicefs.ConfigSlotBytes:]) {
+		t.Error("the device's saved slot was rewritten; its settings are gone")
 	}
 	seq, s, ok := devicefs.DecodeConfigSlot(after[devicefs.ConfigSlotBytes:])
 	if !ok || seq != 7 || s.Volume != 42 {
 		t.Errorf("saved slot came back as seq %d volume %d (ok=%v)", seq, s.Volume, ok)
+	}
+	// ...and the clock stamp the sync wrote into the OTHER slot carries those
+	// same settings forward, so whichever slot the device loads it still has
+	// the user's volume.
+	seq, s, ok = devicefs.DecodeConfigSlot(after[:devicefs.ConfigSlotBytes])
+	if !ok || seq != 8 || s.Volume != 42 {
+		t.Errorf("the stamped slot came back as seq %d volume %d (ok=%v); want 8/42",
+			seq, s.Volume, ok)
+	}
+	if ts, ok := devicefs.DecodeConfigTime(after[:devicefs.ConfigSlotBytes]); !ok ||
+		ts.HostEpoch == 0 || !ts.Pending() {
+		t.Errorf("the sync did not leave a pending clock stamp: %+v (ok=%v)", ts, ok)
 	}
 }
 
@@ -969,7 +1039,18 @@ func sameSnapshot(a, b []fileState) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].rel != b[i].rel || a[i].size != b[i].size || !a[i].mod.Equal(b[i].mod) {
+		if a[i].rel != b[i].rel || a[i].size != b[i].size {
+			return false
+		}
+		// CORECFG.DAT is stamped with the host's clock on every real run
+		// (internal/devicefs/clock.go), so its mtime moves by design. Its
+		// SIZE must not, and what is inside it is checked by name in
+		// TestConfigAndLogAreNotResetWhenValid — a stamp rewrites exactly one
+		// slot and copies the other verbatim.
+		if a[i].rel == devicefs.ConfigName {
+			continue
+		}
+		if !a[i].mod.Equal(b[i].mod) {
 			return false
 		}
 	}

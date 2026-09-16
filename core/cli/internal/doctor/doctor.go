@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/cidx"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/devicefs"
@@ -257,7 +258,12 @@ type VolumeReport struct {
 	IndexBytes            int64
 	IndexOK               bool
 	ConfigValid, LogValid bool
-	Playlists             []string
+	// ClockStamped is the host stamp in CORECFG.DAT (zero when there is
+	// none); ClockPending says the device has not booted since it was
+	// written, so the iPod's own clock is not yet that time.
+	ClockStamped time.Time
+	ClockPending bool
+	Playlists    []string
 	// Note is the one-line reason the volume half stopped early, when
 	// it did.
 	Note   string
@@ -407,6 +413,53 @@ func checkConfig(r *report, rep *VolumeReport, path string) {
 	}
 	rep.ConfigValid = true
 	r.line(OK, "config", "%s valid, newest record at seq %d", devicefs.ConfigName, seq)
+	checkClock(r, rep, b, seq)
+}
+
+// checkClock reads the time block out of the newest record: what the host
+// stamped and whether the device has acted on it.
+//
+// PENDING IS A WARNING, not a failure. The iPod cannot be told the time over
+// the cable — the stamp waits in CORECFG.DAT for the next boot — so "stamped
+// but not applied" is the normal state of a device that has not been switched
+// on since the last sync, and it is also exactly what a user sees when they
+// wonder why the clock is wrong. Saying which of the two it is beats making
+// them guess.
+func checkClock(r *report, rep *VolumeReport, head []byte, newest uint32) {
+	for i := 0; i < devicefs.ConfigSlots; i++ {
+		off := i * devicefs.ConfigSlotBytes
+		slot := head[off : off+devicefs.ConfigSlotBytes]
+		seq, _, ok := devicefs.DecodeConfigSlot(slot)
+		if !ok || seq != newest {
+			continue
+		}
+		ts, ok := devicefs.DecodeConfigTime(slot)
+		if !ok || ts.HostEpoch == 0 {
+			r.line(Warn, "clock", "never stamped — the iPod's clock is whatever it "+
+				"was set to by hand (`core sync` or `core eject` sets it)")
+			return
+		}
+		rep.ClockStamped = time.Unix(int64(ts.HostEpoch), 0).UTC()
+		rep.ClockPending = ts.Pending()
+		when := rep.ClockStamped.Format("2006-01-02 15:04") + " UTC"
+		zone := offsetText(int(ts.HostOffMin))
+		if ts.Pending() {
+			r.line(Warn, "clock", "host stamp %s (%s) is pending — the device applies "+
+				"it at its next boot", when, zone)
+			return
+		}
+		r.line(OK, "clock", "host stamp %s (%s), applied by the device", when, zone)
+		return
+	}
+}
+
+// offsetText renders a minutes offset the way a user reads a time zone.
+func offsetText(min int) string {
+	sign := "+"
+	if min < 0 {
+		sign, min = "-", -min
+	}
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, min/60, min%60)
 }
 
 // checkLog applies evlog_mount()'s two tests together: the header has

@@ -168,7 +168,40 @@ typedef struct {
      */
     int  sleep_timer_min;    /* 0 (off) / 15 / 30 / 60 / 90 / 120 minutes —
                               * RUNTIME ONLY, never persisted                 */
+
+    /*
+     * CLOCK. Two user preferences and four numbers that are state, not
+     * preference — the same arrangement the resume locator has, and for the
+     * same reason: kernel/config.c's record is the only thing on this device
+     * that survives a power cut, so everything that has to persist rides in
+     * settings_t whether or not a row shows it.
+     *
+     * time_24h / time_in_title ARE rows (Settings > Date & Time).
+     *
+     * utc_off_min is the display offset: the RTC holds UTC and local time is
+     * RTC + utc_off_min minutes. A device that has never met the host app has
+     * offset 0 and runs "local as UTC" — internally consistent, and it
+     * displays whatever the user set by hand.
+     *
+     * host_epoch / host_off_min are written by the HOST (core sync / eject /
+     * install stamp them into the record; the firmware never changes them and
+     * carries them through every save unchanged, which is what makes
+     * "applied == host" a stable comparison). applied_epoch is the firmware's
+     * mark: the host_epoch it last acted on. kernel/timesync.h owns the rules.
+     */
+    int  time_24h;           /* 0/1 — a row: 12-hour vs 24-hour clock         */
+    int  time_in_title;      /* 0/1 — a row: show the clock on the strip      */
+    int  utc_off_min;        /* -720..840, the device's display offset        */
+    uint32_t host_epoch;     /* the host's stamp; 0 = never stamped           */
+    int  host_off_min;       /* the host's UTC offset when it stamped         */
+    uint32_t applied_epoch;  /* the stamp we acted on; 0 = none yet           */
 } settings_t;
+
+/* time_24h / time_in_title share one byte on disk (kernel/config.c). The bit
+ * numbers are part of the record format: append, never renumber. */
+#define TIME_FLAG_24H      0x01u
+#define TIME_FLAG_IN_TITLE 0x02u
+#define TIME_FLAGS_MASK    0x03u
 
 /* What kind of queue the resume locator's track was playing in. On disk as
  * one byte; unknown values read back as NONE (the album fallback). */
@@ -208,6 +241,15 @@ typedef enum {
      * rendered wholly by main.c, which is the only place that has the numbers.
      */
     SETTINGS_DIAG,
+    /*
+     * Date & Time: three rows (Set Date & Time / Time Format / Time in Title)
+     * and, behind the first of them, the field editor — which is not a list at
+     * all (ui/settime.h owns its model and ui/screen_settings.c paints it), so
+     * it reports one non-interactive row here and main.c drives it.
+     * Appended after DIAG so no existing screen id moves.
+     */
+    SETTINGS_DATETIME,
+    SETTINGS_SETTIME,
     SETTINGS_SCREEN_COUNT
 } settings_screen_t;
 
@@ -251,7 +293,12 @@ typedef enum {
      * config and write a byte-identical record three seconds later — the
      * spurious write NOOP exists to prevent. Also appended last.
      */
-    SETTINGS_ACTION_SLEEPTIMER
+    SETTINGS_ACTION_SLEEPTIMER,
+    /* Appended after NOOP for the same reason SLEEPTIMER was: main.c switches
+     * on the names and nothing on disk stores them, so the only thing
+     * renumbering would achieve is a diff. */
+    SETTINGS_ENTER_DATETIME,
+    SETTINGS_ENTER_SETTIME
 } settings_action_t;
 
 /*
@@ -305,6 +352,18 @@ const char *settings_eq_name(int preset);
 int settings_volume_clamp(const settings_t *s, int v);
 
 /*
+ * THE CLOCK, INJECTED. Settings > Date & Time's first row shows the time it
+ * would edit ("10:42 AM", "22:42", or "Not set"), and this module is pure — it
+ * has no RTC, no software clock and no idea what time it is. main.c hands the
+ * current LOCAL epoch in once per Settings paint, the way ui/chrome.c is handed
+ * a marquee clock through ui_set_scroll_text.
+ *
+ * `valid` 0 (or an epoch outside 2001..2099) makes the row read "Not set",
+ * which is exactly what a device with a drained cell and no host stamp shows.
+ */
+void settings_set_now(int valid, uint32_t local_epoch);
+
+/*
  * Is row (screen, idx) present but not adjustable right now? True only for
  * Sound's Bass and Treble while an EQ preset is selected: the codec has one
  * low shelf and one high shelf and the preset owns both, so those rows report
@@ -317,9 +376,15 @@ int settings_row_locked(int screen, const settings_t *s, int idx);
 /* The settings_kind_t of row (screen, idx). */
 int settings_kind(int screen, int idx);
 
+/* The buffer every caller of settings_value() must provide. Named because the
+ * Date & Time row formats a clock into it through kernel/datetime.c, which
+ * takes a size. */
+#define SETTINGS_VALUE_MAX 24
+
 /*
  * Fill in the render-facing value of row (screen, idx):
- *   buf         (>= 24 bytes) receives the display text for SELECT/SLIDER/
+ *   buf         (>= SETTINGS_VALUE_MAX bytes) receives the display text for
+ *               SELECT/SLIDER/
  *               submenu-with-value rows ("" otherwise).
  *   *is_toggle  set to 1 for a TOGGLE row (then *toggle_on = its state).
  *   *num,*den   for a SLIDER row, the fill fraction num/den (den>0); 0 else.

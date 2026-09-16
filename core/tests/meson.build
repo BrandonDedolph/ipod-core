@@ -411,11 +411,13 @@ if target == 'sim'
   # Root rows return the right ENTER_*/RESET action codes plus value/kind report,
   # and that Sleep Timer cycles Off/15/30/60/90/120 reporting the SLEEPTIMER
   # action — "changed, but runtime-only", the code that keeps arming it off the
-  # user's disk.
+  # user's disk. kernel/datetime.c is linked because Date & Time's first row
+  # formats the injected clock through it.
   settings_test = executable(
     'settings_test',
-    sources: ['ui/settings_test.c', '../ui/settings.c', '../ui/eq.c'],
-    include_directories: include_directories('../ui'),
+    sources: ['ui/settings_test.c', '../ui/settings.c', '../ui/eq.c',
+              '../kernel/datetime.c'],
+    include_directories: include_directories('../ui', '.'),
     override_options: test_opts,
   )
   test('settings', settings_test, suite: 'unit')

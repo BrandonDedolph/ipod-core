@@ -32,7 +32,7 @@ var (
 	procDeviceIoControl = kernel32.NewProc("DeviceIoControl")
 )
 
-// Eject is the pure-Go route: open the volume, flush it, lock it,
+// ejectVolume is the pure-Go route: open the volume, flush it, lock it,
 // dismount it, re-allow media removal and eject. This is what Explorer's
 // "Safely Remove Hardware" does, minus the tray icon.
 //
@@ -40,7 +40,7 @@ var (
 // fallback for the one case the IOCTL route cannot handle: another process
 // holding a file open makes FSCTL_LOCK_VOLUME fail, and the Shell route asks
 // the volume's owner to close things first.
-func Eject(w io.Writer, target string) error {
+func ejectVolume(w io.Writer, target string) error {
 	vol, letter, err := volumePath(target)
 	if err != nil {
 		return err

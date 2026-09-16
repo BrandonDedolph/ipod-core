@@ -43,3 +43,28 @@ func OpenWriteThrough(path string) (*os.File, error) {
 	}
 	return os.NewFile(uintptr(h), path), nil
 }
+
+// OpenWriteThroughExisting opens an EXISTING file for read/write with
+// FILE_FLAG_WRITE_THROUGH and OPEN_EXISTING — the no-truncate half of the
+// pair above. CREATE_ALWAYS would empty CORECFG.DAT, and an emptied
+// CORECFG.DAT is a device that has forgotten every setting the user has, so
+// the distinction is load-bearing rather than stylistic.
+func OpenWriteThroughExisting(path string) (*os.File, error) {
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	h, err := syscall.CreateFile(
+		p,
+		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
+		syscall.FILE_SHARE_READ,
+		nil,
+		syscall.OPEN_EXISTING,
+		syscall.FILE_ATTRIBUTE_NORMAL|fileFlagWriteThrough,
+		0,
+	)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(h), path), nil
+}

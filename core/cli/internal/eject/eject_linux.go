@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-// Eject on Linux: flush, then hand the volume to udisks, which is what
+// ejectVolume on Linux: flush, then hand the volume to udisks, which is what
 // the desktop's own "safely remove" button uses. Doing it by hand (umount +
 // sending a START STOP UNIT to the disk) needs root; udisks is the thing that
 // is allowed to do it for a logged-in user.
@@ -20,7 +20,7 @@ import (
 // When udisksctl is not installed the command does NOT half-do the job: it
 // prints the two lines to run and returns an error, because "ejected" is a
 // claim the user is about to act on by pulling a cable.
-func Eject(w io.Writer, target string) error {
+func ejectVolume(w io.Writer, target string) error {
 	dev, err := resolveDevice(target)
 	if err != nil {
 		return err

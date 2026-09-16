@@ -224,6 +224,40 @@ enum {
 #define P_SND_PAD       (CFG_PAYLOAD_V2Q + 2u)   /* 46: u16 reserved (0)      */
 #define CFG_PAYLOAD_V2S (CFG_PAYLOAD_V2Q + 4u)   /* = 48                      */
 
+/*
+ * The TIME BLOCK, appended the same way once more: length 48 -> 64, version
+ * still 2. It is the only part of this record the HOST writes.
+ *
+ * The iPod cannot be told the time over the cable — in disk mode it is Apple's
+ * ROM mass-storage stack answering, not our firmware (docs/hw/07-usb.md) — so
+ * `core sync`, `core install` and `core eject` patch host_epoch/host_off_min
+ * into the newest slot's copy and write it to the OTHER slot with seq+1,
+ * preserving every other byte verbatim. The firmware reads the stamp at boot,
+ * decides what it is worth (kernel/timesync.h) and writes applied_epoch /
+ * utc_off_min back. Both halves of that conversation therefore live in one
+ * record, which is the whole reason it is not a second file: a second file
+ * would be a second root-directory walk at boot and a second pre-allocation
+ * path in three host tools.
+ *
+ * The firmware carries host_epoch/host_off_min through every save UNCHANGED.
+ * That is what makes "applied == host" a stable comparison rather than a race.
+ */
+#define P_HOST_EPOCH    (CFG_PAYLOAD_V2S + 0u)   /* 48: u32 host's UTC stamp  */
+#define P_HOST_OFF      (CFG_PAYLOAD_V2S + 4u)   /* 52: i16 host UTC offset   */
+#define P_TIME_FLAGS    (CFG_PAYLOAD_V2S + 6u)   /* 54: u8  TIME_FLAG_*       */
+#define P_TIME_PAD      (CFG_PAYLOAD_V2S + 7u)   /* 55: u8  reserved (0)      */
+#define P_APPLIED_EPOCH (CFG_PAYLOAD_V2S + 8u)   /* 56: u32 stamp acted on    */
+#define P_UTC_OFF       (CFG_PAYLOAD_V2S + 12u)  /* 60: i16 display offset    */
+#define P_TIME_PAD2     (CFG_PAYLOAD_V2S + 14u)  /* 62: u16 reserved (0)      */
+#define CFG_PAYLOAD_V2T (CFG_PAYLOAD_V2S + 16u)  /* = 64                      */
+
+/* Real-world UTC offsets: UTC-12:00 .. UTC+14:00, in whole minutes. Clamped on
+ * decode so a hand-edited or buggy host cannot shift the displayed clock by a
+ * year. The epochs are NOT clamped — clamping an epoch would manufacture a
+ * date, and judging one is timesync_decide()'s job. */
+#define CFG_OFF_MIN_MINUTES (-720)
+#define CFG_OFF_MAX_MINUTES 840
+
 /* Ceiling for both stored second counts. A day is already absurd for one
  * track; the point is that a CRC-valid but insane record cannot hand the
  * player a seek target built from garbage. (player_seek_to clamps to the real
@@ -323,7 +357,7 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
 
     wr32(&rec[CFG_OFF_MAGIC],   CFG_MAGIC);
     wr16(&rec[CFG_OFF_VERSION], (uint16_t)CONFIG_VERSION);
-    wr16(&rec[CFG_OFF_LENGTH],  (uint16_t)CFG_PAYLOAD_V2S);
+    wr16(&rec[CFG_OFF_LENGTH],  (uint16_t)CFG_PAYLOAD_V2T);
     wr32(&rec[CFG_OFF_SEQ],     seq);
 
     uint8_t *p = &rec[CFG_OFF_PAYLOAD];
@@ -377,6 +411,24 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
     p[P_EQ]        = (uint8_t)((s->eq > EQ_OFF && s->eq < EQ_PRESET_COUNT)
                                ? s->eq : EQ_OFF);
     wr16(&p[P_SND_PAD], 0);
+
+    /* The time block. The host's two fields ride through verbatim — the
+     * firmware is not allowed an opinion about them — and the firmware's own
+     * two are written from the record it is holding. The offsets are clamped
+     * on the way out as well as in, so a settings_t built by hand cannot put a
+     * nonsense zone on the disk. */
+    wr32(&p[P_HOST_EPOCH], s->host_epoch);
+    wr16(&p[P_HOST_OFF],
+         (uint16_t)(int16_t)clampi(s->host_off_min,
+                                   CFG_OFF_MIN_MINUTES, CFG_OFF_MAX_MINUTES));
+    p[P_TIME_FLAGS] = (uint8_t)((s->time_24h ? TIME_FLAG_24H : 0u) |
+                                (s->time_in_title ? TIME_FLAG_IN_TITLE : 0u));
+    p[P_TIME_PAD]   = 0;
+    wr32(&p[P_APPLIED_EPOCH], s->applied_epoch);
+    wr16(&p[P_UTC_OFF],
+         (uint16_t)(int16_t)clampi(s->utc_off_min,
+                                   CFG_OFF_MIN_MINUTES, CFG_OFF_MAX_MINUTES));
+    wr16(&p[P_TIME_PAD2], 0);
 
     /* settings_t.sleep_timer_min is deliberately ABSENT from the payload: a
      * countdown armed before a power cut means nothing after one, so the
@@ -501,6 +553,30 @@ int config_decode(const uint8_t *rec, settings_t *s, uint32_t *seq)
      * device whose volume was already above it. */
     if (s->volume > s->volume_limit) {
         s->volume = s->volume_limit;
+    }
+
+    /* The time block, gated on length like every tail before it: a 48-byte
+     * record — which is every record written before the clock existed — reads
+     * as "never stamped, never applied, 12-hour, no clock in the title", which
+     * is exactly what those devices do. The epochs come through verbatim
+     * (see CFG_OFF_MIN_MINUTES on why only the offsets are clamped). */
+    if (len >= CFG_PAYLOAD_V2T) {
+        s->host_epoch    = rd32(&p[P_HOST_EPOCH]);
+        s->host_off_min  = clampi((int16_t)rd16(&p[P_HOST_OFF]),
+                                  CFG_OFF_MIN_MINUTES, CFG_OFF_MAX_MINUTES);
+        int flags        = p[P_TIME_FLAGS] & (int)TIME_FLAGS_MASK;
+        s->time_24h      = (flags & (int)TIME_FLAG_24H) ? 1 : 0;
+        s->time_in_title = (flags & (int)TIME_FLAG_IN_TITLE) ? 1 : 0;
+        s->applied_epoch = rd32(&p[P_APPLIED_EPOCH]);
+        s->utc_off_min   = clampi((int16_t)rd16(&p[P_UTC_OFF]),
+                                  CFG_OFF_MIN_MINUTES, CFG_OFF_MAX_MINUTES);
+    } else {
+        s->host_epoch    = 0;
+        s->host_off_min  = 0;
+        s->time_24h      = 0;
+        s->time_in_title = 0;
+        s->applied_epoch = 0;
+        s->utc_off_min   = 0;
     }
 
     /* Never on disk, and config_load() copies this whole decoded struct over
