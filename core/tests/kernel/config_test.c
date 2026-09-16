@@ -1484,6 +1484,50 @@ static void test_time_block(void)
           out.time_24h == 1 && out.time_in_title == 1 &&
           out.host_epoch == 0xFFFFFFFFu);
 
+    /*
+     * THE HOST'S PATCH, performed here exactly as StampConfigTime() and
+     * make_config.py --stamp perform it — copy the record verbatim, grow the
+     * declared length to 64, write host_epoch/host_off_min, bump seq,
+     * recompute the CRC — and then decoded by the FIRMWARE.
+     *
+     * This is the one edit to this file made by something that is not this
+     * firmware, and the thing it must not do is cost the device anything it
+     * had: the record being patched here carries a resume locator and a queue
+     * context, and both have to come back out the other side.
+     */
+    defaults(&in);
+    spicy(&in);
+    in.host_epoch = 0; in.host_off_min = 0;   /* a device that was never stamped */
+    config_encode(rec, &in, 11);
+    {
+        uint8_t patched[CONFIG_SLOT_BYTES];
+        memcpy(patched, rec, sizeof patched);
+        patched[T_OFF_LENGTH]     = (uint8_t)T_LEN_V2T;
+        patched[T_OFF_LENGTH + 1] = 0;
+        put32le(&patched[T_OFF_TIME], 1789555320u);          /* host_epoch */
+        patched[T_OFF_TIME + 4] = 0x4A;                      /* +330 min   */
+        patched[T_OFF_TIME + 5] = 0x01;
+        put32le(&patched[T_OFF_SEQ], 12u);
+        recrc(patched);
+
+        memset(&out, 0x5A, sizeof out);
+        check("the host's patched slot decodes on the device",
+              config_decode(patched, &out, &seq) == 1 && seq == 12u);
+        check("the host's stamp arrives intact",
+              out.host_epoch == 1789555320u && out.host_off_min == 330);
+        check("and the patch costs the device nothing it had",
+              out.resume_hash == in.resume_hash &&
+              out.resume_secs == in.resume_secs &&
+              out.resume_kind == in.resume_kind &&
+              out.resume_qidx == in.resume_qidx &&
+              out.resume_ctx_hash == in.resume_ctx_hash &&
+              out.volume_limit == in.volume_limit && out.eq == in.eq &&
+              out.applied_epoch == in.applied_epoch &&
+              out.utc_off_min == in.utc_off_min &&
+              out.time_24h == in.time_24h &&
+              out.time_in_title == in.time_in_title);
+    }
+
     /* The host's two fields ride through a FIRMWARE save unchanged — that is
      * what makes "applied == host" a stable comparison instead of a race. */
     defaults(&in);
