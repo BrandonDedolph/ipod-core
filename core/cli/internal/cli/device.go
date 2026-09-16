@@ -204,6 +204,13 @@ func firmwareVersionLine(p fwpart.Partition, d *fwpart.Directory) string {
 	if err != nil {
 		return "firmware: unknown (the OSOS body could not be read: " + err.Error() + ")"
 	}
+	// A device that has never been flashed has no marker AND no Core
+	// image, and "unknown" there reads as a failure of this program
+	// rather than as the fact it is: Apple's firmware is still on the
+	// device. The row says so — see fwpart.Classify.
+	if inst := fwpart.Classify(osos, body); inst.Kind == fwpart.Other {
+		return "firmware: " + inst.Description + " — Core is not installed (core install)"
+	}
 	return "firmware: " + fwpart.VersionText(body)
 }
 

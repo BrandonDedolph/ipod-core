@@ -377,9 +377,10 @@ func (w Write) End() int64 { return w.Off + int64(len(w.Data)) }
 //     and outside the checksum);
 //  2. the single sectorSize-aligned sector that holds the 40-byte
 //     entry, re-read from the partition and re-encoded with the new
-//     Length and Checksum. Every other field of the entry, every
-//     other entry in that sector, and every other byte of the sector
-//     are preserved byte-for-byte.
+//     Length and Checksum (and, under Policy CoreImage, EntryOffset
+//     0). Every other field of the entry, every other entry in that
+//     sector, and every other byte of the sector are preserved
+//     byte-for-byte.
 //
 // sectorSize is a parameter because it is a property of the transport,
 // not of the partition: the USB bridge on this device reports 2048-byte
@@ -390,7 +391,12 @@ func (w Write) End() int64 { return w.Off + int64(len(w.Data)) }
 // old entry pointing at a half-written body (the checksum will not
 // verify and the boot ROM refuses it), rather than a new entry pointing
 // at bytes that were never written.
-func PlanWrite(d *Directory, idx int, image []byte, sectorSize int) ([]Write, firmware.DirectoryEntry, error) {
+//
+// pol decides what happens to EntryOffset: CoreImage zeroes it (our
+// image's entry point is its first byte), KeepEntry leaves whatever the
+// device had. See the Policy doc — on a stock iPod, KeepEntry produces
+// a row whose entry point is 7.5 MB into a 368 KB image.
+func PlanWrite(d *Directory, idx int, image []byte, sectorSize int, pol Policy) ([]Write, firmware.DirectoryEntry, error) {
 	var none firmware.DirectoryEntry
 	if idx < 0 || idx >= len(d.Entries) {
 		return nil, none, fmt.Errorf("fwpart: entry %d out of range (%d entries)", idx, len(d.Entries))
@@ -441,6 +447,13 @@ func PlanWrite(d *Directory, idx int, image []byte, sectorSize int) ([]Write, fi
 	updated := e
 	updated.Length = uint32(len(image))
 	updated.Checksum = ImageChecksum(image)
+	if pol == CoreImage {
+		// The only field beyond Length/Checksum this package ever
+		// changes, and only on request. LoadAddr (0x10000000), Version
+		// (0xB012) and LoadAddr2 (0xFFFFFFFF) stay exactly as the
+		// device had them.
+		updated.EntryOffset = 0
+	}
 
 	var enc bytes.Buffer
 	if err := firmware.WriteDirectoryEntry(&enc, updated); err != nil {

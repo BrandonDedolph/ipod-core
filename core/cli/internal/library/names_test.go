@@ -192,6 +192,41 @@ func TestNormKeyFoldsOnlyWhatItPromises(t *testing.T) {
 	}
 }
 
+// FoldTypography is NormKey without the lower-casing, and that is the whole
+// contract internal/organizer leans on: a name that differs from another only
+// by a quote or a dash hashes the same on the device, so renaming it is a
+// re-copy for nothing, while a CASE difference is still a rename.
+func TestFoldTypographyIsNormKeyWithoutTheCase(t *testing.T) {
+	vectors := []string{
+		// No UPPER-CASE non-ASCII here: NormKey lower-cases A-Z only, so
+		// strings.ToLower would disagree with it on "\u00c9" by design (the
+		// case above pins that).
+		"", "Edouard", "Bj\u00f6rk - Vespertine",
+		"A \u2014 B", "\u201cHi\u201d", "POPPIN\u2019 MY S___",
+		"our little angel \u2013 EP - ROLE MODEL",
+		"our little angel - EP - ROLE MODEL",
+		"SWAG II - Justin Bieber", "swag ii - justin bieber",
+		"Don\u2018t \u2013 \u2014 \u201cQuote\u201d",
+		"\xff\xfe not utf-8",
+	}
+	for _, v := range vectors {
+		if got, want := NormKey(v), strings.ToLower(FoldTypography(v)); got != want {
+			t.Errorf("NormKey(%q) = %q, want ToLower(FoldTypography()) = %q", v, got, want)
+		}
+	}
+	// The fold itself: the typographic set goes, the case stays.
+	for _, c := range []struct{ in, want string }{
+		{"our little angel \u2013 EP - ROLE MODEL", "our little angel - EP - ROLE MODEL"},
+		{"POPPIN\u2019 MY S___", "POPPIN' MY S___"},
+		{"\u201cHi\u201d", `"Hi"`},
+		{"SWAG II", "SWAG II"},
+	} {
+		if got := FoldTypography(c.in); got != c.want {
+			t.Errorf("FoldTypography(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestLeadTrack(t *testing.T) {
 	// The table from core/tests/scripts/check_build_index.py, which is where
 	// each of these was decided.

@@ -21,6 +21,39 @@ type Config struct {
 	// must agree, or `core flash --from-backup` would look in the
 	// wrong place for a backup the app took.
 	BackupDir string `json:"backup_dir"`
+	// Names is the friendly name of each iPod, keyed by the DISK's
+	// serial (Device.Serial, the SCSI inquiry string) — not by the
+	// volume label and not by the drive letter, because the letter
+	// changes with the port and the label is the thing the name is
+	// there to replace. `core name` writes the same map, through the
+	// same file.
+	Names map[string]string `json:"names,omitempty"`
+}
+
+// NameFor is the friendly name remembered for one iPod, or "".
+func (c Config) NameFor(serial string) string {
+	if serial == "" {
+		return ""
+	}
+	return c.Names[serial]
+}
+
+// SetName remembers (or, with an empty name, forgets) one iPod's
+// friendly name. An empty name deletes the entry rather than storing
+// "": a map of serials to empty strings is a file that grows every time
+// somebody clears a name.
+func (c *Config) SetName(serial, name string) {
+	if serial == "" {
+		return
+	}
+	if name == "" {
+		delete(c.Names, serial)
+		return
+	}
+	if c.Names == nil {
+		c.Names = map[string]string{}
+	}
+	c.Names[serial] = name
 }
 
 // ConfigPath is <UserConfigDir>/core/config.json:

@@ -31,6 +31,8 @@ func newArtCmd() *cobra.Command {
 		size    int
 		artSize int
 		thmSize int
+		fetch   artFetchOptions
+		doFetch bool
 	)
 	cmd := &cobra.Command{
 		Use:   "art [in.flac out.art]",
@@ -58,13 +60,39 @@ Forms:
       Do that for every immediate subfolder of <root>. Prints one line
       per album and a count; exits non-zero if any album failed. An
       album with no FLAC, or whose first FLAC has no embedded picture,
-      is reported as skipped, not failed.`,
+      is reported as skipped, not failed.
+
+  core art --fetch <album folder>|--batch <root> [--write] [--yes]
+           [--dry-run] [--min-score 0.9]
+      Find cover art for the albums that have none. Each album whose
+      art source carries no front cover is looked up on the iTunes
+      Search API and then, if that misses, on MusicBrainz + the Cover
+      Art Archive; the candidates are printed with a match score.
+
+      Nothing is written without --write. With --write each album is
+      asked about (y/N) unless --yes, which takes the top candidate
+      only when it scored --min-score (0.9 by default) or better — the
+      score where the artist and the album both match once edition
+      decorations like "(Deluxe)" are stripped. An accepted cover is
+      embedded in EVERY FLAC of the album, written beside them as
+      cover.jpg, and baked into folder.art + folder.thm. --dry-run
+      prints the decision and touches nothing.
+
+      The images belong to their rights-holders: they are written to
+      your own files and your own cache (<user cache dir>/core/art)
+      and nowhere else.`,
 		Args:         cobra.ArbitraryArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			switch {
 			case batch != "" && album != "":
 				return errors.New("--batch and --album are alternatives; pass one")
+			case doFetch:
+				dirs, err := artFetchDirs(args, album, batch)
+				if err != nil {
+					return err
+				}
+				return runArtFetch(cmd, dirs, fetch)
 			case batch != "":
 				if len(args) != 0 {
 					return fmt.Errorf("--batch takes no positional arguments (got %d)", len(args))
@@ -88,6 +116,11 @@ Forms:
 	cmd.Flags().IntVar(&size, "size", coreart.ArtSize, "Square size for the single-file form")
 	cmd.Flags().IntVar(&artSize, "art-size", coreart.ArtSize, "Square size for folder.art")
 	cmd.Flags().IntVar(&thmSize, "thumb-size", coreart.ThumbSize, "Square size for folder.thm (28 = the firmware's ARTCACHE_DIM; anything else is resampled on the device)")
+	cmd.Flags().BoolVar(&doFetch, "fetch", false, "Look up cover art for albums that have none (iTunes, then MusicBrainz + Cover Art Archive)")
+	cmd.Flags().BoolVar(&fetch.Write, "write", false, "--fetch: embed the accepted cover into every FLAC of the album and re-render the sidecars")
+	cmd.Flags().BoolVar(&fetch.Yes, "yes", false, "--fetch --write: accept the top candidate without asking, when it scores --min-score or better")
+	cmd.Flags().BoolVar(&fetch.DryRun, "dry-run", false, "--fetch: print the decision and write nothing")
+	cmd.Flags().Float64Var(&fetch.MinScore, "min-score", 0.9, "--fetch --yes: the match score at which a candidate is accepted unasked")
 	return cmd
 }
 
@@ -253,4 +286,36 @@ func runArtBatch(cmd *cobra.Command, root string, artSize, thmSize int) error {
 		return fmt.Errorf("%d of %d album(s) failed", failed, len(dirs))
 	}
 	return nil
+}
+
+// artFetchDirs works out which album folders --fetch was aimed at:
+// --batch's immediate subfolders, or the one folder named by --album or
+// by a single positional argument.
+func artFetchDirs(args []string, album, batch string) ([]string, error) {
+	switch {
+	case batch != "":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("--batch takes no positional arguments (got %d)", len(args))
+		}
+		ents, err := os.ReadDir(batch)
+		if err != nil {
+			return nil, err
+		}
+		var dirs []string
+		for _, e := range ents {
+			if e.IsDir() {
+				dirs = append(dirs, filepath.Join(batch, e.Name()))
+			}
+		}
+		sort.Strings(dirs)
+		return dirs, nil
+	case album != "":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("--album takes no positional arguments (got %d)", len(args))
+		}
+		return []string{album}, nil
+	case len(args) == 1:
+		return []string{args[0]}, nil
+	}
+	return nil, errors.New("--fetch needs an album folder: pass one, or --album <folder>, or --batch <root>")
 }

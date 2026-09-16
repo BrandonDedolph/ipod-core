@@ -43,8 +43,16 @@ func newFlashCmd() *cobra.Command {
 		Long: `Replaces the OSOS image on the connected iPod's firmware partition —
 the body at devOffset + 0x800, zero-padded to the next 0x800 boundary,
 and the single directory sector holding that entry's row, with the new
-length and checksum and every other field kept. The preamble, the
-partition table and Apple's other images are never written.
+length and checksum. The row's entry point is set to 0, because this
+image starts executing at its first byte; every other field — the load
+address, the version word, loadAddr2 — is kept exactly as the device
+had it. The preamble, the partition table and Apple's other images are
+never written.
+
+To put Core on an iPod that is still running Apple's firmware, use
+"core install": the same write, plus the backup named so the Apple
+firmware can be found again and the files the firmware needs on the
+music volume.
 
 With --from-backup, writes a whole firmware partition back from a file
 produced by "core backup" (or ipodpatcher -r). That is the recovery

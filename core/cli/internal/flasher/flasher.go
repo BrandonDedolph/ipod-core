@@ -79,6 +79,13 @@ type Options struct {
 	// decides it is not elevated refuses instead of spawning another
 	// one.
 	NoRelaunch bool
+	// Install says this write is the first one onto a device that was
+	// not running Core: `core install` rather than `core flash`. It
+	// changes nothing about the write — the entry-point policy is a
+	// property of the image and applies either way — only what the plan
+	// calls itself, so the person reading it sees the command they
+	// typed.
+	Install bool
 }
 
 // Deps are the calls that touch the outside world. Every one of them
@@ -190,8 +197,29 @@ type Result struct {
 	// verified. False is reported, never fatal: a previous bad flash is
 	// the thing someone is here to fix.
 	OldChecksumOK bool
+	// Installed is what was on the device BEFORE this write: Core, an
+	// old Core, or something else (Apple's firmware, on every iPod that
+	// has never been flashed). It decides the backup's name — see
+	// AppleBackupFileName — and it is what `core install` reports as
+	// "was:".
+	Installed fwpart.Installed
 	// BytesWritten is the total handed to WriteAt.
 	BytesWritten int64
+}
+
+// AppleBackup is the backup path when what this write replaced was NOT
+// Core — in practice, the only copy of that device's Apple firmware.
+// Empty for a re-flash over one of our own images, and empty before the
+// backup has been taken.
+//
+// The app's Install card and the CLI's last lines both print this one;
+// it is a method rather than a second field so it cannot disagree with
+// BackupPath.
+func (r *Result) AppleBackup() string {
+	if r == nil || r.Installed.Kind != fwpart.Other {
+		return ""
+	}
+	return r.BackupPath
 }
 
 // Errors callers distinguish.
@@ -503,6 +531,13 @@ func (f *flash) inspectAndPlan() error {
 	verifyErr := fwpart.VerifyEntry(p, osos)
 	f.res.OldChecksumOK = verifyErr == nil
 
+	// What is on the device decides one thing here: the name of the
+	// backup. A device running Apple's firmware has exactly one copy of
+	// it in the world — the one this run is about to overwrite — and a
+	// file called fwpart-131475456-2026-09-15T01-02-03Z.bin is not a
+	// file anyone finds a year later.
+	f.res.Installed = fwpart.ClassifyEntry(p, osos)
+
 	backupPath, err := f.backupPath()
 	if err != nil {
 		return err
@@ -517,7 +552,13 @@ func (f *flash) inspectAndPlan() error {
 				f.restore.path, f.restore.size, f.pod.FWPartLen)
 		}
 	} else {
-		writes, entry, err := fwpart.PlanWrite(dir, idx, f.img.image, f.pod.SectorSize)
+		// fwpart.CoreImage, always, and not a field of Options: every
+		// image this command writes is a Core image, whose entry point
+		// is its first byte on every device (library-manager-plan.md,
+		// decision 1). An option here would be an option whose only
+		// other value produces a device that does not boot — and whose
+		// zero value, fwpart.KeepEntry, is exactly that one.
+		writes, entry, err := fwpart.PlanWrite(dir, idx, f.img.image, f.pod.SectorSize, fwpart.CoreImage)
 		if err != nil {
 			// Oversize lands here, before anything is opened for
 			// writing and before a backup is taken.
@@ -543,7 +584,11 @@ func (f *flash) printPlan(dir *fwpart.Directory, idx int, osos firmware.Director
 	out := f.out
 	pod := f.pod
 
-	fmt.Fprintf(out, "core flash — plan\n\n")
+	name := "core flash"
+	if f.o.Install {
+		name = "core install"
+	}
+	fmt.Fprintf(out, "%s — plan\n\n", name)
 	if f.res.Mode == ModeRestore {
 		fmt.Fprintf(out, "  restore      %s\n", f.restore.path)
 		fmt.Fprintf(out, "               %d bytes, preamble OK, %d images, OSOS %d bytes checksum %#08x OK\n",
@@ -575,10 +620,18 @@ func (f *flash) printPlan(dir *fwpart.Directory, idx int, osos firmware.Director
 	if f.res.Mode == ModeOSOS {
 		fmt.Fprintf(out, "  length       %d → %d\n", f.res.OldLength, f.res.NewLength)
 		fmt.Fprintf(out, "  checksum     %#08x → %#08x\n", f.res.OldChecksum, f.res.NewChecksum)
+		// The field that makes a stock iPod bootable. It is printed
+		// only when it changes, because on a device already running
+		// Core it is 0 → 0 and a line saying so is noise.
+		if osos.EntryOffset != f.newEntry.EntryOffset {
+			fmt.Fprintf(out, "  entryOffset  %#x → %#x  (this image starts at its first byte)\n",
+				osos.EntryOffset, f.newEntry.EntryOffset)
+		}
 	} else {
 		fmt.Fprintf(out, "  length       %d → %d (from the backup)\n", f.res.OldLength, f.res.NewLength)
 		fmt.Fprintf(out, "  checksum     %#08x → %#08x (from the backup)\n", f.res.OldChecksum, f.res.NewChecksum)
 	}
+	fmt.Fprintf(out, "  installed    %s\n", f.res.Installed.Description)
 	if verifyErr != nil {
 		fmt.Fprintf(out, "  current      the image already on the device does NOT verify: %v\n", verifyErr)
 		fmt.Fprintf(out, "               (reported, not fatal — a previous bad flash is what this may be fixing)\n")
@@ -782,17 +835,62 @@ func dryRunArgs(args []string) []string {
 
 // --- step 9: the backup -----------------------------------------------
 
+// backupPath decides where the whole-partition backup goes, once.
+//
+// The NAME depends on what is being overwritten. Anything that is not
+// Core — Apple's firmware on a device that has never been flashed, or
+// somebody else's — gets the apple-<serial>-<date> name, because that
+// file is the only copy of that device's original firmware in
+// existence and it has to be findable by a person a year later. A
+// re-flash over our own image gets the ordinary fwpart-<size>-<time>
+// name.
 func (f *flash) backupPath() (string, error) {
 	name := BackupFileName(f.pod.FWPartLen, f.d.Now())
-	if f.o.BackupDir != "" {
-		return filepath.Join(f.o.BackupDir, name), nil
+	apple := f.res.Installed.Kind == fwpart.Other
+	if apple {
+		name = AppleBackupFileName(f.pod.Disk.Serial, f.d.Now())
 	}
-	dir, err := f.d.ConfigDir()
-	if err != nil {
-		return "", fmt.Errorf("locating the user config directory for the backup "+
-			"(pass --backup-dir to choose one): %w", err)
+	dir := f.o.BackupDir
+	if dir == "" {
+		cfg, err := f.d.ConfigDir()
+		if err != nil {
+			return "", fmt.Errorf("locating the user config directory for the backup "+
+				"(pass --backup-dir to choose one): %w", err)
+		}
+		dir = filepath.Join(cfg, "core", "backups")
 	}
-	return filepath.Join(dir, "core", "backups", name), nil
+	path := filepath.Join(dir, name)
+	if apple {
+		// Only the apple- name needs this. The ordinary name carries a
+		// timestamp to the second, so a collision there means the clock
+		// stood still, and writeFileAtomic's refusal is the right
+		// answer — see TestBackupIsNeverOverwritten.
+		path = unusedPath(path)
+	}
+	return path, nil
+}
+
+// unusedPath returns path, or path with a -2, -3 … before the extension
+// if something is already there.
+//
+// writeFileAtomic refuses to overwrite a backup, which is right, and
+// the apple- name carries only a date — so a second install on the same
+// day (restore Apple, install again) would otherwise abort the flash at
+// the backup step. Renaming the new file is the only answer that
+// neither loses the old backup nor blocks the write.
+func unusedPath(path string) string {
+	if _, err := os.Stat(path); err != nil {
+		return path
+	}
+	ext := filepath.Ext(path)
+	stem := path[:len(path)-len(ext)]
+	for n := 2; n < 1000; n++ {
+		candidate := fmt.Sprintf("%s-%d%s", stem, n, ext)
+		if _, err := os.Stat(candidate); err != nil {
+			return candidate
+		}
+	}
+	return path
 }
 
 // backup copies the WHOLE firmware partition to a file, fsyncs it,
@@ -892,6 +990,9 @@ func (f *flash) writeAndVerify(ctx context.Context) error {
 		fmt.Fprintf(f.out, "\nVERIFIED — %d bytes written to %s and read back byte for byte.\n",
 			f.res.BytesWritten, f.pod.Disk.Path)
 		fmt.Fprintf(f.out, "backup       %s\n", f.res.BackupPath)
+		if line := f.keptFirmwareLine(); line != "" {
+			fmt.Fprintf(f.out, "%s\n", line)
+		}
 		return nil
 	}
 	return f.failure(writeErr, verifyErr)
@@ -1094,6 +1195,10 @@ func (f *flash) Fallback() string {
 	if f.res.BackupPath != "" {
 		fmt.Fprintf(&b, "  The partition as it was before this write is saved at:\n    %s\n",
 			f.res.BackupPath)
+		if f.res.Installed.Kind == fwpart.Other {
+			fmt.Fprintf(&b, "    (%s — this is the only copy of it there is; keep the file)\n",
+				f.res.Installed.Description)
+		}
 		fmt.Fprintf(&b, "  Put it back with:\n    core flash --from-backup %s --yes\n",
 			quoteIfNeeded(f.res.BackupPath))
 	} else {
@@ -1167,6 +1272,58 @@ func isDenied(err error) bool {
 func BackupFileName(sizeBytes int64, t time.Time) string {
 	stamp := strings.ReplaceAll(t.Format(time.RFC3339), ":", "-")
 	return fmt.Sprintf("fwpart-%d-%s.bin", sizeBytes, stamp)
+}
+
+// AppleBackupFileName is the name of the backup taken when the device
+// was NOT running Core — in practice, the one and only copy of that
+// iPod's Apple firmware.
+//
+// It is a different name from BackupFileName on purpose, and the
+// difference is not cosmetic: Apple has not distributed iPod Video
+// firmware for years, so this file cannot be re-downloaded, cannot be
+// borrowed from another device (the preamble is per-device) and must
+// never be pruned. A cleanup that ages out backups — there is none
+// today, and when there is one — keeps every apple-* file forever.
+//
+// The date, not the time: one install per device per day is the whole
+// population, and a name a person can retype is worth more than a
+// unique one. unusedPath adds a -2 in the rare case.
+func AppleBackupFileName(serial string, t time.Time) string {
+	return fmt.Sprintf("apple-%s-%s.bin", backupSerial(serial), t.Format("2006-01-02"))
+}
+
+// backupSerial makes a disk serial safe to put in a file name: the OS
+// hands these back from a SCSI inquiry and they can carry spaces and
+// punctuation. An empty serial becomes "unknown" rather than an empty
+// field, so the name never reads as apple--2026-09-15.bin.
+func backupSerial(serial string) string {
+	var b strings.Builder
+	for _, r := range serial {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
+}
+
+// keptFirmwareLine is the sentence printed after a successful write
+// that replaced something other than Core: where the firmware that was
+// there went, and the command that puts it back. It is the whole
+// reason the backup has a findable name.
+func (f *flash) keptFirmwareLine() string {
+	if f.res.Installed.Kind != fwpart.Other || f.res.BackupPath == "" {
+		return ""
+	}
+	what := f.res.Installed.Description
+	if strings.HasPrefix(what, "Apple firmware") {
+		what = "Apple firmware"
+	}
+	return fmt.Sprintf("%s kept at %s; `core flash --from-backup %s` puts it back",
+		what, f.res.BackupPath, quoteIfNeeded(f.res.BackupPath))
 }
 
 // DefaultBackupDir is <user config dir>/core/backups. The plan names

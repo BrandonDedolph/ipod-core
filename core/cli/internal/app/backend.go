@@ -1,22 +1,32 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/artfetch"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/disk"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/doctor"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/eject"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/flasher"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/fwpart"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/ghrelease"
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/installer"
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/librarian"
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/organizer"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/syncer"
 )
 
@@ -32,6 +42,19 @@ type Backend interface {
 	// Refresh identifies the attached iPod and inspects its library
 	// volume. Read-only, top to bottom.
 	Refresh(ctx context.Context) (Device, Library, error)
+	// Detect is the cheap half of Refresh: which iPods are attached,
+	// one raw open each, no volume walk and no checksum. The 2-second
+	// poll calls it; a change is what starts a Refresh.
+	Detect(ctx context.Context) ([]disk.IPod, error)
+	// Classify says what firmware is on one iPod. It is what decides
+	// between the Install screen and the main screen.
+	Classify(ctx context.Context, pod disk.IPod) (fwpart.Installed, error)
+	// Install puts Core on an iPod that is not running it: the whole
+	// internal/installer sequence, which is the same one `core install`
+	// runs. confirm is the flasher's typed confirmation, exactly as for
+	// Flash.
+	Install(ctx context.Context, o installer.Options, emit func(Event),
+		confirm func(prompt string) (string, error)) (*installer.Result, error)
 	// Sync plans and executes one sync. o.DryRun makes it a plan and
 	// nothing else.
 	Sync(ctx context.Context, o syncer.Options, emit func(Event)) (*syncer.Plan, error)
@@ -46,11 +69,55 @@ type Backend interface {
 	// Backup copies the whole firmware partition to a file and returns
 	// its path.
 	Backup(ctx context.Context, emit func(Event)) (string, error)
+	// Rename writes the iPod's name onto its volume: the FAT label
+	// becomes disk.LegalLabel(name) (upper-case, ASCII, 11 bytes), an
+	// empty name clears it, and the label is read back and returned —
+	// what comes back is what Explorer and the device will show. The
+	// friendly name itself is the UI's business: it lives in
+	// config.json, not on the device.
+	Rename(ctx context.Context, volume, name string) (label string, err error)
 	// Eject flushes and ejects the volume. It emits what the OS
 	// actually did: "flushed but not ejected, run this yourself" and
 	// "dismounted and ejected" are different facts, and the user is
 	// about to pull a cable on the strength of one of them.
 	Eject(ctx context.Context, volume string, emit func(Event)) error
+
+	// --- the library manager (the Library tab) ---------------------
+
+	// Inspect walks the source tree and reports what is wrong with it:
+	// missing covers, files whose names do not match their tags,
+	// folders to organize, and the files nobody can name from their
+	// tags. It writes nothing and makes no network request, which is
+	// why the window runs it the moment a folder is chosen.
+	//
+	// discFolders is librarian's opt-in multi-disc split: with it off the
+	// split is still reported and costs nothing, and only a report made
+	// with it ON can have the split applied — which is why ticking that
+	// row in the window rescans.
+	Inspect(ctx context.Context, src string, discFolders bool, emit func(Event)) (
+		*librarian.Report, error)
+	// Candidates asks the art providers about the coverless albums in
+	// a report. It is the only call in this half that reaches the
+	// internet, so it is a button and not part of Inspect.
+	Candidates(ctx context.Context, rep *librarian.Report, emit func(Event)) (
+		map[librarian.AlbumKey][]artfetch.Candidate, error)
+	// Fix applies the ticked parts of a report as ONE job with ONE undo
+	// journal: covers first, then the moves, then the sidecars.
+	Fix(ctx context.Context, rep *librarian.Report, ch librarian.Choices, emit func(Event)) (
+		*librarian.Result, error)
+	// UndoFix replays one journal backwards, refusing any file that has
+	// changed since it was moved.
+	UndoFix(ctx context.Context, journal string, emit func(Event)) (*organizer.UndoReport, error)
+
+	// Thumbnail decodes one album folder's cover for the grid: the
+	// device's own folder.art sidecar when there is one, the embedded
+	// front cover otherwise. It is called off the UI goroutine by the
+	// thumbnail cache, never from a layout.
+	Thumbnail(dir string) (image.Image, error)
+	// FetchThumb downloads one art candidate's ~200 px thumbnail. It is
+	// on the Backend so the Library tab's tests draw the candidate row
+	// with no network at all.
+	FetchThumb(ctx context.Context, url string) (image.Image, error)
 }
 
 // RealBackend is the production wiring. Its fields are the two paths
@@ -67,6 +134,14 @@ type RealBackend struct {
 	Repo string
 	// GOOS is runtime.GOOS, overridable in a test.
 	GOOS string
+	// HTTP is the client FetchThumb uses; nil means a default one.
+	HTTP *http.Client
+
+	// art is the shared artfetch client, built once: its cache and its
+	// one-request-a-second MusicBrainz limiter have to be shared across
+	// every lookup the window makes.
+	artOnce sync.Once
+	art     *artfetch.Client
 }
 
 // NewRealBackend wires the production backend.
@@ -131,7 +206,21 @@ func (b *RealBackend) Refresh(ctx context.Context) (Device, Library, error) {
 		d.Size = p.Disk.SizeBytes
 		d.SectorSize = p.SectorSize
 		d.Tested = p.Tested
+		if inst, err := b.Classify(ctx, p); err == nil {
+			d.Installed = inst
+		} else if d.Err == "" {
+			// Not fatal and not silent: a device that cannot be
+			// classified stays on the main screen (see State.Phase) and
+			// the reason goes where the user can read it.
+			d.Err = err.Error()
+		}
 		d.Volume = doctor.VolumeOf(p, true)
+		if d.Volume != "" {
+			// The iPod's name. A volume with no label, or a platform
+			// with no way to ask, leaves it empty and the header falls
+			// back — a name is not worth an error on a refresh.
+			d.Label, _ = disk.VolumeLabel(d.Volume)
+		}
 	}
 	// "Reading a raw disk needs Administrator" is worth saying on the
 	// card only when that is actually what went wrong.
@@ -149,6 +238,106 @@ func (b *RealBackend) Refresh(ctx context.Context) (Device, Library, error) {
 		Note:        vol.Note,
 	}
 	return d, lib, nil
+}
+
+// --- Detect ------------------------------------------------------------
+
+// Detect is one disk.FindIPods: a raw read-only open of each physical
+// drive, the MBR and the preamble. It is what the poll runs twice a
+// second-ish, and it is deliberately not the doctor — a full Refresh
+// every 2 s would re-read and re-checksum a 7.6 MB image forever.
+func (b *RealBackend) Detect(ctx context.Context) ([]disk.IPod, error) {
+	return disk.FindIPods()
+}
+
+// Classify opens one iPod read-only and says what is on its OSOS image.
+func (b *RealBackend) Classify(ctx context.Context, pod disk.IPod) (fwpart.Installed, error) {
+	h, err := disk.Open(pod.Disk.Path, false)
+	if err != nil {
+		return fwpart.Installed{}, err
+	}
+	defer h.Close()
+	inst, _, err := fwpart.ClassifyPartition(doctor.FirmwarePartition(pod, h))
+	if err != nil {
+		return fwpart.Installed{}, fmt.Errorf("reading the firmware partition on %s: %w",
+			pod.Disk.Path, err)
+	}
+	return inst, nil
+}
+
+// --- Install -----------------------------------------------------------
+
+// Install runs internal/installer over the attached iPod: classify,
+// refuse a device already running Core, back Apple's firmware up under
+// a name a person can find, write through the same flasher sequence as
+// Flash, then create CORECFG.DAT, CORELOG.BIN and Music\ on the volume.
+func (b *RealBackend) Install(ctx context.Context, o installer.Options, emit func(Event),
+	confirm func(prompt string) (string, error)) (*installer.Result, error) {
+	dir := o.BackupDir
+	if dir == "" {
+		dir = b.BackupDir
+	}
+	if dir == "" {
+		if d, err := flasher.DefaultBackupDir(); err == nil {
+			dir = d
+		}
+	}
+	o.BackupDir = dir
+	deps := buildInstallDeps(b, dir, confirm, emitWriter(emit))
+	if b.GOOS != "" {
+		deps.GOOS = b.GOOS
+	}
+	return installer.Install(ctx, o, deps)
+}
+
+// buildInstallDeps is the app's install wiring, as a function of the
+// backend and nothing else, so a test can assert what the elevated
+// child would be told to do without a device or a UAC prompt.
+//
+// It mirrors buildFlashDeps exactly, and for the same reason: the
+// elevated child is the `core` CLI beside the app, running a command
+// line a person could read in the UAC prompt and re-run by hand. The
+// one difference is the command — `core install <image>`, not `flash`,
+// because the volume step is part of an install and the child is the
+// process that reaches it.
+func buildInstallDeps(b *RealBackend, backupDir string,
+	confirm func(prompt string) (string, error), out io.Writer) installer.Deps {
+	d := installer.Deps{
+		Inspect: func(ctx context.Context) (installer.Device, error) {
+			pod, err := disk.SelectIPod("")
+			if err != nil {
+				return installer.Device{}, err
+			}
+			inst, err := b.Classify(ctx, pod)
+			if err != nil {
+				return installer.Device{}, err
+			}
+			return installer.Device{Pod: pod, Installed: inst}, nil
+		},
+		ChildArgs: func(image string) []string {
+			args := []string{"install", image}
+			if backupDir != "" {
+				args = append(args, "--backup-dir", backupDir)
+			}
+			return args
+		},
+		Confirm: confirm,
+		Out:     out,
+	}
+	if b.CLI != "" {
+		cli := b.CLI
+		d.Executable = func() (string, error) { return cli, nil }
+		d.Relaunch = func(args []string) (int, string, error) {
+			return disk.RelaunchElevatedExe(cli, args)
+		}
+	} else {
+		d.Executable = func() (string, error) { return "core", nil }
+		d.Relaunch = func([]string) (int, string, error) {
+			return 0, "", fmt.Errorf("the core CLI is not next to this app; " +
+				"put core.exe beside core-app.exe, or run `core install` in an Administrator console")
+		}
+	}
+	return d
 }
 
 // --- Sync --------------------------------------------------------------
@@ -420,8 +609,158 @@ func verifyBackup(path string) error {
 	return nil
 }
 
+// --- Rename -------------------------------------------------------------
+
+// Rename writes the volume label and proves it by reading it back.
+//
+// Two things this deliberately does NOT do. It does not touch
+// config.json: the friendly name is the UI's, and a backend that wrote
+// settings would have two owners for one file. And it does not lock the
+// volume first — SetVolumeLabelW needs the volume mounted, and the one
+// thing that must never happen is a rename during a flash, which
+// dismounts the drive letter. The Runner's one-job-at-a-time rule is
+// what keeps those two apart.
+func (b *RealBackend) Rename(ctx context.Context, volume, name string) (string, error) {
+	if volume == "" {
+		return "", fmt.Errorf("no iPod volume: plug the iPod in (disk mode: Select+Play) and press Refresh")
+	}
+	label := disk.LegalLabel(name)
+	if strings.TrimSpace(name) != "" && label == "" {
+		return "", fmt.Errorf("%q has nothing a FAT volume label can hold "+
+			"(A-Z, 0-9, space and !#$%%&'()-@^_`{}~, 11 bytes)", name)
+	}
+	if err := disk.SetVolumeLabel(volume, label); err != nil {
+		return "", err
+	}
+	got, err := disk.VolumeLabel(volume)
+	if err != nil {
+		// The write reported success and the read-back failed: say what
+		// was written rather than claiming the rename did not happen.
+		return label, nil
+	}
+	if got != label {
+		return got, fmt.Errorf("the label read back as %q, not %q — the volume did not take it", got, label)
+	}
+	return got, nil
+}
+
 // Eject hands the volume back to the OS through internal/eject — the
 // same code `core eject` runs.
 func (b *RealBackend) Eject(ctx context.Context, volume string, emit func(Event)) error {
 	return eject.Eject(emitWriter(emit), volume)
 }
+
+// --- the library manager ------------------------------------------------
+
+// The four librarian calls, wired the way `core fix` wires them, plus the
+// two picture readers the grid and the candidate row need.
+//
+// librarian's Event is app's Event with a string job name (it must not
+// import this package — linking Gio into core.exe is the thing that split
+// them), so the adapter here is a switch and two copies, exactly as the
+// plan's L5 said it would be.
+
+// libEvents adapts librarian's progress callback to the window's.
+func libEvents(emit func(Event)) func(librarian.Event) {
+	return func(e librarian.Event) {
+		switch e.Kind {
+		case librarian.EventProgress:
+			emit(Event{Kind: EventProgress, Text: e.Text, Pct: e.Pct})
+		default:
+			emit(Event{Kind: EventLog, Text: e.Text})
+		}
+	}
+}
+
+// artClient is the shared art client. One per backend, so the cache and
+// the MusicBrainz rate limiter are shared across every lookup the window
+// makes — a limiter per call would be no limiter at all.
+func (b *RealBackend) artClient() *artfetch.Client {
+	b.artOnce.Do(func() {
+		b.art = artfetch.New()
+	})
+	return b.art
+}
+
+// Inspect is librarian.Inspect with the window's progress.
+func (b *RealBackend) Inspect(ctx context.Context, src string, discFolders bool,
+	emit func(Event)) (*librarian.Report, error) {
+	return librarian.Inspect(ctx, src, librarian.Options{
+		Progress:    libEvents(emit),
+		DiscFolders: discFolders,
+	})
+}
+
+// Candidates asks the providers about every coverless album in the report.
+func (b *RealBackend) Candidates(ctx context.Context, rep *librarian.Report, emit func(Event)) (
+	map[librarian.AlbumKey][]artfetch.Candidate, error) {
+	return librarian.Candidates(ctx, rep, b.artClient(), librarian.Options{Progress: libEvents(emit)})
+}
+
+// Fix applies the ticked parts of the report. The art client goes in
+// because an accepted candidate is downloaded here, at apply time, rather
+// than held in memory from the lookup.
+func (b *RealBackend) Fix(ctx context.Context, rep *librarian.Report, ch librarian.Choices,
+	emit func(Event)) (*librarian.Result, error) {
+	return librarian.Fix(ctx, rep, ch, librarian.Options{
+		Art:         b.artClient(),
+		Progress:    libEvents(emit),
+		DiscFolders: ch.DiscFolders,
+	})
+}
+
+// UndoFix replays one journal backwards.
+func (b *RealBackend) UndoFix(ctx context.Context, journal string, emit func(Event)) (
+	*organizer.UndoReport, error) {
+	return librarian.Undo(ctx, journal, librarian.Options{Progress: libEvents(emit)})
+}
+
+// Thumbnail is the grid's decode: the device's own sidecar, else the
+// album's embedded front cover.
+func (b *RealBackend) Thumbnail(dir string) (image.Image, error) { return AlbumThumbnail(dir) }
+
+// FetchThumb downloads one candidate's thumbnail.
+//
+// It is a plain GET rather than artfetch.Client.Fetch because Fetch is the
+// downloader for the picture that gets EMBEDDED: it enforces a minimum of
+// several hundred pixels, and a 100 px confirmation thumbnail would fail
+// that check by design. The User-Agent is artfetch's either way —
+// MusicBrainz and the Cover Art Archive require it of every request.
+func (b *RealBackend) FetchThumb(ctx context.Context, url string) (image.Image, error) {
+	if strings.TrimSpace(url) == "" {
+		return nil, ErrNoThumb
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", artfetch.UserAgent())
+	req.Header.Set("Accept", "image/*")
+	client := b.HTTP
+	if client == nil {
+		client = &http.Client{Timeout: artfetch.RequestTimeout}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("art thumbnail %s: %s", url, resp.Status)
+	}
+	// A confirmation thumbnail is 200 px of JPEG; anything an order of
+	// magnitude bigger is not one, and this reader is the trust boundary
+	// for bytes a search result pointed at.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxThumbBytes))
+	if err != nil {
+		return nil, err
+	}
+	img, _, err := image.Decode(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	return Downscale(img, 200), nil
+}
+
+// maxThumbBytes is the cap on a candidate thumbnail download.
+const maxThumbBytes = 2 << 20

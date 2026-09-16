@@ -16,8 +16,9 @@
 //	core-app                          open the window
 //	core-app --source DIR             open it with the music folder preset
 //	core-app --log FILE               append startup diagnostics to FILE
-//	core-app --screenshot OUT.png [--state demo|empty] [--size 900x600]
-//	                                  render one frame headless and exit
+//	core-app --no-detect              do not poll for the iPod
+//	core-app --screenshot OUT.png [--state demo|library|empty|looking|notinstalled]
+//	              [--size 900x600]    render one frame headless and exit
 //
 // --screenshot is the review channel: a `-H windowsgui` process cannot
 // show anyone anything from a shell, and this writes the exact frame
@@ -44,11 +45,14 @@ import (
 
 func main() {
 	var (
-		screenshot  = flag.String("screenshot", "", "Render one frame to this PNG and exit (no window)")
-		stateName   = flag.String("state", "demo", "Which canned state --screenshot renders: demo, empty")
-		size        = flag.String("size", "900x600", "--screenshot size, WxH")
-		source      = flag.String("source", "", "Preset the music source folder")
-		logFile     = flag.String("log", "", "Append startup diagnostics to this file")
+		screenshot = flag.String("screenshot", "", "Render one frame to this PNG and exit (no window)")
+		stateName  = flag.String("state", "demo",
+			"Which canned state --screenshot renders: demo, library, empty, looking, notinstalled")
+		size     = flag.String("size", "900x600", "--screenshot size, WxH")
+		source   = flag.String("source", "", "Preset the music source folder")
+		logFile  = flag.String("log", "", "Append startup diagnostics to this file")
+		noDetect = flag.Bool("no-detect", false,
+			"Do not poll for the iPod every 2 seconds; the window stays on whatever it last read")
 		showVersion = flag.Bool("version", false, "Print the version and exit")
 	)
 	flag.Parse()
@@ -89,6 +93,7 @@ func main() {
 		ConfigPath: cfgPath,
 		Source:     *source,
 		LogFile:    *logFile,
+		NoDetect:   *noDetect,
 	}
 	if cfgErr != nil {
 		writeLog(*logFile, "config: %v", cfgErr)
@@ -105,8 +110,15 @@ func cannedState(name string) (app.State, error) {
 		return app.DemoState(), nil
 	case "empty", "nodevice":
 		return app.EmptyState(), nil
+	case "looking":
+		return app.LookingState(), nil
+	case "notinstalled", "not-installed", "install":
+		return app.NotInstalledState(), nil
+	case "library", "fix":
+		return app.LibraryState(), nil
 	default:
-		return app.State{}, fmt.Errorf("--state %q: expected demo or empty", name)
+		return app.State{}, fmt.Errorf(
+			"--state %q: expected demo, library, empty, looking or notinstalled", name)
 	}
 }
 

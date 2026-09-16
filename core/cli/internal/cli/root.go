@@ -54,8 +54,12 @@ func Root() *cobra.Command {
 		newFirmwareCmd(),
 		newIndexCmd(),
 		newArtCmd(),
+		newOrganizeCmd(),
+		newFixCmd(),
 		newSyncCmd(),
 		newEjectCmd(),
+		newNameCmd(),
+		newInstallCmd(),
 		newFlashCmd(),
 		newUpdateCmd(),
 		newDoctorCmd(),
@@ -115,8 +119,12 @@ Available today:
   core build          Cross-compile the firmware (make -C core <target>)
   core index          Build CORELIB.IDX from a source music tree
   core art            Bake folder.art / folder.thm sidecars
+  core organize       Rename and re-folder a music tree from its tags
+  core fix            List everything wrong with a library, and fix it
   core sync           Put a music tree on the iPod: files, art, playlists, index
   core eject          Flush and eject the volume so the cable can be pulled
+  core name           Read or set the iPod's name (its FAT volume label)
+  core install        Put Core on an iPod still running Apple's firmware
   core flash          Write a firmware image, or restore a partition backup
   core update         Fetch the latest firmware release and flash it
   core doctor         Read-only health check of a device and its library volume

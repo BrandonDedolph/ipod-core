@@ -64,10 +64,31 @@ func entryBytes(t *testing.T, e firmware.DirectoryEntry) []byte {
 }
 
 // syntheticPartition builds the partition image: preamble, directory,
-// an OSOS body and an RSRC body.
+// an OSOS body and an RSRC body. The OSOS row is OUR shape — entry
+// point 0, a small body — because that is the device this project runs.
+// appleShapedPartition below is the other one.
 func syntheticPartition(t *testing.T, osos, rsrc []byte) []byte {
 	t.Helper()
-	part := make([]byte, testPartSize)
+	return partitionWith(t, testPartSize, firmware.DirectoryEntry{
+		ContainerID: [4]byte{'!', 'A', 'T', 'A'},
+		ImageType:   [4]byte{'s', 'o', 's', 'o'},
+		DevOffset:   ososDevOffset,
+		Length:      uint32(len(osos)),
+		LoadAddr:    0x10000000,
+		Checksum:    sumBytes(osos),
+		Version:     0xB012,
+		LoadAddr2:   0xFFFFFFFF,
+	}, osos, rsrcDevOffset, rsrc)
+}
+
+// partitionWith is syntheticPartition with the OSOS row and the
+// geometry handed in, so a test can build a STOCK iPod: Apple's row,
+// entry point 0x736000, 7.6 MB of image, and the RSRC image far enough
+// along to leave room for it.
+func partitionWith(t *testing.T, size int, ososRow firmware.DirectoryEntry, ososBody []byte,
+	rsrcOff uint32, rsrc []byte) []byte {
+	t.Helper()
+	part := make([]byte, size)
 	off := 0
 	for _, line := range []string{
 		"{{~~  /-----\\   ", "{{~~ /       \\  ", "{{~~|         | ",
@@ -85,20 +106,11 @@ func syntheticPartition(t *testing.T, osos, rsrc []byte) []byte {
 	part[0x104], part[0x105], part[0x106] = 0x00, 0x40, 0x00
 	part[0x10A] = 3
 
-	copy(part[testDirStart:], entryBytes(t, firmware.DirectoryEntry{
-		ContainerID: [4]byte{'!', 'A', 'T', 'A'},
-		ImageType:   [4]byte{'s', 'o', 's', 'o'},
-		DevOffset:   ososDevOffset,
-		Length:      uint32(len(osos)),
-		LoadAddr:    0x10000000,
-		Checksum:    sumBytes(osos),
-		Version:     0xB012,
-		LoadAddr2:   0xFFFFFFFF,
-	}))
+	copy(part[testDirStart:], entryBytes(t, ososRow))
 	copy(part[testDirStart+fwpart.EntrySize:], entryBytes(t, firmware.DirectoryEntry{
 		ContainerID: [4]byte{'!', 'A', 'T', 'A'},
 		ImageType:   [4]byte{'c', 'r', 's', 'r'},
-		DevOffset:   rsrcDevOffset,
+		DevOffset:   rsrcOff,
 		Length:      uint32(len(rsrc)),
 		LoadAddr:    0x10000000,
 		EntryOffset: 0x1234,
@@ -109,9 +121,43 @@ func syntheticPartition(t *testing.T, osos, rsrc []byte) []byte {
 	// The terminator row as the device writes it: zero except LoadAddr2.
 	copy(part[testDirStart+2*fwpart.EntrySize+36:], []byte{0xFF, 0xFF, 0xFF, 0xFF})
 
-	copy(part[ososDevOffset+fwpart.BodyBias:], osos)
-	copy(part[rsrcDevOffset+fwpart.BodyBias:], rsrc)
+	copy(part[int(ososRow.DevOffset)+fwpart.BodyBias:], ososBody)
+	copy(part[int(rsrcOff)+fwpart.BodyBias:], rsrc)
 	return part
+}
+
+// --- the stock iPod ---------------------------------------------------
+//
+// The row every iPod that has never been flashed carries, read off
+// bootpartition-backup.bin: len 7,618,128, entryOffset 0x736000, addr
+// 0x10000000, vers 0xB012, loadAddr2 0xFFFFFFFF. The partition is 8 MiB
+// here rather than 131 MB — enough to hold Apple's image and the RSRC
+// entry after it, which is what the classification and the capacity
+// check depend on.
+const (
+	applePartSize  = 8 << 20
+	appleOSOSLen   = 7618128
+	appleOSOSEntry = 0x736000
+	appleRSRCOff   = 0x749000
+)
+
+// appleShapedPartition is a partition as a stock iPod has it. The 7.6 MB
+// body is zeros: nothing here re-sums it, and zeros carry no version
+// marker, which is exactly what Apple's image carries.
+func appleShapedPartition(t *testing.T) []byte {
+	t.Helper()
+	body := make([]byte, appleOSOSLen)
+	return partitionWith(t, applePartSize, firmware.DirectoryEntry{
+		ContainerID: [4]byte{'!', 'A', 'T', 'A'},
+		ImageType:   [4]byte{'s', 'o', 's', 'o'},
+		DevOffset:   ososDevOffset,
+		Length:      appleOSOSLen,
+		LoadAddr:    0x10000000,
+		EntryOffset: appleOSOSEntry,
+		Checksum:    sumBytes(body),
+		Version:     0xB012,
+		LoadAddr2:   0xFFFFFFFF,
+	}, body, appleRSRCOff, plausibleImage(4096, 7))
 }
 
 // --- the fake device and the injection seams --------------------------
@@ -1174,5 +1220,198 @@ func TestConfirmPromptRoundTrips(t *testing.T) {
 		if got, ok := ConfirmTarget(bad); ok {
 			t.Errorf("ConfirmTarget(%q) = %q, ok; want !ok", bad, got)
 		}
+	}
+}
+
+// --- the stock iPod: the install case ---------------------------------
+
+// TestWriteOverAppleFirmware is L1's gate, run through the whole
+// sequence rather than through fwpart alone: flashing a Core image onto
+// a device that is still running Apple's firmware must leave a row
+// whose entry point is 0, must keep addr/vers/loadAddr2, and must leave
+// the only copy of that device's Apple firmware in a file a person can
+// find.
+//
+// Both commands are checked, because the policy is a property of the
+// image and not of the command: `core flash` onto a stock iPod has to
+// produce exactly what `core install` does.
+func TestWriteOverAppleFirmware(t *testing.T) {
+	for _, install := range []bool{false, true} {
+		name := "flash"
+		if install {
+			name = "install"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, appleShapedPartition(t))
+			before := readEntry(t, e.partition(), 0)
+			image := plausibleImage(367608, 11)
+			path := writeIPod(t, t.TempDir(), "core.ipod", image)
+
+			res, err := Flash(context.Background(), Options{
+				Image: path, Yes: true, Install: install, BackupDir: e.backupDir,
+			}, e.deps())
+			if err != nil {
+				t.Fatalf("Flash: %v\n%s", err, e.out.String())
+			}
+			if !res.Verified {
+				t.Fatal("the write did not verify")
+			}
+
+			// What was there.
+			if res.Installed.Kind != fwpart.Other {
+				t.Errorf("Installed.Kind = %s, want %s", res.Installed.Kind, fwpart.Other)
+			}
+			if res.Installed.Description != "Apple firmware (7.6 MB, entry 0x736000)" {
+				t.Errorf("Installed.Description = %q", res.Installed.Description)
+			}
+
+			// The row on the device: entry 0, and nothing else moved.
+			got := readEntry(t, e.partition(), 0)
+			if got.EntryOffset != 0 {
+				t.Errorf("EntryOffset on the device = %#x, want 0 — this row would boot to "+
+					"nothing", got.EntryOffset)
+			}
+			if got.Length != uint32(len(image)) {
+				t.Errorf("Length = %d, want %d", got.Length, len(image))
+			}
+			if got.Checksum != sumBytes(image) {
+				t.Errorf("Checksum = %#08x, want %#08x", got.Checksum, sumBytes(image))
+			}
+			if got.LoadAddr != before.LoadAddr || got.Version != before.Version ||
+				got.LoadAddr2 != before.LoadAddr2 || got.DevOffset != before.DevOffset ||
+				got.ImageType != before.ImageType || got.ContainerID != before.ContainerID {
+				t.Errorf("a field other than Length/Checksum/EntryOffset changed:\n old %+v\n new %+v",
+					before, got)
+			}
+			if got.LoadAddr != 0x10000000 || got.Version != 0xB012 || got.LoadAddr2 != 0xFFFFFFFF {
+				t.Errorf("addr/vers/la2 = %#x/%#x/%#x, want Apple's values kept",
+					got.LoadAddr, got.Version, got.LoadAddr2)
+			}
+			// The image after it is untouched.
+			if rsrc := readEntry(t, e.partition(), 1); rsrc.DevOffset != appleRSRCOff {
+				t.Errorf("the RSRC row changed: %+v", rsrc)
+			}
+
+			// The backup: Apple's name, and the whole partition in it.
+			backup := onlyBackup(t, e.backupDir)
+			wantName := "apple-TESTSERIAL-2026-09-15.bin"
+			if filepath.Base(backup) != wantName {
+				t.Errorf("backup name = %q, want %q", filepath.Base(backup), wantName)
+			}
+			blob, err := os.ReadFile(backup)
+			if err != nil {
+				t.Fatalf("read the backup: %v", err)
+			}
+			if len(blob) != applePartSize {
+				t.Errorf("the backup is %d bytes, the partition is %d", len(blob), applePartSize)
+			}
+			if kept := readEntry(t, blob, 0); kept.EntryOffset != appleOSOSEntry ||
+				kept.Length != appleOSOSLen {
+				t.Errorf("the backup does not hold Apple's row: %+v", kept)
+			}
+
+			out := e.out.String()
+			for _, want := range []string{
+				name + " — plan",
+				"installed    Apple firmware (7.6 MB, entry 0x736000)",
+				"entryOffset  0x736000 → 0x0",
+				"Apple firmware kept at " + backup,
+				"core flash --from-backup " + backup,
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("the output does not contain %q:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
+// A re-flash over one of our own images keeps the ordinary backup name.
+// The apple- name means "the only copy of the firmware this device came
+// with"; spending it on a routine re-flash would make it meaningless.
+func TestFlashOverCoreKeepsTheOrdinaryBackupName(t *testing.T) {
+	e := newEnv(t, syntheticPartition(t, plausibleImage(8192, 1), plausibleImage(4096, 2)))
+	path := writeIPod(t, t.TempDir(), "core.ipod", plausibleImage(12345, 3))
+
+	res, err := Flash(context.Background(), Options{Image: path, Yes: true, BackupDir: e.backupDir},
+		e.deps())
+	if err != nil {
+		t.Fatalf("Flash: %v", err)
+	}
+	if res.Installed.Kind != fwpart.CoreOld {
+		t.Errorf("Installed.Kind = %s, want %s", res.Installed.Kind, fwpart.CoreOld)
+	}
+	name := filepath.Base(onlyBackup(t, e.backupDir))
+	if !strings.HasPrefix(name, "fwpart-") {
+		t.Errorf("backup name = %q, want the ordinary fwpart- name", name)
+	}
+	if strings.Contains(e.out.String(), "kept at") {
+		t.Error("a re-flash printed the Apple-firmware recovery sentence")
+	}
+	// Nothing to change: the row was already entry 0.
+	if strings.Contains(e.out.String(), "entryOffset") {
+		t.Error("the plan printed an entryOffset change that did not happen")
+	}
+}
+
+// Two installs on the same device on the same day: the second backup
+// gets a -2 rather than overwriting the first or aborting the write.
+// The date is only a date on purpose (a name someone can retype), so
+// this is the collision that has to be handled.
+func TestAppleBackupNamesDoNotCollide(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "backups")
+	path := writeIPod(t, t.TempDir(), "core.ipod", plausibleImage(367608, 11))
+	for i := 0; i < 2; i++ {
+		e := newEnv(t, appleShapedPartition(t))
+		e.backupDir = dir
+		if _, err := Flash(context.Background(),
+			Options{Image: path, Yes: true, Install: true, BackupDir: dir}, e.deps()); err != nil {
+			t.Fatalf("install %d: %v", i+1, err)
+		}
+	}
+	for _, want := range []string{"apple-TESTSERIAL-2026-09-15.bin", "apple-TESTSERIAL-2026-09-15-2.bin"} {
+		if _, err := os.Stat(filepath.Join(dir, want)); err != nil {
+			t.Errorf("%s is not there: %v", want, err)
+		}
+	}
+	if n := backupCount(t, dir); n != 2 {
+		t.Errorf("the backup directory holds %d files, want 2", n)
+	}
+}
+
+func TestAppleBackupFileName(t *testing.T) {
+	when := time.Date(2026, 9, 15, 1, 2, 3, 0, time.UTC)
+	for _, tc := range []struct{ serial, want string }{
+		{"000A2700123456AB", "apple-000A2700123456AB-2026-09-15.bin"},
+		{"has spaces/and:punct", "apple-hasspacesandpunct-2026-09-15.bin"},
+		{"", "apple-unknown-2026-09-15.bin"},
+	} {
+		if got := AppleBackupFileName(tc.serial, when); got != tc.want {
+			t.Errorf("AppleBackupFileName(%q) = %q, want %q", tc.serial, got, tc.want)
+		}
+	}
+	if got := AppleBackupFileName("x", when); strings.ContainsAny(got, `:/\ `) {
+		t.Errorf("the name %q carries a character a path will not take", got)
+	}
+}
+
+// Result.AppleBackup is the one path the app's Install card prints, and
+// it must be empty for a re-flash: a fwpart- backup of a Core image is
+// not somebody's irreplaceable Apple firmware.
+func TestResultAppleBackup(t *testing.T) {
+	r := &Result{BackupPath: "/b/apple-X-2026-09-15.bin",
+		Installed: fwpart.Installed{Kind: fwpart.Other}}
+	if r.AppleBackup() != r.BackupPath {
+		t.Errorf("AppleBackup() = %q, want %q", r.AppleBackup(), r.BackupPath)
+	}
+	for _, k := range []fwpart.InstalledKind{fwpart.Core, fwpart.CoreOld, ""} {
+		r.Installed.Kind = k
+		if got := r.AppleBackup(); got != "" {
+			t.Errorf("AppleBackup() with kind %s = %q, want empty", k, got)
+		}
+	}
+	var nilr *Result
+	if nilr.AppleBackup() != "" {
+		t.Error("AppleBackup() on a nil Result is not empty")
 	}
 }

@@ -573,6 +573,58 @@ func TestInvalidSidecarIsRewritten(t *testing.T) {
 	mustSidecar(t, thumb, coreart.ThumbSize)
 }
 
+// TestSidecarsFollowTheSourcePicture is plan §1 decision 11: embedding a cover
+// in the source FLAC must reach the iPod on the next sync without a flag.
+//
+// The sidecars on the device stay structurally valid when the source picture
+// changes — they are the OLD cover — so validity alone would keep them for
+// ever. `core fix` and `core art --fetch` deliberately do not preserve the
+// source's mtime, and this is the rule that reads it.
+func TestSidecarsFollowTheSourcePicture(t *testing.T) {
+	src, dst := srcTree(t), t.TempDir()
+	syncOnce(t, opts(src, dst))
+
+	// Nothing touched: the art of the album that HAS a cover stays put.
+	// (Artist B - Red has no embedded picture at all, so its sidecars are
+	// never written and it is "missing" on every run.)
+	p := planFor(t, opts(src, dst))
+	for _, a := range p.Art {
+		if a.Album == "Artist A - Blue" && a.Write {
+			t.Fatalf("an untouched tree re-rendered %s: %s", a.Album, a.Reason)
+		}
+	}
+
+	// The cover in the album's art source is replaced (which is exactly what
+	// flac.WritePicture does, mtime and all).
+	artSrc := filepath.Join(src, "Blue - Artist A", "Alpha.flac")
+	later := time.Now().Add(1 * time.Minute)
+	if err := os.Chtimes(artSrc, later, later); err != nil {
+		t.Fatal(err)
+	}
+
+	p = planFor(t, opts(src, dst))
+	var got *ArtOp
+	for i := range p.Art {
+		if p.Art[i].Album == "Artist A - Blue" {
+			got = &p.Art[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("no art op for Artist A - Blue")
+	}
+	if !got.Write {
+		t.Errorf("a newer art source did not re-render the sidecars: %s", got.Reason)
+	}
+	if !strings.Contains(got.Reason, "newer") {
+		t.Errorf("reason = %q, want it to say the source is newer", got.Reason)
+	}
+	// And the reason is the mtime, not a coincidence: the album is only in
+	// the list because its source moved forward.
+	if got.SrcFLAC != artSrc {
+		t.Errorf("art source = %s, want %s", got.SrcFLAC, artSrc)
+	}
+}
+
 // TestDryRunWritesNothing — not the music, not the playlists, and not
 // CORECFG.DAT either.
 func TestDryRunWritesNothing(t *testing.T) {

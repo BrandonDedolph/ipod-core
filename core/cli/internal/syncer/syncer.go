@@ -395,10 +395,12 @@ func MakePlan(o Options, scan *library.Scan) (*Plan, error) {
 				art.Reason = "no source file to read a cover from"
 			case o.ArtRefresh:
 				art.Write, art.Reason = true, "--art-refresh"
-			case sidecarsValid(albumDir):
-				art.Reason = "folder.art + folder.thm are already valid"
-			default:
+			case !sidecarsValid(albumDir):
 				art.Write, art.Reason = true, "missing or invalid sidecars"
+			case sidecarsStale(albumDir, art.SrcFLAC):
+				art.Write, art.Reason = true, "the source file is newer than folder.art"
+			default:
+				art.Reason = "folder.art + folder.thm are already valid"
 			}
 			p.Art = append(p.Art, art)
 		}
@@ -470,6 +472,37 @@ func sidecarsValid(dir string) bool {
 	}
 	thm, err := os.ReadFile(filepath.Join(dir, coreart.ThumbName))
 	return err == nil && coreart.Valid(thm, coreart.ThumbSize)
+}
+
+// sidecarsStale reports whether the album's art source has been touched since
+// the sidecars on the device were rendered.
+//
+// This is what makes embedding a cover reach the iPod without a flag (plan §1
+// decision 11). `core fix` and `core art --fetch` write a PICTURE block into
+// the source FLAC and deliberately do not preserve its mtime; the sidecars
+// already on the device are still structurally valid — they are the OLD cover,
+// or the placeholder-less pair of an album that had none — so the validity
+// test alone would keep them for ever and the user would see the new art only
+// after --art-refresh.
+//
+// The comparison carries MTimeSlack for the same reason the copy decision
+// does: FAT stores a timestamp to two seconds, so a sidecar written moments
+// after its source can read back as older than it.
+func sidecarsStale(dir, srcFLAC string) bool {
+	si, err := os.Stat(srcFLAC)
+	if err != nil {
+		return false // unreadable source: the copy phase has already said so
+	}
+	for _, name := range []string{coreart.ArtName, coreart.ThumbName} {
+		di, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			return true
+		}
+		if si.ModTime().Sub(di.ModTime()) > MTimeSlack {
+			return true
+		}
+	}
+	return false
 }
 
 // unchanged answers "is the file already on the device the one we would send?"

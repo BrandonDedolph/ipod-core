@@ -348,7 +348,7 @@ func TestPlanWriteOSOS(t *testing.T) {
 		{512, 0x4200},  // what an ATA bridge or an image file gives
 	} {
 		t.Run(fmt.Sprintf("sector%d", tc.sectorSize), func(t *testing.T) {
-			writes, e, err := PlanWrite(d, idx, image, tc.sectorSize)
+			writes, e, err := PlanWrite(d, idx, image, tc.sectorSize, KeepEntry)
 			if err != nil {
 				t.Fatalf("PlanWrite: %v", err)
 			}
@@ -446,12 +446,12 @@ func TestPlanWriteRefusesOversizeImage(t *testing.T) {
 	}
 	idx, _, _ := d.OSOS()
 
-	if _, _, err := PlanWrite(d, idx, make([]byte, ososCapacity+1), 2048); !errors.Is(err, ErrImageTooLarge) {
+	if _, _, err := PlanWrite(d, idx, make([]byte, ososCapacity+1), 2048, CoreImage); !errors.Is(err, ErrImageTooLarge) {
 		t.Errorf("PlanWrite(capacity+1) = %v, want ErrImageTooLarge", err)
 	}
 	// Exactly capacity is fine here: 7,618,560 is a multiple of 0x800,
 	// so the zero padding adds nothing.
-	if _, _, err := PlanWrite(d, idx, make([]byte, ososCapacity), 2048); err != nil {
+	if _, _, err := PlanWrite(d, idx, make([]byte, ososCapacity), 2048, CoreImage); err != nil {
 		t.Errorf("PlanWrite(capacity) = %v, want success", err)
 	}
 	// If the gap were not 0x800-aligned, an image that fits would still
@@ -466,18 +466,18 @@ func TestPlanWriteRefusesOversizeImage(t *testing.T) {
 	if got := od.Capacity(oi); got != ososCapacity+0x100 {
 		t.Fatalf("capacity = %d, want %d", got, ososCapacity+0x100)
 	}
-	if _, _, err := PlanWrite(od, oi, make([]byte, ososCapacity+0x100), 2048); !errors.Is(err, ErrImageTooLarge) {
+	if _, _, err := PlanWrite(od, oi, make([]byte, ososCapacity+0x100), 2048, CoreImage); !errors.Is(err, ErrImageTooLarge) {
 		t.Errorf("PlanWrite(unaligned capacity) = %v, want ErrImageTooLarge", err)
 	}
-	if _, _, err := PlanWrite(d, idx, nil, 2048); err == nil {
+	if _, _, err := PlanWrite(d, idx, nil, 2048, CoreImage); err == nil {
 		t.Error("PlanWrite with an empty image succeeded")
 	}
 	for _, s := range []int{0, -512, 1000} {
-		if _, _, err := PlanWrite(d, idx, newImage(), s); !errors.Is(err, ErrBadSectorSize) {
+		if _, _, err := PlanWrite(d, idx, newImage(), s, CoreImage); !errors.Is(err, ErrBadSectorSize) {
 			t.Errorf("PlanWrite(sectorSize=%d) = %v, want ErrBadSectorSize", s, err)
 		}
 	}
-	if _, _, err := PlanWrite(d, 99, newImage(), 2048); err == nil {
+	if _, _, err := PlanWrite(d, 99, newImage(), 2048, CoreImage); err == nil {
 		t.Error("PlanWrite with an out-of-range index succeeded")
 	}
 }
@@ -490,7 +490,7 @@ func TestVerifyWrittenRoundTrip(t *testing.T) {
 	}
 	idx, _, _ := d.OSOS()
 	image := newImage()
-	writes, e, err := PlanWrite(d, idx, image, 2048)
+	writes, e, err := PlanWrite(d, idx, image, 2048, CoreImage)
 	if err != nil {
 		t.Fatalf("PlanWrite: %v", err)
 	}

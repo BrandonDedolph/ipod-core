@@ -18,6 +18,10 @@ build*/
 # Go build artifacts
 cli/core
 cli/core-*
+# `go build ./...` from core/cli drops the main packages' executables in
+# the working directory, and a Windows cross-build drops core.exe, which
+# the two patterns above do not match.
+cli/*.exe
 
 # Test outputs
 tests/runs/

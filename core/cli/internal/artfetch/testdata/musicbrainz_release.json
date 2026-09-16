@@ -1,0 +1,36 @@
+{
+ "count": 3,
+ "offset": 0,
+ "releases": [
+  {
+   "id": "b36a69a1-7af5-4ee6-a1b1-5110ee465ad8",
+   "score": 100,
+   "title": "One Thing at a Time",
+   "artist-credit": [
+    {
+     "name": "Morgan Wallen"
+    }
+   ]
+  },
+  {
+   "id": "dc62a91d-9891-47d6-8fe4-5a45eceb3dfa",
+   "score": 100,
+   "title": "One Thing at a Time",
+   "artist-credit": [
+    {
+     "name": "Morgan Wallen"
+    }
+   ]
+  },
+  {
+   "id": "1e102e68-230d-431a-99f3-045d9407bd75",
+   "score": 100,
+   "title": "One Thing At A Time",
+   "artist-credit": [
+    {
+     "name": "Morgan Wallen"
+    }
+   ]
+  }
+ ]
+}

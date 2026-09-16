@@ -1,0 +1,29 @@
+{
+ "resultCount": 3,
+ "results": [
+  {
+   "wrapperType": "collection",
+   "collectionType": "Album",
+   "collectionId": 1792811746,
+   "artistName": "Morgan Wallen",
+   "collectionName": "I'm The Problem - Single",
+   "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/7d/39/b5/7d39b5a8-b576-fe3e-b1fe-2ec06ec0900e/25UMGIM05950.rgb.jpg/100x100bb.jpg"
+  },
+  {
+   "wrapperType": "collection",
+   "collectionType": "Album",
+   "collectionId": 1802103906,
+   "artistName": "Morgan Wallen",
+   "collectionName": "I’m The Problem",
+   "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/fa/60/fe/fa60fe4a-4329-a0bb-eb7c-3b6094a4d831/25UMGIM46049.rgb.jpg/100x100bb.jpg"
+  },
+  {
+   "wrapperType": "collection",
+   "collectionType": "Album",
+   "collectionId": 1818449588,
+   "artistName": "Morgan Wallen",
+   "collectionName": "Cover Me Up - Single",
+   "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/33/30/69/3330697c-0da0-0ab9-58c0-c3c9e2ddfd1b/00602435214924_Cover.jpg/100x100bb.jpg"
+  }
+ ]
+}

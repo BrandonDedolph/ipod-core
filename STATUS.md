@@ -733,6 +733,14 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
 9. **Host CLI install/flash/recover are stubs** —
     `core/cli/internal/cli/install.go` says so outright; flashing is
     `ipodpatcher` by hand today.
+10. **The firmware does not read the iPod's name.** As of L5b the host
+    owns it: `core name D: "Brandon's iPod"` writes the FAT volume label
+    (`BRANDON'S I` — 11 upper-case ASCII bytes is the whole field) and
+    core-app shows the friendly name in its header. The device could read
+    the same name off the boot sector's `BS_VolLab` (or the root
+    directory's volume entry, which is what Windows really shows) and put
+    it in About and on the boot screen. Nothing in the firmware does yet;
+    it is a read of bytes we already mount, not a filesystem project.
 
 ## Testing
 

@@ -29,8 +29,9 @@ func TestRootRegistersOnlyRealCommands(t *testing.T) {
 	want := map[string]bool{
 		"build": true, "info": true, "backup": true,
 		"firmware": true, "index": true, "art": true,
-		"sync": true, "eject": true, "flash": true,
+		"organize": true, "fix": true, "sync": true, "eject": true, "flash": true,
 		"update": true, "doctor": true,
+		"name": true, "install": true,
 	}
 	for _, c := range Root().Commands() {
 		if c.Name() == "help" || c.Name() == "completion" {
@@ -59,7 +60,7 @@ func TestDeviceFlagExists(t *testing.T) {
 	}
 	// Persistent root flags must be inherited by every subcommand.
 	for _, name := range []string{"build", "info", "backup", "firmware", "index", "art",
-		"sync", "eject", "flash", "update", "doctor"} {
+		"organize", "fix", "sync", "eject", "install", "flash", "update", "doctor", "name"} {
 		c := findCmd(t, name)
 		if c.InheritedFlags().Lookup("device") == nil {
 			t.Errorf("%s cannot see the global --device flag", name)

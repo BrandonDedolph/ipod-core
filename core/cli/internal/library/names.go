@@ -23,14 +23,18 @@ const (
 	fnvPrime  = 0x01000193
 )
 
-// NormKey is the canonical form for name matching: smart quotes and dashes
-// folded to ASCII, A-Z lowercased, nothing else touched. It must stay identical
-// to norm_key() in tools/build_index.py and to the fold inside name_hash() in
-// core/library/names.c.
+// FoldTypography is the TYPOGRAPHIC half of NormKey: curly quotes and en/em
+// dashes folded to their ASCII shapes, case left alone. It is exported because
+// two names that differ only by this fold hash to the same NameHash and so
+// resolve to the same file on the device — which makes renaming one into the
+// other a re-copy of the whole album for nothing. internal/organizer compares
+// an existing name with its canonical one through this rather than through
+// NormKey, because a CASE difference is worth a rename (the device shows the
+// folder's own spelling) and a quote or dash difference is not.
 //
 // Invalid UTF-8 decodes to U+FFFD one byte at a time, which is what
 // core/library/names.c's mn_utf8_next does with a malformed sequence.
-func NormKey(s string) string {
+func FoldTypography(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, ch := range s {
@@ -42,12 +46,27 @@ func NormKey(s string) string {
 		case 0x2013, 0x2014:
 			ch = '-'
 		}
-		if ch >= 'A' && ch <= 'Z' {
-			ch += 32
-		}
 		b.WriteRune(ch)
 	}
 	return b.String()
+}
+
+// NormKey is the canonical form for name matching: smart quotes and dashes
+// folded to ASCII, A-Z lowercased, nothing else touched. It must stay identical
+// to norm_key() in tools/build_index.py and to the fold inside name_hash() in
+// core/library/names.c.
+//
+// It is FoldTypography followed by an ASCII-only lower-casing: A-Z and nothing
+// else, which is what the C and Python sides do.
+func NormKey(s string) string {
+	folded := FoldTypography(s)
+	b := []byte(folded)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + 32
+		}
+	}
+	return string(b)
 }
 
 // NameHash is FNV-1a 32 over the UTF-8 bytes of NormKey(s) — the locator that

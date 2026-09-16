@@ -42,12 +42,18 @@ type StreamInfo struct {
 	TotalSamples  uint64
 }
 
-// Picture is one PICTURE block. Width/height/depth/colour-count are parsed for
-// bounds but not kept: the art pipeline decodes the image itself.
+// Picture is one PICTURE block. The art pipeline decodes the image itself, so
+// the dimension fields are advisory on read — they are what the file claims,
+// not what the bytes are. WritePicture ignores whatever the caller puts in
+// them and fills them from the image.
 type Picture struct {
-	Type uint32
-	MIME string
-	Data []byte
+	Type   uint32
+	MIME   string
+	Width  uint32
+	Height uint32
+	Depth  uint32 // bits per pixel
+	Colors uint32 // palette size for indexed images, 0 otherwise
+	Data   []byte
 }
 
 // Meta is everything Read recovered from a file's metadata blocks.
@@ -273,10 +279,13 @@ func parsePicture(b []byte) (Picture, error) {
 	if _, err := c.take(descLen, "description"); err != nil {
 		return p, err
 	}
-	for _, what := range []string{"width", "height", "colour depth", "colour count"} {
-		if _, err := c.u32be(what); err != nil {
+	dims := make([]uint32, 4)
+	for i, what := range []string{"width", "height", "colour depth", "colour count"} {
+		v, err := c.u32be(what)
+		if err != nil {
 			return p, err
 		}
+		dims[i] = v
 	}
 	dataLen, err := c.u32be("data length")
 	if err != nil {
@@ -288,6 +297,7 @@ func parsePicture(b []byte) (Picture, error) {
 	}
 	p.Type = typ
 	p.MIME = string(mime)
+	p.Width, p.Height, p.Depth, p.Colors = dims[0], dims[1], dims[2], dims[3]
 	p.Data = data
 	return p, nil
 }

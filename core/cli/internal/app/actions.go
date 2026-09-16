@@ -8,6 +8,7 @@ import (
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/disk"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/flasher"
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/installer"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/library"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/syncer"
 )
@@ -74,10 +75,12 @@ func (u *UI) startSync(kind JobKind) {
 		switch kind {
 		case JobDryRun:
 			o.DryRun = true
-			_, err := u.be.Sync(ctx, o, emit)
+			plan, err := u.be.Sync(ctx, o, emit)
+			u.publishPlan(plan, false)
 			return err
 		case JobSync:
-			_, err := u.be.Sync(ctx, o, emit)
+			plan, err := u.be.Sync(ctx, o, emit)
+			u.publishPlan(plan, err == nil)
 			return err
 		}
 
@@ -121,7 +124,8 @@ func (u *UI) startSync(kind JobKind) {
 			return fmt.Errorf("aborted: the confirmation did not match")
 		}
 		o.Prune, o.Yes = true, true
-		_, err = u.be.Sync(ctx, o, emit)
+		plan, err = u.be.Sync(ctx, o, emit)
+		u.publishPlan(plan, err == nil)
 		return err
 	})
 }
@@ -198,14 +202,36 @@ func (u *UI) startFlash(file string) {
 // passed in: this function runs on the job goroutine, where u.st is
 // off limits.
 func (u *UI) flashFile(ctx context.Context, file, cliPath string, emit func(Event)) error {
-	var plan strings.Builder
-	tee := func(e Event) {
+	plan, tee := teePlan(emit)
+	confirm := u.confirmWrite(ctx, plan, cliPath,
+		"Write this image to the iPod?", "Write it")
+	return u.be.Flash(ctx, file, confirm, tee)
+}
+
+// teePlan splits a job's log events two ways: on to the window, and
+// into a buffer the confirmation dialog shows as the plan. Everything
+// the flasher printed before it asked is what the person is agreeing
+// to, and it is the flasher's own words rather than a paraphrase.
+func teePlan(emit func(Event)) (*strings.Builder, func(Event)) {
+	plan := &strings.Builder{}
+	return plan, func(e Event) {
 		if e.Kind == EventLog {
 			plan.WriteString(e.Text)
 		}
 		emit(e)
 	}
-	confirm := func(prompt string) (string, error) {
+}
+
+// confirmWrite is the modal that guards every raw write this app makes:
+// the flasher's own plan, and the device path typed exactly. Flash,
+// Update and Install share it, because a second dialog with a slightly
+// different gate is a second gate to get wrong.
+//
+// cliPath is read from the model on the UI goroutine by the caller and
+// passed in: this runs on the job goroutine, where u.st is off limits.
+func (u *UI) confirmWrite(ctx context.Context, plan *strings.Builder,
+	cliPath, title, okLabel string) func(prompt string) (string, error) {
+	return func(prompt string) (string, error) {
 		note := ""
 		if runtime.GOOS == "windows" && cliPath != "" {
 			note = "\n\nWindows will show a UAC prompt for:\n  " + cliPath
@@ -219,14 +245,76 @@ func (u *UI) flashFile(ctx context.Context, file, cliPath string, emit func(Even
 			return "", fmt.Errorf("the flasher's confirmation prompt is not in the form core-app knows: %q", prompt)
 		}
 		return u.ask(ctx, &dialogRequest{
-			title:   "Write this image to the iPod?",
+			title:   title,
 			body:    tail(plan.String(), 40) + note,
 			prompt:  strings.TrimSpace(prompt),
 			want:    want,
-			okLabel: "Write it",
+			okLabel: okLabel,
 		})
 	}
-	return u.be.Flash(ctx, file, confirm, tee)
+}
+
+// startInstall is the Install screen's one button: put Core on an iPod
+// that is still running Apple's firmware.
+//
+// file is an image the user picked, or "" for the latest release —
+// which is downloaded and checksum-verified here, in this process,
+// before anything is written, so the elevated child (when there is one)
+// never makes a network request.
+//
+// It ends with a Refresh rather than with what it wrote: the phase the
+// window moves to is decided by reading the device back, so a write
+// that verified but somehow left something else installed cannot show
+// the main screen.
+func (u *UI) startInstall(file string) {
+	cli := u.st.CLIPath
+	rel := u.st.Release
+	u.start(JobInstall, func(ctx context.Context, emit func(Event)) error {
+		image := file
+		if image == "" {
+			if !rel.Checked || rel.Tag == "" {
+				got, err := u.be.Release(ctx)
+				u.mu.Lock()
+				u.newRel = &got
+				u.mu.Unlock()
+				if err != nil {
+					return err
+				}
+				rel = got
+			}
+			var err error
+			if image, err = u.be.Download(ctx, rel, emit); err != nil {
+				return err
+			}
+		}
+
+		plan, tee := teePlan(emit)
+		confirm := u.confirmWrite(ctx, plan, cli,
+			"Install Core on this iPod?", "Install it")
+		res, err := u.be.Install(ctx, installer.Options{Image: image}, tee, confirm)
+		if err != nil {
+			return err
+		}
+		if res != nil && res.Flash != nil && res.Flash.Aborted {
+			return fmt.Errorf("aborted: the confirmation did not match")
+		}
+		if res != nil && res.Flash != nil {
+			if apple := res.Flash.AppleBackup(); apple != "" {
+				emit(Event{Kind: EventLog, Text: "Apple's firmware is kept at " + apple +
+					" — `core flash --from-backup " + apple + "` puts it back"})
+			}
+		}
+
+		dev, lib, rerr := u.be.Refresh(ctx)
+		if rerr != nil {
+			return rerr
+		}
+		u.mu.Lock()
+		u.newDev, u.newLib = &dev, &lib
+		u.mu.Unlock()
+		emit(Event{Kind: EventLog, Text: "firmware now: " + dev.Installed.Description})
+		return nil
+	})
 }
 
 // devicePathFromPrompt pulls the exact string the flasher wants typed
@@ -285,4 +373,230 @@ func (u *UI) pick(for_ JobKind) {
 		u.mu.Unlock()
 		u.invalidate()
 	}()
+}
+
+// --- the library manager -----------------------------------------------
+
+// The Library tab's four jobs. Each one reads what it needs from the
+// model on the UI goroutine, hands the rest to the Runner, and writes
+// its result back under the mutex for the next frame's drain() — the
+// same shape every other job in this file has.
+
+// doPrimary runs whatever the top bar's one button currently says.
+//
+// The decision is State.Primary and it is made in exactly one place, so
+// the label and the action cannot disagree: a button that says Sync and
+// ejects is the single worst bug a one-button window can have.
+func (u *UI) doPrimary() {
+	switch u.st.Primary() {
+	case ActionInstall:
+		u.startInstall("")
+	case ActionSync:
+		u.startSync(JobSync)
+	case ActionUpdate:
+		u.startUpdate()
+	case ActionEject:
+		u.startEject()
+	}
+}
+
+// setSource is the one place the music folder changes: the Browse
+// button, the footer's Change, and Enter in either copy of the field.
+//
+// A new folder invalidates everything that was said about the old one —
+// the report, the candidates, the decisions and the undo journal all
+// describe a tree nobody is looking at any more — and then the two
+// read-only passes run: the scan that fills the Library tab and the dry
+// run that fills the grid.
+func (u *UI) setSource(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	changed := path != u.st.Source
+	u.st.Source = path
+	u.sourceEd.SetText(path)
+	u.saveConfig()
+	if changed {
+		u.st.Report, u.st.ArtCands, u.st.ArtChoices = nil, nil, nil
+		u.st.Journal, u.st.Albums = "", nil
+		u.st.LibraryChanged = false
+	}
+	u.startInspect(path)
+	u.later(func() { u.startSync(JobDryRun) })
+}
+
+// startInspect is librarian.Inspect: one walk of the source tree, no
+// network and no writes, which is why it runs on its own the moment a
+// folder is chosen rather than waiting for a button.
+func (u *UI) startInspect(src string) {
+	src = strings.TrimSpace(src)
+	if src == "" {
+		u.st.Logf("scan: no music folder yet — press Browse")
+		return
+	}
+	discs := u.st.DiscFolders
+	u.start(JobInspect, func(ctx context.Context, emit func(Event)) error {
+		emit(Event{Kind: EventProgress, Text: "reading the tags in " + src, Pct: -1})
+		rep, err := u.be.Inspect(ctx, src, discs, emit)
+		if err != nil {
+			return err
+		}
+		u.mu.Lock()
+		u.newReport = rep
+		u.mu.Unlock()
+		return nil
+	})
+}
+
+// startCandidates is the one thing on this screen that goes to the
+// internet, which is why it is a button and not part of the scan
+// (plan §5 decision 2: Inspect never touches the network).
+func (u *UI) startCandidates() {
+	rep := u.st.Report
+	if rep == nil || len(rep.MissingArt) == 0 {
+		return
+	}
+	u.start(JobArt, func(ctx context.Context, emit func(Event)) error {
+		cands, err := u.be.Candidates(ctx, rep, emit)
+		if len(cands) > 0 {
+			u.mu.Lock()
+			u.newCands = cands
+			u.mu.Unlock()
+		}
+		return err
+	})
+}
+
+// startFix is Fix all: one job, one journal, one undo.
+//
+// The confirmation is not "are you sure" — it is the count of what will
+// change and what that will cost the next sync, because a rename IS a
+// re-copy and a person who has not been told that will read the sync
+// that follows as a bug.
+func (u *UI) startFix() {
+	rep := u.st.Report
+	if rep == nil {
+		return
+	}
+	ch := u.choices()
+	summary := u.fixSummary()
+	src := u.st.Source
+	u.start(JobFix, func(ctx context.Context, emit func(Event)) error {
+		answer, err := u.ask(ctx, &dialogRequest{
+			title:   "Fix the library?",
+			body:    "in " + src + "\n\n" + summary,
+			prompt:  "Names and folders can be undone until the next sync; a cover written into a file stays.",
+			okLabel: "Fix all",
+		})
+		if err != nil {
+			return err
+		}
+		if answer == "" {
+			return fmt.Errorf("cancelled before anything was changed")
+		}
+		res, err := u.be.Fix(ctx, rep, ch, emit)
+		if res != nil {
+			u.mu.Lock()
+			u.newFix = res
+			u.mu.Unlock()
+			emit(Event{Kind: EventLog, Text: fmt.Sprintf(
+				"fixed: %d renamed, %d moved, %d cover(s) written, %d skipped",
+				res.Renamed, res.Moved, res.ArtWritten, res.Skipped)})
+			for _, f := range res.Failures {
+				emit(Event{Kind: EventLog, Text: "could not finish " + string(f.Album) + ": " + f.Reason})
+			}
+			if res.Journal != "" {
+				emit(Event{Kind: EventLog, Text: "undo journal: " + res.Journal})
+			}
+		}
+		return err
+	})
+}
+
+// startUndo replays the last journal backwards. It is enabled only while
+// there is one: organizer refuses an op whose target changed since the
+// move, so an undo of a journal the user has already synced past is not
+// a promise this button should imply.
+func (u *UI) startUndo(journal string) {
+	if journal == "" {
+		return
+	}
+	u.start(JobUndoFix, func(ctx context.Context, emit func(Event)) error {
+		rep, err := u.be.UndoFix(ctx, journal, emit)
+		if rep != nil {
+			u.mu.Lock()
+			u.newUndo = rep
+			u.mu.Unlock()
+			emit(Event{Kind: EventLog, Text: fmt.Sprintf("undone: %d file(s) put back, %d left alone",
+				rep.Undone, len(rep.Skipped))})
+			for _, sk := range rep.Skipped {
+				emit(Event{Kind: EventLog, Text: "left alone: " + sk.Op.To + " — " + sk.Reason})
+			}
+			emit(Event{Kind: EventLog, Text: "embedded covers are not undone; " +
+				"`core art --remove` takes a picture back out"})
+		}
+		return err
+	})
+}
+
+// gridEvents is the Albums tab's half of the frame: a tile click shows
+// what the plan says about that album.
+func (u *UI) gridEvents(gtx C, busy bool) {
+	for i := range u.tileClicks {
+		if i >= len(u.st.Albums) {
+			break
+		}
+		if u.tileClicks[i].Clicked(gtx) {
+			u.showAlbum(u.st.Albums[i])
+		}
+	}
+}
+
+// showAlbum puts one album's facts on screen, in the modal the write
+// confirmations already use. It is a read: there is no job behind it and
+// the reply channel is buffered, so the OK button simply closes it.
+func (u *UI) showAlbum(a Album) {
+	state := "every track is on the iPod"
+	switch a.State {
+	case TileNew:
+		state = "none of it is on the iPod yet"
+	case TileChanged:
+		state = fmt.Sprintf("%d of %d tracks are about to be copied", a.Copy, a.Tracks)
+	}
+	body := strings.Join([]string{
+		"folder on the iPod   Music/" + a.Device,
+		"folder on this PC    " + a.Dir,
+		fmt.Sprintf("tracks               %d", a.Tracks),
+		fmt.Sprintf("to copy              %d  (%s)", a.Copy, disk.HumanSize(a.Bytes)),
+	}, "\n")
+	u.dlg = &dialogRequest{
+		title:   a.Title,
+		body:    body,
+		prompt:  state,
+		okLabel: "Close",
+		reply:   make(chan string, 1),
+	}
+}
+
+// later queues one thing to start on a frame when nothing is running.
+//
+// The Runner takes one job at a time on purpose, so "scan the library,
+// then plan the sync" cannot be two Start calls in a row. This is the
+// queue that makes a sequence out of them without the second one
+// racing the first: drain() pops it when the model says idle.
+func (u *UI) later(f func()) { u.pending = append(u.pending, f) }
+
+// publishPlan hands a finished plan to the UI goroutine.
+//
+// synced says the plan was executed rather than only planned, which is
+// the difference between "these albums are about to be copied" and
+// "these albums have just been copied" — the same plan, two grids.
+func (u *UI) publishPlan(plan *syncer.Plan, synced bool) {
+	if plan == nil {
+		return
+	}
+	u.mu.Lock()
+	u.newPlan, u.planSynced = plan, synced
+	u.mu.Unlock()
 }

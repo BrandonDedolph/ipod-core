@@ -3,6 +3,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -41,6 +42,15 @@ func runWindow(o Options) error {
 	o.Invalidate = w.Invalidate
 	u := NewUI(o)
 	logf(o, "window opened")
+
+	// Auto-detect. Started here, on the goroutine that owns State and
+	// before the first frame, so the flag it sets is already true when
+	// the Looking screen first draws.
+	ctx, stopDetect := context.WithCancel(context.Background())
+	defer stopDetect()
+	if !o.NoDetect {
+		u.StartDetect(ctx, nil)
+	}
 
 	// The pump. Job goroutines write to the Runner's channel; this
 	// moves each event onto the UI goroutine's queue and asks for a

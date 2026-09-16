@@ -18,6 +18,14 @@ import (
 // Defaults applied: block size 4096 (min = max in STREAMINFO), frame sizes 0
 // (unknown), MD5 all zero (unknown, so decoders skip the check).
 func BuildFile(info StreamInfo, tags map[string]string, pics []Picture) []byte {
+	return BuildFileP(info, tags, pics, 0)
+}
+
+// BuildFileP is BuildFile with a PADDING block of padding bytes appended to
+// the metadata chain (0 = no PADDING block at all, which is what BuildFile
+// produces). The writer's in-place path needs a fixture that has room and one
+// that has none, and the difference is exactly this block.
+func BuildFileP(info StreamInfo, tags map[string]string, pics []Picture, padding int) []byte {
 	if info.SampleRate == 0 {
 		info.SampleRate = 44100
 	}
@@ -38,6 +46,10 @@ func BuildFile(info StreamInfo, tags map[string]string, pics []Picture) []byte {
 	for _, p := range pics {
 		blocks = append(blocks, buildPicture(p))
 		types = append(types, blockPicture)
+	}
+	if padding > 0 {
+		blocks = append(blocks, make([]byte, padding))
+		types = append(types, blockPadding)
 	}
 	for i, b := range blocks {
 		out = appendBlock(out, types[i], i == len(blocks)-1, b)
@@ -106,12 +118,12 @@ func buildPicture(p Picture) []byte {
 	b = appendU32BE(b, p.Type)
 	b = appendU32BE(b, uint32(len(p.MIME)))
 	b = append(b, p.MIME...)
-	b = appendU32BE(b, 0)                   // description length
-	b = appendU32BE(b, 0)                   // width
-	b = appendU32BE(b, 0)                   // height
-	b = appendU32BE(b, 0)                   // colour depth
-	b = appendU32BE(b, 0)                   // colour count (0 = not indexed)
-	b = appendU32BE(b, uint32(len(p.Data))) //
+	b = appendU32BE(b, 0) // description length
+	b = appendU32BE(b, p.Width)
+	b = appendU32BE(b, p.Height)
+	b = appendU32BE(b, p.Depth)
+	b = appendU32BE(b, p.Colors) // 0 = not indexed
+	b = appendU32BE(b, uint32(len(p.Data)))
 	return append(b, p.Data...)
 }
 

@@ -64,6 +64,7 @@ func runInfoDevice(cmd *cobra.Command, jsonOut bool) error {
 	}
 
 	describeDevice(out, pod)
+	fmt.Fprintf(out, "name        %s\n", deviceNameText(pod))
 	describePartitions(out, pod)
 	fmt.Fprintf(out, "\nfirmware partition at %#x, %d bytes\n", pod.FWPartStart, pod.FWPartLen)
 	d, err := printPartitionDirectory(out, p)

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/syncer"
 )
@@ -62,6 +63,46 @@ func TestBuildFlashDepsWithoutTheCLIRefusesToRelaunch(t *testing.T) {
 		t.Fatal("Relaunch succeeded with no CLI beside the app")
 	}
 	if !strings.Contains(err.Error(), "not next to this app") {
+		t.Errorf("the refusal does not explain itself: %v", err)
+	}
+}
+
+// The install wiring, for the same reason as the flash wiring: if
+// ChildArgs is wrong the UAC child writes the wrong file, and if
+// Executable is wrong the elevation prompt names core-app, which has no
+// install command and would open a second window instead of writing.
+func TestBuildInstallDepsNamesTheCLIAndRunsInstall(t *testing.T) {
+	b := &RealBackend{CLI: `C:\app\core.exe`, GOOS: "windows"}
+	d := buildInstallDeps(b, `C:\backups`,
+		func(string) (string, error) { return "typed", nil }, nil)
+
+	want := []string{"install", `C:\img\core.ipod`, "--backup-dir", `C:\backups`}
+	if got := d.ChildArgs(`C:\img\core.ipod`); !reflect.DeepEqual(got, want) {
+		t.Errorf("ChildArgs = %q, want %q", got, want)
+	}
+	exe, err := d.Executable()
+	if err != nil || exe != `C:\app\core.exe` {
+		t.Errorf("Executable() = %q, %v — the elevation line must name the CLI, not the app", exe, err)
+	}
+	if d.Inspect == nil {
+		t.Error("Inspect is nil; the installer would have nothing to classify")
+	}
+	got, err := d.Confirm("type the device path: ")
+	if err != nil || got != "typed" {
+		t.Errorf("Confirm returned %q, %v", got, err)
+	}
+}
+
+// With no CLI beside the app, Relaunch must refuse and say what to do —
+// a second core-app window would write nothing and look like success.
+func TestBuildInstallDepsWithoutTheCLIRefusesToRelaunch(t *testing.T) {
+	d := buildInstallDeps(&RealBackend{}, "/backups", nil, nil)
+	exe, _ := d.Executable()
+	if exe != "core" {
+		t.Errorf("Executable() = %q, want the bare name so the printed line is runnable", exe)
+	}
+	if _, _, err := d.Relaunch([]string{"install", "x"}); err == nil ||
+		!strings.Contains(err.Error(), "not next to this app") {
 		t.Errorf("the refusal does not explain itself: %v", err)
 	}
 }
@@ -273,9 +314,14 @@ func TestFlashDialogShowsThePlanAndDemandsTheDevicePath(t *testing.T) {
 	u := newTestUI(f)
 	u.st.Device = f.dev
 
-	var seen *dialogRequest
+	// Wait for the dialog the way a person would: until it appears or a
+	// deadline passes. A bounded busy loop here once missed the request
+	// when the job did a little more work before asking, and the job then
+	// waited on its reply forever (the whole package hung for ten minutes).
+	seenCh := make(chan *dialogRequest, 1)
 	go func() {
-		for i := 0; i < 2000; i++ {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
 			u.mu.Lock()
 			req := u.askQueue
 			if req != nil {
@@ -283,15 +329,18 @@ func TestFlashDialogShowsThePlanAndDemandsTheDevicePath(t *testing.T) {
 			}
 			u.mu.Unlock()
 			if req != nil {
-				seen = req
 				req.reply <- `\\.\PhysicalDrive2`
+				seenCh <- req
 				return
 			}
+			time.Sleep(time.Millisecond)
 		}
+		seenCh <- nil
 	}()
 	u.startFlash("/img/core.ipod")
 	settle(u)
 
+	seen := <-seenCh
 	if seen == nil {
 		t.Fatal("no confirmation dialog was raised")
 	}

@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	"os"
@@ -50,6 +51,70 @@ func TestSnapshot(t *testing.T) {
 		}
 		checkPNG(t, out, s.w, s.h)
 		t.Logf("wrote %s", out)
+	}
+}
+
+// TestSnapshotLaunchPhases renders the two screens a person meets
+// before the main one: the window with no iPod (which is what most
+// launches start as) and the window on a stock iPod, which is the
+// single screen a first-time install has to carry by itself.
+//
+// Both sizes, because the install screen is mostly prose and prose is
+// what reflows badly at 720 px.
+func TestSnapshotLaunchPhases(t *testing.T) {
+	dir := snapshotDir(t)
+	cases := []struct {
+		name string
+		st   State
+	}{
+		{"looking", LookingState()},
+		{"notinstalled", NotInstalledState()},
+	}
+	sizes := [][2]int{{900, 600}, {MinWidth, MinHeight}}
+	for _, c := range cases {
+		for _, sz := range sizes {
+			out := filepath.Join(dir, fmt.Sprintf("%s-%dx%d.png", c.name, sz[0], sz[1]))
+			err := Snapshot(c.st, sz[0], sz[1], out)
+			if errors.Is(err, ErrNoHeadless) || errors.Is(err, ErrNoGPU) {
+				t.Skipf("no headless GPU surface on this machine: %v", err)
+			}
+			if err != nil {
+				t.Fatalf("Snapshot(%s): %v", out, err)
+			}
+			checkPNG(t, out, sz[0], sz[1])
+			t.Logf("wrote %s", out)
+		}
+	}
+}
+
+// TestSnapshotTheTabs renders the two screens this slice is: the album grid
+// (the body of the window, direction B) and the Library tab with a report in
+// every row. Both sizes, because the grid reflows its columns from the width
+// and the Library tab drops to one column at the minimum.
+func TestSnapshotTheTabs(t *testing.T) {
+	dir := snapshotDir(t)
+	cases := []struct {
+		name string
+		st   State
+	}{
+		{"grid", DemoState()},
+		{"library", LibraryState()},
+		{"details", func() State { st := DemoState(); st.Tab = TabDetails; return st }()},
+	}
+	sizes := [][2]int{{900, 600}, {MinWidth, MinHeight}}
+	for _, c := range cases {
+		for _, sz := range sizes {
+			out := filepath.Join(dir, fmt.Sprintf("%s-%dx%d.png", c.name, sz[0], sz[1]))
+			err := Snapshot(c.st, sz[0], sz[1], out)
+			if errors.Is(err, ErrNoHeadless) || errors.Is(err, ErrNoGPU) {
+				t.Skipf("no headless GPU surface on this machine: %v", err)
+			}
+			if err != nil {
+				t.Fatalf("Snapshot(%s): %v", out, err)
+			}
+			checkPNG(t, out, sz[0], sz[1])
+			t.Logf("wrote %s", out)
+		}
 	}
 }
 

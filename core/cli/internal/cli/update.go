@@ -68,6 +68,10 @@ image (see "core info"). Images before v0.1.3 do not carry one, so the
 answer there is "unknown"; that is not an error and does not stop an
 update.
 
+An iPod that is still running Apple's firmware is an INSTALL, not an
+update: "core install" keeps Apple's firmware under a name you can find
+again and creates the files the firmware needs on the music volume.
+
 --check prints the comparison and the release notes and stops, having
 downloaded nothing and opened nothing for writing.
 
@@ -210,6 +214,8 @@ func printComparison(out io.Writer, installed string, deviceErr error, rel ghrel
 	case installed == "":
 		fmt.Fprintf(out, "        no version marker in the installed image; "+
 			"images before v0.1.3 carry none\n")
+		fmt.Fprintf(out, "        (if this iPod has never had Core on it, the command is "+
+			"`core install`; `core info` says which it is)\n")
 	}
 	if name := strings.TrimSpace(rel.Name); name != "" && name != rel.Tag {
 		fmt.Fprintf(out, "release: %s — %s\n", rel.Tag, name)

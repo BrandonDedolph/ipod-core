@@ -3,12 +3,14 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
 func TestConfigRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sub", "config.json")
-	want := Config{Source: `C:\Users\you\Music\MC`, BackupDir: `D:\backups`}
+	want := Config{Source: `C:\Users\you\Music\MC`, BackupDir: `D:\backups`,
+		Names: map[string]string{"000A2700168F1E3C": "Brandon's iPod"}}
 	if err := SaveConfig(path, want); err != nil {
 		t.Fatalf("SaveConfig: %v", err)
 	}
@@ -16,7 +18,7 @@ func TestConfigRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("round trip gave %+v, want %+v", got, want)
 	}
 	// No leftover temp file: an interrupted save must not leave
@@ -31,7 +33,7 @@ func TestConfigRoundTrip(t *testing.T) {
 func TestLoadConfigMissingAndCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	got, err := LoadConfig(filepath.Join(dir, "nope.json"))
-	if err != nil || got != (Config{}) {
+	if err != nil || !reflect.DeepEqual(got, Config{}) {
 		t.Errorf("a missing config gave %+v, %v", got, err)
 	}
 
@@ -40,7 +42,7 @@ func TestLoadConfigMissingAndCorrupt(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err = LoadConfig(bad)
-	if err != nil || got != (Config{}) {
+	if err != nil || !reflect.DeepEqual(got, Config{}) {
 		t.Errorf("a corrupt config gave %+v, %v", got, err)
 	}
 }

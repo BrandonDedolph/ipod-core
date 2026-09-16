@@ -30,7 +30,14 @@ func newTestContext(w, h int) layout.Context {
 // columns and shorter strings; this asserts the frame still reports the
 // size it was given, in every state, at both sizes.
 func TestLayoutAtEverySizeAndState(t *testing.T) {
-	states := map[string]State{"demo": DemoState(), "empty": EmptyState()}
+	states := map[string]State{
+		"demo":         DemoState(),
+		"library":      LibraryState(),
+		"details":      detailsState(),
+		"empty":        EmptyState(),
+		"looking":      LookingState(),
+		"notinstalled": NotInstalledState(),
+	}
 	sizes := [][2]int{{MinWidth, MinHeight}, {900, 600}, {1400, 900}}
 	for name, st := range states {
 		for _, sz := range sizes {
@@ -40,6 +47,42 @@ func TestLayoutAtEverySizeAndState(t *testing.T) {
 			got := ui.Layout(gtx).Size
 			if got.X != sz[0] || got.Y != sz[1] {
 				t.Errorf("%s at %dx%d laid out %v", name, sz[0], sz[1], got)
+			}
+		}
+	}
+}
+
+// detailsState is the demo with the Details tab open: the log, the device
+// facts and the firmware fields, which is the densest pane in the window.
+func detailsState() State {
+	st := DemoState()
+	st.Tab = TabDetails
+	return st
+}
+
+// Every tab of every state has to lay out inside the window it was given.
+// The grid reflows its columns from the width, the Library tab drops its
+// second column below 620 dp, and both of those are decisions that can be
+// got wrong in exactly one direction: something sticking out of the frame.
+func TestEveryTabFitsItsWindow(t *testing.T) {
+	sizes := [][2]int{{MinWidth, MinHeight}, {900, 600}, {1400, 900}}
+	for _, tab := range []Tab{TabAlbums, TabLibrary, TabDetails} {
+		for _, sz := range sizes {
+			st := LibraryState()
+			st.Tab = tab
+			ui := NewUI(Options{})
+			ui.SetState(st)
+			gtx := newTestContext(sz[0], sz[1])
+			got := ui.Layout(gtx).Size
+			if got.X != sz[0] || got.Y != sz[1] {
+				t.Errorf("the %s tab at %dx%d laid out %v", tab, sz[0], sz[1], got)
+			}
+			// A second frame with the same state must be identical: a
+			// grid whose column count depended on the last frame would
+			// make the window flicker between two layouts.
+			again := ui.Layout(newTestContext(sz[0], sz[1])).Size
+			if again != got {
+				t.Errorf("the %s tab at %dx%d laid out %v then %v", tab, sz[0], sz[1], got, again)
 			}
 		}
 	}
