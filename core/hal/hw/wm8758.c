@@ -227,8 +227,8 @@ static const struct wm_write init_seq_c[] = {
     { WM_BIASCTRL,  0 },
 
     /* --- volume + unmute -------------------------------------------- */
-    { WM_LDACVOL,   DACVOL_MASK },               /* full-scale, no VU yet */
-    { WM_RDACVOL,   DACVOL_MASK | DACVOL_DACVU }, /* VU latches L+R */
+    { WM_LDACVOL,   DACVOL_0DB },                /* full-scale, no VU yet */
+    { WM_RDACVOL,   DACVOL_0DB | DACVOL_DACVU },  /* VU latches L+R */
     { WM_LOUT1VOL,  WM_HP_GAIN_0DB | OUTVOL_ZC },
     { WM_ROUT1VOL,  WM_HP_GAIN_0DB | OUTVOL_ZC | OUTVOL_VU },
     { WM_DACCTRL,   DACCTRL_DACOSR128 },         /* unmute (128x OSR) */

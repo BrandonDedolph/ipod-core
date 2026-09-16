@@ -45,6 +45,7 @@
 #include "../ui/screen_charging.h"
 #include "../ui/screen_battery.h"
 #include "../ui/settings.h"
+#include "../ui/eq.h"
 #include "../ui/palette.h"
 #include "../ui/chrome.h"
 #include "../library/names.h"
@@ -2966,16 +2967,31 @@ static int g_set_root_sel;                /* saved ROOT selection               
 static int g_set_accum;                   /* wheel accumulator                  */
 static int g_set_editing;                 /* editing a slider row               */
 
+/* The UI's band count and the HAL's are the same silicon's; a curve is copied
+ * across the boundary as a plain array, so a disagreement would be a buffer
+ * overrun rather than a compile error. */
+_Static_assert(EQ_BANDS == EQ_BAND_COUNT, "ui/eq.h and wm8758.h disagree");
+
 /* Push the FUNCTIONAL settings out to the subsystems. Cosmetic fields are a
  * no-op. The backlight timeout/brightness are read live by the loop. */
 static void settings_apply(void)
 {
     player_set_shuffle(g_settings.shuffle);
     player_set_repeat((int)g_settings.repeat);
-    g_volume = g_settings.volume;
+    /* The volume ceiling goes through the same helper the Now Playing wheel
+     * uses. config_decode and settings_adjust both keep volume <= limit, so
+     * this only ever bites on a record from somewhere else -- and then it
+     * writes the clamped value back, rather than leaving the Settings slider
+     * showing a level the codec is not being given. */
+    g_volume = settings_volume_clamp(&g_settings, g_settings.volume);
+    g_settings.volume = g_volume;
     hal_volume_set(g_volume);
     hal_balance_set(g_settings.balance);
-    hal_tone_set(g_settings.bass, g_settings.treble);
+    /* A preset owns both shelves; at EQ Off it is the Bass/Treble sliders. */
+    eq_curve_t curve;
+    eq_effective_curve(g_settings.eq, g_settings.bass, g_settings.treble,
+                       &curve);
+    hal_eq_set(curve.gain_db, curve.cutoff, curve.narrow);
     theme_set(g_settings.theme);           /* Linen / Onyx -> live palette swap */
 }
 
@@ -3473,8 +3489,13 @@ static void draw_speaker(int sx, int sy, uint16_t c, int vol)
  * ink fill bar + big percent, on a light near-surface plate. Everything it
  * draws stays inside the VOL_PLATE_* rect (chrome.h) — the main loop presents
  * exactly that rect for a volume tick, so ink outside it would never reach
- * the panel. */
-static void volume_overlay_render(int vol)
+ * the panel.
+ *
+ * The bar keeps its 0..100 scale whatever the Volume Limit is, and a limit
+ * below 100 puts a small triangle over the track at the ceiling — the marker
+ * the 5G's own Features Guide describes, and the only thing on screen that
+ * explains why the wheel stopped. */
+static void volume_overlay_render(int vol, int limit)
 {
     const int PX = VOL_PLATE_X, PY = VOL_PLATE_Y, PW = VOL_PLATE_W, PH = VOL_PLATE_H;
     fill_round_rect_aa(PX, PY, PW, PH, 8, LINEN_PLATE);    /* raised plate, AA r8  */
@@ -3488,6 +3509,18 @@ static void volume_overlay_render(int vol)
     if (fw < 0) fw = 0;
     if (fw > bw) fw = bw;
     console_fill_rect(bx, by, fw, bh, LINEN_INK);
+
+    /* Ceiling marker: a 5x3 triangle, apex down, sitting ON the track's top
+     * edge. Rows PY+9..PY+11 and x in [bx-2, bx+bw+2] are both well inside
+     * the plate, so the present rect the caller pushes still covers every
+     * pixel drawn here. The fill can never reach past it (vol <= limit by
+     * construction), so the two never collide. */
+    if (limit < 100) {
+        int mx = bx + bw * limit / 100;
+        console_fill_rect(mx - 2, by - 4, 5, 1, LINEN_INK);
+        console_fill_rect(mx - 1, by - 3, 3, 1, LINEN_INK);
+        console_fill_rect(mx,     by - 2, 1, 1, LINEN_INK);
+    }
 
     /* Percent, right-aligned. */
     char p[5];
@@ -3679,7 +3712,7 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
 
     /* Volume overlay rides on top for ~1.5 s after a wheel adjustment. */
     if (ui_window_up(&g_vol_show, VOL_SHOW_US, mmio_read32(USEC_TIMER_ADDR))) {
-        volume_overlay_render(g_volume);
+        volume_overlay_render(g_volume, g_settings.volume_limit);
     }
 }
 
@@ -6605,14 +6638,20 @@ _Noreturn static void run_ui(fat32_t *fs)
                     int step = (mag <= 1) ? sign : sign * mag * 2;  /* 1->1, 2->4, 3->6 */
                     if (step >  12) step =  12;
                     if (step < -12) step = -12;
-                    int prev_vol = g_volume;
-                    g_volume += step;
-                    if (g_volume < 0)   g_volume = 0;
-                    if (g_volume > 100) g_volume = 100;
-                    (void)prev_vol;   /* no click on volume — it's a slider, not nav */
-                    hal_volume_set(g_volume);
-                    g_settings.volume = g_volume;         /* keep Settings in sync */
-                    settings_touch();     /* debounced: one write per volume sweep */
+                    /* The Volume Limit is applied by the same helper the
+                     * Settings slider uses — one rule, two wheels. No click
+                     * either way: this is a slider, not navigation. */
+                    int nv = settings_volume_clamp(&g_settings, g_volume + step);
+                    if (nv != g_volume) {
+                        g_volume = nv;
+                        hal_volume_set(g_volume);
+                        g_settings.volume = g_volume;     /* keep Settings in sync */
+                        settings_touch(); /* debounced: one write per volume sweep */
+                    }
+                    /* Armed even when the wheel could not move: at a rail —
+                     * and especially AT THE LIMIT, where the plate's triangle
+                     * is the explanation — the user still needs to see why. A
+                     * pinned wheel no longer earns a disk write, though. */
                     ui_window_arm(&g_vol_show);
                     /* The plate is its own present (see the Now Playing
                      * branch of the render step): not `dirty`, which would
@@ -6697,7 +6736,12 @@ _Noreturn static void run_ui(fat32_t *fs)
                     slider = (settings_kind(g_set_screen, g_set_sel)
                               == SETTINGS_KIND_SLIDER);    /* the CURRENT row   */
                     if (slider) {
-                        g_set_editing = !g_set_editing;    /* enter/exit edit   */
+                        /* A locked slider (Bass/Treble under an EQ preset) is
+                         * a readout: the click happens, edit mode does not. */
+                        if (!settings_row_locked(g_set_screen, &g_settings,
+                                                 g_set_sel)) {
+                            g_set_editing = !g_set_editing; /* enter/exit edit  */
+                        }
                     } else {
                         int act = settings_activate(g_set_screen, &g_settings,
                                                     g_set_sel);
