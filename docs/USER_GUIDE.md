@@ -16,13 +16,21 @@ bottom, Left and Right at the sides. The Hold switch is on the top edge.
 |---|---|---|
 | Wheel | Moves the selection | Volume. After a Select tap, seeks |
 | Select | Opens the row. On a track, plays it | Tap: scrub mode. Hold: the queue |
-| Menu | Back one screen | Back to the screen you came from |
-| Play | Tap: pause or resume. Hold two seconds: sleep. Hold longer: power off | Same |
-| Right | Jumps to Now Playing if a track is loaded, playing or paused | Next track |
-| Left | Nothing but the click | Previous track |
+| Menu | Back one screen. Hold one second: the main menu | Back to the screen you came from. Hold: the main menu |
+| Play | Tap on an album, artist, genre, playlist or song: plays it. Tap elsewhere: pause or resume. Hold two seconds anywhere: sleep. Hold longer: power off | Tap: pause or resume. Hold: sleep, then power off |
+| Right | Jumps to Now Playing if a track is loaded, playing or paused | Tap: next track. Hold: fast forward |
+| Left | Nothing but the click | Tap: previous track. Hold: rewind |
+
+Play on a highlighted album, artist, genre or playlist starts that list from its first track, and
+on a highlighted song it plays that song — whether something was already playing or not, and the
+queue is replaced either way. On the Music menu's Shuffle Songs row it deals a fresh shuffle. On
+rows that name no music (the main menu, the rest of the Music menu, Settings) and on an empty
+list, Play stays pause and resume.
 
 Right on a list pushes Now Playing over it, so Menu brings you back to the exact row you left.
-Left and Right skip tracks only on Now Playing and the queue. Play works everywhere.
+Left and Right are transport — skip on a tap, seek on a hold — only on Now Playing and the queue.
+Holding Menu for a second goes to the main menu from wherever you are; a plain tap is still back
+one screen.
 
 On the Songs list only, spinning the wheel fast puts the selected row's first letter on screen so
 you can aim. The letter stays for just over a second after you stop.
@@ -68,7 +76,7 @@ greyed placeholders.
 
 **Albums** lists every album with its cover chip and artist. Select opens the album: cover, title,
 artist, track count and length, then the tracks with their numbers and durations. Select on a
-track plays the album from there.
+track plays the album from there; Play on an album row plays it without opening it.
 
 **Artists** lists artists; Select shows that artist's albums with an All Songs row at the top that
 is the whole discography, album on the sub-line.
@@ -105,9 +113,22 @@ click the faster you turn. The left time shows where you are aiming and the righ
 far that is from where playback is, as a signed figure. Stop turning and it seeks after about four
 tenths of a second. Leave it alone for four seconds and the wheel goes back to volume.
 
+**Fast forward and rewind.** Hold Right or Left. The left time and the bar show where you are
+heading and the right time how far that is, as a signed figure. It moves five seconds a quarter
+second at first, then fifteen after two seconds of holding, thirty after five and sixty after ten,
+so a long recording is crossable without letting go. It stops at the ends of the track and goes no
+further. Let go and it seeks there, once — the audio does not move while you hold: a hold walked to
+the end lands at the end, and the track then finishes normally. Let go before it has moved anywhere
+at all — a press only just longer than a tap, or a hold that had nowhere to go because you were
+already at the end — and nothing happens. If the track ends under your thumb and the next one
+starts, the seek is dropped rather than carried into a track you have not heard. A quick tap skips
+instead, and because the length of the press is what tells the two apart, the skip happens when you
+let go.
+
 **The queue.** Hold Select for about half a second. The queue view lists what is playing and what
 is next, with the playing row marked. Select a row to jump to it; Menu returns to Now Playing.
-Left and Right skip here as well.
+Left and Right skip here as well, and a hold seeks; the queue has no time readout, so you see the
+result when you let go.
 
 **Shuffle and repeat** are in Settings, Playback. They show as SHUF and RPT (or RPT1) in the top
 band, followed by SLEEP and the minutes left when the sleep timer is running.

@@ -9,6 +9,7 @@ void keyhold_reset(keyhold_t *k)
 {
     k->down    = 0;
     k->no_tap  = 0;
+    k->no_hold = 0;
     k->grace   = 0;
     k->fired   = 0;
     k->down_us = 0;
@@ -24,9 +25,10 @@ keyhold_action_t keyhold_feed(keyhold_t *k, int is_down, uint32_t now_us,
                               uint32_t hold_us)
 {
     if (!k->down) {
-        if (!is_down && k->no_tap) {
+        if (!is_down && (k->no_tap || k->no_hold)) {
             if (k->grace == 0 || --k->grace == 0) {
-                k->no_tap = 0;            /* stale pre-press swallow: lapse */
+                k->no_tap  = 0;           /* stale pre-press swallow: lapse */
+                k->no_hold = 0;
             }
             return KEYHOLD_NONE;
         }
@@ -47,12 +49,14 @@ keyhold_action_t keyhold_feed(keyhold_t *k, int is_down, uint32_t now_us,
          * long one or its tap was claimed by whoever consumed the down-edge. */
         keyhold_action_t a = (k->fired || k->no_tap) ? KEYHOLD_NONE
                                                      : KEYHOLD_TAP;
-        k->down   = 0;
-        k->no_tap = 0;
+        k->down    = 0;
+        k->no_tap  = 0;
+        k->no_hold = 0;
         return a;
     }
 
-    if (!k->fired && (uint32_t)(now_us - k->down_us) >= hold_us) {
+    if (!k->fired && !k->no_hold &&
+        (uint32_t)(now_us - k->down_us) >= hold_us) {
         k->fired = 1;
         return KEYHOLD_HOLD;
     }
@@ -67,6 +71,19 @@ void keyhold_swallow_tap(keyhold_t *k)
     if (!k->down) {
         k->grace = KEYHOLD_SWALLOW_GRACE;
     }
+}
+
+void keyhold_void(keyhold_t *k)
+{
+    /* Same pre-press race as keyhold_swallow_tap, same grace: the event that
+     * consumes the down-edge can run before the live sampler shows it. */
+    keyhold_swallow_tap(k);
+    k->no_hold = 1;
+}
+
+int keyhold_held(const keyhold_t *k)
+{
+    return k->down && k->fired;
 }
 
 uint32_t keyhold_down_us(const keyhold_t *k)

@@ -153,6 +153,108 @@ int main(void)
     xpect(&c, "wrap: 2 s into a press across the wrap IS a hold",
           keyhold_feed(&k, 1, now, HOLD_US) == KEYHOLD_HOLD);
 
+    /* --- void: the press produces NEITHER action -------------------------- *
+     * A press that dismissed the charging screen or lit a dark panel is spent
+     * on that. For PLAY the hold survives (that is how you power off), but
+     * MENU's hold walks you to the main menu and RIGHT's seeks — neither may
+     * ride on a press the user aimed at a modal. */
+    keyhold_reset(&k);
+    now = 1000u;
+    keyhold_feed(&k, 1, now += 10000u, HOLD_US);
+    keyhold_void(&k);
+    feed_n(&k, 1, &now, 10000u, 600, KEYHOLD_NONE, &c,
+           "void: silent past three times the threshold");
+    xpect(&c, "void: and the release is silent too",
+          keyhold_feed(&k, 0, now += 10000u, HOLD_US) == KEYHOLD_NONE);
+
+    /* Before the press, the same drain-then-sample race keyhold_swallow_tap
+     * covers: the void claims the next press, tap AND hold. */
+    keyhold_reset(&k);
+    keyhold_void(&k);
+    xpect(&c, "early void: the press it was meant for is silent at the down-edge",
+          keyhold_feed(&k, 1, now += 10000u, HOLD_US) == KEYHOLD_NONE);
+    feed_n(&k, 1, &now, 10000u, 300, KEYHOLD_NONE, &c,
+           "early void: no hold from the press it claimed");
+    xpect(&c, "early void: no tap from it either",
+          keyhold_feed(&k, 0, now += 10000u, HOLD_US) == KEYHOLD_NONE);
+
+    /* ...and only that one: the void clears on the release. */
+    xpect(&c, "void clears on release: the NEXT press holds",
+          keyhold_feed(&k, 1, now += 10000u, HOLD_US) == KEYHOLD_NONE &&
+          keyhold_feed(&k, 1, now += HOLD_US, HOLD_US) == KEYHOLD_HOLD);
+    keyhold_feed(&k, 0, now += 10000u, HOLD_US);
+
+    /* A void whose press never arrives lapses with the same grace, so a
+     * gesture a minute later is not eaten by it. */
+    keyhold_reset(&k);
+    keyhold_void(&k);
+    feed_n(&k, 0, &now, 10000u, 5, KEYHOLD_NONE, &c,
+           "stale void: idle feeds are silent");
+    xpect(&c, "stale void: the next press is a fresh one (its tap counts)",
+          keyhold_feed(&k, 1, now += 10000u, HOLD_US) == KEYHOLD_NONE &&
+          keyhold_feed(&k, 0, now += 10000u, HOLD_US) == KEYHOLD_TAP);
+
+    /* --- keyhold_held(): the long action is in force RIGHT NOW ------------ *
+     * A seek aims for as long as the button is down, so the caller needs the
+     * state, not just the edge. */
+    keyhold_reset(&k);
+    xpect(&c, "held: idle is not held", keyhold_held(&k) == 0);
+    keyhold_feed(&k, 1, now += 10000u, HOLD_US);
+    xpect(&c, "held: 0 before the threshold", keyhold_held(&k) == 0);
+    xpect(&c, "held: 1 from the pass the hold fired",
+          keyhold_feed(&k, 1, now += HOLD_US, HOLD_US) == KEYHOLD_HOLD &&
+          keyhold_held(&k) == 1);
+    feed_n(&k, 1, &now, 10000u, 10, KEYHOLD_NONE, &c,
+           "held: the passes after it are silent");
+    xpect(&c, "held: still 1 while the finger stays down", keyhold_held(&k) == 1);
+    keyhold_feed(&k, 0, now += 10000u, HOLD_US);
+    xpect(&c, "held: 0 once released", keyhold_held(&k) == 0);
+    /* A voided press never fires, so it is never "held". */
+    keyhold_reset(&k);
+    keyhold_feed(&k, 1, now += 10000u, HOLD_US);
+    keyhold_void(&k);
+    keyhold_feed(&k, 1, now += HOLD_US, HOLD_US);
+    xpect(&c, "held: a voided press is never held", keyhold_held(&k) == 0);
+    keyhold_feed(&k, 0, now += 10000u, HOLD_US);
+
+    /* --- two instances, two thresholds ------------------------------------ *
+     * PLAY sleeps at 2 s, MENU jumps home at 1 s, RIGHT seeks at 0.5 s; all
+     * of them are keyhold_t. Nothing in this file may assume one length, and
+     * one instance must not disturb another. */
+    {
+        keyhold_t fast, slow;
+        const uint32_t FAST_US = 500000u, SLOW_US = 2000000u;
+        keyhold_reset(&fast);
+        keyhold_reset(&slow);
+        uint32_t t0 = 7000u, t = t0;
+        keyhold_action_t fa = keyhold_feed(&fast, 1, t, FAST_US);
+        keyhold_action_t sa = keyhold_feed(&slow, 1, t, SLOW_US);
+        int ok = (fa == KEYHOLD_NONE && sa == KEYHOLD_NONE);
+        int fast_holds = 0, slow_holds = 0;
+        for (int i = 0; i < 300; i++) {          /* 3 s of 10 ms passes */
+            t += 10000u;
+            if (keyhold_feed(&fast, 1, t, FAST_US) == KEYHOLD_HOLD) {
+                fast_holds++;
+                ok = ok && (t - t0 == FAST_US);  /* fired at ITS threshold */
+            }
+            if (keyhold_feed(&slow, 1, t, SLOW_US) == KEYHOLD_HOLD) {
+                slow_holds++;
+                ok = ok && (t - t0 == SLOW_US);
+            }
+        }
+        xpect(&c, "two thresholds: each instance fires once, at its own length",
+              ok && fast_holds == 1 && slow_holds == 1);
+        /* And the tap of one is not eaten by the other's void. */
+        keyhold_reset(&fast);
+        keyhold_reset(&slow);
+        keyhold_void(&fast);
+        xpect(&c, "two instances: voiding one leaves the other's tap alone",
+              keyhold_feed(&fast, 1, t += 10000u, FAST_US) == KEYHOLD_NONE &&
+              keyhold_feed(&slow, 1, t, SLOW_US) == KEYHOLD_NONE &&
+              keyhold_feed(&fast, 0, t += 10000u, FAST_US) == KEYHOLD_NONE &&
+              keyhold_feed(&slow, 0, t, SLOW_US) == KEYHOLD_TAP);
+    }
+
     /* --- the threshold is >=, like SELECT's ------------------------------- */
     keyhold_reset(&k);
     now = 5000u;
