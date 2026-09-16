@@ -6929,7 +6929,7 @@ _Noreturn static void run_ui(fat32_t *fs)
              * a quorum, which is the decision the filter exists to refuse.
              *
              * That is acceptable for exactly this write: the platters are
-             * already up for the mount and the index load, it is one sector,
+             * already up from the mount (the index load follows), it is one sector,
              * and SHUTOFF cannot have fired yet (nothing has been able to
              * judge the cell). Every later save meets the armed gate.
              *

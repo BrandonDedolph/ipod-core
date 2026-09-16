@@ -221,7 +221,7 @@ seconds into a boot that is still spinning the drive up — and sampling harder
 at boot would not help, because five conversions microseconds apart are one
 spin-up-sagged reading with a quorum rather than a median over time. So the
 mark is written against the policy's default. That is acceptable for this write
-specifically: the platters are already up for the mount and the index load, it
+specifically: the platters are already up from the mount and stay up for the index load, it
 is one sector, and the shut-off line cannot have been crossed yet because
 nothing has been able to judge the cell. It is not a licence for any other
 early write.
