@@ -22,6 +22,7 @@
  */
 
 #include "settings.h"
+#include "settime.h"                          /* the Date & Time editor model */
 #include "chrome.h"
 #include "palette.h"                          /* live theme palette (g_pal[]) */
 
@@ -814,4 +815,108 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
     } else {
         st_text_right(16, 230, "off", F_SUB, S_MUTED_D);
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Set Date & Time (plans/14-clock.md's widget; there is no jsx for it).
+ *
+ * A row of plates, one per field, drawn in the list's own language: the
+ * selected plate is the selection bar's inversion (filled ink, surface text),
+ * the others are surface with a 1 px border, exactly as a selected row inverts
+ * against an unselected one. Everything is a palette token, so the seven
+ * themes get it for free.
+ *
+ *   y  72   the date being edited, spelled out            FONT_SUB / MUTED2
+ *     100   the plates, 34 px tall, r=6                   FONT_TITLE
+ *     150   the captions under them                       FONT_SMALL / MUTED
+ *     224   what the buttons do                           FONT_SMALL / MUTED2
+ *
+ * Widths: year 52, the rest 34; gaps 10, 22 between the date and the time, and
+ * 8 for the colon — 282 px in 12-hour mode, 238 in 24-hour, centred either
+ * way. The band above the header is left clear like every other Settings
+ * screen; the firmware paints the status strip over it.
+ * ------------------------------------------------------------------------- */
+
+#define ST_PLATE_Y 100
+#define ST_PLATE_H 34
+#define ST_PLATE_R 6
+#define ST_CAP_Y   150                         /* caption baseline            */
+#define ST_SUM_Y   72                          /* summary line baseline       */
+#define ST_HINT_Y  224                         /* button hint baseline        */
+
+/* Plate width, and the gap BEFORE each plate (the first has none). */
+static const uint8_t ST_W[ST_FIELDS]   = { 52, 34, 34, 34, 34, 34 };
+static const uint8_t ST_GAP[ST_FIELDS] = {  0, 10, 10, 22,  8, 10 };
+
+void settime_render(const settime_t *t)
+{
+    console_clear(S_SURFACE);
+    ui_header("Set Date & Time", "", 1);
+
+    int nf = settime_field_count(t);
+
+    /* The date in words, so the plates never have to be read as a date. */
+    datetime_t civil;
+    settime_civil(t, &civil);
+    char line[DATETIME_DATE_MAX];
+    if (datetime_fmt_date(line, (int)sizeof(line), &civil) > 0) {
+        int w = text_width(line, F_SUB);
+        st_text((LCD_WIDTH - w) / 2, ST_SUM_Y, line, F_SUB, S_MUTED2);
+    }
+
+    int total = 0;
+    for (int f = 0; f < nf; f++) {
+        total += (int)ST_GAP[f] + (int)ST_W[f];
+    }
+
+    /* Vertically centre the plate text on its ink box, not on the line box:
+     * the caption sits close underneath and leading would push the digits up
+     * off centre. */
+    int asc  = text_ascent(F_BIG);
+    int desc = text_descent(F_BIG);
+    int base = ST_PLATE_Y + (ST_PLATE_H - (asc + desc)) / 2 + asc;
+
+    int x = (LCD_WIDTH - total) / 2;
+    for (int f = 0; f < nf; f++) {
+        x += (int)ST_GAP[f];
+        int w = (int)ST_W[f];
+        int is_sel = (f == t->field);
+
+        if (is_sel) {
+            ui_round_rect(x, ST_PLATE_Y, w, ST_PLATE_H, ST_PLATE_R, S_SEL_BG);
+        } else {
+            /* Border then an inset fill: the same two-call outline the volume
+             * plate uses, and the only way to get a 1 px rounded rule. */
+            ui_round_rect(x, ST_PLATE_Y, w, ST_PLATE_H, ST_PLATE_R, S_BORDER);
+            ui_round_rect(x + 1, ST_PLATE_Y + 1, w - 2, ST_PLATE_H - 2,
+                          ST_PLATE_R - 1, S_SURFACE);
+        }
+
+        char buf[SETTIME_FIELD_MAX];
+        if (settime_field_text(t, f, buf, (int)sizeof(buf)) > 0) {
+            int tw = text_width(buf, F_BIG);
+            st_text(x + (w - tw) / 2, base, buf, F_BIG,
+                    is_sel ? S_SEL_FG : S_INK);
+        }
+
+        const char *cap = settime_field_label(f);
+        if (cap[0] != '\0') {
+            int cw = text_width(cap, F_SMALL);
+            st_text(x + (w - cw) / 2, ST_CAP_Y, cap, F_SMALL, S_MUTED);
+        }
+
+        /* The colon lives in the 8 px gap that precedes the minute plate. */
+        if (f == ST_MIN) {
+            int gap = (int)ST_GAP[ST_MIN];
+            int cw  = text_width(":", F_BIG);
+            st_text(x - gap + (gap - cw) / 2, base, ":", F_BIG, S_INK);
+        }
+
+        x += w;
+    }
+
+    const char *hint = "Wheel changes " UI_GLYPH_MIDDOT
+                       " Select next " UI_GLYPH_MIDDOT " Menu cancels";
+    int hw = text_width(hint, F_SMALL);
+    st_text((LCD_WIDTH - hw) / 2, ST_HINT_Y, hint, F_SMALL, S_MUTED2);
 }

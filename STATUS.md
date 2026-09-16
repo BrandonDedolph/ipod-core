@@ -360,6 +360,27 @@ bss +456 B, text +1.2 KB.
   (g) PLAY on an artist / genre / album row (the gesture) with Albums on:
       the queue it builds groups by album too — it goes through the same four
       builders, which is the whole reason the keys live on the entry.
+- **Clock: the foundation half is in, the UI and the record are not.** The
+  device has an RTC — the PCF50605 PMIC keeps a BCD calendar in the same
+  always-on domain the standby machine lives in — and nothing has ever read it.
+  This lands everything under the screens: `hal/hw/rtc.c` (`hal_rtc_get` /
+  `hal_rtc_set` over the existing I²C path, a torn-read retry, and a validity
+  gate that makes every wrong answer read as "no time known"), the integer
+  calendar `kernel/datetime.c`, the boot decision `kernel/timesync.c`, the
+  software clock `kernel/wallclock.c`, the editor model `ui/settime.c` with its
+  painter, and the sim's own RTC. Four new host suites (`datetime`, `timesync`,
+  `settime`, `hw-rtc`), one of which walks all 36 525 days of 2000..2099.
+
+  **Nothing calls any of it yet.** There is no Date & Time row, no clock on the
+  status strip, and no host stamp in `CORECFG.DAT` — those are the second half
+  (the settings record's time block at payload 48..63, the Go/Python writers,
+  the Settings screens and the boot apply), landing on top of this.
+
+  **The register map is unconfirmed.** Every RTC address is derived from the
+  public PCF50606 datasheet and cross-checked against the six PMU registers
+  `docs/hw/06-power.md` already documented; the doc now carries the table with a
+  confidence column, the `RTCWAK` conflict, and the bench procedure that settles
+  it. Nothing here has been on a device.
 
 - **Pause on headphone unplug — the policy, and a probe that needs no cable.**
   The pause decision moved out of `kernel/main.c` (five untested inline lines

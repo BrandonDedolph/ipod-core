@@ -434,6 +434,22 @@ if target == 'sim'
   )
   test('eq', eq_test, suite: 'unit')
 
+  # settime: the Set Date & Time field editor's model (core/ui/settime.c) — the
+  # SAME source the ARM build links into core.elf. A field editor is nothing
+  # but edge cases and the only way to find them at the bench is to stand there
+  # turning a wheel, so: 31 January stepped into February (and into a leap
+  # February), the year clamping where every other field wraps, midnight and
+  # noon both reading 12, an AM/PM plate that moves the hour by exactly twelve
+  # without dragging the hour plate with it, and Select reporting "done"
+  # exactly once, on the last plate, in both 12- and 24-hour mode.
+  settime_test = executable(
+    'settime_test',
+    sources: ['ui/settime_test.c', '../ui/settime.c', '../kernel/datetime.c'],
+    include_directories: include_directories('../ui', '.'),
+    override_options: test_opts,
+  )
+  test('settime', settime_test, suite: 'unit')
+
   # palette: the seven theme tables + theme_set() (core/ui/palette.c) — the SAME
   # source the ARM build links into core.elf. Asserts every table is fully
   # populated, that light themes are light and dark themes dark (the selection
