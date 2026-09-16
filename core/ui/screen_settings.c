@@ -292,7 +292,7 @@ void settings_render(int screen, const settings_t *s, int sel)
         /* main.c should call settings_about_render() with live values; this
          * placeholder path keeps settings_render total over every screen. */
         settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, ABOUT_LOG_OFF,
-                              0, "v0.0.0");
+                              0, "v0.0.0", NULL);
         return;
     }
 
@@ -371,7 +371,7 @@ static void su_append(char *d, const char *w)
  *   │ ▓▓▓▓▓▓▓▓▓░░░       │  │ [▓▓▓▓▓▓▓░░]▏       │
  *   │ 55.3 of 76.3 GB    │  │ 3912 mV            │
  *   └────────────────────┘  └────────────────────┘
- *              ADC 2731 · LOG 6 on
+ *          ADC 2731 · LOG 6 on · JACK 1 n4
  *
  * The first cut stacked STORAGE and BATTERY as two identical full-width
  * accent bars with their diagnostics jammed against the labels, and the
@@ -399,12 +399,14 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            uint32_t total_mb, uint32_t free_mb,
                            int n_songs, int n_albums, int n_artists,
                            uint32_t log_seq, int log_state, int lib_truncated,
-                           const char *version)
+                           const char *version, const about_jack_t *jack)
 {
     console_clear(S_SURFACE);
     ui_header("About", "", 1);
 
-    char v[48], w[24];
+    /* v holds the footer, which is the longest string this screen builds:
+     * three tokens, the last of which can carry a pin-configuration tail. */
+    char v[80], w[24];
 
     /* --- device row: name left, firmware chip right, one baseline ---
      * The chip is the release version: "Core v0.1.0", from the nearest git
@@ -511,25 +513,67 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
     }
 
     /*
-     * Diagnostics footer: the raw ADC code behind the millivolts, and the
-     * event log. "LOG off" is the one that matters — CORELOG.BIN is missing
-     * or did not validate. The number is the next block's sequence: it
-     * climbing across sessions is how you know flushes are landing.
+     * Diagnostics footer: the raw ADC code behind the millivolts, the event
+     * log, and the headphone jack. "LOG off" is the one that matters —
+     * CORELOG.BIN is missing or did not validate. The number is the next
+     * block's sequence: it climbing across sessions is how you know flushes
+     * are landing.
+     *
+     * JACK is the pin probe (settings.h): the raw level, then the debounced
+     * one as well once the line is trusted (so a bench can watch the two
+     * agree), then "n<count>" — how many times the raw level has moved since
+     * power-on, which is what separates "this pin follows the plug" from
+     * "this pin flaps on its own". "en=0"/"oe=1" appear only when the boot
+     * ROM did not leave A7 as a plain GPIO input, i.e. when a level that
+     * never changes means nothing.
      */
     {
-        v[0] = '\0';
+        char adc[20], jk[40];
+
+        adc[0] = '\0';
         if (battery_raw >= 0) {
-            su_copy(v, "ADC ");
-            su_to_str(v + 4, (unsigned)battery_raw);
-            su_append(v, " " UI_GLYPH_MIDDOT " ");
+            su_copy(adc, "ADC ");
+            su_to_str(adc + 4, (unsigned)battery_raw);
+            su_append(adc, " " UI_GLYPH_MIDDOT " ");
         }
+        jk[0] = '\0';
+        if (jack) {
+            su_copy(jk, " " UI_GLYPH_MIDDOT " JACK ");
+            su_append(jk, jack->raw ? "1" : "0");
+            if (jack->debounced >= 0) {
+                su_append(jk, jack->debounced ? "/1" : "/0");
+            }
+            su_append(jk, " n");
+            su_to_str(w, jack->edges);
+            su_append(jk, w);
+            if (!(jack->pin_cfg & ABOUT_JACK_PIN_ENABLED)) {
+                su_append(jk, " en=0");
+            }
+            if (jack->pin_cfg & ABOUT_JACK_PIN_OUTPUT) {
+                su_append(jk, " oe=1");
+            }
+        }
+
         if (log_state == ABOUT_LOG_OFF) {
-            su_append(v, "LOG off");
+            su_copy(w, "LOG off");
         } else {
-            su_append(v, "LOG ");
-            su_to_str(w, (unsigned)log_seq);
-            su_append(v, w);
-            su_append(v, log_state == ABOUT_LOG_ERR ? " err" : " on");
+            char n[12];
+            su_copy(w, "LOG ");
+            su_to_str(n, (unsigned)log_seq);
+            su_append(w, n);
+            su_append(w, log_state == ABOUT_LOG_ERR ? " err" : " on");
+        }
+
+        su_copy(v, adc);
+        su_append(v, w);
+        su_append(v, jk);
+        /* ui_text_centered neither clips nor ellipsises, so a footer wider
+         * than the row would run off both ends. The ADC code is the least
+         * useful of the three (the millivolts above it are the number anyone
+         * reads), so it is the one that goes. */
+        if (text_width(v, F_SMALL) > LCD_WIDTH - 32) {
+            su_copy(v, w);
+            su_append(v, jk);
         }
         ui_text_centered(236, v, F_SMALL, S_MUTED);
     }

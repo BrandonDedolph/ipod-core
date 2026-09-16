@@ -106,7 +106,9 @@ A screenshot here is a claim about what the device draws. So:
   (Boot Details on the device today: cold boot ≈ 3.3 s; a healthy decode
   margin is ~34 %; underruns 0; CONFIG LBAs 49236472 / 49236474; LOG LBAs
   49238456 / 49238464; About: 4127 songs / 318 albums / 142 artists,
-  21.0 GB free of 74.5, battery 73 % at 3912 mV, ADC 2731, LOG 6 on).
+  21.0 GB free of 74.5, battery 73 % at 3912 mV, ADC 2731, LOG 6 on,
+  JACK 1 n0 — the shipping image's jack token: raw level only, since the
+  detect line is untrusted, and no movement since power-on).
 - **GIFs tell one story each** and hold on the frames a reader needs to see.
   The frame lists live in `render.py` (`walkthrough_spec`, `_boot_spec`,
   `gif_*`). Keep total sizes reasonable (the walkthrough is under 1 MB, the

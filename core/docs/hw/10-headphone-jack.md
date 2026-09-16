@@ -8,7 +8,7 @@ below with its evidence:
 |---|---|---|
 | Can the firmware sense an inline headphone button (play/pause, volume) on the 5G/5.5G? | **No.** There is no electrical path from any jack conductor to anything the SoC or the PMU can read, other than the insertion switch. | High — from Apple's own documentation plus the codec datasheet; see "Why buttons cannot work". |
 | Is the jack a plain 3-conductor TRS? | **No — it is 4-pole.** Tip/ring = L/R audio, plus ground, plus **composite video out**. The fourth conductor is an *output*, which is exactly why it is useless for buttons. | High — Apple's spec sheet. |
-| Does the jack have an insertion (plug-present) switch the firmware can read? | **Yes.** Apple's own service diagnostics test it and Apple's firmware pauses on unplug. The public iPodLinux GPIO table puts it on **GPIO port A bit 7**. | Line: medium (public wiki, cross-validated). **Polarity: unconfirmed** — see "Confirming it on the device". |
+| Does the jack have an insertion (plug-present) switch the firmware can read? | **Yes.** Apple's own service diagnostics test it and Apple's firmware pauses on unplug. The public iPodLinux GPIO table puts it on **GPIO port A bit 7**. | Line: medium (public wiki, cross-validated). **Polarity: unconfirmed** — see "Confirming it on the device". <!-- bench result: --> |
 
 Nothing in this file was derived from Rockbox source. The GPIO assignment
 comes from the iPodLinux **wiki** (documentation, GFDL), the codec facts
@@ -179,15 +179,69 @@ and it gets every one of our four known pins right under that convention.
 So the candidate is `GPIOA_INPUT_VAL` (`0x6000D030`) **bit 7** (`0x80`),
 and by the table's convention the bit reads **1 = plug seated**. The line
 is well supported; the polarity is an inference from a notation
-convention and is **not confirmed on this device** until the probe below
-has run. A wrong polarity would pause playback every time headphones are
-plugged *in*, which is why the driver ships with the feature gated off
-(`HEADPHONE_DETECT_TRUSTED` = 0 in `core/hal/hw/headphone.h`) until the
-transcript has been seen.
+convention and is **not confirmed on this device** until one of the two
+procedures below has been run. A wrong polarity would pause playback every
+time headphones are plugged *in*, which is why the driver ships with the
+feature gated off (`HEADPHONE_DETECT_TRUSTED` = 0 in
+`core/hal/hw/headphone.h`) until the reading has been taken.
 
-### Confirming it on the device (the probe)
+### Confirming it on the device (the About screen)
 
-`core/hal/hw/headphone.c` carries a compiled-out probe. Built with
+**This is the procedure this device can run**, and as of 2026-09-16 it is
+still owed: nothing below has been done on hardware yet. This device has no
+serial cable and is not getting one (the owner ruled one out on 2026-07-17),
+so the UART probe further down — the better instrument — can never run on
+it. The pin is therefore readable on the screen instead: **Settings > About**
+draws a live `JACK` token in its footer, in every build, trusted or not,
+because reading the pin is one 32-bit read of the same register the Hold
+switch is read from on every main-loop pass.
+
+The token reads `JACK <raw> n<count>`: the raw (un-debounced) level, then how
+many times that level has changed since power-on. A trusted build shows
+`JACK <raw>/<debounced>` so a bench can watch the debouncer agree. `en=0`
+and/or `oe=1` are appended when the boot ROM did **not** leave A7 as a plain
+GPIO input, which is the one case where "the level never changes" means
+something other than "wrong pin".
+
+Flash the ordinary (untrusted) image, then:
+
+1. Boot with **nothing in the jack**, no charger, Hold off. Wait for the menu.
+2. Settings > About. Read the footer's last token; write down `JACK <d>` and
+   whether it carries `en=`/`oe=`.
+3. Push the plug fully home. The token should change within a second
+   (`JACK 1 n1` expected). Write it down.
+4. Pull the plug (`JACK 0 n2`). Write it down.
+5. Repeat 3–4 twice more (`n6` at the end). Then, with the plug half in,
+   wiggle it for a few seconds: a count jumping by more than ~2 per wiggle is
+   the contact bounce the 200 ms debounce exists for (informational).
+6. Interpretation:
+   - **1 in / 0 out, the count climbing by exactly one per motion:** the
+     default polarity is right. Set `HEADPHONE_DETECT_TRUSTED` to 1 in
+     `core/hal/hw/headphone.h` and leave `HEADPHONE_DETECT_ACTIVE_LOW` at 0.
+   - **0 in / 1 out:** set `HEADPHONE_DETECT_ACTIVE_LOW` to 1 as well.
+   - **Never changes, no `en=`/`oe=`:** A7 is a GPIO input but is not the
+     jack. Leave TRUSTED at 0; the follow-up is an on-screen version of the
+     UART probe's all-ports dump (a Boot Details sub-page), not a cable.
+   - **Never changes, `en=0` or `oe=1`:** A7 is not configured as an input.
+     Leave TRUSTED at 0; the follow-up is a one-line forced-input config at
+     boot, behind its own flash — `probe_force_candidate_input()` below
+     already has the masked-write grammar for it.
+   - **Flaps with the plug untouched:** not the jack. Leave TRUSTED at 0.
+7. Every raw edge is also narrated on the UART as
+   `core: jack raw=<0|1> n=<count>`, and every byte of that is captured into
+   `CORELOG.BIN` (kernel/evlog.h). Pull the log in disk mode afterwards and
+   `tools/make_log.py --dump` it: that is the written record of steps 3–5,
+   with no cable. Budgeted at 64 lines per boot, so a plug chewed in a pocket
+   cannot fill the ring.
+
+Record the answer in the table at the top of this file, in the
+`<!-- bench result: -->` slot.
+
+### Confirming it on the device (the UART probe)
+
+For a bench that **does** have a serial cable, this is the better instrument:
+it watches all twelve ports at once, so it finds the pin even if A7 is the
+wrong guess. `core/hal/hw/headphone.c` carries it compiled out. Built with
 `-DHEADPHONE_PROBE=1` it dumps every GPIO input port to the SER0 UART
 whenever any bit changes — all twelve ports in one line, so a single
 session identifies the pin without guessing which port to watch.
@@ -264,7 +318,7 @@ Hence `GPIOA_INPUT_VAL` = `0x6000D030`, `GPIOB_INPUT_VAL` = `0x6000D034`,
 
 `hal_headphones_present()` (hal.h) returns the **debounced** plug state:
 1 seated, 0 absent, or -1 while the line is untrusted (the default until
-the transcript above has been seen) — a caller must treat -1 as "do
+one of the procedures above has been run) — a caller must treat -1 as "do
 nothing", never as "unplugged".
 
 Debounce: a new raw level must hold continuously for **200 ms** before it
@@ -281,6 +335,63 @@ pocket.
 The first sample primes the state without waiting, so a device booted with
 headphones in reads "present" immediately and never reports a phantom
 unplug at start-up.
+
+### The policy
+
+The HAL owns the debounce; `core/ui/jackwatch.c` owns the decision, and
+nothing else does. It is fed one debounced level per main-loop pass together
+with whether the transport is playing, and it is pure — no clock, no
+hardware, no screen state — so `core/tests/ui/jackwatch_test.c` pins every
+row of it on the host. Only `PAUSE` is an instruction; `IN` and `OUT` are
+notifications, so the caller never has to re-derive "an edge happened this
+pass" from the state:
+
+| believed | new level | playing | result |
+|---|---|---|---|
+| any | -1 | any | nothing; -1 is "no answer", never a level, and never primes |
+| unknown | 0 or 1 | any | prime only — a boot with an empty jack is not a pull-out |
+| seated | absent | yes | **`PAUSE`**, once |
+| seated | absent | no | `OUT` (already paused, or nothing loaded) |
+| absent | seated | any | `IN` — a notification, never a resume |
+
+The one-directionality is deliberate. The insertion switch closes before the
+audio contacts seat, so resuming on that edge would start playing into a
+half-made connection at whatever the volume happened to be, while the user
+still has hold of the plug. Every reference player waits for Play.
+
+The poll sits outside `kernel/main.c`'s Hold-locked branch and above the
+charging modal, so neither the lock switch nor a modal can swallow a yank in
+a pocket; ≤10 ms of loop period against a 200 ms window is ~20 samples per
+window, and 100 ms during a suspend is still two.
+
+**Suspend and wake.** The main loop is not running during a suspend, so the
+suspend loop feeds the module itself, every 100 ms, with `playing` set to the
+transport state the sleep interrupted (the pause on the way down was the
+sleep's, not the listener's). A pull therefore answers `PAUSE` *while it
+happens*, and the suspend path answers that by declining to resume at wake —
+which is also why a plug pulled and then re-inserted before the wake leaves
+the device paused: the pull was already counted, and the seated plug at wake
+is only an `IN`. Nothing is printed from inside the low-power park, where
+SER0's clock may be gated; the wake says
+`core: jack out during suspend, staying paused` once the clocks are back.
+
+At wake the module is re-primed from the current debounced answer
+(`jackwatch_prime()`: new believed level, no action, no counting). That is
+the backstop for the paths that leave the suspend loop without a last feed —
+a refused PMU standby, a battery verdict — and it is what stops a level that
+moved on one of those paths from reading as a fresh edge on the first loop
+pass back.
+
+**The log.** Debounced edges print `core: jack in` / `core: jack out` /
+`core: jack out, pause`, at most one per genuine transition. Raw edges print
+`core: jack raw=<0|1> n=<count>`, budgeted at 64 lines per boot. All of it
+lands in `CORELOG.BIN` through the evlog tap.
+
+**USEC_TIMER during a PLL park.** The debouncer times on USEC_TIMER. If
+`SUSPEND_PARK_PLL` (default 0) is ever enabled and that counter slows or
+stops, a candidate started before the park is accepted early or late. The
+wake re-prime takes the *current* answer and the debouncer's first-sample
+rule means the worst case is one 200 ms delay, not a wrong level.
 
 ## Sources
 

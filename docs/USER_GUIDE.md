@@ -112,6 +112,13 @@ band, followed by SLEEP and the minutes left when the sleep timer is running.
 **When a track ends** while you are browsing, the name in the status strip changes. Nothing pops
 up.
 
+**Headphones.** Pull the plug while a track plays and it pauses; plugging back in does not start
+it again — press Play. Nothing on the cable can control playback: this iPod's jack has no button
+line, and its fourth conductor is a video output, not a remote. *Not switched on in this release.*
+The pin that senses the plug is documented but has never been read on a real device, and sensing
+it backwards would stop the music every time you plugged headphones **in** — so it stays off until
+the reading is taken. Settings, About shows the pin live (`JACK`) for exactly that purpose.
+
 ## Settings
 
 <table>
@@ -144,7 +151,9 @@ until the device sleeps or powers off, so leaving Settings never makes you wait.
   Brightness: 1 to 32, shown as a percentage.
 - **Clicker.** The click the wheel makes: Off, Tick, Click, Pop, Blip, Tock, Double, Chirp.
 - **About.** The firmware version, model, song, album and artist counts, storage free, battery
-  percentage and voltage, and the event log's state.
+  percentage and voltage, the event log's state, and the headphone jack's switch — `JACK 1` when a
+  plug is seated, `JACK 0` when it is not, followed by `n` and the number of times it has changed
+  since power-on.
 - **Boot Details.** The full build string, how long the last cold boot took and where it went
   (LCD, disk, library, resume, other), the FLAC decode cost against real time, audio underruns,
   and the disk addresses of the settings file and the log. Reading it never wakes a sleeping drive.
@@ -343,6 +352,9 @@ voltage on the About page is steadier.
   it wakes **paused**: you fell asleep, so the next press is where was I, not play. Thirty minutes
   later, on battery, it powers itself off like any sleeping device. Waking it with Hold on needs
   Hold off first, as always. The timer reads Off again afterwards, and after any restart.
+  screen and backlight go off, the codec powers down. Any button wakes it back where it was. (Once
+  jack sensing is switched on — see Now Playing — headphones pulled out while it sleeps make it
+  wake paused instead of resuming, even if you plug them back in before waking it.)
 - **Power off.** Hold Play past five seconds, or leave a sleeping device on battery for thirty
   minutes: it powers itself off. The next press cold boots; with Resume on you come back on the
   same track, paused.

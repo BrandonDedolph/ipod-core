@@ -3,6 +3,88 @@
 The README is the canonical public story; this doc is the running list of
 what works, what doesn't, and what to pick up next.
 
+## 2026-09-16 — UNFLASHED
+
+- **Pause on headphone unplug — the policy, and a probe that needs no cable.**
+  The pause decision moved out of `kernel/main.c` (five untested inline lines
+  over a file-scope `g_hp_last`) into `ui/jackwatch.c`, a pure module with its
+  own host suite — the same extraction `ui/keyhold.c` got. It closes a real
+  hole: the suspend path never updated `g_hp_last`, so a plug pulled while the
+  device slept left the first pass back looking at an edge the wake had already
+  accounted for. The suspend loop now feeds the module as it sleeps (with
+  `playing` = the transport state the sleep interrupted), so a pull is seen
+  while it happens and the wake simply declines to resume — which is also what
+  makes "pulled and plugged back in before waking it" stay paused. The wake
+  re-primes as a backstop for the paths that leave that loop early. main.c
+  keeps the wiring only: sample, act, narrate — the module reports `IN`/`OUT`
+  alongside `PAUSE` so there is exactly one edge detector, and it is the
+  tested one.
+
+  **The feature ships INERT.** `HEADPHONE_DETECT_TRUSTED` is still 0, so
+  `hal_headphones_present()` answers -1 with no bus traffic and the module
+  never sees an edge. What is live in this image is the *probe*: Settings >
+  About's footer now reads `ADC 2731 · LOG 6 on · JACK 1 n0` — the raw A7
+  level and how many times it has moved since power-on (plus `en=0`/`oe=1` if
+  the boot ROM did not leave A7 a GPIO input, and `/1` for the debounced level
+  once trusted). Reading it is one 32-bit read of the register the Hold switch
+  is already read from, so it costs nothing and is drawn in every build. Every
+  edge is also narrated to the UART, which means `CORELOG.BIN`; raw lines are
+  budgeted at 64 per boot.
+
+  Why on screen: the only probe that existed prints to SER0, and this device
+  has no serial cable (ruled out 2026-07-17), so the pin's polarity was
+  unreadable. Now it is a digit on the About page.
+
+  Also: `headphone_pin_cfg()` (two reads, no writes, trace-tested in both
+  non-probe binaries); `tests/meson.build` spells out
+  `-DHEADPHONE_DETECT_TRUSTED=0` for `hw-headphone-untrusted` so flipping the
+  header default at the bench cannot silently turn it into a second trusted
+  binary; 58 → 59 host suites (60 with the sleep timer merged beside it). `make sim && meson test -C build-sim` green
+  (also green with the header set to TRUSTED 1), `make hw && make verify-hw`
+  clean under gcc-16 `-Werror` (also with TRUSTED 1).
+
+  **Nothing here was run on the device.** `kernel/main.c` is not host-built, so
+  its wiring is covered by the module's tests plus the bench below — and every
+  "on device" line is owed. The bench, in order:
+
+  *Flash 1 — read the pin (the default image, TRUSTED 0):*
+  1. Boot with **nothing in the jack**, no charger, Hold off; wait for the menu.
+  2. Settings > About. Write down the footer's `JACK <d>` and whether it shows
+     `en=`/`oe=`. Any `en=0`/`oe=1` means A7 is not a GPIO input — stop at 6.
+  3. Push the plug fully home; the token should change within a second
+     (`JACK 1 n1`). Write it down.
+  4. Pull it (`JACK 0 n2`). Write it down.
+  5. Repeat 3–4 twice more (`n6`). Then wiggle a half-inserted plug for a few
+     seconds and note the count (bounce; informational).
+  6. Interpret: 1 in / 0 out and one count per motion → set
+     `HEADPHONE_DETECT_TRUSTED` 1, leave `ACTIVE_LOW` 0. 0 in / 1 out → also
+     set `HEADPHONE_DETECT_ACTIVE_LOW` 1. Never changes with no `en=`/`oe=` →
+     wrong pin, leave TRUSTED 0 (follow-up: an on-screen all-ports dump).
+     Never changes with `en=0`/`oe=1` → follow-up is a forced-input config at
+     boot, its own flash. Flaps untouched → not the jack, leave TRUSTED 0.
+  7. Pull `CORELOG.BIN` in disk mode and `tools/make_log.py --dump` it: the
+     `core: jack raw=… n=…` lines are the written record of steps 3–5.
+
+  *Flash 2 — the feature (after that two-line edit):*
+  8. `make sim && meson test -C build-sim`, `make hw && make verify-hw`, flash.
+  9. Play a track, pull the plug: pauses within ~0.3 s, strip says Paused,
+     About reads `JACK 0/0`. Re-insert: still paused. PLAY: resumes.
+  10. Pause with PLAY, pull, re-insert: nothing either way.
+  11. Hold on, playing, pull: pauses. Hold off, PLAY: resumes.
+  12. Charger in (charging modal up), playing, pull the headphones: pauses.
+  13. Power-cycle with the jack **empty**, Resume on: boots paused as always,
+      and no `core: jack out` line in the log for that boot.
+  14. Playing with the plug in, hold PLAY 2 s (sleep), pull the plug while
+      asleep, press a button: wakes paused, no resume, and the log carries
+      `core: jack out during suspend, staying paused`. Re-insert, PLAY: plays.
+  14b. Same again, but plug the headphones back IN before waking it: still
+      wakes paused (the suspend loop saw the pull as it happened).
+  15. Playing, plug in, sleep, wake without touching the plug: resumes
+      (unchanged).
+  16. Dump `CORELOG.BIN`: `core: jack out, pause` / `core: jack in` at each step.
+
+  Paste the results here and fill the `<!-- bench result: -->` slot in
+  `core/docs/hw/10-headphone-jack.md`'s summary table.
 ## 2026-09-16 — Sleep timer, UNFLASHED
 
 Settings > Playback has a fourth row, **Sleep Timer**: Off / 15 / 30 / 60 /

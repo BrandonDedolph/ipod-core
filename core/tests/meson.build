@@ -212,6 +212,24 @@ if target == 'sim'
     override_options: test_opts,
   )
   test('sleeptimer', sleeptimer_test, suite: 'unit')
+  # jackwatch: the pause-on-unplug policy (core/ui/jackwatch.c) — the SAME
+  # source the ARM build links into core.elf, fed one debounced jack level per
+  # main-loop pass. It replaced five untested lines inline in kernel/main.c,
+  # which is not host-built, so these are the first assertions this decision
+  # has ever had: -1 ("the detect line is not trusted on this device") is not
+  # a level and can neither prime nor pause; a boot with an empty jack is a
+  # prime, not a pull-out; a pull while playing is exactly one PAUSE; a pull
+  # while paused is only an OUT; re-inserting is only an IN, NEVER a resume; the wake re-prime
+  # moves the believed level with no action; raw-edge bookkeeping counts
+  # transitions but not the first reading; and the module does no timing of
+  # its own (a pull across the 32-bit clock wrap still pauses).
+  jackwatch_test = executable(
+    'jackwatch_test',
+    sources: ['ui/jackwatch_test.c', '../ui/jackwatch.c'],
+    include_directories: include_directories('../ui', '.'),
+    override_options: test_opts,
+  )
+  test('jackwatch', jackwatch_test, suite: 'unit')
 
   # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
   # — the SAME source the ARM build links into core.elf. Shrinks a loaded
@@ -697,8 +715,11 @@ if target == 'sim'
   #              bouncing switch yields exactly one transition, timed from the
   #              last bounce; sub-window glitches yield none; the first sample
   #              primes without waiting; a USEC_TIMER wrap mid-window is fine.
-  #   untrusted  (defaults, what ships until the device transcript confirms
-  #              the line): answers -1 and never touches the bus.
+  #   untrusted  (TRUSTED=0, what ships until the pin has been read on the
+  #              device): answers -1 and never touches the bus.
+  #
+  # Both non-probe binaries also pin headphone_pin_cfg(), the two-read,
+  # no-write accessor the About screen's on-screen probe draws from.
   #   probe      (-DHEADPHONE_PROBE=1): the pin-finding UART probe prints its
   #              config block once, nothing while inputs are static, two lines
   #              per change, honours its 20 ms sample interval, and goes silent
@@ -715,13 +736,19 @@ if target == 'sim'
   )
   test('hw-headphone-trace', headphone_trace_test, suite: 'unit')
 
+  # TRUSTED=0 is spelled out rather than inherited from the header default.
+  # The bench flips that default to 1 the moment the polarity is read off the
+  # About screen, and an inherited default would quietly turn this binary into
+  # a SECOND trusted build — main() would compile the trusted branch, the
+  # suite would stay green, and the "-1 and not one bus cycle" promise that is
+  # the whole reason this binary exists would stop being tested by anything.
   headphone_untrusted_test = executable(
     'headphone_untrusted_test',
     sources: ['hw_mmio/headphone_trace_test.c',
               'hw_mmio/mmio_mock.c',
               '../hal/hw/headphone.c'],
     include_directories: hw_mmio_inc,
-    c_args: ['-DMMIO_MOCK'],
+    c_args: ['-DMMIO_MOCK', '-DHEADPHONE_DETECT_TRUSTED=0'],
     override_options: test_opts,
   )
   test('hw-headphone-untrusted', headphone_untrusted_test, suite: 'unit')

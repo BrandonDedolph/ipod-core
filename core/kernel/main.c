@@ -18,6 +18,7 @@
 #include "hw/clickwheel.h"
 #include "hw/backlight.h"
 #include "hw/battery.h"
+#include "hw/headphone.h"
 #include "hw/i2c.h"
 #include "hw/power.h"
 #include "hw/audio.h"
@@ -53,6 +54,7 @@
 #include "../ui/wheel.h"
 #include "../ui/keyhold.h"
 #include "../ui/sleeptimer.h"
+#include "../ui/jackwatch.h"
 #include "hw/volume.h"
 
 /* Host-findable version stamp: `core info` scans the OSOS body for this tag
@@ -646,10 +648,11 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
  * and a small padlock stays in the status strip while held. */
 static int         g_locked;
 
-/* Last believed headphone state (1 seated, 0 out, -1 unknown) — the unplug
- * edge detector in run_ui(). Starts unknown so a boot with nothing in the
- * jack cannot look like a pull-out. */
-static int         g_hp_last = -1;
+/* Pause-on-unplug (ui/jackwatch.c): the believed jack level, the raw-edge
+ * count the About footer shows, and whether this module owns the last pause.
+ * Reset in run_ui() beside the PLAY keyhold — zero is not its "nothing known
+ * yet" state. */
+static jackwatch_t g_jack;
 static ui_window_t g_lock_flash;
 
 /*
@@ -767,6 +770,41 @@ static void uart_dec(int v)
     u32_to_dec(b, (unsigned)v);
     uart_puts(b);
 }
+
+/*
+ * The jack probe's narration. These lines go through the evlog tap into
+ * CORELOG.BIN, so a bench session on a cable-less device leaves a written
+ * record: plug, unplug, dump the log afterwards. Budgeted because the RAW
+ * level is un-debounced and a cable chewed in a pocket would otherwise fill
+ * the ring — the same "cannot spam" promise the UART probe makes. Debounced
+ * edges are unbudgeted: at most one per genuine transition.
+ */
+#define JACK_RAW_LINE_BUDGET 64u
+
+static unsigned g_jack_raw_lines;
+
+static void jack_narrate_raw(int raw, unsigned edges)
+{
+    if (g_jack_raw_lines >= JACK_RAW_LINE_BUDGET) {
+        return;
+    }
+    if (++g_jack_raw_lines == JACK_RAW_LINE_BUDGET) {
+        uart_puts("core: jack raw line budget spent; silent from here\n");
+        return;
+    }
+    uart_puts("core: jack raw=");
+    uart_dec(raw);
+    uart_puts(" n=");
+    uart_dec((int)edges);
+    uart_putc('\n');
+}
+
+/* The About screen's jack token carries the pin configuration, and ui/ is
+ * host-built so it cannot see hal/hw/headphone.h. Two names for one bit is
+ * fine as long as they cannot drift. */
+_Static_assert(ABOUT_JACK_PIN_ENABLED == HEADPHONE_PIN_ENABLED &&
+               ABOUT_JACK_PIN_OUTPUT  == HEADPHONE_PIN_OUTPUT,
+               "ui/settings.h mirrors hal/hw/headphone.h's pin-config bits");
 
 /* Volume capacity / free (MB), computed once from the FS after mount for the
  * About screen. g_free_mb == 0xFFFFFFFF means the FSInfo free count was absent. */
@@ -3333,12 +3371,23 @@ static void settings_render_cur(void)
          * screen says so — otherwise a library that's too big just looks
          * like it lost tracks. The warning and the load time are
          * INDEPENDENT (the warning used to hide the number entirely). */
+        /* The jack token is the only probe this device has for the detect
+         * line (ui/settings.h). Three reads, paid on this page alone: the
+         * pin and its two configuration registers. The debounced half comes
+         * from the loop's own last answer, so it reads -1 — and the token
+         * drops that half — exactly while the line is untrusted. */
+        about_jack_t jack = {
+            .raw       = (int8_t)headphone_raw(),
+            .debounced = g_jack.last,
+            .pin_cfg   = (uint8_t)headphone_pin_cfg(),
+            .edges     = g_jack.raw_edges,
+        };
         settings_about_render(g_bat_pct, g_bat_mv, g_bat_raw, g_total_mb, g_free_mb,
                               g_songs_n, g_albums_n, g_artists_n,
                               evlog_seq(),
                               evlog_enabled()  ? ABOUT_LOG_ON :
                               evlog_failures() ? ABOUT_LOG_ERR : ABOUT_LOG_OFF,
-                              g_lib_truncated, CORE_VERSION);
+                              g_lib_truncated, CORE_VERSION, &jack);
     } else if (g_set_screen == SETTINGS_DIAG) {
         /* Boot Details owns the diagnostics now: the cold-boot phase
          * breakdown and the settings-file locator. They used to be squeezed
@@ -5344,6 +5393,7 @@ static void suspend_to_ram(uint32_t play_down_us)
      * asked for into a PMU power-off. */
     uint32_t dark_us = mmio_read32(USEC_TIMER_ADDR);
     int standby_refused = 0;
+    int jack_pulled = 0;              /* the headphones came out while asleep */
     while (clickwheel_buttons() & WHEEL_BTN_PLAY) {
         uint32_t nowh = mmio_read32(USEC_TIMER_ADDR);
         if ((uint32_t)(nowh - play_down_us) > 5000000u &&
@@ -5479,9 +5529,25 @@ static void suspend_to_ram(uint32_t play_down_us)
             suspend_lowpower_enter();
         }
 
-        /* Keep the jack debouncer fed (a GPIO read), so the answer it gives
-         * at wake reflects what happened during the suspend, not before it. */
-        (void)hal_headphones_present();
+        /*
+         * Keep the jack watcher fed (one GPIO read through the debouncer), so
+         * a plug pulled while the device sleeps is SEEN rather than inferred
+         * from the level at wake. `was_playing` is the transport's state as
+         * far as this feature is concerned — the pause above was the sleep's,
+         * not the listener's — so a pull here answers PAUSE, and answering it
+         * by dropping `was_playing` is how the wake below declines to resume.
+         *
+         * This is what makes "pulled and re-inserted while it slept" stay
+         * paused: without it the wake sees a seated plug and cannot tell that
+         * anything happened. Nothing is printed from inside the park (SER0's
+         * clock may be gated); the wake says it once the clocks are back.
+         */
+        uint32_t now = mmio_read32(USEC_TIMER_ADDR);
+        if (jackwatch_feed(&g_jack, hal_headphones_present(), was_playing,
+                           now) == JACKWATCH_PAUSE) {
+            was_playing = 0;
+            jack_pulled = 1;
+        }
 
         /*
          * Escalate. Past SUSPEND_TO_STANDBY_US on battery this is no longer
@@ -5490,8 +5556,7 @@ static void suspend_to_ram(uint32_t play_down_us)
          * the deadline escalates on the next one.
          */
         if (!power_is_external() &&
-            (uint32_t)(mmio_read32(USEC_TIMER_ADDR) - suspend_t0) >
-                SUSPEND_TO_STANDBY_US) {
+            (uint32_t)(now - suspend_t0) > SUSPEND_TO_STANDBY_US) {
             if (enter_standby() != 0) {   /* normally no return */
                 standby_refused = 1;
                 was_playing     = 0;
@@ -5536,15 +5601,27 @@ static void suspend_to_ram(uint32_t play_down_us)
     paint_current_screen();               /* render the real screen while dark... */
     lcd_present_fb(console_framebuffer()); /* ...retire the panel init...     */
     backlight_set(g_settings.backlight_bright);  /* ...then light up straight to it */
+    /*
+     * The jack, once, for both of the decisions below. The watcher was fed
+     * through the whole suspend, so it has already accounted for anything
+     * that happened; priming it here is the backstop for the paths that
+     * leave that loop without a last feed (a refused standby, a battery
+     * verdict), and it costs nothing when the level has not moved.
+     */
+    int hp = hal_headphones_present();
+    jackwatch_prime(&g_jack, hp);
+    if (jack_pulled) {
+        /* Said here rather than inside the park: SER0's clock may be gated
+         * down there. */
+        uart_puts("core: jack out during suspend, staying paused\n");
+    }
     if (was_playing) {
         /*
-         * Resume only into a seated plug. The main loop pauses on an unplug
-         * edge but was not running to see one during the suspend; the
-         * debouncer was kept fed above, so this is the current answer. -1
-         * (detect not yet trusted on this device, hal/hw/headphone.h) keeps
-         * today's behaviour: resume. 0 leaves it paused, one PLAY away.
+         * Resume only into a seated plug. -1 (detect not yet trusted on this
+         * device, hal/hw/headphone.h) keeps today's behaviour: resume. 0
+         * leaves it paused, one PLAY away.
          */
-        if (hal_headphones_present() != 0) {
+        if (hp != 0) {
             player_resume();
         }
     }
@@ -5757,6 +5834,10 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      bat_glyph_prev = battery_glyph_key(g_bat_pct); /* strip gauge as drawn */
     keyhold_t play_key;                  /* PLAY: tap = pause, hold = sleep       */
     keyhold_reset(&play_key);
+    /* Nothing believed about the jack yet. The first pass primes it from the
+     * HAL's own first (already primed) sample, so a boot with an empty jack
+     * yields "out" with no edge and no pause. */
+    jackwatch_reset(&g_jack);
     g_locked = hold_prev;
 
     /* Backlight inactivity: full -> dim -> off. Any input wakes to full; a press
@@ -5889,28 +5970,43 @@ _Noreturn static void run_ui(fat32_t *fs)
         }
 
         /*
-         * Pause when the headphones are pulled out.
+         * The headphone jack. All of the policy is in ui/jackwatch.c; this is
+         * sample, act, narrate.
          *
-         * Deliberately one-directional: re-inserting does NOT resume. The
-         * insertion switch closes before the audio contacts seat, so resuming
-         * on that edge would start playing into a half-made connection, at
-         * whatever the volume happened to be, while the user still has hold of
-         * the plug. Every reference player waits for Play, and keeping it
-         * one-way means there is no "was this pause the jack's or the user's?"
-         * flag to get wrong later.
+         * Sitting here, outside the g_locked branch and above the charging
+         * modal, is deliberate: a yank in the pocket is the canonical case,
+         * and neither Hold nor a modal may swallow it. The pause needs no
+         * resume-position call of its own — the capture above fires on any
+         * pause flip.
          *
-         * hal_headphones_present() returns -1 until the detect line's polarity
-         * is confirmed on the device (hal/hw/headphone.h), and the >= 0 guard
-         * is what makes that inert rather than a pause storm. Sitting outside
-         * the input-swallowing branch is also deliberate: a yank in the pocket
-         * is the canonical case, and Hold must not swallow it.
+         * The RAW level is read in every build, trusted or not: one 32-bit
+         * read of the register the hold switch is already read from, and it
+         * is the whole on-screen probe (hal/hw/headphone.h, "WHICH PROBE").
          */
-        int hp = hal_headphones_present();
-        if (hp == 0 && g_hp_last == 1 && player_active() && !player_paused()) {
-            player_pause();
-        }
-        if (hp >= 0) {
-            g_hp_last = hp;
+        {
+            int raw = headphone_raw();
+            if (jackwatch_note_raw(&g_jack, raw)) {
+                jack_narrate_raw(raw, g_jack.raw_edges);
+                if (scr_cur() == SCR_SETTINGS && g_set_screen == SETTINGS_ABOUT) {
+                    dirty = 1;          /* the digit follows the plug */
+                }
+            }
+            int playing = player_active() && !player_paused();
+            switch (jackwatch_feed(&g_jack, hal_headphones_present(), playing,
+                                   pump_t0)) {
+            case JACKWATCH_PAUSE:
+                player_pause();
+                uart_puts("core: jack out, pause\n");
+                break;
+            case JACKWATCH_OUT:
+                uart_puts("core: jack out\n");
+                break;
+            case JACKWATCH_IN:
+                uart_puts("core: jack in\n");
+                break;
+            case JACKWATCH_NONE:
+                break;
+            }
         }
 
         /* Charging screen: pop up on a plug-IN edge (not if already powered at

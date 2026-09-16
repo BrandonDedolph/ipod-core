@@ -74,6 +74,18 @@ int headphone_debounce_feed(headphone_debounce_t *d, int raw, uint32_t now_us)
 
 /* ---------- Driver -------------------------------------------------------- */
 
+/*
+ * GPIO bank layout (10-headphone-jack.md, "GPIO bank layout"): three quads of
+ * four 8-bit ports, per-port stride 4, register groups at +0x00 ENABLE,
+ * +0x10 OUTPUT_EN, +0x20 OUTPUT_VAL, +0x30 INPUT_VAL. Port A is the first
+ * port of the A-D quad, so these two plus the quad base ARE the A7
+ * configuration registers. The remaining quads and groups are used only by
+ * the UART probe and are defined with it.
+ */
+#define GPIO_QUAD_AD         0x6000D000u
+#define GPIO_GRP_ENABLE      0x00u
+#define GPIO_GRP_OUTPUT_EN   0x10u
+
 static headphone_debounce_t s_db;   /* zero-init == unprimed */
 
 int headphone_raw(void)
@@ -85,6 +97,21 @@ int headphone_raw(void)
 #else
     return set;
 #endif
+}
+
+int headphone_pin_cfg(void)
+{
+    uint32_t en = mmio_read32(GPIO_QUAD_AD + GPIO_GRP_ENABLE);
+    uint32_t oe = mmio_read32(GPIO_QUAD_AD + GPIO_GRP_OUTPUT_EN);
+    int cfg = 0;
+
+    if (en & HEADPHONE_DETECT_BIT) {
+        cfg |= HEADPHONE_PIN_ENABLED;
+    }
+    if (oe & HEADPHONE_DETECT_BIT) {
+        cfg |= HEADPHONE_PIN_OUTPUT;
+    }
+    return cfg;
 }
 
 void headphone_reset(void)
@@ -117,14 +144,11 @@ int hal_headphones_present(void)
 
 #include "uart.h"
 
-/* Bank layout (10-headphone-jack.md, "GPIO bank layout used by the probe").
- * Three quads of four ports; per-port stride 4; register groups at +0x00
- * (ENABLE), +0x10 (OUTPUT_EN), +0x20 (OUTPUT_VAL), +0x30 (INPUT_VAL). */
-#define PROBE_QUAD_AD        0x6000D000u
+/* The rest of the bank layout (10-headphone-jack.md, "GPIO bank layout"):
+ * the A-D quad base and the two configuration groups the driver itself needs
+ * are up with headphone_pin_cfg(); these are the ones only the probe walks. */
 #define PROBE_QUAD_EH        0x6000D080u   /* derived midpoint; unconfirmed */
 #define PROBE_QUAD_IL        0x6000D100u
-#define PROBE_GRP_ENABLE     0x00u
-#define PROBE_GRP_OUTPUT_EN  0x10u
 #define PROBE_GRP_OUTPUT_VAL 0x20u
 #define PROBE_GRP_INPUT_VAL  0x30u
 #define PROBE_BITWISE        0x800u        /* masked-write shadow (02-lcd.md) */
@@ -146,7 +170,7 @@ static uint8_t  s_pr_exhausted;
 
 static uint32_t probe_quad_base(int q)
 {
-    return q == 0 ? PROBE_QUAD_AD : q == 1 ? PROBE_QUAD_EH : PROBE_QUAD_IL;
+    return q == 0 ? GPIO_QUAD_AD : q == 1 ? PROBE_QUAD_EH : PROBE_QUAD_IL;
 }
 
 static uint32_t probe_read_port(int q, int p, uint32_t group)
@@ -192,8 +216,8 @@ static void probe_dump_config(void)
         for (int p = 0; p < 4; p++) {
             uart_puts("core: hpprobe cfg ");
             uart_putc((char)('A' + q * 4 + p));
-            uart_puts(" en=");  probe_put_hex8(probe_read_port(q, p, PROBE_GRP_ENABLE));
-            uart_puts(" oe=");  probe_put_hex8(probe_read_port(q, p, PROBE_GRP_OUTPUT_EN));
+            uart_puts(" en=");  probe_put_hex8(probe_read_port(q, p, GPIO_GRP_ENABLE));
+            uart_puts(" oe=");  probe_put_hex8(probe_read_port(q, p, GPIO_GRP_OUTPUT_EN));
             uart_puts(" ov=");  probe_put_hex8(probe_read_port(q, p, PROBE_GRP_OUTPUT_VAL));
             uart_puts(" in=");  probe_put_hex8(probe_read_port(q, p, PROBE_GRP_INPUT_VAL));
             uart_putc('\n');
@@ -207,14 +231,14 @@ static void probe_dump_config(void)
  * pins it has not been proven to own. */
 static void probe_force_candidate_input(void)
 {
-    uint32_t en = probe_read_port(0, 0, PROBE_GRP_ENABLE);
-    uint32_t oe = probe_read_port(0, 0, PROBE_GRP_OUTPUT_EN);
+    uint32_t en = probe_read_port(0, 0, GPIO_GRP_ENABLE);
+    uint32_t oe = probe_read_port(0, 0, GPIO_GRP_OUTPUT_EN);
     if ((en & HEADPHONE_DETECT_BIT) && !(oe & HEADPHONE_DETECT_BIT)) {
         return;
     }
-    mmio_write32(PROBE_QUAD_AD + PROBE_GRP_OUTPUT_EN + PROBE_BITWISE,
+    mmio_write32(GPIO_QUAD_AD + GPIO_GRP_OUTPUT_EN + PROBE_BITWISE,
                  HEADPHONE_DETECT_BIT << 8);                        /* clear */
-    mmio_write32(PROBE_QUAD_AD + PROBE_GRP_ENABLE + PROBE_BITWISE,
+    mmio_write32(GPIO_QUAD_AD + GPIO_GRP_ENABLE + PROBE_BITWISE,
                  (HEADPHONE_DETECT_BIT << 8) | HEADPHONE_DETECT_BIT); /* set */
     uart_puts("core: hpprobe A7 forced to GPIO input (was en=");
     probe_put_hex8(en);
