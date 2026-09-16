@@ -207,8 +207,10 @@ a brief click.
 Two attenuators in series: DAC volume (digital, applies before the
 output amps) and output amp gain (analog).
 
-- **DAC digital volume** — `LDACVOL`/`RDACVOL`, an 8-bit field (0..0xFF,
-  roughly −∞ to 0 dB). It is global, so it attenuates every output path.
+- **DAC digital volume** — `LDACVOL`/`RDACVOL`, an 8-bit field, 0.5 dB per
+  step: `0xFF` = 0 dB (full scale), `0x00` = mute. It is global, so it
+  attenuates every output path, which is why it is not the user's volume knob;
+  its one use here is the EQ pre-cut (see "WM8758 tone controls" below).
   Writes latch only when the `DACVU` bit is set on the second (right)
   write — the classic Wolfson "write left, then write right with the
   update bit" so both channels change together.
@@ -351,17 +353,18 @@ mute bit) and `OUT3MIX = OUT4MIX = 0x40` (mute). Source:
 ## WM8758 tone controls (5-band EQ)
 
 The WM8758B carries a 5-band equaliser that can be switched onto either the
-ADC (record) or DAC (playback) path. `core` uses only the two shelving bands
-as a Bass/Treble tone control on playback; the three parametric mid bands are
-held flat. Source: **Wolfson WM8758B datasheet, "Equaliser" section, register
-map R18–R22** (a primary hardware datasheet, transcribed here — not Rockbox).
+ADC (record) or DAC (playback) path. `core` drives all five bands on playback:
+the two shelves are the Bass/Treble tone control, and an **EQ preset**
+(`core/ui/eq.c`) is a full five-band curve. Source: **Wolfson WM8758B
+datasheet, "Equaliser" section, register map R18–R22** (a primary hardware
+datasheet, transcribed here — not Rockbox).
 
 | Reg | Addr | Band | Role |
 |-----|------|------|------|
 | `WM_EQ1` | `0x12` | band 1 | **low shelf (Bass)** |
-| `WM_EQ2` | `0x13` | band 2 | peaking (held flat) |
-| `WM_EQ3` | `0x14` | band 3 | peaking (held flat) |
-| `WM_EQ4` | `0x15` | band 4 | peaking (held flat) |
+| `WM_EQ2` | `0x13` | band 2 | peaking |
+| `WM_EQ3` | `0x14` | band 3 | peaking |
+| `WM_EQ4` | `0x15` | band 4 | peaking |
 | `WM_EQ5` | `0x16` | band 5 | **high shelf (Treble)** |
 
 9-bit data layout, shared by all five registers:
@@ -369,27 +372,88 @@ map R18–R22** (a primary hardware datasheet, transcribed here — not Rockbox)
 - **`EQxG[4:0]`** (bits 4:0) — band gain, **`code = 12 − gain_dB`**, so
   `0x0C` = 0 dB (flat), `0x00` = +12 dB, `0x18` = −12 dB, 1 dB/step, range
   ±12 dB. Values outside `0x00..0x18` are reserved.
-- **`EQxC[1:0]`** (bits 6:5) — band centre/cutoff select. For the shelves:
-  `EQ1C`: `00`=80 Hz, `01`=105 Hz, `10`=135 Hz, `11`=175 Hz.
-  `EQ5C`: `00`=5.3 kHz, `01`=6.9 kHz, `10`=9 kHz, `11`=11.7 kHz.
+- **`EQxC[1:0]`** (bits 6:5) — band centre/cutoff select. The code means a
+  different frequency in each band:
+
+  | code | `EQ1C` shelf | `EQ2C` peak | `EQ3C` peak | `EQ4C` peak | `EQ5C` shelf |
+  |------|------|------|------|------|------|
+  | `00` | 80 Hz  | 230 Hz | 650 Hz  | 1.8 kHz | 5.3 kHz |
+  | `01` | 105 Hz | 300 Hz | 850 Hz  | 2.4 kHz | 6.9 kHz |
+  | `10` | 135 Hz | 385 Hz | 1.1 kHz | 3.2 kHz | 9 kHz |
+  | `11` | 175 Hz | 500 Hz | 1.4 kHz | 4.1 kHz | 11.7 kHz |
+
+  ⚠️ **Verify against the datasheet before trusting the three mid rows.** The
+  shelf columns have been exercised on the device (the tone control has shipped
+  on them); the `EQ2C`/`EQ3C`/`EQ4C` centres and the `EQxBW` polarity below were
+  transcribed from the WM8758B PDF from memory and have **not** been listened to
+  on hardware. A wrong code there is a band centred somewhere else — audibly a
+  differently-shaped preset, never a fault.
 - **`EQ3DMODE`** (bit 8, **`EQ1` register only**) — EQ path select:
   `0` = applied to the ADC (record), `1` = applied to the **DAC (playback)**.
-  Bit 8 on `EQ2..EQ5` is `EQxBW` (bandwidth, peaking bands only) and is left
-  `0`; on the shelving bands it is unused.
+- **`EQxBW`** (bit 8 of `EQ2`/`EQ3`/`EQ4`) — peaking-band bandwidth,
+  `0` = wide, `1` = narrow. Band 5 has no bit 8, and band 1's is the path
+  select, so **neither shelf may ever carry a bandwidth bit** —
+  `hal_eq_set()` drops it there rather than trusting its caller.
 
 | Constant | Reg | Value | Meaning |
 |----------|-----|-------|---------|
+| `EQ_GAIN_MASK`     | EQ1..EQ5 | `0x01F`| `EQxG[4:0]` gain field |
 | `EQ_GAIN_0DB`      | EQ1..EQ5 | `0x0C` | flat (0 dB) gain code |
+| `EQ_CUTOFF_SHIFT`  | EQ1..EQ5 | `5`    | position of `EQxC[1:0]` |
+| `EQ_CUTOFF_MASK`   | EQ1..EQ5 | `0x060`| `EQxC[1:0]` field |
 | `EQ_DAC_MODE`      | EQ1      | `0x100`| route EQ to the DAC (playback) |
+| `EQ_BW_NARROW`     | EQ2..EQ4 | `0x100`| `EQxBW` = narrow bandwidth |
 | `EQ1_CUTOFF_105HZ` | EQ1      | `0x020`| Bass shelf corner = 105 Hz (`EQ1C=01`) |
 | `EQ5_CUTOFF_6K9`   | EQ5      | `0x020`| Treble shelf corner = 6.9 kHz (`EQ5C=01`) |
+| `EQ_BAND_COUNT`    | —        | `5`    | EQ1..EQ5 |
 
-Driver policy (`core/hal/hw/volume.c`, `hal_tone_set`): Bass drives `EQ1G`,
-Treble drives `EQ5G`; `EQ2..EQ4` are written at `EQ_GAIN_0DB`. `EQ_DAC_MODE`
-is set on the `EQ1` write **only when Bass or Treble is non-zero**, so at the
-0/0 default the EQ stays on the (silent) ADC path and playback is bit-identical
-to no-EQ — the tone control is inert until the user moves it. On-device listen
-test confirms polarity (boost vs. cut) and corner choice.
+### Driver policy (`core/hal/hw/volume.c`)
+
+`hal_eq_set(gain_db[5], cutoff[5], narrow[5])` is the one register encoder and
+the only way tone reaches the codec. The Bass/Treble sliders are not a second
+entry point: they are the flat curve with the two shelves moved — mids at
+`EQ_GAIN_0DB` on centre code `00` — which is what `ui/eq.c`'s
+`eq_effective_curve()` hands over at EQ Off, so the words are the ones this
+firmware has always emitted.
+
+- **`EQ_DAC_MODE` is set on `EQ1` only when some band is non-zero.** At a flat
+  curve the EQ stays on the (silent) ADC path and playback is bit-identical to
+  no-EQ — the tone control and "EQ Off" are inert until the user moves them.
+  On-device listen test confirms the shelves' polarity (boost vs. cut) and
+  corner choice.
+- **DAC pre-cut.** A boosting band is digital gain ahead of the DAC, so a
+  full-scale track through, say, a +6 dB low shelf would clip. Every curve is
+  therefore written with `LDACVOL`/`RDACVOL` set to
+  `DACVOL_0DB − 2 × (largest boost in dB)` (the field is 0.5 dB per step), i.e.
+  the boost is paid for in headroom rather than in distortion. A curve that only
+  cuts leaves the DAC at `0xFF`, byte-identical to the bring-up sequence.
+- **Write order follows the sign of the pre-cut change**, so the attenuation is
+  never smaller than the boost that is live, at any instant *including the few
+  I2C transactions inside `hal_eq_set`*:
+
+  | change | order |
+  |---|---|
+  | new pre-cut **>** the one the codec holds (e.g. Off → Bass Booster) | `DACVOL` pair, then `EQ1..EQ5` — cut before boosting |
+  | new pre-cut **<** it (e.g. Bass Booster → Off) | `EQ1..EQ5`, then the `DACVOL` pair — unboost before restoring level |
+  | equal | `DACVOL` first (nothing to sequence; deterministic) |
+
+  The driver tracks what the codec *holds*, not what the cached curve implies:
+  `hal_codec_restore()` zeroes it first, because the per-track `wm8758_init()`
+  has just written `0xFF` over it, so a replay re-cuts before it re-boosts.
+  Both directions are pinned as literal bus bytes in
+  `tests/hw_mmio/volume_trace_test.c`.
+- None of these registers has a zero-cross latch (unlike `OUT1VOL`), so a large
+  step can be audible; `DACVU` on the right DAC write at least latches both
+  channels together. If a preset change pops on the device, soft-mute
+  (`DACCTRL_SOFTMUTE`, already used by `wm8758_mute`) around `hal_eq_set` is the
+  fallback — **not yet needed or tried on hardware**.
+- **The curve is cached in RAM** and replayed by `hal_codec_restore()` through
+  the `wm8758_set_restore` hook, because `hal_audio_init()` resets the codec
+  once per track.
+
+The preset gains themselves are **not** a hardware fact and do not live here:
+they are `core/ui/eq.c`'s table, host-tested, and this file only says how a
+curve becomes register words.
 
 ## WM8758 sample-rate program: 44.1 kHz resolved
 

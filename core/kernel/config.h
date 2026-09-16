@@ -78,6 +78,10 @@
  *         bytes) — appended under the SAME version, length 24 -> 44, so
  *         a 24-byte v2 record still reads (context unknown) and a build
  *         that only knows 24 bytes still reads a 44-byte one.
+ *       + the sound tail (volume limit / EQ preset, 4 more bytes) — appended
+ *         the same way, length 44 -> 48. A 44-byte record (every device in
+ *         the field today) reads as "no volume limit, EQ off", which is what
+ *         those devices already do.
  *
  * The v2 payload is v1's with fields APPENDED — no existing offset moved, so
  * the header and the first 12 payload bytes of a v1 record on a user's disk

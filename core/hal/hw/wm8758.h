@@ -111,8 +111,12 @@
 #define DACCTRL_DACOSR128      0x008  /* 128x oversample (the "unmuted" state) */
 #define DACCTRL_SOFTMUTE       0x040
 
-/* ---- LDACVOL / RDACVOL (0x0B / 0x0C) -------------------------------- */
+/* ---- LDACVOL / RDACVOL (0x0B / 0x0C) --------------------------------
+ * 8-bit digital attenuator, 0.5 dB per step: 0xFF = 0 dB (full scale),
+ * 0x00 = mute. hal_eq_set() pre-attenuates here by the EQ curve's largest
+ * boost so a full-scale track cannot clip the digital path. */
 #define DACVOL_MASK            0x0FF
+#define DACVOL_0DB             0x0FF  /* full scale — the codec's own default */
 #define DACVOL_DACVU           0x100  /* latch L+R DAC volume now */
 
 /* ---- PLLN (0x24) ---------------------------------------------------- */
@@ -154,6 +158,26 @@
 #define EQ_DAC_MODE            0x100  /* EQ1 bit 8: apply EQ to the DAC   */
 #define EQ1_CUTOFF_105HZ       0x020  /* EQ1C=01: bass shelf @ 105 Hz     */
 #define EQ5_CUTOFF_6K9         0x020  /* EQ5C=01: treble shelf @ 6.9 kHz  */
+/*
+ * EQxC[1:0] (bits 6:5) selects the band's corner/centre. The code means a
+ * different frequency per band — the tables are in 05-audio.md; here is only
+ * the field. EQxBW (bit 8) widens/narrows a PEAKING band (EQ2..EQ4): on EQ1
+ * that bit is EQ3DMODE and on EQ5 it is unused, so neither shelf may carry
+ * it.
+ *
+ * UNVERIFIED — FROM DATASHEET MEMORY: the per-band centre-frequency tables for
+ * EQ2..EQ4 and the polarity of EQxBW (this header assumes 0 = wide, 1 =
+ * narrow) were written down from memory of the WM8758B datasheet, not read out
+ * of it or off the device. Check both against the PDF before relying on them.
+ * Being wrong costs a band centred elsewhere, or five presets whose three
+ * peaks are narrow instead of wide — a differently shaped preset, never a
+ * fault. The two SHELF corners are not in doubt: the shipped tone control has
+ * used them. See 05-audio.md.
+ */
+#define EQ_CUTOFF_SHIFT        5      /* EQxC[1:0] position               */
+#define EQ_CUTOFF_MASK         0x060  /* EQxC[1:0] field                  */
+#define EQ_BW_NARROW           0x100  /* EQ2..EQ4 bit 8: narrow bandwidth */
+#define EQ_BAND_COUNT          5      /* EQ1..EQ5 — the silicon's bands   */
 
 /* ---- Sample-rate program: 44.1 kHz (05-audio.md, resolved) ---------
  * PLL preset 0 -> fPLLOUT 22.5792 MHz; MCLKDIV/2 -> SYSCLK = 256*44.1kHz.

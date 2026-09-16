@@ -112,12 +112,16 @@ static void draw_toggle(int ry, int selected, int on)
 }
 
 /* Slider fill bar for a value fraction num/den (menus.jsx SettingsSound bar):
- * a full-width track with a proportional fill, colours flipping when selected. */
-static void draw_slider(int ry, int selected, int num, int den)
+ * a full-width track with a proportional fill, colours flipping when selected.
+ * A locked row (settings_row_locked — Bass/Treble under an EQ preset) keeps
+ * its bar, because the number it shows is real, but draws it in the muted
+ * tone the label and value use so it reads as state rather than as a control. */
+static void draw_slider(int ry, int selected, int locked, int num, int den)
 {
     int bx = 14, bw = LCD_WIDTH - 16 - bx, by = ry + 17, bh = 3;
     uint16_t trackc = selected ? S_SEL_TRK : S_TRK;
-    uint16_t fillc  = selected ? S_SEL_FG  : S_INK;
+    uint16_t fillc  = locked   ? (selected ? S_SEL_SUB : S_MUTED2)
+                               : (selected ? S_SEL_FG  : S_INK);
     console_fill_rect(bx, by, bw, bh, trackc);
     if (den > 0) {
         int fw = bw * num / den;
@@ -168,9 +172,10 @@ static void st_scrollbar(int y0, int top, int visible, int total)
 static void list_render(int screen, const settings_t *s, int sel)
 {
     int n   = settings_count(screen);
-    /* Sliders are double-height, so a slider screen shows fewer rows. Only
-     * Sound is all-sliders and it has 4 rows, which fits either way; the
-     * window maths below is row-count based and stays correct regardless. */
+    /* Every row is ROW_H tall whatever its kind — a slider just puts its bar
+     * at ry+17 inside that same row — so the window maths is row-count based
+     * and needs no per-kind arithmetic. Sound is the tallest screen at six
+     * rows and still fits in the eight-row window. */
     int top = st_scroll_window(sel, n, LIST_ROWS);
     int end = top + LIST_ROWS;
     if (end > n) end = n;
@@ -188,9 +193,17 @@ static void list_render(int screen, const settings_t *s, int sel)
         int is_toggle = 0, on = 0, num = 0, den = 0;
         settings_value(screen, s, r, buf, &is_toggle, &on, &num, &den);
 
+        /* A locked row is drawn, and drawn greyed: it is explaining state
+         * (an EQ preset owns this shelf), which is exactly what a row the
+         * user cannot move has to do to earn its place on the screen. */
+        int locked = settings_row_locked(screen, s, r);
+
         uint16_t fg     = is_sel ? S_SEL_FG  : S_INK;
         uint16_t rightc = is_sel ? S_SEL_SUB : S_MUTED_D;
         uint16_t chevc  = is_sel ? S_SEL_SUB : S_CHEVRON;
+        if (locked) {
+            fg = rightc = is_sel ? S_SEL_SUB : S_MUTED2;
+        }
 
         if (kind == SETTINGS_KIND_SLIDER) {
             /* label + right value lifted to make room for the bar below. */
@@ -199,7 +212,7 @@ static void list_render(int screen, const settings_t *s, int sel)
             if (buf[0]) {
                 st_text_right(16, ry + 11, buf, F_SUB, rightc);
             }
-            draw_slider(ry, is_sel, num, den);
+            draw_slider(ry, is_sel, locked, num, den);
             continue;
         }
 

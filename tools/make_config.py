@@ -76,7 +76,8 @@ SLOTS = 2
 MIN_BYTES = SLOT_BYTES * SLOTS    # 2048 — the smallest file the device accepts
 
 MAGIC = 0x45524F43                # 'C''O''R''E' little-endian
-VERSION = 2                       # v1 = settings only; v2 adds the resume locator
+VERSION = 2                       # v1 = settings only; v2 adds the resume locator,
+                                  # the queue context and the sound tail
 
 OFF_MAGIC, OFF_VERSION, OFF_LENGTH, OFF_SEQ, OFF_PAYLOAD = 0, 4, 6, 8, 12
 OFF_CRC = SLOT_BYTES - 4          # 1020; the CRC covers bytes [0, OFF_CRC)
@@ -129,7 +130,20 @@ CTX_FIELDS = [
     ("resume_order_keep", "<h", 40),   # the player's shuffle-deal pin
     ("resume_pad",        "<H", 42),   # reserved, 0
 ]
-PAYLOAD_LEN = PAYLOAD_V2_LEN + 20                          # 44
+PAYLOAD_V2Q_LEN = PAYLOAD_V2_LEN + 20                      # 44
+
+# The SOUND TAIL, appended the same way again (length 44 -> 48, version still
+# 2): the Volume Limit and the EQ preset. Mirrors P_VOL_LIMIT.. in config.c.
+# A 44-byte record — every device in the field — decodes as limit 100 / EQ off.
+# The firmware reads a volume_limit byte of 0 as UNSET (-> 100), so a file
+# whose new bytes were never written cannot pin anyone at 10%.
+SOUND_FIELDS = [
+    ("volume_limit",      "<B", 44),   # 10..100; 100 = no limit, 0 = unset
+    ("eq",                "<B", 45),   # ui/eq.c preset id, 0 = Off
+    ("sound_pad",         "<H", 46),   # reserved, 0
+]
+SOUND_DEFAULTS = {"volume_limit": 100, "eq": 0}
+PAYLOAD_LEN = PAYLOAD_V2Q_LEN + 4                          # 48
 
 SIGNED = {"bass", "treble", "balance"}
 
@@ -160,6 +174,9 @@ def encode(values: dict, seq: int) -> bytes:
         struct.pack_into("<I", rec, OFF_PAYLOAD + PAYLOAD_V1_LEN + 4 * j, v)
     for name, fmt, off in CTX_FIELDS:
         struct.pack_into(fmt, rec, OFF_PAYLOAD + off, int(values.get(name, 0)))
+    for name, fmt, off in SOUND_FIELDS:
+        v = int(values.get(name, SOUND_DEFAULTS.get(name, 0)))
+        struct.pack_into(fmt, rec, OFF_PAYLOAD + off, v)
     struct.pack_into("<I", rec, OFF_CRC, crc32(bytes(rec[:OFF_CRC])))
     return bytes(rec)
 
@@ -190,8 +207,11 @@ def decode(rec: bytes):
         for j, name in enumerate(RESUME_FIELDS):
             out[name] = struct.unpack_from(
                 "<I", rec, OFF_PAYLOAD + PAYLOAD_V1_LEN + 4 * j)[0]
-    if length >= PAYLOAD_LEN:
+    if length >= PAYLOAD_V2Q_LEN:
         for name, fmt, off in CTX_FIELDS:
+            out[name] = struct.unpack_from(fmt, rec, OFF_PAYLOAD + off)[0]
+    if length >= PAYLOAD_LEN:
+        for name, fmt, off in SOUND_FIELDS:
             out[name] = struct.unpack_from(fmt, rec, OFF_PAYLOAD + off)[0]
     return seq, out
 

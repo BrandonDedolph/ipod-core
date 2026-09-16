@@ -123,7 +123,7 @@ A screenshot here is a claim about what the device draws. So:
 | `artists.png` `albums.png` `songs.png` `genres.png` `allsongs.png` | library lists | `screen_*` |
 | `playlists.png` | Music → Playlists list | `screen_playlists` |
 | `detail.png` | album detail (tracklist) | `screen_detail` |
-| `nowplaying.png` `volume.png` | Now Playing, volume plate | `screen_nowplaying`, `screen_volume` |
+| `nowplaying.png` `volume.png` `volume_limit.png` | Now Playing, volume plate, the plate at a Volume Limit (triangle marker) | `screen_nowplaying`, `screen_volume`, `screen_volume_limit` |
 | `hold_unlocked.png` `hold_locked.png` `hold_locked_list.png` | Hold-switch banners (Now Playing row / list chrome) | `screen_lock`, `screen_locked`, `screen_locked_list` |
 | `settings.png` `playback.png` `sound.png` `clicker.png` `theme.png` | Settings (the Playback still carries the strip's `SLEEP` token) | `screen_settings`, `screen_playback`, `screen_sound`, `screen_clicker`, `screen_theme` |
 | `about.png` `bootdetails.png` | About dashboard, Boot Details | `screen_about`, `screen_diag` |

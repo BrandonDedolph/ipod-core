@@ -862,7 +862,7 @@ def screen_detail(sel=DETAIL_SEL):
 
 
 def _now_playing_base(vol_overlay=None, elapsed=73, total=182, locked=False,
-                      sleep=None):
+                      sleep=None, vol_limit=100):
     sc = Screen()
     # top status row
     sc.text(12, 15, "Now Playing", bold_11, INK)
@@ -899,7 +899,7 @@ def _now_playing_base(vol_overlay=None, elapsed=73, total=182, locked=False,
     elif fw > 0:
         sc.fill_rect(pbx, by, fw, bh, INK)
     if vol_overlay is not None:
-        volume_overlay(sc, vol_overlay)
+        volume_overlay(sc, vol_overlay, vol_limit)
     return sc
 
 
@@ -926,7 +926,7 @@ def draw_speaker(sc, sx, sy, c, vol):
         arc(9, 5)
 
 
-def volume_overlay(sc, vol):
+def volume_overlay(sc, vol, limit=100):
     PX, PY, PW, PH = 60, 101, 200, 32
     sc.fill_round_rect_aa(PX, PY, PW, PH, 8, PLATE)
     draw_speaker(sc, PX + 16, PY + PH // 2, INK, vol)
@@ -937,6 +937,14 @@ def volume_overlay(sc, vol):
     sc.fill_rect(bx, by, bw, bh, TRK)
     fw = max(0, min(bw, bw * vol // 100))
     sc.fill_rect(bx, by, fw, bh, INK)
+    # Volume Limit marker: a 5x3 triangle, apex down, on the track's top edge
+    # at the ceiling (main.c volume_overlay_render). The bar keeps its 0..100
+    # scale, so the marker is where the wheel stops.
+    if limit < 100:
+        mx = bx + bw * limit // 100
+        sc.fill_rect(mx - 2, by - 4, 5, 1, INK)
+        sc.fill_rect(mx - 1, by - 3, 3, 1, INK)
+        sc.fill_rect(mx, by - 2, 1, 1, INK)
     sc.text_right(PX + PW - 14, PY + PH // 2 + 4, str(vol), bold_11, INK)
 
 
@@ -946,6 +954,12 @@ def screen_nowplaying():
 
 def screen_volume():
     return _now_playing_base(vol_overlay=78).img
+
+
+def screen_volume_limit():
+    """The same plate with Volume Limit set to 60: the wheel is pinned at the
+    ceiling and the triangle says why."""
+    return _now_playing_base(vol_overlay=60, vol_limit=60).img
 
 
 # -- Hold banner -------------------------------------------------------------
@@ -1417,7 +1431,7 @@ def gif_settings():
     settles on the seven-theme picker."""
     def sound_vol(v):
         rows = list(SOUND_ROWS)
-        rows[0] = ("Volume", "%d%%" % v, v, 100)
+        rows[0] = ("Volume", "%d%%" % v, v, 100, False)
         return screen_sound(rows=rows, sel_row=0)
     vals = [20, 35, 50, 65, 80, 92]
     spec = [(sound_vol(20), 3, 150)]
@@ -1740,34 +1754,46 @@ def screen_diag():
     return sc.img
 
 
+# (label, value, num, den, locked) — den 0 means a SELECT row (no bar).
+# Shown with an EQ preset ACTIVE, which is the state that needs explaining:
+# Rock owns both codec shelves, so Bass and Treble read its gains and render
+# greyed (ui/screen_settings.c list_render + settings_row_locked).
 SOUND_ROWS = [
-    # (label, value, num, den)
-    ("Volume", "72%", 72, 100),
-    ("Bass", "+3 dB", 3 + 12, 24),
-    ("Treble", "0 dB", 0 + 12, 24),
-    ("Balance", "Center", 0 + 100, 200),
+    ("Volume", "72%", 72, 100, False),
+    ("Volume Limit", "100%", 100, 100, False),
+    ("EQ", "Rock", 0, 0, False),
+    ("Bass", "+5 dB", 5 + 12, 24, True),
+    ("Treble", "+4 dB", 4 + 12, 24, True),
+    ("Balance", "Center", 0 + 100, 200, False),
 ]
-SOUND_SEL = 1   # Bass (boosted)
+SOUND_SEL = 2   # EQ
 
 def screen_sound(rows=None, sel_row=SOUND_SEL):
     rows = rows if rows is not None else SOUND_ROWS
     sc = Screen()
     header(sc, "Sound", back=True)
     status_strip(sc)                 # main.c settings_render_cur
-    for r, (label, val, num, den) in enumerate(rows):
+    for r, (label, val, num, den, locked) in enumerate(rows):
         ry = LIST_Y0 + r * ROW_H
         sel = (r == sel_row)
         if sel:
             _sel_bar(sc, LIST_Y0, ROW_H, r)
         fg = SEL_FG if sel else INK
         rightc = SEL_SUB if sel else MUTED_D
+        if locked:
+            fg = rightc = SEL_SUB if sel else MUTED2
+        if den <= 0:                 # SELECT row: label + value, centred
+            sc.text(14, ry + 15, label, FONT_HEADER if sel else FONT_ROW, fg)
+            sc.text_right(W - 16, ry + 15, val, regular_11, rightc)
+            continue
         sc.text(14, ry + 11, label, FONT_HEADER if sel else FONT_ROW, fg)
         sc.text_right(W - 16, ry + 11, val, regular_11, rightc)
         # slider bar
         bx, bw, by, bh = 14, W - 16 - 14, ry + 17, 3
         sc.fill_rect(bx, by, bw, bh, SEL_TRK if sel else TRK)
         fw = max(0, min(bw, bw * num // den))
-        sc.fill_rect(bx, by, fw, bh, SEL_FG if sel else INK)
+        fillc = (SEL_SUB if sel else MUTED2) if locked else (SEL_FG if sel else INK)
+        sc.fill_rect(bx, by, fw, bh, fillc)
     return sc.img
 
 
@@ -2065,6 +2091,7 @@ def main():
     outputs.append(save_png(screen_genres(), "genres.png"))
     outputs.append(save_png(screen_about(), "about.png"))
     outputs.append(save_png(screen_volume(), "volume.png"))
+    outputs.append(save_png(screen_volume_limit(), "volume_limit.png"))
     outputs.append(save_png(screen_lock(), "hold_unlocked.png"))
     outputs.append(save_png(screen_locked(), "hold_locked.png"))
     outputs.append(save_png(screen_locked_list(), "hold_locked_list.png"))

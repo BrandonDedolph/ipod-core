@@ -216,6 +216,8 @@ static void defaults(settings_t *s)
 {
     memset(s, 0, sizeof *s);
     s->shuffle = 0;  s->repeat = REPEAT_OFF; s->volume = 70;
+    s->volume_limit = 100;   /* settings_defaults()'s "no limit"; a zeroed  */
+                             /* struct would encode as the 10% floor        */
     s->backlight_secs = 15; s->backlight_bright = 32;
 }
 
@@ -229,6 +231,7 @@ static int settings_eq(const settings_t *a, const settings_t *b)
            a->backlight_secs == b->backlight_secs &&
            a->backlight_bright == b->backlight_bright &&
            a->theme == b->theme && a->clicker == b->clicker &&
+           a->volume_limit == b->volume_limit && a->eq == b->eq &&
            a->resume_hash == b->resume_hash &&
            a->resume_secs == b->resume_secs &&
            a->resume_total == b->resume_total &&
@@ -262,6 +265,10 @@ static void spicy(settings_t *s)
     s->resume_kind = 6;  s->resume_flags = 0; s->resume_qidx = 5999;
     s->resume_seed = 0xC0FFEE01u; s->resume_order_seed = 0xBADC0DE5u;
     s->resume_order_keep = -2; s->resume_ctx_hash = 0x5EEDF00Du;
+    /* The sound tail at its far end: the last preset this build knows, and a
+     * limit that leaves the spicy volume (100) alone so the round trip is a
+     * round trip. The limit-vs-volume coupling gets its own test. */
+    s->volume_limit = 100; s->eq = 17;
 }
 
 /* ---- mock-bus programming ---------------------------------------------- */
@@ -502,8 +509,10 @@ static void recrc(uint8_t *rec)
 #define T_LEN_V1      12u          /* settings only                        */
 #define T_LEN_V2      24u          /* + resume hash/secs/total, 4 bytes ea. */
 #define T_LEN_V2Q     44u          /* + the resume queue context (same ver) */
+#define T_LEN_V2S     48u          /* + the sound tail (limit, EQ; same ver) */
 #define T_OFF_RES     (T_OFF_PAYLOAD + T_LEN_V1)   /* 24: resume_hash      */
 #define T_OFF_CTX     (T_OFF_PAYLOAD + T_LEN_V2)   /* 36: resume_kind      */
+#define T_OFF_SND     (T_OFF_PAYLOAD + T_LEN_V2Q)  /* 56: volume_limit     */
 #define T_RESUME_MAX  86400u       /* the decoder's ceiling on both counts  */
 
 static void put32le(uint8_t *p, uint32_t v)
@@ -544,8 +553,8 @@ static void test_resume_record(void)
     config_encode(rec, &in, 7);
     check("record is version 2", rec[T_OFF_VERSION] == 2 &&
                                  rec[T_OFF_VERSION + 1] == 0);
-    check("record declares the v2 payload length, context included",
-          rec[T_OFF_LENGTH] == T_LEN_V2Q && rec[T_OFF_LENGTH + 1] == 0);
+    check("record declares the v2 payload length, sound tail included",
+          rec[T_OFF_LENGTH] == T_LEN_V2S && rec[T_OFF_LENGTH + 1] == 0);
     check("resume fields land at the documented offsets",
           get32le(&rec[T_OFF_RES])     == 0xDEADBEEFu &&
           get32le(&rec[T_OFF_RES + 4]) == 1234u &&
@@ -790,6 +799,141 @@ static void test_resume_context(void)
 }
 
 /* ---- seq ordering ------------------------------------------------------ */
+
+/*
+ * The SOUND TAIL: the Volume Limit and the EQ preset, appended after the
+ * queue context under the SAME record version, `length` 44 -> 48. What it
+ * must get right:
+ *
+ *   - the 44-byte record every device in the field holds right now still
+ *     decodes, and decodes to "no limit, EQ off" with its VOLUME UNTOUCHED —
+ *     the state those devices are already in;
+ *   - a volume_limit byte of 0 means UNSET, not 10%: a 48-byte record whose
+ *     new bytes were never written must not pin the user at the floor;
+ *   - both fields are clamped/declined on the way in AND on the way out;
+ *   - decode enforces the invariant the two Sound rows share, volume <=
+ *     volume_limit, whatever the bytes say.
+ */
+static void test_sound_tail(void)
+{
+    uint8_t rec[CONFIG_SLOT_BYTES];
+    settings_t in, out;
+    uint32_t seq = 0;
+
+    defaults(&in);
+    spicy(&in);
+    config_encode(rec, &in, 21);
+    check("sound tail lands at the documented offsets",
+          rec[T_OFF_SND] == 100 && rec[T_OFF_SND + 1] == 17 &&
+          rec[T_OFF_SND + 2] == 0 && rec[T_OFF_SND + 3] == 0);
+    memset(&out, 0xA5, sizeof out);
+    check("sound tail round-trips",
+          config_decode(rec, &out, &seq) == 1 && settings_eq(&in, &out) &&
+          out.volume_limit == 100 && out.eq == 17);
+
+    /* The record the PREVIOUS build wrote: version 2, length 44, zero padding
+     * where the sound tail now lives. This is the live-format constraint —
+     * it is the record on every deployed device. */
+    defaults(&in);
+    in.volume = 90;
+    config_encode(rec, &in, 22);
+    rec[T_OFF_LENGTH] = (uint8_t)T_LEN_V2Q;
+    memset(&rec[T_OFF_SND], 0, T_LEN_V2S - T_LEN_V2Q);
+    recrc(rec);
+    memset(&out, 0x5A, sizeof out);
+    check("a 44-byte v2 record still decodes under this build",
+          config_decode(rec, &out, &seq) == 1 && seq == 22u && out.volume == 90);
+    check("...as no limit and EQ off, with the volume untouched",
+          out.volume_limit == 100 && out.eq == 0 && out.volume == 90);
+
+    /* One byte short of the tail: the bytes are there, `length` says padding. */
+    defaults(&in);
+    in.volume_limit = 40; in.eq = 3;
+    config_encode(rec, &in, 23);
+    rec[T_OFF_LENGTH] = (uint8_t)(T_LEN_V2S - 1u);
+    recrc(rec);
+    memset(&out, 0x5A, sizeof out);
+    check("a length one byte short of the sound tail drops it",
+          config_decode(rec, &out, &seq) == 1 &&
+          out.volume_limit == 100 && out.eq == 0);
+
+    /* A limit below the volume pulls the volume down on the way in, so the
+     * device can never come up louder than the ceiling the user set. */
+    defaults(&in);
+    in.volume = 90; in.volume_limit = 60;
+    config_encode(rec, &in, 24);
+    check("encode writes the limit verbatim", rec[T_OFF_SND] == 60);
+    memset(&out, 0x5A, sizeof out);
+    check("decode clamps the volume to the limit",
+          config_decode(rec, &out, &seq) == 1 &&
+          out.volume_limit == 60 && out.volume == 60);
+
+    /* The limit byte's edges, hand-edited into an otherwise valid record. */
+    defaults(&in);
+    config_encode(rec, &in, 25);
+    rec[T_OFF_SND] = 0;                    /* unset */
+    recrc(rec);
+    check("limit byte 0 reads as no limit",
+          config_decode(rec, &out, &seq) == 1 && out.volume_limit == 100);
+
+    config_encode(rec, &in, 26);
+    rec[T_OFF_SND] = 5;                    /* below the floor */
+    recrc(rec);
+    check("limit byte 5 clamps up to the 10% floor",
+          config_decode(rec, &out, &seq) == 1 && out.volume_limit == 10 &&
+          out.volume == 10);
+
+    config_encode(rec, &in, 27);
+    rec[T_OFF_SND] = 250;                  /* above the ceiling */
+    recrc(rec);
+    check("limit byte 250 clamps down to 100",
+          config_decode(rec, &out, &seq) == 1 && out.volume_limit == 100);
+
+    /* Encode clamps the same way, so a stray value in RAM never reaches the
+     * disk as a limit outside the field's range. */
+    defaults(&in);
+    in.volume_limit = 250;
+    config_encode(rec, &in, 28);
+    check("encode clamps a limit above the ceiling", rec[T_OFF_SND] == 100);
+    in.volume_limit = 1;
+    config_encode(rec, &in, 29);
+    check("encode clamps a limit below the floor", rec[T_OFF_SND] == 10);
+
+    /* The EQ byte: the top preset this build knows survives, anything past it
+     * is Off — the theme byte's rule, for the same reason (declining to
+     * interpret beats acting on a curve we have no table for). */
+    defaults(&in);
+    config_encode(rec, &in, 30);
+    rec[T_OFF_SND + 1] = 17;
+    recrc(rec);
+    check("EQ byte 17 is the last preset this build knows",
+          config_decode(rec, &out, &seq) == 1 && out.eq == 17);
+
+    config_encode(rec, &in, 31);
+    rec[T_OFF_SND + 1] = 18;
+    recrc(rec);
+    check("EQ byte 18 decodes as Off",
+          config_decode(rec, &out, &seq) == 1 && out.eq == 0);
+
+    config_encode(rec, &in, 32);
+    rec[T_OFF_SND + 1] = 200;
+    recrc(rec);
+    check("EQ byte 200 decodes as Off",
+          config_decode(rec, &out, &seq) == 1 && out.eq == 0);
+
+    defaults(&in);
+    in.eq = 200;
+    config_encode(rec, &in, 33);
+    check("encode writes an unknown preset as Off", rec[T_OFF_SND + 1] == 0);
+
+    /* The tail is inside the CRC's range, like every other field. */
+    defaults(&in);
+    in.volume_limit = 40;
+    config_encode(rec, &in, 34);
+    rec[T_OFF_SND] ^= 0x01;
+    check("a flipped sound-tail byte fails the CRC",
+          config_decode(rec, &out, &seq) == 0);
+}
 
 static void test_seq_order(void)
 {
@@ -1304,12 +1448,13 @@ static void test_host_fixture(const char *path)
           s.balance == def.balance &&
           s.backlight_secs == def.backlight_secs &&
           s.backlight_bright == def.backlight_bright &&
-          s.theme == def.theme && s.clicker == def.clicker);
+          s.theme == def.theme && s.clicker == def.clicker &&
+          s.volume_limit == def.volume_limit && s.eq == def.eq);
     /* The host tool writes the v2 layout too — if it kept emitting v1 the
      * device would still boot, but a freshly imported iPod would silently be
      * unable to remember a position until its first save. */
     check("host record is v2 with an empty resume locator",
-          blob[4] == 2 && blob[5] == 0 && blob[6] == 44 && blob[7] == 0 &&
+          blob[4] == 2 && blob[5] == 0 && blob[6] == 48 && blob[7] == 0 &&
           s.resume_hash == 0 && s.resume_secs == 0 && s.resume_total == 0 &&
           s.resume_kind == 0 && s.resume_qidx == 0 && s.resume_seed == 0 &&
           s.resume_order_seed == 0 && s.resume_order_keep == 0);
@@ -1323,6 +1468,7 @@ int main(int argc, char **argv)
     test_codec();
     test_resume_record();
     test_resume_context();
+    test_sound_tail();
     test_seq_order();
     test_two_slot();
     test_write_trace();

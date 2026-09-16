@@ -97,6 +97,7 @@
 #include "../fs/fat32.h"
 #include "../ui/settings.h"
 #include "../ui/palette.h"             /* THEME_COUNT: the stored theme's range */
+#include "../ui/eq.h"                  /* EQ_PRESET_COUNT / EQ_OFF: the EQ byte */
 
 /* ---- module state ------------------------------------------------------ */
 
@@ -202,6 +203,21 @@ enum {
 #define P_RES_PAD       (CFG_PAYLOAD_V2 + 18u)   /* 42: u16 reserved (0)      */
 #define CFG_PAYLOAD_V2Q (CFG_PAYLOAD_V2 + 20u)   /* = 44                      */
 
+/*
+ * The SOUND TAIL, appended the same way again: length 44 -> 48, version still
+ * 2. Two bytes of setting and a reserved half-word to keep the payload a
+ * multiple of four.
+ *
+ * volume_limit reads 0 as UNSET -> 100. That is not paranoia about garbage:
+ * it is what a 48-byte record whose new bytes were never written looks like,
+ * and clamping a 0 into the field's 10..100 range instead would hand the user
+ * a device pinned at 10% with no indication why.
+ */
+#define P_VOL_LIMIT     (CFG_PAYLOAD_V2Q + 0u)   /* 44: u8  10..100, 0=unset  */
+#define P_EQ            (CFG_PAYLOAD_V2Q + 1u)   /* 45: u8  EQ preset id      */
+#define P_SND_PAD       (CFG_PAYLOAD_V2Q + 2u)   /* 46: u16 reserved (0)      */
+#define CFG_PAYLOAD_V2S (CFG_PAYLOAD_V2Q + 4u)   /* = 48                      */
+
 /* Ceiling for both stored second counts. A day is already absurd for one
  * track; the point is that a CRC-valid but insane record cannot hand the
  * player a seek target built from garbage. (player_seek_to clamps to the real
@@ -301,7 +317,7 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
 
     wr32(&rec[CFG_OFF_MAGIC],   CFG_MAGIC);
     wr16(&rec[CFG_OFF_VERSION], (uint16_t)CONFIG_VERSION);
-    wr16(&rec[CFG_OFF_LENGTH],  (uint16_t)CFG_PAYLOAD_V2Q);
+    wr16(&rec[CFG_OFF_LENGTH],  (uint16_t)CFG_PAYLOAD_V2S);
     wr32(&rec[CFG_OFF_SEQ],     seq);
 
     uint8_t *p = &rec[CFG_OFF_PAYLOAD];
@@ -347,6 +363,14 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
     wr32(&p[P_RES_CTX],   ctx);
     wr16(&p[P_RES_OKEEP], (uint16_t)(int16_t)okeep);
     wr16(&p[P_RES_PAD],   0);
+
+    /* The sound tail. A preset id this build does not know is written as Off
+     * rather than as a number a future reader might act on — the same rule the
+     * queue kind follows above, and the one decode applies coming back. */
+    p[P_VOL_LIMIT] = (uint8_t)clampi(s->volume_limit, 10, 100);
+    p[P_EQ]        = (uint8_t)((s->eq > EQ_OFF && s->eq < EQ_PRESET_COUNT)
+                               ? s->eq : EQ_OFF);
+    wr16(&p[P_SND_PAD], 0);
 
     /* settings_t.sleep_timer_min is deliberately ABSENT from the payload: a
      * countdown armed before a power cut means nothing after one, so the
@@ -449,6 +473,24 @@ int config_decode(const uint8_t *rec, settings_t *s, uint32_t *seq)
         s->resume_order_seed = 0;
         s->resume_order_keep = 0;
         s->resume_ctx_hash   = 0;
+    }
+
+    /* The sound tail, gated the same way: a 44-byte record — which is what
+     * is on every device in the field — reads as no limit and EQ off, exactly
+     * what those devices do today. */
+    if (len >= CFG_PAYLOAD_V2S) {
+        int vl = p[P_VOL_LIMIT];
+        s->volume_limit = (vl == 0) ? 100 : clampi(vl, 10, 100);
+        s->eq           = (p[P_EQ] < EQ_PRESET_COUNT) ? (int)p[P_EQ] : EQ_OFF;
+    } else {
+        s->volume_limit = 100;
+        s->eq           = EQ_OFF;
+    }
+    /* The one invariant the two Sound rows share, re-asserted against a record
+     * written by an older build, a hand-edited file, or a limit lowered on a
+     * device whose volume was already above it. */
+    if (s->volume > s->volume_limit) {
+        s->volume = s->volume_limit;
     }
 
     /* Never on disk, and config_load() copies this whole decoded struct over

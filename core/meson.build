@@ -367,13 +367,15 @@ if target == 'hw'
   # Settings subsystem (ours): a data-driven settings_t model + a matching
   # renderer for the Settings screens (design_reference menus.jsx + ThemePicker).
   # settings.c is pure model logic (no framebuffer/hardware — the SAME source the
-  # host settings_test compiles); screen_settings.c draws it via the Nunito text
+  # host settings_test compiles); eq.c is the equaliser preset table it and
+  # kernel/main.c read; screen_settings.c draws it via the Nunito text
   # renderer + console fill_rect. main.c owns the settings_t state + navigation
   # and calls these generically. No libc/libm/malloc; relative includes only
   # (settings.h, ui/text.h, ../kernel/console.h, ../hal/hal.h); stays -Werror.
   settings_hw_lib = static_library(
     'core_settings_hw',
-    sources: ['ui/settings.c', 'ui/screen_settings.c', 'ui/palette.c'],
+    sources: ['ui/settings.c', 'ui/screen_settings.c', 'ui/palette.c',
+              'ui/eq.c'],
     c_args: ['-DCORE_FREESTANDING'],
   )
 
