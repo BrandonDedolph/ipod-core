@@ -179,6 +179,24 @@ if target == 'sim'
   )
   test('wheel', wheel_test, suite: 'unit')
 
+  # letterindex: the A-Z run index (core/ui/letterindex.c) — the SAME source
+  # the ARM build links into core.elf. It is the piece that decides whether a
+  # list gets an A-Z plate at all and where a letter detent lands, and both
+  # judgements are invisible on the device: an index that wrongly said "this
+  # list is not sorted" would look exactly like a feature nobody had built.
+  # The per-row initial is injected, so each "list" here is a string of
+  # letters — which is how the collation cases that actually bite (a '#' group
+  # BEFORE A and a second one AFTER Z, rows in no order at all, an unsorted
+  # list) each cost one literal. Sentinels bracket the index struct, and the
+  # step cases are wheel_test §6's, because Stage B swaps the walk for this.
+  letterindex_test = executable(
+    'letterindex_test',
+    sources: ['ui/letterindex_test.c', '../ui/letterindex.c'],
+    include_directories: include_directories('../ui', '.'),
+    override_options: test_opts,
+  )
+  test('letterindex', letterindex_test, suite: 'unit')
+
   # keyhold: tap-vs-hold press-length arbitration (core/ui/keyhold.c) — the
   # SAME source the ARM build links into core.elf, driving PLAY (tap = pause,
   # hold = sleep), MENU (tap = back, hold = the main menu) and, through

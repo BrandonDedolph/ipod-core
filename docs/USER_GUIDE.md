@@ -32,8 +32,14 @@ Left and Right are transport — skip on a tap, seek on a hold — only on Now P
 Holding Menu for a second goes to the main menu from wherever you are; a plain tap is still back
 one screen.
 
-On the Songs list only, spinning the wheel fast puts the selected row's first letter on screen so
-you can aim. The letter stays for just over a second after you stop.
+On any long alphabetical list — Songs, an artist's All Songs, a genre's songs, Artists, Albums,
+Playlists, Genres — spinning the wheel fast puts a big letter on screen so you can aim. The letter
+stays for just over a second after you stop. It is the letter the list is **sorted by**, which is
+not always the letter the row starts with: Artists ignore a leading "The", so The Kid LAROI is
+under K, and an album is under its own title, not its artist's. Short lists have no letter: aiming
+only beats scrolling once a list is longer than about six screens. A name that starts with a digit,
+a bracket or an accented letter shows `#` — accented names sort after Z, so Élan is at the bottom
+of the list rather than under E.
 
 Hold Play for two seconds to sleep. Keep holding past five seconds and the device powers off
 instead. Any button wakes a sleeping device where you left it. A powered-off device cold boots on
@@ -82,7 +88,7 @@ track plays the album from there; Play on an album row plays it without opening 
 **Artists** lists artists; Select shows that artist's albums with an All Songs row at the top that
 is the whole discography, album on the sub-line.
 
-**Songs** is every song in the library. **Genres** lists genres with a count each. **Shuffle
+**Songs** is every song in the library. **Genres** lists genres A→Z with a count each. **Shuffle
 Songs** deals the whole library and starts playing.
 
 **Playlists** are `.m3u8` files you put in `Music/Playlists/` on the disk (see Putting music on

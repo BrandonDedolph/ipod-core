@@ -53,6 +53,7 @@
 #include "../library/sort.h"
 #include "../library/playlist.h"
 #include "../ui/wheel.h"
+#include "../ui/letterindex.h"
 #include "../ui/keyhold.h"
 #include "../ui/gesture.h"
 #include "../ui/sleeptimer.h"
@@ -2621,11 +2622,73 @@ static int album_key_cmp_idx(uint16_t a, uint16_t b)
     return title_cmp(g_album_key[a], g_album_key[b]);
 }
 
+static int genre_cmp_idx(uint16_t a, uint16_t b)
+{
+    return title_cmp(g_genres[a], g_genres[b]);
+}
+
+/* The genre sort's order array. Its own, not g_sort_tmp: that is the scratch
+ * merge_sort_idx needs, and the inverse permutation is built into it. */
+static uint16_t g_genre_order[LIB_MAX_GENRES];
+
+/*
+ * Alphabetise the genre table A->Z.
+ *
+ * genre_intern() appends in FIRST-SEEN order, which is the order the index
+ * records happen to arrive in, so Music > Genres was the one long list on the
+ * device with no order at all to read down or to locate within. Sorting it is
+ * also what lets the A-Z plate appear there: the letter index rejects a list
+ * whose initial changes on nearly every row.
+ *
+ * A genre is identified by its INDEX (lib_song_t.genre, songview_build's
+ * argument), so the sort has to remap every song's field through the inverse
+ * permutation. That is safe here and nowhere else: library_finish is the last
+ * thing the load does, before any screen or the resume restore can capture an
+ * index. Nothing on disk holds one — the resume record stores the song, and
+ * rebuilds the genre view from the song's own field.
+ */
+static void genres_sort(void)
+{
+    int n = g_genres_n;
+    if (n <= 1) {
+        return;
+    }
+    for (int i = 0; i < n; i++) g_genre_order[i] = (uint16_t)i;
+    merge_sort_idx(g_genre_order, n, g_sort_tmp, genre_cmp_idx);
+
+    /* inv[old] = new: both the remap the song fields need and the SCATTER
+     * permutation the in-place apply below follows — the sort hands back a
+     * gather order, exactly as in the album sort above. g_sort_tmp is free
+     * again now the sort is done, and the apply consumes it. */
+    uint16_t *inv = g_sort_tmp;
+    for (int k = 0; k < n; k++) inv[g_genre_order[k]] = (uint16_t)k;
+    for (int i = 0; i < g_songs_n; i++) {
+        int g = g_songs[i].genre;
+        if (g >= 0 && g < n) g_songs[i].genre = (int16_t)inv[g];
+    }
+    for (int i = 0; i < n; i++) {
+        while (inv[i] != (uint16_t)i) {
+            int j = inv[i];
+            for (int k = 0; k < LIB_GENRE_MAX; k++) {
+                char ck = g_genres[i][k];
+                g_genres[i][k] = g_genres[j][k];
+                g_genres[j][k] = ck;
+            }
+            uint16_t tk = inv[i];
+            inv[i] = inv[j];
+            inv[j] = tk;
+        }
+    }
+}
+
 /* Shared post-load: title-sort the index array + precompute per-genre counts. */
 static void library_finish(void)
 {
     for (int i = 0; i < g_songs_n; i++) g_song_sorted[i] = (uint16_t)i;
     merge_sort_idx(g_song_sorted, g_songs_n, g_sort_tmp, song_title_cmp_idx);
+    /* Before the counts: the sort renumbers the genres the counts are indexed
+     * by, so counting first would mean permuting g_genre_count[] as well. */
+    genres_sort();
     for (int i = 0; i < g_genres_n; i++) g_genre_count[i] = 0;
     for (int i = 0; i < g_songs_n; i++) {
         int g = g_songs[i].genre;
@@ -2663,6 +2726,19 @@ static void library_finish(void)
                 lib_album_t t = g_albums[i];
                 g_albums[i] = g_albums[j];
                 g_albums[j] = t;
+                /* The KEY travels with its album. It did not, and nothing
+                 * noticed because after this loop g_album_key[] was never read
+                 * again — it existed only to make the comparator cheap. The
+                 * A-Z locator reads it (the album initial is the initial of
+                 * the album title, and re-splitting the folder name per row
+                 * under a spinning wheel is exactly the string scan this array
+                 * was introduced to stop), so a stale key is now a wrong
+                 * letter on the plate rather than a dead array. */
+                for (int k = 0; k <= NAME_MAX; k++) {
+                    char ck = g_album_key[i][k];
+                    g_album_key[i][k] = g_album_key[j][k];
+                    g_album_key[j][k] = ck;
+                }
                 uint16_t tk = g_sort_tmp[i];
                 g_sort_tmp[i] = g_sort_tmp[j];
                 g_sort_tmp[j] = tk;
@@ -3909,10 +3985,18 @@ typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_SONGS, SCR_GENRES,
 static screen_t g_scr[SCR_STACK_MAX];
 static int      g_scr_n;
 
+/* Both ends of the stack forget the wheel gesture, which is what ui/wheel.h
+ * has always said a screen change does. It matters more now than it read:
+ * letter mode survives a pause shorter than the plate's hold (1.2 s), so
+ * without this a fast spin that ended in a SELECT would carry letter mode —
+ * and the plate — onto the screen that SELECT opened, where one detent would
+ * jump a letter on a list the user had not even seen yet. */
 static void      scr_push(screen_t s) { g_list_epoch++;
+                                        wheel_accel_reset();
                                         if (g_scr_n < SCR_STACK_MAX) g_scr[g_scr_n++] = s;
                                         else uart_puts("core: scr_push overflow, dropped\n"); }
 static void      scr_pop(void)        { g_list_epoch++;
+                                        wheel_accel_reset();
                                         if (g_scr_n > 1) g_scr_n--; }
 static screen_t  scr_cur(void)        { return g_scr[g_scr_n - 1]; }
 static int       scr_is_modal(screen_t s) { return s == SCR_BATTERY || s == SCR_CHARGING; }
@@ -4660,34 +4744,106 @@ static int list_repaint_partial(void)
 #define CHIP_WHEEL_SETTLE_US   150000u
 #define CHIP_SPINUP_QUIET_US   500000u
 
-/* The selected row's initial on the alphabetised lists (songs / artists /
- * albums), read straight off the already-sorted arrays; 0 on screens where an
- * A-Z cue would mean nothing. */
-/*
- * The A-Z locator letter for a row, or 0 on screens that have no alphabetical
- * order to locate WITHIN.
+/* ---------------------------------------------------------------------------
+ * The A-Z locator: which letter a row is under, on whichever list is up
  *
- * SONGS ONLY, deliberately. Letter stepping is worth its cost on the one list
- * that is thousands of entries long and sorted by title; on a fixed six-row
- * menu it is meaningless, and on Artists/Albums the lists are short enough that
- * row acceleration already gets you there. Returning 0 here is also what stops
- * wheel_move() from trying to letter-step a list that cannot be letter-stepped
- * — see the guard there.
- */
-static char list_initial_at(int idx)
+ * This used to be SONGS ONLY, for one reason: the locator's only tool was a
+ * linear walk of the rows, which is affordable exactly once. ui/letterindex.c
+ * turns the per-row answer into a run index built once per list, so every
+ * long alphabetised list can have the plate and the letter stepping —
+ * Songs, a genre's songs, an artist's All Songs, Artists, Albums (all and one
+ * artist's), Playlists and Genres.
+ *
+ * What differs per screen is the KEY the list is sorted BY, and that is the
+ * only thing main.c has to answer: Artists sort past a leading "The " (so
+ * "The Kid LAROI" is under K), Albums by the album half of the folder name,
+ * Songs/Playlists/Genres by the name itself. Returning 0 for a row (or for a
+ * whole screen) is what keeps the queue, the tracklists, the menus and
+ * Settings out of it — and it is the same 0 wheel_move()'s guard reads to
+ * fall through to row scrolling.
+ * ------------------------------------------------------------------------- */
+
+/* The initial of the key row `row` is SORTED BY, or 0 for a row that is not
+ * part of the order (the album list's synthetic "All Songs" row) and for
+ * every screen that has no alphabetical order to locate within. */
+static char screen_initial_raw(int row)
 {
-    if (scr_cur() != SCR_SONGS) {
+    switch (scr_cur()) {
+    case SCR_SONGS:
+        if (row >= 0 && row < g_songview_n) {
+            return initial_of(g_songs[g_songview[row]].title);
+        }
+        return 0;
+    case SCR_ARTISTS:
+        if (row >= 0 && row < g_artists_n) {
+            return initial_of(artist_key(g_artists[row].name));
+        }
+        return 0;
+    case SCR_GENRES:
+        if (row >= 0 && row < g_genres_n) {
+            return initial_of(g_genres[row]);
+        }
+        return 0;
+    case SCR_PLAYLISTS:
+        if (row >= 0 && row < g_playlists_n) {
+            return initial_of(g_playlists[row].name);
+        }
+        return 0;
+    case SCR_BROWSER: {
+        /* Depth 0 is the album list; depth 1 is one album's tracklist, which
+         * is in track order and has no letters. albumlist_album_at answers -1
+         * for the "All Songs" row and for a row off the end. */
+        if (g_dir_depth != 0) return 0;
+        int a = albumlist_album_at(row);
+        return (a >= 0) ? initial_of(g_album_key[a]) : 0;
+    }
+    default:
         return 0;
     }
-    if (idx >= 0 && idx < g_songview_n) {
-        return initial_of(g_songs[g_songview[idx]].title);
-    }
-    return 0;
 }
 
+/* The index, and the list it was built for. g_list_epoch already bumps on
+ * every content rebuild and every push/pop, so this is one compare per call
+ * in the common case and a single walk when the list underneath changes. */
+static letteridx_t g_letters;
+static struct { int scr, depth, count; uint32_t epoch; } g_letters_for = {
+    -1, -1, -1, 0
+};
+
+/* Bring the index up to date with whatever list is on screen, and hand back
+ * that list's view (count 0 on a screen that is not a list). */
+static void letters_ensure(list_view_t *v)
+{
+    v->count = 0;
+    v->sel   = 0;
+    (void)list_view_current(v);
+    int scr = (int)scr_cur();
+    if (g_letters_for.scr   == scr        && g_letters_for.depth == g_dir_depth &&
+        g_letters_for.count == v->count   && g_letters_for.epoch == g_list_epoch) {
+        return;
+    }
+    g_letters_for.scr   = scr;
+    g_letters_for.depth = g_dir_depth;
+    g_letters_for.count = v->count;
+    g_letters_for.epoch = g_list_epoch;
+    (void)letteridx_build(&g_letters, v->count, screen_initial_raw);
+}
+
+/* The ui/wheel.h seam: the locator letter for row `idx`, 0 where there is
+ * none. Also the guard that decides whether this screen letter-steps at all. */
+static char list_initial_at(int idx)
+{
+    list_view_t v;
+    letters_ensure(&v);
+    return letteridx_letter_at(&g_letters, idx);
+}
+
+/* The letter the plate shows: the selected row's. */
 static char list_sel_initial(void)
 {
-    return (scr_cur() == SCR_SONGS) ? list_initial_at(g_song_sel) : 0;
+    list_view_t v;
+    letters_ensure(&v);
+    return letteridx_letter_at(&g_letters, v.sel);
 }
 
 /* The wheel's clock (the ui/wheel.h seam): the free-running USEC_TIMER. */

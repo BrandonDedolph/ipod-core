@@ -271,6 +271,19 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # Where each letter starts on an alphabetised list (ours): the run index
+  # every long list's A-Z plate and letter stepping is answered out of. It is
+  # what lets the locator work on Artists / Albums / Playlists / Genres and
+  # not just Songs — the per-row initial is a different KEY on each of them,
+  # so it is injected and the index is built once per list instead of walked
+  # per detent. Pure integer logic over an injected callback, no globals.
+  # Same letterindex.c the host letterindex_test compiles.
+  letterindex_hw_lib = static_library(
+    'core_letterindex_hw',
+    sources: ['ui/letterindex.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Tap-vs-hold press-length arbitration (ours): the machine that decides
   # whether PLAY was tapped (pause) or held (sleep), fed live button state
   # once per main-loop pass. Extracted from kernel/main.c so the host can
@@ -407,7 +420,7 @@ if target == 'hw'
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c')
       + [core_version_h, core_version_tag_h],   # generated stamps; main.c includes both
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, keyhold_hw_lib, gesture_hw_lib, sleeptimer_hw_lib, jackwatch_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, letterindex_hw_lib, keyhold_hw_lib, gesture_hw_lib, sleeptimer_hw_lib, jackwatch_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),
