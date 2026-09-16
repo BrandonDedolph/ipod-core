@@ -185,8 +185,13 @@ func TestFreshSyncWritesEverythingAndIndexLast(t *testing.T) {
 	if rep.Copied != 3 || rep.Skipped != 0 {
 		t.Errorf("report: copied %d skipped %d, want 3/0", rep.Copied, rep.Skipped)
 	}
-	if !rep.ConfigCreated || !rep.LogCreated {
-		t.Errorf("device files: config created %v, log created %v; want both", rep.ConfigCreated, rep.LogCreated)
+	if !rep.ConfigCreated || !rep.LogCreated || !rep.OTGCreated {
+		t.Errorf("device files: config created %v, log created %v, otg created %v; want all three",
+			rep.ConfigCreated, rep.LogCreated, rep.OTGCreated)
+	}
+	if rep.OTGSlotsCreated != devicefs.OTGPlaylistSlots {
+		t.Errorf("On-The-Go slots created = %d, want %d",
+			rep.OTGSlotsCreated, devicefs.OTGPlaylistSlots)
 	}
 	if !rep.IndexWritten {
 		t.Error("the index was not written on a fresh sync")
@@ -195,12 +200,18 @@ func TestFreshSyncWritesEverythingAndIndexLast(t *testing.T) {
 	want := []string{
 		"CORECFG.DAT",
 		"CORELOG.BIN",
+		"COREOTG.DAT",
 		"Music/Artist A - Blue/01. Alpha.flac",
 		"Music/Artist A - Blue/02. Beta.flac",
 		"Music/Artist A - Blue/folder.art",
 		"Music/Artist A - Blue/folder.thm",
 		"Music/Artist B - Red/01. Gamma.flac",
 		"Music/CORELIB.IDX",
+		"Music/Playlists/On-The-Go 1.m3u8",
+		"Music/Playlists/On-The-Go 2.m3u8",
+		"Music/Playlists/On-The-Go 3.m3u8",
+		"Music/Playlists/On-The-Go 4.m3u8",
+		"Music/Playlists/On-The-Go 5.m3u8",
 		"Music/Playlists/mix.m3u8",
 	}
 	if got := walkFiles(t, dst); !equalStrings(got, want) {
@@ -561,12 +572,18 @@ func TestPruneWithYesRemovesOrphans(t *testing.T) {
 	want := []string{
 		"CORECFG.DAT",
 		"CORELOG.BIN",
+		"COREOTG.DAT",
 		"Music/Artist A - Blue/01. Alpha.flac",
 		"Music/Artist A - Blue/02. Beta.flac",
 		"Music/Artist A - Blue/folder.art",
 		"Music/Artist A - Blue/folder.thm",
 		"Music/Artist B - Red/01. Gamma.flac",
 		"Music/CORELIB.IDX",
+		"Music/Playlists/On-The-Go 1.m3u8",
+		"Music/Playlists/On-The-Go 2.m3u8",
+		"Music/Playlists/On-The-Go 3.m3u8",
+		"Music/Playlists/On-The-Go 4.m3u8",
+		"Music/Playlists/On-The-Go 5.m3u8",
 		"Music/Playlists/mix.m3u8",
 	}
 	if got := walkFiles(t, dst); !equalStrings(got, want) {

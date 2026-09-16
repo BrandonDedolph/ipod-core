@@ -157,9 +157,12 @@ type Result struct {
 	// Volume is the FAT volume the device files were created on, or ""
 	// when it was not mounted (or not reached).
 	Volume string
-	// Created records whether each of the three things the firmware
-	// cannot make for itself had to be made.
-	ConfigCreated, LogCreated, MusicCreated bool
+	// Created records whether each of the things the firmware cannot make
+	// for itself had to be made. OTGSlotsCreated counts the On-The-Go slot
+	// playlists (there are devicefs.OTGPlaylistSlots of them); an existing
+	// one is never touched, whatever it holds.
+	ConfigCreated, LogCreated, OTGCreated, MusicCreated bool
+	OTGSlotsCreated                                     int
 	// ClockStamped is the host time written into CORECFG.DAT for the
 	// device's first boot to pick up; zero when no stamp was written.
 	ClockStamped time.Time
@@ -291,19 +294,20 @@ func Install(ctx context.Context, o Options, d Deps) (*Result, error) {
 }
 
 // volumeFiles creates what the firmware cannot: CORECFG.DAT,
-// CORELOG.BIN and Music\.
+// CORELOG.BIN, COREOTG.DAT, the five On-The-Go slot playlists and Music\.
 //
 // The device's FAT driver can overwrite the data sectors of a file that
 // already exists and nothing else — it cannot create, grow, move or
 // delete (internal/devicefs). A freshly installed iPod with none of
-// these boots with no settings and no log and finds no library root, so
-// this step is part of the install and not an optional extra.
+// these boots with no settings and no log, cannot keep an On-The-Go list
+// past a power cycle, has nowhere to save one, and finds no library root,
+// so this step is part of the install and not an optional extra.
 func volumeFiles(out io.Writer, volume string, res *Result) error {
 	if volume == "" {
-		fmt.Fprintf(out, "\nthe music volume is not mounted, so %s, %s and %s\\ were not created.\n"+
+		fmt.Fprintf(out, "\nthe music volume is not mounted, so %s, %s, %s and %s\\ were not created.\n"+
 			"  Unplug and replug the iPod (still in disk mode) and run `core doctor`, which\n"+
 			"  says which of them are missing, or `core sync`, which creates them.\n",
-			devicefs.ConfigName, devicefs.LogName, devicefs.MusicDir)
+			devicefs.ConfigName, devicefs.LogName, devicefs.OTGName, devicefs.MusicDir)
 		return nil
 	}
 	res.Volume = volume
@@ -337,6 +341,13 @@ func volumeFiles(out io.Writer, volume string, res *Result) error {
 	res.LogCreated = created
 	fmt.Fprintf(out, "  %-12s %s\n", devicefs.LogName, createdText(created))
 
+	created, err = devicefs.EnsureOTG(volume)
+	if err != nil {
+		return fmt.Errorf("creating %s on %s: %w", devicefs.OTGName, volume, err)
+	}
+	res.OTGCreated = created
+	fmt.Fprintf(out, "  %-12s %s\n", devicefs.OTGName, createdText(created))
+
 	music := filepath.Join(volume, devicefs.MusicDir)
 	_, statErr := os.Stat(music)
 	if err := os.MkdirAll(music, 0o755); err != nil {
@@ -345,6 +356,16 @@ func volumeFiles(out io.Writer, volume string, res *Result) error {
 	res.MusicCreated = statErr != nil
 	fmt.Fprintf(out, "  %-12s %s (empty — `core sync` fills it)\n",
 		devicefs.MusicDir+`\`, createdText(statErr != nil))
+
+	// The five saved On-The-Go slots live under Music\Playlists\, so they
+	// come after the folder exists. An existing one is never touched.
+	slots, err := devicefs.EnsureOTGSlots(music)
+	if err != nil {
+		return fmt.Errorf("creating the On-The-Go slots on %s: %w", volume, err)
+	}
+	res.OTGSlotsCreated = len(slots)
+	fmt.Fprintf(out, "  %-12s %d of %d created\n", "On-The-Go",
+		len(slots), devicefs.OTGPlaylistSlots)
 	return nil
 }
 

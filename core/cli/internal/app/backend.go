@@ -270,7 +270,8 @@ func (b *RealBackend) Classify(ctx context.Context, pod disk.IPod) (fwpart.Insta
 // Install runs internal/installer over the attached iPod: classify,
 // refuse a device already running Core, back Apple's firmware up under
 // a name a person can find, write through the same flasher sequence as
-// Flash, then create CORECFG.DAT, CORELOG.BIN and Music\ on the volume.
+// Flash, then create CORECFG.DAT, CORELOG.BIN, COREOTG.DAT, Music\ and
+// the five On-The-Go slot playlists on the volume.
 func (b *RealBackend) Install(ctx context.Context, o installer.Options, emit func(Event),
 	confirm func(prompt string) (string, error)) (*installer.Result, error) {
 	dir := o.BackupDir

@@ -437,6 +437,35 @@ bss +456 B, text +1.2 KB.
   9. Drain or disconnect the cell once and read the raw bytes again: that is
      the reset value, and it settles the "year 00 = unset" row in the doc.
 
+- **On-The-Go — the storage half landed; the UI is pending.** Everything the
+  feature needs to persist now exists and is host-tested, and nothing on the
+  device shows it yet: `kernel/main.c` calls none of it (the one line it did
+  gain is `playlist_scan`'s new argument). What landed:
+  `library/otg.c` (the live list: 512 `(folder_hash, file_hash)` locator
+  pairs, the same locator `CORELIB.IDX` binds a record to its file by, so an
+  entry costs eight bytes); `kernel/otg_store.c` (`COREOTG.DAT` — two CRC-32'd
+  5120-byte slots in a pre-allocated file, **the third writer to the user's
+  disk**, with `config.c`'s rules copied and not reinterpreted, plus the one
+  thing `config.c` never needed: a record bigger than a cluster, so a slot is
+  read and written per **cluster run**); `library/otg_slot.c` (the five saved
+  lists as ordinary M3U8 files, **the fourth writer**, which writes the file
+  whole through a 4096-byte staging buffer and writes stage 0 LAST — that
+  order is the entire tear-detection scheme); `fs/fat32.c`'s new
+  `fat32_cache_drop()` (a slot playlist is the first file the firmware writes
+  AND reads back through the cached paths); `PLAYLIST_TRACKS_MAX` 128 -> 512;
+  `RESUME_KIND_OTG = 7`, codec-only. Host side: `tools/make_otg.py` and
+  `core/cli/internal/devicefs/otg.go`, byte-identical, with `core sync`
+  creating both files once, keeping all five slot paths out of prune, and
+  refusing a source playlist that would land on one; `core doctor` reporting
+  `COREOTG.DAT` and each slot's state; `core install` creating them.
+  Format reference: `core/docs/design/on-the-go.md`.
+
+  **Neither write path has been qualified on hardware**, and neither may be
+  used until it is: `make_otg.py --verify` against the firmware's
+  `core: otg load ... lba A/B` line BEFORE the first add, then a write, a
+  power cycle, a raw read-back and `chkdsk`/`fsck -n`. The procedure is at the
+  top of `kernel/otg_store.c` and it is `config.c`'s, unchanged.
+
 - **Pause on headphone unplug — the policy, and a probe that needs no cable.**
   The pause decision moved out of `kernel/main.c` (five untested inline lines
   over a file-scope `g_hp_last`) into `ui/jackwatch.c`, a pure module with its

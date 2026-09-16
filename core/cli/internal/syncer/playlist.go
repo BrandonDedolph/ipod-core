@@ -65,6 +65,18 @@ func planPlaylists(o Options, scan *library.Scan, musicDir string) ([]PlaylistOp
 			return nil, nil, fmt.Errorf("playlist %s: %w", src, err)
 		}
 		op := PlaylistOp{Name: devicePlaylistName(name), Src: src}
+		// "On-The-Go N.m3u8" is a DEVICE file: the firmware overwrites it in
+		// place when the user saves their On-The-Go list, and treats what is
+		// in it as a saved list. A source playlist that would land on that
+		// name is refused rather than planned — writing it would put the
+		// user's own tracks where the device expects its own format, and the
+		// next Save would overwrite them without asking.
+		if n := devicefs.OTGSlotIndex(op.Name); n > 0 {
+			warns = append(warns, fmt.Sprintf(
+				"playlist %s: %s is one of the device's five On-The-Go slots; rename the playlist (it was not copied)",
+				src, op.Name))
+			continue
+		}
 		if prev, dup := used[strings.ToLower(op.Name)]; dup {
 			warns = append(warns, fmt.Sprintf("playlist %s: would overwrite %s on the device (both become %s); skipped", src, prev, op.Name))
 			continue
