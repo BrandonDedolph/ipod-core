@@ -28,9 +28,13 @@ var ErrNoPicker = errors.New("app: no folder picker on this system (type the pat
 // interpolate anything the user typed: the only input is the dialog's
 // own output, which comes back on stdout.
 const (
+	// RootFolder MyComputer starts the tree at This PC (drives, then
+	// Users\…), not at the profile's Desktop/Music/Downloads list.
 	winFolderPS = `Add-Type -AssemblyName System.Windows.Forms; ` +
 		`$d = New-Object System.Windows.Forms.FolderBrowserDialog; ` +
 		`$d.Description = 'Choose the music folder'; ` +
+		`$d.RootFolder = [System.Environment+SpecialFolder]::MyComputer; ` +
+		`$d.ShowNewFolderButton = $false; ` +
 		`if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }`
 	winFilePS = `Add-Type -AssemblyName System.Windows.Forms; ` +
 		`$d = New-Object System.Windows.Forms.OpenFileDialog; ` +
@@ -52,7 +56,12 @@ func pickerCommand(goos string, dir bool, look lookPath) (string, []string, erro
 		if dir {
 			script = winFolderPS
 		}
-		return "powershell.exe", []string{"-NoProfile", "-NonInteractive", "-Command", script}, nil
+		// -STA is load-bearing: Windows Forms dialogs need a single-
+		// threaded apartment, and PowerShell's default (MTA) draws the
+		// FolderBrowserDialog tree WITHOUT expand arrows — the user sees
+		// Desktop/Music/Downloads and cannot open any of them. Seen on
+		// the first real pass through the window, 2026-09-16.
+		return "powershell.exe", []string{"-NoProfile", "-NonInteractive", "-STA", "-Command", script}, nil
 	case "darwin":
 		// osascript's `choose folder` returns an alias; `POSIX path of`
 		// turns it into something Go can open. A cancelled dialog exits
