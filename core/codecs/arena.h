@@ -13,13 +13,14 @@
  * real decode rather than guessed. On exhaustion alloc() returns NULL (which
  * dr_flac treats as an open failure) and sets `oom`.
  *
- * realloc() has a GROW-IN-PLACE fast path for the arena's most recent block,
- * which is the case that actually matters: dr_mp3 grows its input buffer in
- * 64 KB steps and dr_flac grows during header parse, always the newest block.
- * Without it each growth abandoned the old copy, so a couple of steps ran a
- * 128 KB arena dry — and an OOM there looks exactly like a normal end of
- * track (the decoder reports 0 frames, the wrapper reports EOS). `oom` is the
- * only evidence, so surface it (player_stats()).
+ * realloc() has a GROW-IN-PLACE fast path for the arena's most recent block.
+ * dr_flac grows during header parse, always the newest block; dr_mp3, which is
+ * gone now, grew its input buffer in 64 KB steps and is what the fast path was
+ * written for. Without it each growth abandoned the old copy, so a couple of
+ * steps ran a 128 KB arena dry — and an OOM there looks exactly like a normal
+ * end of track (the decoder reports 0 frames, the wrapper reports EOS). `oom`
+ * is the only evidence, so surface it (player_stats()). (pvmp3 takes one
+ * fixed-size block at open and never reallocates.)
  */
 #ifndef CORE_CODECS_ARENA_H
 #define CORE_CODECS_ARENA_H

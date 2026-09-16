@@ -3,6 +3,96 @@
 The README is the canonical public story; this doc is the running list of
 what works, what doesn't, and what to pick up next.
 
+## 2026-09-16 — MP3 is on, and UNFLASHED
+
+`dr_mp3` is gone and AOSP's fixed-point **pvmp3** is vendored in its place
+(`core/codecs/pvmp3/`, Apache-2.0, pinned commit, `vendor.sh` reproduces the
+tree byte for byte). `CORE_ENABLE_MP3` is deleted with it: `.mp3` is a real
+format now, in the browser, in Songs / Genres / Shuffle, in the index, in
+`core sync`, and resume seeks one.
+
+Why it could move: dr_mp3's float synthesis needed 219 M ARMv4T instructions
+per second of audio, 24x FLAC, on a CPU with no FPU. pvmp3 is integer
+throughout and needs 15.7 M at 128 kbps — about **1.7x FLAC**. It is also the
+only permissive fixed-point Layer III decoder that exists; everything else is
+float, GPL/LGPL, RPSL or a binary blob. The survey, the measurements and the
+method are in `core/docs/design/mp3-playback.md`.
+
+What is done, on the host:
+- MPEG-1/2/2.5 Layer III, CBR and VBR. 8/11.025/12/16 kHz are refused at open
+  (`DECODER_ERR_UNSUPPORTED`) — the WM8758B cannot be clocked there.
+- ID3v2.2/2.3/2.4 tags into the same `flac_meta_t` FLAC fills, with REAL
+  UTF-16 → UTF-8 (the old reader dropped the high byte and put `?` through the
+  marquee of every Windows-tagged file), TCON's numeric genres, and the
+  duration from Xing/Info/VBRI less the LAME delay and padding — ffprobe's
+  rule, so the progress bar agrees with the index.
+- Seeking through the Xing TOC: one frame plus one percent of the file, a
+  couple of reads, so **resume cues an MP3 at its saved position** instead of
+  at 0:00.
+- Boot Details' DECODE % now divides by the PLAYING stream's rate instead of a
+  hard-coded 44.1 kHz (it under-reported a 48 kHz track by 8 %).
+- Seven host suites cover it, all green: `codec-kat` (re-pinned to pvmp3),
+  `mp3-frame`, `id3-meta`, `mp3-accuracy` (vs ffmpeg, PSNR 101.7 dB / 1 LSB
+  against a 96 dB / 2 LSB gate), `mp3-seek` (landing measured in the audio by
+  correlation), `mp3-robust` (truncated, corrupted, junk-spliced, wrong layer,
+  unclockable rate, lying ID3 size), `mp3-freestanding` (arena high-water
+  28 360 B of the 128 KB budget). Five of them are new and `tag-mp3` is gone
+  with dr_mp3, so the tree is at **70 suites**, green under the sanitizers
+  too. `make hw && make verify-hw` clean; text 382 496 → 399 516 B of 1 MB.
+  Of that +16.6 KB the decoder itself is +3.4 KB (36.4 KB against dr_mp3's
+  33.0), and the rest is the framing / Xing / ID3 / seek layer pvmp3 has no
+  notion of — 11.5 KB, including 2.8 KB of ID3v1 genre table. bss grows 520 B
+  (12 216 384 → 12 216 904): `scan_file_t.fmt` across BROWSE_MAX and the
+  decode rate in `player_stats_t`. The decoder's own ~28 KB comes out of the
+  128 KB arena, which does not move.
+
+**NOT FLASHED, and the one thing the host cannot answer is real time.** The
+bound is 24–39 MHz of the 80 MHz core at 128 kbps, the same shape of budget
+FLAC lives in, but that is arithmetic. Next bench, in order:
+
+1. read FLAC's DECODE % on Boot Details FIRST, as the baseline — MP3 should
+   land near 1.7x it;
+2. 128 kbps CBR, 320 kbps CBR, a VBR file, a 22.05 kHz mono podcast;
+3. underruns over a ten-minute album;
+4. resume into an MP3; a scrub on a VBR file — and TIME the scrub. A seek
+   backs off a fixed 6276 bytes and decodes every frame from there to the
+   landing, which is four frame decodes at 320 kbps and about fifteen at 128.
+   The constant is deliberate (nothing about the file can be trusted to size
+   it — see `codecs/pvmp3/mp3.c`); if `g_boot_res_seek_ms` or a scrub reads
+   slow, the tighter version reads the header AT the landing first and scales
+   by that frame's size;
+5. a FLAC → MP3 → FLAC hand-over, which must not stop the DAC;
+6. **time-to-first-sound on an MP3 against a FLAC.** An MP3 open reads the
+   file's TAIL twice — `id3_meta_read` through the metadata read-ahead, then
+   `mp3_open_stream` through the disk buffer — where a FLAC open seeks to the
+   end without reading. Each is a cluster walk plus a 32 KB block over PIO.
+   The no-index library scan pays it once per file too. Nothing here is
+   measurable on the host; if it shows, the fix is to hand the scan's result
+   to the open instead of repeating it.
+
+Over 80 %: IRAM the polyphase/IMDCT hot loops (96 KB free, `boot/linker.ld`),
+then the parked COP. Not: shipping the low rates to dodge it.
+
+Also unflashed from this change: `tools/build_index.py` and `core sync` admit
+`.mp3` and keep the source extension (nothing transcodes), `folder.art` can
+come from an ID3 APIC frame, and `core/cli/internal/id3` computes the duration
+by ffprobe's rule with a parity test against it.
+
+**One hole in the byte-identical-index guarantee, and it is only one.** An MP3
+with no Xing or VBRI header states no length, so `build_index.py` (through
+ffprobe) and `core sync` both ESTIMATE it — and the two estimates are the same
+answer only when the file really is constant bitrate. For an untagged VBR file
+they differ, sometimes by seconds, and so do the two indexes. `lame` writes a
+Xing header unless told not to (`-t`), so such a file is rare rather than
+impossible; the parity test names and skips those and ASSERTS every other file,
+including untagged CBR. Said again in `core index --help` and in
+`core/docs/design/mp3-playback.md`.
+
+`internal/librarian` — the desktop app's organizer — still walks `*.flac` only;
+that belongs with the library-manager work. `core art --fetch` is FLAC-only for
+a different reason: it EMBEDS the cover it finds and there is no ID3 writer
+here. Reading an MP3's existing cover works on every other art path.
+
 ## 2026-09-16 — Music › Search, UNFLASHED
 
 The one thing this device could not do: find a track whose album you cannot
@@ -1077,15 +1167,11 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
 - **Storage** — PIO ATA reader (aligned bulk reads straight into the caller
   buffer) + from-scratch read-only FAT32 (long names decoded to UTF-8),
   every chain walk bounded and every cluster validated.
-- **Streaming decode** — `dr_flac` freestanding, fed by a read-ahead disk
-  source over an 8 MB anti-skip buffer; a full-length track streams off the
-  disk while the UI stays live. **FLAC only.** `dr_mp3` is built and linked
-  and passes its host KAT, but MP3 is switched off on the device
-  (`CORE_ENABLE_MP3 0`, `core/library/names.h`) and `classify_ext()` does
-  not surface `.mp3` at all, so those files are invisible in the browser.
-  Its float synthesis filter cannot hit real time on this FPU-less CPU —
-  the PCM ring starves and playback stutters. Parked, not removed;
-  re-enabling needs a fixed-point or second-core decoder.
+- **Streaming decode** — `dr_flac` and `pvmp3` freestanding, fed by a
+  read-ahead disk source over an 8 MB anti-skip buffer; a full-length track
+  streams off the disk while the UI stays live. FLAC is proven on the device.
+  MP3 is switched ON as of the entry at the top of this file, but has never
+  been played on hardware — see that entry for what to bench.
 - **FLAC seeking is O(log n)** — `DR_FLAC_NO_CRC` had silently compiled out
   dr_flac's binary-search seek (the search needs the header CRC to tell a
   real frame header from audio that looks like a sync code), and these

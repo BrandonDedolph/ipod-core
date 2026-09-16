@@ -264,8 +264,12 @@ until the device sleeps or powers off, so leaving Settings never makes you wait.
   plug is seated, `JACK 0` when it is not, followed by `n` and the number of times it has changed
   since power-on.
 - **Boot Details.** The full build string, how long the last cold boot took and where it went
-  (LCD, disk, library, resume, other), the FLAC decode cost against real time, audio underruns,
-  and the disk addresses of the settings file and the log. Reading it never wakes a sleeping drive.
+  (LCD, disk, library, resume, other), the decode cost against real time, audio underruns, and the
+  disk addresses of the settings file and the log. Reading it never wakes a sleeping drive. DECODE
+  is the percentage of one second of CPU that one second of audio costs — measured against the
+  playing track's own sample rate, and drawn in red past 80 %, where a slow disk refill becomes an
+  audible gap. It is the number to watch on an MP3: the MP3 decoder is new and costs about 1.7x
+  what FLAC does.
 - **Disk Mode.** Saves everything and reboots into Apple's USB disk mode.
 - **Reset Settings.** Back to the defaults, saved.
 
@@ -338,10 +342,11 @@ core eject D:
 ```
 
 `--dst` is the iPod's volume root, not its `Music` folder. The source is one folder per album named
-`Album - Artist`, one FLAC per track, and playlists, if you keep any, as `.m3u8` files in a
+`Album - Artist`, one FLAC or MP3 per track, and playlists, if you keep any, as `.m3u8` files in a
 `Playlists/` folder beside the albums.
 
-`sync` copies each track to `Music/Artist - Album/NN. Title.flac`, writes `folder.art` and
+`sync` copies each track to `Music/Artist - Album/NN. Title.flac` (or `.mp3` — nothing is
+converted, each file keeps its own format), writes `folder.art` and
 `folder.thm` beside it from the file's embedded cover, rewrites the playlists to device paths under
 `Music/Playlists/`, creates `CORECFG.DAT` and `CORELOG.BIN` in the volume root if they are missing
 (a valid one is never reset, so your settings survive), and writes `Music/CORELIB.IDX` last — last
@@ -401,14 +406,17 @@ core.ipod`, read back with `-rfb` and compared against the image.
 how to put it there by hand. Either way it happens on a computer with the iPod in disk mode, on the
 iPod's FAT32 volume.
 
-1. **Folders.** Put each album in its own folder under `Music/`, one FLAC per track. The firmware
-   plays FLAC. MP3 files are ignored: the decoder is built but switched off because it cannot keep
-   up on this CPU, so `.mp3` files never enter the library.
+1. **Folders.** Put each album in its own folder under `Music/`, one FLAC or MP3 per track. Both
+   play, and nothing is converted either way. MP3 means MPEG-1, MPEG-2 or MPEG-2.5 Layer III, at
+   any constant or variable bitrate — the only exclusion is the low sample rates (8, 11.025, 12 and
+   16 kHz, which some spoken-word files use), because the iPod's DAC cannot be clocked there; such
+   a file appears in the list but will not start.
 2. **The index.** Run `tools/build_index.py --src <your Music folder> --out <iPod>/Music/CORELIB.IDX`.
    The firmware looks for `CORELIB.IDX` in `Music/`, or in the volume root if there is no `Music/`
    folder. There is no default output path; pass `--out` yourself. The firmware loads this in one
    read at boot. Rebuild it whenever you add or remove music. Titles, artists, albums, genres and
-   durations come from the files' tags through `ffprobe`.
+   durations come from the files' tags through `ffprobe` — Vorbis comments in a FLAC, ID3 in an
+   MP3.
 3. **Album art.** Run `tools/coreart.py --thumb <album folder>` (or `--batch <root>` on the tree).
    It writes `folder.art` (120 px, the Now Playing cover) and `folder.thm` (28 px, the list chip)
    next to the tracks from the FLAC's embedded cover. No art file, no chip: the row shows a

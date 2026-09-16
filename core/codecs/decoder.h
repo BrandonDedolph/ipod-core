@@ -1,9 +1,10 @@
 /*
  * core/codecs/decoder.h — unified audio-decoder ABI.
  *
- * Every codec we ship (Helix MP3, Helix AAC, dr_flac, ALAC, Tremor,
- * libopus, hand-rolled WAV) plugs into this contract. The audio engine
- * doesn't know or care which one is decoding; it only sees decoder_t.
+ * Every codec we ship (dr_flac, pvmp3, and whatever comes after — AAC,
+ * ALAC, Tremor, libopus, a hand-rolled WAV) plugs into this contract. The
+ * audio engine doesn't know or care which one is decoding; it only sees
+ * decoder_t.
  *
  * Lifecycle:
  *

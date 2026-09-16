@@ -52,12 +52,14 @@ Each was a deliberate change, not drift.
   read-only by construction, every chain walk bounded, every cluster
   validated, and it is fuzz-adjacent tested under ASan/UBSan against corrupt
   images.
-- **Codecs: `dr_flac` + `dr_mp3`, not Helix.** No Helix MP3/AAC, no ALAC, no
-  Tremor, no libopus. The device is FLAC-only in practice — `dr_mp3`'s float
-  synthesis filter cannot hit real time on an FPU-less ARM7, which is the
-  concrete form of the plan's own "no floating point in core code" rule
-  coming back around. The plan's claim that codecs run on the COP is also
-  unrealised: everything decodes on the CPU.
+- **Codecs: `dr_flac` + `pvmp3`, not Helix.** No Helix MP3/AAC, no ALAC, no
+  Tremor, no libopus. Helix was named here for its ARM7 speed and is
+  unusable: RPSL/RCSL is not Apache-compatible. MP3 waited for a decoder that
+  was both fixed point and permissively licensed, and AOSP's `pvmp3` is the
+  only one that exists — the interim `dr_mp3` was float, which is this plan's
+  own "no floating point in core code" rule arriving as a bill (219 M ARMv4T
+  instructions per second of audio, 24x FLAC). The plan's claim that codecs
+  run on the COP is still unrealised: everything decodes on the CPU.
 - **Tagcache: a host-built index, not a device-side database.** `CORELIB.IDX`
   is built by `tools/build_index.py` and loaded in one read. No on-device
   scan, no delta rebuild, no atomic-rename machinery — and no write path, so
