@@ -3565,13 +3565,22 @@ static void playlist_open(fat32_t *fs, int pi)
      * trailer's, or a line count that disagrees with the header's. The parser
      * has just produced that count, so the check is two small reads and no
      * CRC pass. See library/otg_slot.h.
+     *
+     * otg_slot_of(), not otg_slot_index(): the NAME only says which slot this
+     * COULD be, and a user is entitled to keep their own "On-The-Go 2.m3u8".
+     * Offering Delete on that — a row that overwrites the file — is exactly
+     * the data loss this feature is built to avoid, so the file has to carry
+     * the directive before it is treated as ours. A playlist that would not
+     * read is not ours either: g_pl_err leaves the row off.
      */
-    g_pl_slot = otg_slot_index(g_playlists[pi].name);
-    if (g_pl_slot > 0 && g_pl_err == 0) {
+    g_pl_slot    = 0;
+    g_pl_damaged = 0;
+    if (g_pl_err == 0) {
         otg_slot_info_t info;
-        if (otg_slot_verify(fs, g_playlists[pi].clus, g_playlists[pi].size,
-                            g_pl_stats.listed, &info) == 0) {
-            g_pl_damaged = (info.present && info.damaged) ? 1 : 0;
+        g_pl_slot = otg_slot_of(fs, g_playlists[pi].name, g_playlists[pi].clus,
+                                g_playlists[pi].size, g_pl_stats.listed, &info);
+        if (g_pl_slot > 0) {
+            g_pl_damaged = info.damaged ? 1 : 0;
         }
     }
 }
@@ -4133,11 +4142,18 @@ static void otg_render(int sel)
     otg_header_right(right, sel);
     ui_header("On-The-Go", right, 1);
     if (g_otg.n == 0) {
-        /* The action rows are still there (greyed), but an empty list needs
-         * the sentence that says how one is made — nothing else on the device
-         * teaches the gesture. */
-        ui_text(14, LIST_Y0 + 20, "On-The-Go is empty", FONT_ROW, LINEN_MUTED);
-        ui_text(14, LIST_Y0 + 40, "Hold Select on a song to add it",
+        /* The two action rows stay, greyed — an empty screen with nothing on
+         * it reads as a bug, and the rows are what the screen IS — with the
+         * sentence that says how a list is made underneath, because nothing
+         * else on the device teaches the gesture. Drawn here rather than
+         * through the row loop so the sentences sit under them; the list-view
+         * table declines this state for the same reason, so it always
+         * repaints whole. */
+        otg_row_draw(0, OTG_ROW_CLEAR);
+        otg_row_draw(1, OTG_ROW_SAVE);
+        ui_text(14, LIST_Y0 + 2 * ROW_H2 + 22, "On-The-Go is empty",
+                FONT_ROW, LINEN_MUTED);
+        ui_text(14, LIST_Y0 + 2 * ROW_H2 + 42, "Hold Select on a song to add it",
                 FONT_SMALL, LINEN_MUTED2);
         return;
     }
@@ -9142,6 +9158,9 @@ _Noreturn static void run_ui(fat32_t *fs)
                 break;
 
             case SCR_OTG:
+                /* Both action rows are greyed and do nothing on an empty
+                 * list, so there is nothing to move to and nothing to press:
+                 * the cursor stays on row 0 and the wheel is silent. */
                 if (ev.wheel_delta && g_otg.n > 0) {
                     g_otg_sel = wheel_move(g_otg_sel, otg_row_count(),
                                            ev.wheel_delta, &g_otg_accum);

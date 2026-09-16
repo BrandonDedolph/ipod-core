@@ -365,6 +365,27 @@ static int find_trailer(fat32_t *fs, uint32_t clus, uint32_t size,
     return 0;
 }
 
+int otg_slot_of(fat32_t *fs, const char *name, uint32_t clus, uint32_t size,
+                uint32_t listed, otg_slot_info_t *out)
+{
+    otg_slot_info_t local;
+    if (out == 0) {
+        out = &local;
+    }
+    memset(out, 0, sizeof *out);
+    int n = otg_slot_index(name);
+    if (n == 0) {
+        return 0;                      /* not even the right name */
+    }
+    if (otg_slot_verify(fs, clus, size, listed, out) != 0) {
+        return 0;                      /* unreadable: we cannot prove it is ours */
+    }
+    /* The name got us here; the DIRECTIVE is what says the file is one of
+     * ours. Without it this is a playlist the user keeps at that name, and
+     * every writer must leave it alone. */
+    return out->present ? n : 0;
+}
+
 int otg_slot_verify(fat32_t *fs, uint32_t clus, uint32_t size,
                     uint32_t listed, otg_slot_info_t *out)
 {
@@ -617,6 +638,21 @@ int otg_slot_save(fat32_t *fs, uint32_t clus, uint32_t size,
      * touch. */
     if (size < OTG_SLOT_FILE_MIN || (size % OTG_SLOT_SIZE_GRAIN) != 0) {
         return -1;
+    }
+    /*
+     * The target must already BE a slot file. One 512-byte read stands
+     * between this module and overwriting a playlist somebody made, and it
+     * lives here rather than only at the callers because that promise must
+     * not depend on remembering it at a second call site.
+     */
+    {
+        otg_slot_info_t info;
+        if (otg_slot_probe(fs, clus, size, &info) != 0) {
+            return -1;                 /* could not look: do not write */
+        }
+        if (!info.present) {
+            return OTG_SLOT_EFOREIGN;
+        }
     }
     uint32_t prefix_len = slen_n(root_prefix, M3U_PATH_MAX);
     if (prefix_len == 0 || root_prefix[0] != '/' ||

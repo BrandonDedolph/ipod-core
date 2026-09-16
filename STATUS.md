@@ -497,46 +497,26 @@ bss +456 B, text +1.2 KB.
   install` creating them. Format reference:
   `core/docs/design/on-the-go.md`.
 
-  74 host suites green (was 70), `make hw && make verify-hw` clean under
-  gcc-16 `-Werror`, `.bss` 11.81 MiB of a 14 MiB budget, text 406 KB,
-  `go test ./...` green, `make_otg.py --selftest` green.
+  78 host suites green (was 74), `make hw && make verify-hw` clean under
+  gcc-16 `-Werror`, `.bss` 11.81 MiB of a 14 MiB budget, text 415 KB,
+  `go test ./...` green, `make_otg.py --selftest` green, the three gallery
+  stills re-render byte-identical.
 
-  **Nothing here was run on the device**, and two of it cannot be until the
-  first-flash checks below are done — these are the THIRD and FOURTH writers
-  to the user's disk and they owe `config.c`'s qualification, unchanged. The
-  bench, in order:
+  **Nothing here was run on the device.** These are the THIRD and FOURTH
+  writers to the user's disk and they owe `kernel/config.c`'s qualification,
+  unchanged — `make_otg.py --verify` against the firmware's own two UART lines
+  BEFORE the first add and BEFORE the first Save. The nine-step bench is
+  first-flash checklist item 10 below.
 
-  1. **Before the first add.** `sudo python3 tools/make_otg.py --verify
-     /dev/sdX` on the host; boot and read `core: otg load <n> writable <w> seq
-     <s> lba <A>/<B>`. A and B MUST equal the FIRST cluster run of each slot
-     the tool printed. If they differ, add nothing and power off.
-  2. Hold Select on a Songs row: the banner reads "Added to On-The-Go ·
-     1 SONGS" within ~450 ms, the release does nothing, and Playlists →
-     On-The-Go shows the row. A TAP still plays — check that first, on every
-     list, because this is the change with the widest blast radius. Check
-     Search too, both halves: typing on the ring must still feel instant, and
-     a hold on a song hit must add it.
-  3. Hold on an album row adds its tracks in disc/track order; on the All
-     Songs row nothing happens.
-  4. Wait for `core: otg save rc 00000000 seq 1`, power-cycle, confirm the
-     list came back AND that the music is still there and `chkdsk` /
-     `fsck.vfat -n` reports the volume clean. Repeat twice and confirm
-     `make_otg.py --dump COREOTG.DAT` shows the two slots ALTERNATING.
-  5. **Before the first Save**, check `core: otg slot N lba <X>` against the
-     same tool's slot-file line. Then Save: the banner names the slot, the
-     live list empties, Playlists lists "On-The-Go N" and opens it whole.
-     `fsck` again, and open the `.m3u8` in a desktop player.
-  6. Inside On-The-Go: hold removes; Clear needs two presses; Delete on a
-     saved slot frees it.
-  7. Power off (hold Play 5 s) and cold boot: the live list is back and
-     resume lands in the OTG queue on the same track, paused. After a Save,
-     the next resume lands in the saved playlist.
-  8. Adding with the drive parked must NOT spin it up (no wake on the UART
-     until the next forced or platter-turning event); Save DOES wake it and
-     shows the load bar.
-  9. With `COREOTG.DAT` absent the session works and nothing persists — the
-     UART says `otg load 0 writable 0`. With no free slot, Save is greyed and
-     says why.
+  The host half of that qualification is done: `make_otg.py --verify` was run
+  against a raw image built with `otg_store_test`'s exact geometry
+  (BytesPerSector 2048, one FS-sector per cluster, part_lba 64, `COREOTG.DAT`
+  fragmented 3 -> 7 -> 4 -> 9 -> 5 -> 11, an MBR bolted on). It prints slot
+  LBAs **0x4C and 0x52** with runs of 4+4+2 and 2+4+4 sectors — byte for byte
+  what the C test's own `expect_runs` formula asserts `otg_store_probe_lba`
+  returns over the same chain, including the slot that does not start on a
+  cluster boundary. Python and C agree on a fragmented file; what is left is
+  the device (plan acceptance criterion 5).
 
 - **Pause on headphone unplug — the policy, and a probe that needs no cable.**
   The pause decision moved out of `kernel/main.c` (five untested inline lines
@@ -1058,6 +1038,49 @@ log capturing the loop.
    is ~40 battery lines, ~4 min) and `chkdsk` once more. About must read
    `LOG <n> on`; `LOG off` means the file was not found or did not
    validate, and nothing is written.
+
+10. **On-The-Go — the write path's THIRD and FOURTH callers; qualify both
+    before either writes.** `python3 tools/make_otg.py --create` (Windows-native
+    copy + `Write-VolumeCache`) makes `COREOTG.DAT` and the five slot
+    playlists; `core sync` does it too. Then, in this order:
+
+    1. **Before the first add.** `sudo python3 tools/make_otg.py --verify
+       /dev/sdX` on the host; boot and read `core: otg load <n> writable <w> seq
+       <s> lba <A>/<B>`. A and B MUST equal the FIRST cluster run of each slot
+       the tool printed. If they differ, add nothing and power off.
+    2. Hold Select on a Songs row: the banner reads "Added to On-The-Go ·
+       1 SONGS" within ~450 ms, the release does nothing, and Playlists →
+       On-The-Go shows the row. A TAP still plays — check that first, on every
+       list, because this is the change with the widest blast radius. Check
+       Search too, both halves: typing on the ring must still feel instant, and
+       a hold on a song hit must add it.
+    3. Hold on an album row adds its tracks in disc/track order; on the All
+       Songs row nothing happens.
+    4. Wait for `core: otg save rc 00000000 seq 1`, power-cycle, confirm the
+       list came back AND that the music is still there and `chkdsk` /
+       `fsck.vfat -n` reports the volume clean. Repeat twice and confirm
+       `make_otg.py --dump COREOTG.DAT` shows the two slots ALTERNATING.
+    5. **Before the first Save**, check `core: otg slot N lba <X>` against the
+       same tool's slot-file line. Then Save: the banner names the slot, the
+       live list empties, Playlists lists "On-The-Go N" and opens it whole.
+       `fsck` again, and open the `.m3u8` in a desktop player.
+    6. Inside On-The-Go: hold removes; Clear needs two presses; Delete on a
+       saved slot frees it. Delete is the ONLY thing that frees a slot that
+       holds anything — a torn save included; Save only ever writes into an
+       empty one, which is what makes the one tear gen+count cannot see
+       unreachable. And a playlist of your OWN at a slot name must show no
+       Delete row at all: drop an `On-The-Go 4.m3u8` of your own (8 KiB, no
+       `#CORE-OTG` line) on the volume, open it, and confirm there is no
+       Delete row and that `--dump` shows it byte-identical afterwards.
+    7. Power off (hold Play 5 s) and cold boot: the live list is back and
+       resume lands in the OTG queue on the same track, paused. After a Save,
+       the next resume lands in the saved playlist.
+    8. Adding with the drive parked must NOT spin it up (no wake on the UART
+       until the next forced or platter-turning event); Save DOES wake it and
+       shows the load bar.
+    9. With `COREOTG.DAT` absent the session works and nothing persists — the
+       UART says `otg load 0 writable 0`. With no free slot, Save is greyed and
+       says why.
 
 Still open from the audit: the BCM power gate, the ROM's undocumented
 `DEV_EN` bits (USB/FireWire/IDE) and a 32 kHz suspend point — `DEV_EN`

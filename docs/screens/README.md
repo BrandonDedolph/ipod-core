@@ -131,6 +131,7 @@ A screenshot here is a claim about what the device draws. So:
 | `artists.png` `albums.png` `songs.png` `genres.png` `allsongs.png` | library lists | `screen_*` |
 | `playlists.png` | Music → Playlists list, On-The-Go pinned as row 0 | `screen_playlists` |
 | `otg.png` | Playlists → On-The-Go: Clear / Save, then the tracks | `screen_otg` |
+| `otg_empty.png` | On-The-Go with nothing in it: both rows greyed, and how to add one | `screen_otg_empty` |
 | `otg_added.png` | The "Added to On-The-Go" banner over the Songs list | `screen_otg_added` |
 | `letter.png` | the A-Z plate over a long Artists list | `screen_letter` (`az_plate`) |
 | `search.png` `search_results.png` | Music → Search: typing, and the hits | `screen_search`, `screen_search_results` |

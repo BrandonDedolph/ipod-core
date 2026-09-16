@@ -241,12 +241,16 @@ def parse_slot_playlist(data: bytes):
             if (s[13:19] != "count=" or s[24] != " " or s[25:29] != "crc="
                     or s[37] != " " or s[38:42] != "gen="):
                 continue
-            try:
-                out["count"] = int(s[19:24], 10)
-                out["crc"] = int(s[29:37], 16)
-                out["gen"] = int(s[42:47], 10)
-            except ValueError:
+            # Digits only, exactly as the device's parse_dec() and Go's
+            # parseDecN() accept them. int() would take "+0012" and " 0012",
+            # which would make this oracle laxer than the two implementations
+            # it exists to be the oracle for.
+            if not (s[19:24].isdigit() and s[42:47].isdigit()
+                    and all(c in "0123456789abcdefABCDEF" for c in s[29:37])):
                 continue
+            out["count"] = int(s[19:24], 10)
+            out["crc"] = int(s[29:37], 16)
+            out["gen"] = int(s[42:47], 10)
             out["present"] = True
             continue
         if line.startswith(b"#CORE-OTG-END "):
@@ -254,12 +258,9 @@ def parse_slot_playlist(data: bytes):
             if len(full) != END_BYTES:
                 continue
             s = full.decode("ascii", "replace")
-            if s[14:18] != "gen=":
+            if s[14:18] != "gen=" or not s[18:23].isdigit():
                 continue
-            try:
-                out["trailer_gen"] = int(s[18:23], 10)
-            except ValueError:
-                pass
+            out["trailer_gen"] = int(s[18:23], 10)
             continue
         if line.startswith(b"#"):
             continue
@@ -442,8 +443,12 @@ def _dump_slot_playlist(path: str, data: bytes) -> int:
     print("  entries: %d, crc of their bytes %08X"
           % (len(info["entries"]), info["body_crc"]))
     if info["damaged"]:
-        print("  -> DAMAGED: the device lists it, opens it to "
-              "'Playlist damaged — save again', and treats the slot as free")
+        print("  -> DAMAGED: the device lists it and opens it to "
+              "'Playlist damaged — save again' with Delete Playlist under it.")
+        print("     The slot is NOT free until that Delete rewrites it: Save "
+              "only ever writes into an")
+        print("     EMPTY slot, which is what makes the one tear gen+count "
+              "cannot see unreachable.")
     elif info["crc"] != info["body_crc"]:
         print("  -> the header's CRC does not match the entry bytes. The DEVICE "
               "does not check this (gen + count are its test), but the bytes "
@@ -677,7 +682,7 @@ def do_verify(dev: str) -> int:
         pld = v.find(music[0], PLAYLIST_DIR, is_dir=True) if music else None
         if not pld:
             print("  not found — the saved On-The-Go lists have nowhere to live")
-            return 1 if rc else 1
+            return 1
         for n in range(1, SLOT_COUNT + 1):
             name = slot_file_name(n)
             e = v.find(pld[0], name, is_dir=False)
@@ -706,7 +711,7 @@ def do_verify(dev: str) -> int:
                       "your own, never written to)")
             elif info["damaged"]:
                 print("      DAMAGED (header gen %d, trailer gen %s, %d entry "
-                      "lines vs count %d)"
+                      "lines vs count %d) — not free until Delete"
                       % (info["gen"], info["trailer_gen"],
                          len(info["entries"]), info["count"]))
             elif info["count"] == 0:
@@ -824,6 +829,16 @@ def do_selftest() -> int:
     torn[8:8 + HDR_BYTES] = (HDR_FMT % (5, 0, 7)).encode("ascii")
     check("a count mismatch reads as damaged",
           parse_slot_playlist(bytes(torn))["damaged"])
+
+    for bad in (b"#CORE-OTG v1 count=+0012 crc=00000000 gen=00000\n",
+                b"#CORE-OTG v1 count= 0012 crc=00000000 gen=00000\n",
+                b"#CORE-OTG v1 count=00012 crc=0000000G gen=00000\n",
+                b"#CORE-OTG v1 count=00012 crc=00000000 gen=+0000\n"):
+        assert len(bad) == HDR_BYTES
+        check("a non-digit field is not a directive (%s)"
+              % bad[13:47].decode(),
+              not parse_slot_playlist(b"#EXTM3U\n" + bad +
+                                      b"#CORE-OTG-END gen=00000\n")["present"])
 
     foreign = b"#EXTM3U\n/Music/Something/else.flac\n"
     info = parse_slot_playlist(foreign)

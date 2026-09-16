@@ -61,10 +61,19 @@
  *   - a completed last write is durable, because the injected write issues
  *     FLUSH CACHE and stage 0 is the final call.
  *
- * A damaged slot is never believed: it lists as "On-The-Go N", opens to
- * "Playlist damaged — save again", and counts as FREE for the next Save.
- * Checking it costs no CRC pass — two small reads and the count the parser
- * already produced.
+ * A damaged slot is never believed: it lists as "On-The-Go N" and opens to
+ * "Playlist damaged — save again" with Delete Playlist under it. Checking it
+ * costs no CRC pass — two small reads and the count the parser already
+ * produced.
+ *
+ * IT IS NOT FREE FOR THE NEXT SAVE. Only an EMPTY slot (count = 0, i.e. a
+ * file that is all padding after its two directive lines) is, and that is
+ * load-bearing rather than a simplification: writing a new list over an old
+ * one is the single case the gen/count test cannot see, because a new line
+ * that happens to be exactly as long as the old one it lands on leaves a file
+ * whose count still matches. Save only ever writes over padding, so that case
+ * cannot arise. Delete is what recovers a damaged slot, and it rewrites the
+ * file WHOLE.
  *
  * A FOREIGN FILE AT A SLOT NAME. A user may have their own
  * "On-The-Go 2.m3u8". It has no directive line, so it is not a slot: it is
@@ -122,12 +131,21 @@
 #define OTG_HDR_LINE_BYTES  48u
 #define OTG_END_LINE_BYTES  24u
 
+/* otg_slot_save / otg_slot_erase: the target is not a slot file — it carries
+ * no `#CORE-OTG` directive, so it is somebody's own playlist (or unreadable).
+ * Nothing was written. */
+#define OTG_SLOT_EFOREIGN   (-5)
+
 /*
  * Which slot `name` is: 1..OTG_SLOTS for exactly "On-The-Go N" (ASCII
  * case-insensitive, one digit, nothing before or after), 0 for anything else.
  *
  * `name` is the EXT-TRIMMED playlist name, i.e. playlist_t.name — so
  * "On-The-Go 1.m3u8" is 0, because that is not a name this list ever holds.
+ *
+ * A NAME IS NOT A SLOT. This answers "could this file be slot N", and a user
+ * is perfectly entitled to keep their own "On-The-Go 2.m3u8". Anything that
+ * is going to WRITE must ask otg_slot_of() instead, which also looks inside.
  */
 int otg_slot_index(const char *name);
 
@@ -173,6 +191,24 @@ int otg_slot_probe(fat32_t *fs, uint32_t clus, uint32_t size,
  */
 int otg_slot_verify(fat32_t *fs, uint32_t clus, uint32_t size,
                     uint32_t listed, otg_slot_info_t *out);
+
+/*
+ * Which slot the FILE is — the question every writer has to ask, and the one
+ * otg_slot_index() cannot answer.
+ *
+ * Returns 1..OTG_SLOTS only when `name` is a slot name AND the file at
+ * (`clus`, `size`) carries the `#CORE-OTG` directive. 0 for everything else:
+ * a name that is not a slot name, a FOREIGN playlist the user keeps at one
+ * (the case this exists for), a file too small or unreadable. `out` is
+ * otg_slot_verify()'s report, so a caller that wants `damaged` gets it from
+ * the same two reads; `listed` is what the parser counted, as for verify.
+ *
+ * A 0 here means "do not write to this file". The device offering to DELETE
+ * somebody's own playlist because of its name would be exactly the data loss
+ * this whole feature is built to avoid.
+ */
+int otg_slot_of(fat32_t *fs, const char *name, uint32_t clus, uint32_t size,
+                uint32_t listed, otg_slot_info_t *out);
 
 /*
  * One row to save: where the file is. kernel/main.c fills these from g_songs
@@ -224,10 +260,23 @@ typedef struct {
  * or "/", and must end in '/'. `gen` is the live list's mutation counter.
  * `write` is the injected sector writer. `st` is filled on every return.
  *
- * Returns 0 when the whole file is on the platter, negative when nothing was
- * written (a size the format cannot use, an unresolvable address) or when a
- * write failed part-way — in which case `st` says how far it got and the file
- * is DAMAGED by construction, which is exactly what the next reader will say.
+ * REFUSES A FILE THAT IS NOT A SLOT FILE. The target must already carry a
+ * `#CORE-OTG` directive, which is what the host's empty form has and what a
+ * playlist of the user's own at a slot name does not. That check is here, at
+ * the writer, and not only at the callers: "never write to a file the user
+ * made" is the promise this module exists to keep, and a promise kept in one
+ * place cannot be forgotten at a second call site.
+ *
+ * Returns 0 when the whole file is on the platter, OTG_SLOT_EFOREIGN when the
+ * target is not a slot file, and other negatives when nothing was written (a
+ * size the format cannot use, an unresolvable address, a read that failed) or
+ * when a write failed part-way — in which case `st` says how far it got. A
+ * part-way failure BEFORE the last write leaves a file the next reader calls
+ * damaged (old header, new tail); a failure inside the LAST write, the one
+ * that puts stage 0 down, can leave a first sector with no header at all,
+ * which reads as foreign — listed and played, never written to again until a
+ * host sync, and reported by `core doctor`. Both are honest about not being
+ * a saved list; neither is believed.
  *
  * Calls fat32_cache_drop() before returning, so the parse that follows reads
  * the bytes that were just written rather than the ones that were there
@@ -241,8 +290,9 @@ int otg_slot_save(fat32_t *fs, uint32_t clus, uint32_t size,
 
 /*
  * Write the EMPTY form (count = 0, crc = 0, gen = `gen`) over a slot file —
- * what "Delete Playlist" does, and what makes the slot free again. Same
- * writer, same stats, same tear rules.
+ * what "Delete Playlist" does, and the ONLY way a slot that holds something
+ * (a saved list, or a torn save) becomes free again. Same writer, same
+ * stats, same tear rules, and the same refusal to touch a foreign file.
  */
 int otg_slot_erase(fat32_t *fs, uint32_t clus, uint32_t size, uint16_t gen,
                    otg_write_fn write, otg_save_scratch_t *scr,

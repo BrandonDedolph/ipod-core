@@ -1678,6 +1678,23 @@ OTG_TRACKS = [
 ]
 OTG_SEL = 2                                  # the first track row
 
+def screen_otg_empty():
+    """The same screen with nothing in it: both action rows greyed (they do
+    nothing, and a screen with nothing on it reads as a bug), and the sentence
+    that teaches the gesture underneath."""
+    sc = Screen()
+    status_strip(sc)
+    header(sc, "On-The-Go", "", back=True)
+    list_row(sc, LIST_Y0, 0, "Clear Playlist", selected=True, greyed=True,
+             rh=ROW_H2, title_priority=True)
+    list_row(sc, LIST_Y0, 1, "Save Playlist", greyed=True, rh=ROW_H2,
+             title_priority=True)
+    sc.text(14, LIST_Y0 + 2 * ROW_H2 + 22, "On-The-Go is empty", FONT_ROW, MUTED)
+    sc.text(14, LIST_Y0 + 2 * ROW_H2 + 42, "Hold Select on a song to add it",
+            FONT_SMALL, MUTED2)
+    return sc.img
+
+
 def screen_otg(sel=OTG_SEL):
     sc = Screen()
     status_strip(sc)
@@ -2465,6 +2482,7 @@ def main():
     outputs.append(save_png(screen_allsongs(), "allsongs.png"))
     outputs.append(save_png(screen_playlists(), "playlists.png"))
     outputs.append(save_png(screen_otg(), "otg.png"))
+    outputs.append(save_png(screen_otg_empty(), "otg_empty.png"))
     outputs.append(save_png(screen_otg_added(), "otg_added.png"))
     outputs.append(save_png(screen_letter(), "letter.png"))
     outputs.append(save_png(screen_search(), "search.png"))

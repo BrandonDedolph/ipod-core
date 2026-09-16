@@ -80,9 +80,6 @@ the boot screen and Settings → About show the one the device runs.
   their maximum. Bass +6 is 6 dB quieter overall than it was.
 - The settings record grew from 44 to 48 payload bytes for those two fields, under the same
   version: a record written by any earlier build still loads, and loads as "no limit, EQ off".
-
-## Unreleased
-
 - **On-The-Go.** Hold Select for half a second on a song and it joins a list you build as you go; on
   an album row the whole album goes in. A banner across the top confirms it. Playlists pins
   **On-The-Go** as its first row: Select a track to play the list, hold to take one out, Clear

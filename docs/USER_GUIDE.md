@@ -122,7 +122,12 @@ Playlists, On-The-Go opens it: two rows at the top, then the tracks.
   `On-The-Go 5`, and empties the live list. The banner names the one it used. A saved list is an
   ordinary playlist from then on: it appears in Playlists, it plays like any other, and it is a
   plain `.m3u8` file you can copy off the iPod. When all five are in use, Save is greyed and says
-  so; open a saved one and use **Delete Playlist** at the bottom of it to free a slot.
+  so; open a saved one and use **Delete Playlist** at the bottom of it to free a slot. Delete is
+  the only thing that frees a slot — including one whose save was interrupted, which opens to
+  "Playlist damaged — save again" with Delete under it.
+
+A playlist of your own that happens to be called `On-The-Go 3.m3u8` is just a playlist: the device
+lists it, plays it, and never writes to it — it has no Delete row, and Save skips it.
 
 A row that reads "Not on this iPod" is a track that was in the list when its file went away — a
 re-sync that renamed or removed it. It is kept rather than dropped, in case a later sync brings it

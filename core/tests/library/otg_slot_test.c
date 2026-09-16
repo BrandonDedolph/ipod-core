@@ -68,9 +68,9 @@ static uint8_t *clus_ptr(uint32_t c) { return fs_sec(c); }
 enum {
     C_ROOT = 2, C_MUSIC = 3, C_ROOTFLAC = 4, C_ALBUM = 5, C_PLDIR = 6,
     C_LONG = 7, C_SONG1 = 10, C_SONG2 = 11, C_NOTES = 12, C_LONGTRK = 13,
-    C_LOOSE = 14,
+    C_LOOSE = 14, C_SONG3 = 15,
     C_SLOT1 = 20, C_SLOT1B = 40, C_SLOT1C = 21, C_SLOT1D = 41,  /* fragmented */
-    C_SLOT2 = 22, C_SLOT3 = 26, C_SLOT4 = 30, C_FAV = 31
+    C_SLOT2 = 22, C_SLOT3 = 26, C_SLOT4 = 30, C_FAV = 34
 };
 
 /* On-The-Go 1's cluster chain, in order: the save must follow it. */
@@ -78,6 +78,7 @@ static const uint32_t SLOT1_CHAIN[4] = { C_SLOT1, C_SLOT1B, C_SLOT1C, C_SLOT1D }
 #define SLOT1_BYTES 8192u
 #define SLOT2_BYTES 8192u
 #define SLOT3_BYTES 8192u
+#define SLOT4_BYTES 8192u        /* the FOREIGN one — a size the writer takes */
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v)
@@ -217,6 +218,12 @@ static const char *SLOT2_ENTRIES[3] = {
     "/Music/Artist - Album/02 Other.fla",
     "/Music/Loose.flac",
 };
+/* What a user's own "On-The-Go 4.m3u8" holds. */
+static const char FOREIGN_TEXT[] =
+    "#EXTM3U\n"
+    "/Music/Artist - Album/01 Song.flac\n"
+    "/Music/Loose.flac\n";
+
 static const char *SLOT3_ENTRIES[2] = {
     "/Music/Artist - Album/01 Song.flac",
     "/Music/Loose.flac",
@@ -250,10 +257,11 @@ static void build_image(void)
     for (uint32_t i = 0; i + 1 < 4; i++) {
         put32(&fat[SLOT1_CHAIN[i] * 4], SLOT1_CHAIN[i + 1]);
     }
-    /* Slots 2 and 3 are contiguous four-cluster runs. */
+    /* Slots 2, 3 and the foreign file are contiguous four-cluster runs. */
     for (uint32_t i = 0; i < 3; i++) {
         put32(&fat[(C_SLOT2 + i) * 4], C_SLOT2 + i + 1);
         put32(&fat[(C_SLOT3 + i) * 4], C_SLOT3 + i + 1);
+        put32(&fat[(C_SLOT4 + i) * 4], C_SLOT4 + i + 1);
     }
 
     uint8_t *d;
@@ -278,6 +286,10 @@ static void build_image(void)
     /* A 3-character extension with a long name: the saved line must carry
      * ".fla" exactly, not a normalised ".flac". */
     off += put_lfn(d + off, "02 Other.fla", "02OTHE~1FLA", 0x20, C_SONG2, 2000);
+    /* An MP3 row, now that MP3 plays: the writer copies a dirent's name
+     * verbatim, so nothing about the format is codec-specific — what a line
+     * plays as is classify_ext's answer on the READ side. */
+    off += put_lfn(d + off, "03 Third.mp3", "03THIR~1MP3", 0x20, C_SONG3, 3000);
     put_dirent(d + off, "NOTES   TXT", 0x20, C_NOTES, 10); off += 32;
 
     d = clus_ptr(C_LONG); off = 0;
@@ -294,8 +306,12 @@ static void build_image(void)
                    C_SLOT2, SLOT2_BYTES);
     off += put_lfn(d + off, "On-The-Go 3.m3u8", "ONTHEG~3M3U", 0x20,
                    C_SLOT3, SLOT3_BYTES);
+    /* The foreign file is a WRITEABLE size on purpose: 8192 B, a multiple of
+     * the grain. If the only thing stopping the device from erasing a
+     * playlist somebody made were the size gate, this fixture would pass and
+     * a real user's 8 KiB file would not. */
     off += put_lfn(d + off, "On-The-Go 4.m3u8", "ONTHEG~4M3U", 0x20,
-                   C_SLOT4, 64);
+                   C_SLOT4, SLOT4_BYTES);
     off += put_lfn(d + off, "Favourites.m3u8", "FAVOUR~1M3U", 0x20, C_FAV, 45);
 
     /* Slot 1: the empty form. Slot 2: three entries. Slot 3: TORN — the
@@ -317,7 +333,16 @@ static void build_image(void)
             memcpy(clus_ptr(C_SLOT3 + i), buf + i * BPS, BPS);
         }
     }
-    memcpy(clus_ptr(C_SLOT4), "#EXTM3U\n/Music/Artist - Album/01 Song.flac\n", 43);
+    {
+        /* The foreign file: a playlist of the user's own that happens to use
+         * a slot name. No #CORE-OTG directive anywhere in it. */
+        static uint8_t f[SLOT4_BYTES];
+        memset(f, '\n', sizeof f);
+        memcpy(f, FOREIGN_TEXT, sizeof FOREIGN_TEXT - 1);
+        for (uint32_t i = 0; i < 4; i++) {
+            memcpy(clus_ptr(C_SLOT4 + i), f + i * BPS, BPS);
+        }
+    }
     memcpy(clus_ptr(C_FAV),   "#EXTM3U\n/Music/Artist - Album/01 Song.flac\n", 43);
 }
 
@@ -469,7 +494,7 @@ static void test_probe(void)
           info.present && info.gen == 5);
 
     check("a FOREIGN playlist at a slot name is not a slot file",
-          otg_slot_probe(&g_fs, C_SLOT4, 64, &info) == 0 && !info.present);
+          otg_slot_probe(&g_fs, C_SLOT4, SLOT4_BYTES, &info) == 0 && !info.present);
 
     check("a file too small to hold a header is not a slot file",
           otg_slot_probe(&g_fs, C_FAV, 8, &info) == 0 && !info.present);
@@ -547,7 +572,7 @@ static void test_verify(void)
           info.damaged);
 
     check("a foreign playlist is not a slot and is never 'damaged'",
-          otg_slot_verify(&g_fs, C_SLOT4, 64, 1, &info) == 0 &&
+          otg_slot_verify(&g_fs, C_SLOT4, SLOT4_BYTES, 2, &info) == 0 &&
           !info.present && !info.damaged);
 }
 
@@ -583,21 +608,94 @@ static void test_scan_hides_empty_slots(void)
 
 /* What the save is asked to write. The middle two rows are the ones that
  * cannot be written; the last is a duplicate, which is allowed. */
-static const otg_save_row_t SAVE_ROWS[6] = {
+static const otg_save_row_t SAVE_ROWS[7] = {
     { C_ALBUM, C_SONG1   },   /* /Music/Artist - Album/01 Song.flac */
     { C_ALBUM, C_SONG2   },   /* /Music/Artist - Album/02 Other.fla */
+    { C_ALBUM, C_SONG3   },   /* /Music/Artist - Album/03 Third.mp3 */
     { C_LONG,  C_LONGTRK },   /* the 180-char folder: over M3U_PATH_MAX */
     { C_MUSIC, C_LOOSE   },   /* /Music/Loose.flac — the library root */
     { C_ALBUM, C_SONG1   },   /* the duplicate */
     { C_ALBUM, 999       },   /* no such file in that folder */
 };
 
-static const char *SAVE_EXPECT[4] = {
+static const char *SAVE_EXPECT[5] = {
     "/Music/Artist - Album/01 Song.flac",
     "/Music/Artist - Album/02 Other.fla",
+    "/Music/Artist - Album/03 Third.mp3",
     "/Music/Loose.flac",
     "/Music/Artist - Album/01 Song.flac",
 };
+
+/* ---- 3b. a NAME is not a slot ------------------------------------------- */
+
+/*
+ * The one thing standing between this feature and overwriting a playlist the
+ * user made is that a slot is decided by what is INSIDE the file, never by
+ * what it is called. Two halves, both pinned here: otg_slot_of() is what the
+ * UI asks before it offers Delete, and otg_slot_save/erase refuse a foreign
+ * target themselves so the promise does not depend on the caller remembering.
+ */
+static void test_a_name_is_not_a_slot(void)
+{
+    otg_slot_info_t info;
+
+    check("a real slot file IS its slot",
+          otg_slot_of(&g_fs, "On-The-Go 2", C_SLOT2, SLOT2_BYTES, 3, &info) == 2 &&
+          info.present && !info.damaged);
+    check("an EMPTY slot is still its slot",
+          otg_slot_of(&g_fs, "On-The-Go 1", C_SLOT1, SLOT1_BYTES, 0, &info) == 1 &&
+          info.present);
+    check("a DAMAGED slot is still ours — Delete is how it is recovered",
+          otg_slot_of(&g_fs, "On-The-Go 3", C_SLOT3, SLOT3_BYTES, 2, &info) == 3 &&
+          info.present && info.damaged);
+    check("a FOREIGN playlist at a slot name is NOT a slot",
+          otg_slot_of(&g_fs, "On-The-Go 4", C_SLOT4, SLOT4_BYTES, 2, &info) == 0 &&
+          !info.present);
+    check("...and neither is a real slot file under another name",
+          otg_slot_of(&g_fs, "Favourites", C_SLOT2, SLOT2_BYTES, 3, &info) == 0);
+    check("a null name is refused", otg_slot_of(&g_fs, 0, C_SLOT2, SLOT2_BYTES,
+                                                3, &info) == 0);
+    check("...and the out-parameter is optional",
+          otg_slot_of(&g_fs, "On-The-Go 2", C_SLOT2, SLOT2_BYTES, 3, 0) == 2);
+
+    /*
+     * And the writer's own refusal. The foreign file is 8192 bytes — a size
+     * the writer would happily take — so nothing but the directive check
+     * stands between it and the empty form.
+     */
+    static uint8_t before[SLOT4_BYTES], after[SLOT4_BYTES];
+    static const uint32_t SLOT4_CHAIN[4] = { C_SLOT4, C_SLOT4 + 1,
+                                             C_SLOT4 + 2, C_SLOT4 + 3 };
+    read_file(SLOT4_CHAIN, 4, before, SLOT4_BYTES);
+
+    target(SLOT4_CHAIN, 4);
+    reset_writes();
+    check("ERASE refuses a foreign file",
+          otg_slot_erase(&g_fs, C_SLOT4, SLOT4_BYTES, 9, mem_write,
+                         &g_scr, &g_st) == OTG_SLOT_EFOREIGN);
+    check("SAVE refuses one too",
+          otg_slot_save(&g_fs, C_SLOT4, SLOT4_BYTES, C_MUSIC, "/Music/",
+                        SAVE_ROWS, 2, 9, mem_write, &g_scr, &g_st) ==
+          OTG_SLOT_EFOREIGN);
+    check("...and NOT ONE BYTE was written", g_writes == 0);
+    read_file(SLOT4_CHAIN, 4, after, SLOT4_BYTES);
+    check("...so the user's playlist is exactly as they left it",
+          memcmp(before, after, SLOT4_BYTES) == 0);
+
+    /* It still reads, lists and plays as the ordinary playlist it is. */
+    uint32_t dir = 0;
+    int trunc = 0;
+    int n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc, 1);
+    const playlist_t *pl = find_pl(n, "On-The-Go 4");
+    check("a foreign file is listed like any other playlist", pl != 0);
+    if (pl) {
+        playlist_stats_t st;
+        int r = playlist_resolve(&g_fs, pl, "Music/Playlists", g_rows,
+                                 PLAYLIST_TRACKS_MAX, &g_plscr, &st);
+        check("...and plays: it is a playlist, not a damaged slot",
+              r == 2 && g_rows[0].clus == C_SONG1 && g_rows[1].clus == C_LOOSE);
+    }
+}
 
 static void test_save(void)
 {
@@ -616,16 +714,16 @@ static void test_save(void)
     target(SLOT1_CHAIN, 4);
     reset_writes();
     int rc = otg_slot_save(&g_fs, C_SLOT1, SLOT1_BYTES, C_MUSIC, "/Music/",
-                           SAVE_ROWS, 6, 42, mem_write, &g_scr, &g_st);
+                           SAVE_ROWS, 7, 42, mem_write, &g_scr, &g_st);
     check("the save succeeds", rc == 0);
     check("no write left the file's clusters or crossed one", !g_stray);
-    check("four rows were written", g_st.written == 4);
+    check("five rows were written", g_st.written == 5);
     check("the long folder and the missing file are counted unsaveable",
           g_st.unsaveable == 2);
     check("nothing was a read error, nothing was truncated",
           g_st.io_err == 0 && g_st.truncated == 0);
 
-    uint32_t crc = build_slot_file(want, SLOT1_BYTES, SAVE_EXPECT, 4, 42, -1, -1);
+    uint32_t crc = build_slot_file(want, SLOT1_BYTES, SAVE_EXPECT, 5, 42, -1, -1);
     read_file(SLOT1_CHAIN, 4, got, SLOT1_BYTES);
     check("the file is EXACTLY the expected bytes, padding included",
           memcmp(got, want, SLOT1_BYTES) == 0);
@@ -653,9 +751,9 @@ static void test_save(void)
     otg_slot_info_t info;
     check("the freshly written slot probes as used",
           otg_slot_probe(&g_fs, C_SLOT1, SLOT1_BYTES, &info) == 0 &&
-          info.present && info.count == 4 && info.gen == 42 && info.crc == crc);
+          info.present && info.count == 5 && info.gen == 42 && info.crc == crc);
     check("...and verifies intact",
-          otg_slot_verify(&g_fs, C_SLOT1, SLOT1_BYTES, 4, &info) == 0 &&
+          otg_slot_verify(&g_fs, C_SLOT1, SLOT1_BYTES, 5, &info) == 0 &&
           !info.damaged);
 
     uint32_t dir = 0;
@@ -668,12 +766,17 @@ static void test_save(void)
         int r = playlist_resolve(&g_fs, pl, "Music/Playlists", g_rows,
                                  PLAYLIST_TRACKS_MAX, &g_plscr, &st);
         check("...and resolves to the same rows, in the same order",
-              r == 4 && st.listed == 4 &&
+              r == 5 && st.listed == 5 &&
               g_rows[0].clus == C_SONG1 && g_rows[1].clus == C_SONG2 &&
-              g_rows[2].clus == C_LOOSE && g_rows[3].clus == C_SONG1);
+              g_rows[2].clus == C_SONG3 && g_rows[3].clus == C_LOOSE &&
+              g_rows[4].clus == C_SONG1);
         check("...with the on-disk names the save read out of the dirents",
-              r == 4 && strcmp(g_rows[1].name, "02 Other") == 0 &&
+              r == 5 && strcmp(g_rows[1].name, "02 Other") == 0 &&
               g_rows[1].file_hash == name_hash("02 Other.fla"));
+        check("...an MP3 row written and read back as MP3, verbatim",
+              r == 5 && strcmp(g_rows[2].name, "03 Third") == 0 &&
+              g_rows[2].fmt == 1 && g_rows[0].fmt == 0 &&
+              g_rows[2].file_hash == name_hash("03 Third.mp3"));
         check("...and nothing missing or unplayable",
               st.missing == 0 && st.unplayable == 0 && st.rejected == 0);
     }
@@ -760,7 +863,7 @@ static void test_erase_and_refusals(void)
     g_wfail_left = 1;
     check("a failing write is reported",
           otg_slot_save(&g_fs, C_SLOT1, SLOT1_BYTES, C_MUSIC, "/Music/",
-                        SAVE_ROWS, 6, 45, mem_write, &g_scr, &g_st) == -3);
+                        SAVE_ROWS, 7, 45, mem_write, &g_scr, &g_st) == -3);
     check("...and it stopped there, rather than carrying on", g_writes == 1);
 }
 
@@ -783,13 +886,13 @@ static void test_unnameable_folder(void)
     target(SLOT1_CHAIN, 4);
     reset_writes();
     int rc = otg_slot_save(&g_fs, C_SLOT1, SLOT1_BYTES, C_MUSIC, "/Music/",
-                           SAVE_ROWS, 6, 46, mem_write, &g_scr, &g_st);
+                           SAVE_ROWS, 7, 46, mem_write, &g_scr, &g_st);
     check("a save over an unnameable album still writes a well-formed file",
           rc == 0 && !g_stray);
     check("...with only the row it could name — Loose.flac, in Music/",
           g_st.written == 1);
     check("...and every other row counted, not silently dropped",
-          g_st.unsaveable + g_st.io_err == 5);
+          g_st.unsaveable + g_st.io_err == 6);
 
     otg_slot_info_t info;
     check("...and the file it left behind is intact, not damaged",
@@ -822,6 +925,7 @@ int main(void)
     test_probe();
     test_verify();
     test_scan_hides_empty_slots();
+    test_a_name_is_not_a_slot();
     test_save();
     test_erase_and_refusals();
     test_unnameable_folder();

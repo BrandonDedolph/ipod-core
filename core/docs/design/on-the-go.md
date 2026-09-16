@@ -1,16 +1,16 @@
 # On-The-Go — the two on-disk formats
 
-Status: **storage half implemented, UI pending.** The modules below exist and
-are host-tested (`core/library/otg.c`, `core/library/otg_slot.c`,
-`core/kernel/otg_store.c`, `tools/make_otg.py`, `core/cli/internal/devicefs`);
-nothing in `kernel/main.c` calls them yet, so the feature is invisible on the
-device. **Neither write path has been verified on hardware** — see the
-bring-up procedure at the top of `kernel/otg_store.c`, which is
-`kernel/config.c`'s and is not optional for a third and fourth writer.
+Status: **implemented, UNFLASHED.** The modules below exist and are
+host-tested (`core/library/otg.c`, `core/library/otg_slot.c`,
+`core/kernel/otg_store.c`, `tools/make_otg.py`, `core/cli/internal/devicefs`),
+and `kernel/main.c` wires the whole feature. **Neither write path has been
+verified on hardware** — see the bring-up procedure at the top of
+`kernel/otg_store.c`, which is `kernel/config.c`'s and is not optional for a
+third and fourth writer, and the bench list in `STATUS.md`.
 
-This is the format reference. The behaviour — hold Select to add, the banner,
-the Playlists pinned row, Clear / Save / Delete, resuming into the list — is
-the second half and is documented in `docs/USER_GUIDE.md` when it lands.
+This is the FORMAT reference. The behaviour a user sees — hold Select to add,
+the banner, the Playlists pinned row, Clear / Save / Delete, resuming into the
+list — is `docs/USER_GUIDE.md`'s On-The-Go section.
 
 ## What On-The-Go is, and why it needs two formats
 
@@ -171,8 +171,17 @@ two small reads and the line count the parser already produced — no CRC pass:
 A completed final write is durable because the injected writer issues FLUSH
 CACHE and stage 0 is the last call.
 
-A damaged slot is never believed: it is listed as "On-The-Go N", opens to
-"Playlist damaged — save again", and counts as FREE for the next Save.
+A damaged slot is never believed: it is listed as "On-The-Go N" and opens to
+"Playlist damaged — save again" with **Delete Playlist** under it, which is
+how it is recovered. It is **not** free for the next Save.
+
+That is load-bearing, not a simplification. Save only ever writes into an
+EMPTY slot — a file that is nothing but its two directive lines and padding —
+so it never writes content over content, and the one tear the gen/count test
+cannot see is therefore unreachable: a new entry line that happened to be
+exactly as long as the old line it landed on would leave a file whose count
+still matched its lines. Delete rewrites the file WHOLE, so a damaged slot
+comes back through the same one-pass writer as everything else.
 
 ### Naming a row
 
@@ -207,12 +216,17 @@ call fails three checks in `tests/library/otg_slot_test.c`.
 |---|---|---|---|
 | empty | `count=00000` | hidden | free |
 | used | `count>0`, gen and count agree | listed, opens | in use |
-| damaged | trailer gen or line count disagrees | listed, opens to "Playlist damaged — save again" | free |
+| damaged | trailer gen or line count disagrees | listed, opens to "Playlist damaged — save again" | NOT free — Delete first |
 | foreign | an `.m3u8` at a slot name with no `#CORE-OTG` line | listed, plays | skipped |
 
 "Foreign" is a playlist of the user's own that happens to use the name. The
-device never writes to it; `core sync` refuses to plan a source playlist onto
-a slot name (it warns and copies nothing); `core doctor` says which slot it is.
+device never writes to it, and that is enforced in two places rather than
+one: `otg_slot_of()` is what the UI asks before it offers **Delete Playlist**
+(a NAME says only which slot a file could be — the `#CORE-OTG` directive is
+what says it is one), and `otg_slot_save()` / `otg_slot_erase()` refuse a
+directive-less target themselves, so the promise does not depend on a caller
+remembering it. `core sync` refuses to plan a source playlist onto a slot
+name (it warns and copies nothing); `core doctor` says which slot it is.
 
 The five slot files always exist, so `playlist_scan(..., hide_empty_slots)`
 drops the empty ones after the sort — otherwise the Playlists screen would

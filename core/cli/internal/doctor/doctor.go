@@ -592,7 +592,9 @@ func checkPlaylists(r *report, rep *VolumeReport, dir string) {
 		case info.State == devicefs.OTGSlotDamaged:
 			r.line(Fail, label, "%s is a torn save (header gen %d, trailer gen %d, "+
 				"%d entry line(s) against a count of %d); the device opens it to "+
-				"\"Playlist damaged\" and treats the slot as free",
+				"\"Playlist damaged\" with Delete Playlist under it. The slot is NOT "+
+				"free until that Delete rewrites it — Save only ever writes into an "+
+				"empty slot",
 				name, info.Gen, info.TrailerGen, info.Lines, info.Count)
 		case info.Size < devicefs.OTGSlotFileMin ||
 			info.Size%devicefs.OTGSlotSizeGrain != 0:
