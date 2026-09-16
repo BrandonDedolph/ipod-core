@@ -667,14 +667,25 @@ def draw_lock_glyph(sc, x, y, c):
     sc.fill_rect(x + 5, y, 2, 5, c)
     sc.fill_rect(x + 1, y, 6, 2, c)
 
-def status_strip(sc, left="", pct=78, locked=False):
+def status_strip(sc, left="", pct=78, locked=False, sleep=None):
     # main.c status_strip_render: the playing track's name, clipped before the
     # right cluster (12, LCD_WIDTH-70) rather than drawn full width and painted
     # over — and NOTHING when nothing is playing (the strip is a now-playing
     # readout, not a wordmark; the main menu's own header says "Core").
-    if left:
-        sc.text(12, STATUS_H - 4, left, FONT_SMALL, MUTED2, clip=(12, W - 70))
+    #
+    # `sleep` is the sleep timer's minutes left (None = off). Its token goes
+    # LEFT of the padlock, which sits left of the battery, so neither of those
+    # ever moves when the timer is armed — only the name gives ground, and its
+    # clip shortens to make the room.
     bx = W - 12 - 24
+    clip_r = W - 70
+    if sleep is not None:
+        tok = "SLEEP %d" % sleep
+        tok_x = (bx - 14 - 6 if locked else bx - 6) - text_width(tok, FONT_SMALL)
+        sc.text(tok_x, STATUS_H - 4, tok, FONT_SMALL, MUTED2)
+        clip_r = min(clip_r, tok_x - 8)
+    if left:
+        sc.text(12, STATUS_H - 4, left, FONT_SMALL, MUTED2, clip=(12, clip_r))
     draw_battery(sc, bx, 1, pct)
     if locked:
         draw_lock_glyph(sc, bx - 14, 3, INK)
@@ -850,7 +861,8 @@ def screen_detail(sel=DETAIL_SEL):
     return sc.img
 
 
-def _now_playing_base(vol_overlay=None, elapsed=73, total=182, locked=False):
+def _now_playing_base(vol_overlay=None, elapsed=73, total=182, locked=False,
+                      sleep=None):
     sc = Screen()
     # top status row
     sc.text(12, 15, "Now Playing", bold_11, INK)
@@ -860,7 +872,10 @@ def _now_playing_base(vol_overlay=None, elapsed=73, total=182, locked=False):
     # of the battery at bx-14). The shuffle token shifts left to clear it.
     if locked:
         draw_lock_glyph(sc, bx - 14, 3, INK)
-    sc.text_right(bx - (18 if locked else 6), 13, "SHUF", FONT_SMALL, MUTED2)
+    # main.c nowplaying_render builds SHUF / RPT / SLEEP as ONE string and
+    # measures it once, so the spacing is the font's own kerning.
+    tokens = "SHUF" if sleep is None else "SHUF SLEEP %d" % sleep
+    sc.text_right(bx - (18 if locked else 6), 13, tokens, FONT_SMALL, MUTED2)
     # art 120x120 at (16,44)
     sc.blit_art(16, 44, 120, "austin")
     mx = 16 + 120 + 14
@@ -1745,6 +1760,32 @@ def screen_sound(rows=None, sel_row=SOUND_SEL):
     return sc.img
 
 
+# Settings > Playback — core/ui/settings.c PLAY_L and the values
+# settings_value() writes for them. Sleep Timer's options are SLEEP_OPTS
+# there: Off / 15 / 30 / 60 / 90 / 120 min, cycled by SELECT.
+PLAY_L = [("Shuffle", "On"), ("Repeat", "All"), ("Resume", "On"),
+          ("Sleep Timer", "30 min")]
+PLAY_SEL = 3        # cursor on Sleep Timer, showing what it cycles
+PLAY_SLEEP = 28     # …and the strip counting it down, two minutes in
+
+def screen_playback():
+    sc = Screen()
+    header(sc, "Playback", back=True)
+    # The strip carries the SLEEP token while the timer runs — this is the one
+    # still that shows it (main.c status_strip_render / strip_sleep_token).
+    status_strip(sc, "Something Real", sleep=PLAY_SLEEP)
+    for r, (label, val) in enumerate(PLAY_L):
+        ry = LIST_Y0 + r * ROW_H
+        sel = (r == PLAY_SEL)
+        if sel:
+            _sel_bar(sc, LIST_Y0, ROW_H, r)
+        fg = SEL_FG if sel else INK
+        rightc = SEL_SUB if sel else MUTED_D
+        sc.text(14, ry + 15, label, FONT_HEADER if sel else FONT_ROW, fg)
+        sc.text_right(W - 16, ry + 15, val, regular_11, rightc)
+    return sc.img
+
+
 CLICK_L = ["Off", "Tick", "Click", "Pop", "Blip", "Tock", "Double", "Chirp"]
 CLICK_ACTIVE = 1   # Tick
 CLICK_SEL = 2      # Click
@@ -2027,6 +2068,7 @@ def main():
     outputs.append(save_png(screen_settings(), "settings.png"))
     outputs.append(save_png(screen_diag(), "bootdetails.png"))
     outputs.append(save_png(screen_sound(), "sound.png"))
+    outputs.append(save_png(screen_playback(), "playback.png"))
     outputs.append(save_png(screen_clicker(), "clicker.png"))
     outputs.append(save_png(screen_theme(), "theme.png"))
     # --- new: dual theme (Onyx) ---
