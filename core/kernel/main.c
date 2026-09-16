@@ -6805,20 +6805,31 @@ _Noreturn static void run_ui(fat32_t *fs)
      * again on the next boot.
      */
     {
-        uint32_t rtc_epoch = 0;
-        int      rtc_rc    = hal_rtc_get(&rtc_epoch);
-        uint32_t now_us    = mmio_read32(USEC_TIMER_ADDR);
-        uint8_t  raw[RTC_REG_COUNT];
+        /* ONE pass over the chip: the raw bytes are logged and the decision is
+         * made from exactly those bytes. Reading twice would cost three more
+         * I2C transactions and, worse, let the log line and the decision
+         * disagree — and that line is the only evidence the register map is
+         * right at all (docs/hw/06-power.md, "Bench procedure"). */
+        uint32_t   now_us = mmio_read32(USEC_TIMER_ADDR);
+        uint8_t    raw[RTC_REG_COUNT];
+        datetime_t rtc_civil;
+        uint32_t   rtc_epoch = 0;
+        int        rtc_rc    = -1;            /* the bus did not answer */
 
-        /* The raw calendar bytes, before anything trusts the register map:
-         * the first flash's evidence that the map and the BCD encoding are
-         * what docs/hw/06-power.md says (DEVICE). */
         if (rtc_read_raw(raw) == 0) {
             uart_puts("core: rtc raw");
             for (int i = 0; i < RTC_REG_COUNT; i++) {
                 uart_putc(' ');
                 uart_put_hex32(raw[i]);
             }
+            rtc_rc = rtc_decode(raw, &rtc_civil);
+            if (rtc_rc == 1) {
+                rtc_epoch = datetime_to_epoch(&rtc_civil);
+            }
+            uart_puts(" valid ");
+            uart_put_hex32((uint32_t)rtc_rc);
+            uart_puts(" epoch ");
+            uart_put_hex32(rtc_epoch);
             uart_putc('\n');
         }
 
@@ -9063,8 +9074,10 @@ _Noreturn void kernel_main(void) {
         cpu_boost();
 
         /* Bring up the I2C control bus now (not just at first-song hal_audio_init)
-         * so the status strip can read the PCF50605 battery gauge from the menu.
-         * Bounded/idempotent — hal_audio_init re-inits it harmlessly per track. */
+         * so the status strip can read the PCF50605 battery gauge from the menu
+         * — and so run_ui's boot block can read the same chip's clock, which it
+         * does before anything paints a time. Bounded/idempotent —
+         * hal_audio_init re-inits it harmlessly per track. */
         i2c_init();
         battery_init();
         hal_volume_init();               /* codec output gain -> safe default      */

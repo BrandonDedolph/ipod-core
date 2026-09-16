@@ -132,11 +132,14 @@ int rtc_read_raw(uint8_t regs[RTC_REG_COUNT])
 int rtc_read(datetime_t *d)
 {
     uint8_t regs[RTC_REG_COUNT];
-    int rc = rtc_read_raw(regs);
-    if (rc != 0) {
+    if (rtc_read_raw(regs) != 0) {
         return -1;
     }
+    return rtc_decode(regs, d);
+}
 
+int rtc_decode(const uint8_t regs[RTC_REG_COUNT], datetime_t *d)
+{
     int sec   = bcd_to_int(regs[R_SC]);
     int min   = bcd_to_int(regs[R_MN]);
     int hour  = bcd_to_int(regs[R_HR]);

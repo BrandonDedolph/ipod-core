@@ -279,6 +279,59 @@ static int test_unset_shapes(void)
     return trace_done(&tc);
 }
 
+/*
+ * rtc_decode() is the half kernel/main.c's boot block uses directly, so that
+ * the bytes it LOGS are the bytes it decides from. Two things matter: it is
+ * pure (no bus traffic, or the boot would pay for a second pass it is not
+ * being charged for), and it agrees with rtc_read() byte for byte.
+ */
+static int test_decode_is_pure(void)
+{
+    mmio_mock_reset();
+    seed_calendar();
+    datetime_t via_read;
+    int rc_read = rtc_read(&via_read);
+
+    size_t before = mmio_mock_log_len();
+    static const uint8_t regs[RTC_REG_COUNT] = {
+        0x00, 0x42, 0x10, 0x03, 0x16, 0x09, 0x26,   /* 2026-09-16 10:42:00 */
+    };
+    datetime_t via_decode;
+    int rc_dec = rtc_decode(regs, &via_decode);
+
+    trace_cursor tc = trace_begin("rtc_decode");
+    if (mmio_mock_log_len() != before) {
+        fprintf(stderr, "[rtc_decode] touched the bus: %u events became %u\n",
+                (unsigned)before, (unsigned)mmio_mock_log_len());
+        tc.fails++;
+    }
+    if (rc_dec != 1 || rc_read != 1 ||
+        via_decode.year != via_read.year || via_decode.month != via_read.month ||
+        via_decode.day != via_read.day || via_decode.hour != via_read.hour ||
+        via_decode.min != via_read.min || via_decode.sec != via_read.sec ||
+        via_decode.wday != via_read.wday) {
+        fprintf(stderr, "[rtc_decode] disagrees with rtc_read\n");
+        tc.fails++;
+    }
+    /* The same shapes rtc_read() calls unset, decoded directly. */
+    uint8_t bad[RTC_REG_COUNT];
+    for (int i = 0; i < RTC_REG_COUNT; i++) {
+        bad[i] = regs[i];
+    }
+    bad[6] = 0x00;                                   /* year 00 */
+    if (rtc_decode(bad, &via_decode) != 0) {
+        fprintf(stderr, "[rtc_decode] year 00 must decode as unset\n");
+        tc.fails++;
+    }
+    bad[6] = 0x26;
+    bad[0] = 0x4A;                                   /* not BCD */
+    if (rtc_decode(bad, &via_decode) != 0) {
+        fprintf(stderr, "[rtc_decode] bad BCD must decode as unset\n");
+        tc.fails++;
+    }
+    return trace_done(&tc);
+}
+
 /* The write order is the safety argument: seconds first, so the counter
  * restarts and the next minute carry is a whole second away while the other
  * six registers are written. */
@@ -459,6 +512,7 @@ int main(void)
     fails |= test_read_grammar();
     fails |= test_torn_read();
     fails |= test_unset_shapes();
+    fails |= test_decode_is_pure();
     fails |= test_write_order();
     fails |= test_set_and_readback();
     fails |= test_readback_mismatch();

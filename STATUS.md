@@ -404,7 +404,9 @@ bss +456 B, text +1.2 KB.
   **Nothing here has been on a device.** The bench, in order:
 
   1. Flash, boot, and read the UART/`CORELOG.BIN` line
-     `core: rtc raw SC MN HR WD DT MT YR`. Every nibble ≤ 9 confirms BCD and
+     `core: rtc raw SC MN HR WD DT MT YR valid N epoch XXXXXXXX` — one pass
+     over the chip, so those bytes are also the ones the boot decided from.
+     Every nibble ≤ 9 confirms BCD and
      the block placement; whatever Apple's firmware left there also says
      whether the OF used the same registers. If the bytes are not BCD, STOP:
      the map is wrong, and the doc's table is where to fix it.

@@ -48,6 +48,17 @@
 int rtc_read_raw(uint8_t regs[RTC_REG_COUNT]);
 
 /*
+ * Decode bytes that rtc_read_raw() returned, with no bus traffic of its own.
+ * Returns 1 and fills *d for a plausible date, 0 for "unset" — see rtc_read()
+ * for what makes a reading unset, since this is the half that decides it.
+ *
+ * Exposed so the boot path can LOG the raw bytes and decide from exactly those
+ * bytes rather than reading the chip a second time: two passes could disagree,
+ * and the log line is the evidence the register map is right at all.
+ */
+int rtc_decode(const uint8_t regs[RTC_REG_COUNT], datetime_t *d);
+
+/*
  * The calendar as a civil date. Returns:
  *   1  — a running clock holding a plausible date (2001..2099);
  *   0  — UNSET: year register 00 (the reset value a drained cell leaves), or
