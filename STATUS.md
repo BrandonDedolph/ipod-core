@@ -56,7 +56,7 @@ FLAC lives in, but that is arithmetic. Next bench, in order:
 3. underruns over a ten-minute album;
 4. resume into an MP3; a scrub on a VBR file — and TIME the scrub. A seek
    backs off a fixed 6276 bytes and decodes every frame from there to the
-   landing, which is four frame decodes at 320 kbps and about fifteen at 128.
+   landing, which is six frame decodes at 320 kbps and about fifteen at 128.
    The constant is deliberate (nothing about the file can be trusted to size
    it — see `codecs/pvmp3/mp3.c`); if `g_boot_res_seek_ms` or a scrub reads
    slow, the tighter version reads the header AT the landing first and scales

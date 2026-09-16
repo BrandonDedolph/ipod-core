@@ -276,7 +276,7 @@ static int mp3_seek(decoder_t *d, uint64_t target_frame)
      * is the first frame's length wearing a hat.
      *
      * It costs decode time on a seek, and the cost is worst where frames are
-     * small: four frames at 320 kbps, about fifteen at 128 kbps, more on a low
+     * small: six frames at 320 kbps (1044 B each at 44.1 kHz), about fifteen at 128 kbps, more on a low
      * bitrate — where each frame is correspondingly cheap. That is bounded and
      * paid once per scrub or resume, against a muted landing that is silence
      * the listener can hear. Tightening it means reading the header AT the

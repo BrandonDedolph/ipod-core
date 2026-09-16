@@ -145,7 +145,7 @@ Every per-file figure available at that point is untrustworthy for it — the
 first frame's length is a quarter of the loud part on a VBR encode that opens
 on silence, and without a Xing count the frame count is itself extrapolated
 from that same first frame, so a "mean" derived from it is the first frame's
-length restated. It costs four extra frame decodes at 320 kbps and about
+length restated. It costs six extra frame decodes at 320 kbps and about
 fifteen at 128, paid once per scrub. Accuracy
 is one frame (26 ms) plus the TOC's granularity, which is one percent of the
 file: the same class of answer dr_flac's binary search gives. It costs one
