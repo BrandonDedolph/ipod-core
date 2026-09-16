@@ -5,6 +5,14 @@ the boot screen and Settings → About show the one the device runs.
 
 ## Unreleased
 
+- **Shuffle Albums.** Settings → Playback → Shuffle is now Off, Songs or Albums. Songs is what
+  Shuffle always did. Albums plays the album you are on to its end in track order, then another
+  album from the same list at random, until every album in that list has played; Repeat All starts
+  again with a new album order, Repeat One is unchanged, and one album on its own just plays in
+  order. Shuffle Songs on the Music menu still shuffles songs whichever setting is on. Now Playing
+  reads SHUF·ALB while albums are being shuffled. The setting rides the byte the old on/off flag
+  used, so a record written by an earlier build loads unchanged and an earlier build reads Albums
+  as Songs.
 - **Volume Limit.** Settings → Sound has a ceiling on the volume, 10% to 100%, with 100% meaning
   no limit. Lower it below where the volume is and the volume comes down with it at once. On Now
   Playing a small triangle marks it on the volume bar and the wheel stops there; the bar keeps its

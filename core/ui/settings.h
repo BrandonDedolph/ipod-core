@@ -42,12 +42,29 @@
 typedef enum { REPEAT_OFF, REPEAT_ALL, REPEAT_ONE } repeat_mode_t;
 
 /*
+ * Shuffle policy (FUNCTIONAL — the player's playback order).
+ *
+ * SONGS is a seeded permutation of the queue's tracks. ALBUMS keeps each
+ * album whole: the album you are on plays out in its tracklist order, then
+ * another album from the same queue at random, until every album in it has
+ * played once. The ids ARE the byte stored at payload offset 0 (kernel/
+ * config.c), so they must never be renumbered: a build that only knows
+ * OFF/SONGS reads a 2 as SONGS, which is the right downgrade, and this build
+ * reads anything it does not know as OFF.
+ */
+typedef enum {
+    SHUFFLE_OFF    = 0,
+    SHUFFLE_SONGS  = 1,
+    SHUFFLE_ALBUMS = 2
+} shuffle_mode_t;
+
+/*
  * The whole persisted settings state. Ranges + which fields are live are noted
  * per field; keep this in sync with settings_defaults() and the clamps in
  * settings_adjust().
  */
 typedef struct {
-    int  shuffle;            /* 0/1 — FUNCTIONAL (player queue order)          */
+    shuffle_mode_t shuffle;  /* SHUFFLE_* — FUNCTIONAL (player queue order)    */
     repeat_mode_t repeat;    /* FUNCTIONAL (player auto-advance)               */
     int  resume_on_startup;  /* 0/1 — FUNCTIONAL (boot re-opens the last track)*/
     int  crossfade;          /* 0/1 — COSMETIC (no crossfade mixer yet)       */

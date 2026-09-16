@@ -5,6 +5,58 @@ what works, what doesn't, and what to pick up next.
 
 ## 2026-09-16 — UNFLASHED
 
+- **Shuffle Albums.** Settings > Playback > Shuffle is a three-way select now,
+  Off / Songs / Albums, like the original iPod's. Songs is exactly today's
+  shuffle. Albums plays the album you are on to its end in the index's track
+  order, then another album from the same queue at random, until every album
+  in that queue has played once; Repeat All deals a fresh album order (with a
+  different first album whenever the queue holds more than one), Repeat One is
+  untouched, and a one-album queue simply plays — and, under Repeat All,
+  loops — in order.
+
+  It is one new branch of the player's existing seeded deal, not a second
+  mechanism: `album_deal()` sorts the playable queue indices by
+  `(album, order_key, index)`, shuffles the resulting runs with the same LCG
+  from the same seed, and expands them back in place. So an album order is a
+  pure function of (queue, seed, keep, mode) exactly as a song order is, and
+  it rides the resume record's existing `resume_order_seed` /
+  `resume_order_keep` pair with **no record change**. The two keys come from
+  two new `browse_entry_t` fields that main.c fills at every queue builder:
+  `album` (the library's album id + 1, 0 = unknown, which makes an entry its
+  own group) and `order_key` (the `(disc << 16) | track` that `browse_bind()`
+  already sorts a tracklist by, so an album plays in the order it lists in).
+
+  **On disk:** the same payload byte 0, widened from a flag to the mode
+  (0 off, 1 songs, 2 albums). No version bump, no length change, no offset
+  moved — a v0.1.3 record loads unchanged, and a v0.1.3 build reading an
+  albums record sees "shuffle on", which is Songs. An unknown value reads as
+  Off (the theme-id precedent, not a clamp). A SELECT that changes a Settings
+  row now also captures the resume context, so the saved
+  (seed, keep) can never lag a mode change by a capture window.
+
+  Now Playing shows `SHUF·ALB` instead of `SHUF` — except over a Shuffle Songs
+  queue, which is its own song order (`PLAYER_KEEP_QUEUE`) whatever the
+  setting says, and still reads `SHUF`. bss grows 36 KB (`g_queue` +24 KB for
+  the two fields, `g_sorted` +12 KB of deal scratch); the size gate is
+  unmoved at 83% of 14 MB. New host suite `player-album` (35 assertions over a
+  fixture of three interleaved albums with scrambled track numbers) plus
+  extensions to `settings` and `config`; 63 suites green, `make verify-hw`
+  clean.
+
+  **UNFLASHED.** Bench list:
+  (a) Songs > play a track with Albums on: the album finishes in tracklist
+      order and the next album starts at its track 1;
+  (b) Repeat All wraps to a different album;
+  (c) power off mid-album, boot: Next is that album's next track;
+  (d) Settings > Shuffle cycles Off / Songs / Albums and the token reads
+      `SHUF·ALB`;
+  (e) Shuffle Songs from the Music menu still shuffles songs with the setting
+      on Albums, and shows `SHUF`;
+  (f) a v0.1.3 record (byte 0 = 0 or 1) loads with every setting intact;
+  (g) PLAY on an artist / genre / album row (the gesture) with Albums on:
+      the queue it builds groups by album too — it goes through the same four
+      builders, which is the whole reason the keys live on the entry.
+
 - **Pause on headphone unplug — the policy, and a probe that needs no cable.**
   The pause decision moved out of `kernel/main.c` (five untested inline lines
   over a file-scope `g_hp_last`) into `ui/jackwatch.c`, a pure module with its
@@ -973,7 +1025,8 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
 - **Overlays** — volume (skinny-wave speaker icon + fill bar + %),
   lock/unlock padlock modals, charging screen ("CHARGED" when done), boot
   splash. Anti-aliased modal/progress corners.
-- **Settings** — nine rows: Playback (shuffle / repeat / **resume**), Sound
+- **Settings** — nine rows: Playback (shuffle **Off/Songs/Albums** / repeat /
+  **resume** / sleep timer), Sound
   (volume / bass / treble / balance via the WM8758 EQ), Theme (seven live
   palette swaps — Linen, Onyx, Sage, Plaster, Olive, Umber, Mushroom; the
   picker scrolls, an unknown stored id lands on Linen), Display (backlight

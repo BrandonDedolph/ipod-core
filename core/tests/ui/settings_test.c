@@ -6,9 +6,9 @@
  * touches nothing but settings_t + stdint, so the on-device path and this test
  * compile the SAME source. This proves the model contract main.c relies on:
  *   1. Defaults: the documented starting values.
- *   2. activate() SELECT: toggles Shuffle, cycles Repeat OFF->ALL->ONE->OFF,
- *      flips Crossfade / Resume, cycles the Sleep Timer's durations, sets a
- *      theme.
+ *   2. activate() SELECT: cycles Shuffle Off->Songs->Albums->Off, cycles
+ *      Repeat OFF->ALL->ONE->OFF, flips Crossfade / Resume, cycles the Sleep
+ *      Timer's durations, sets a theme.
  *   3. adjust() wheel: clamps Volume/Bass and Display Brightness to range.
  *   4. Navigation: Root rows return the right ENTER_* / RESET action codes;
  *      value/kind reporting for a toggle and a slider row.
@@ -55,13 +55,36 @@ int main(void)
     check("def-resume-cleared",
           s.resume_hash == 0 && s.resume_secs == 0 && s.resume_total == 0);
 
-    /* --- Test 2: activate() toggles Shuffle --- */
-    check("shuffle-0", s.shuffle == 0);
-    check("act-shuffle-none",
-          settings_activate(SETTINGS_PLAYBACK, &s, 0) == SETTINGS_ACTION_NONE);
-    check("shuffle-1", s.shuffle == 1);
-    settings_activate(SETTINGS_PLAYBACK, &s, 0);
-    check("shuffle-back-0", s.shuffle == 0);
+    /* --- Test 2: activate() cycles Shuffle Off -> Songs -> Albums -> Off ---
+     *
+     * Three states since Shuffle Albums, on the same row and the same record
+     * byte, so the cycle (and the label each state shows) is what a reviewer
+     * of the persisted byte has to be able to trust. */
+    {
+        char v[24];
+        int tog, on, num, den;
+        check("shuffle-off", s.shuffle == SHUFFLE_OFF);
+        check("shuffle-kind-select",
+              settings_kind(SETTINGS_PLAYBACK, 0) == SETTINGS_KIND_SELECT);
+        settings_value(SETTINGS_PLAYBACK, &s, 0, v, &tog, &on, &num, &den);
+        check("shuffle-val-off", strcmp(v, "Off") == 0);
+
+        check("act-shuffle-songs-none",
+              settings_activate(SETTINGS_PLAYBACK, &s, 0) == SETTINGS_ACTION_NONE);
+        check("shuffle-songs", s.shuffle == SHUFFLE_SONGS);
+        settings_value(SETTINGS_PLAYBACK, &s, 0, v, &tog, &on, &num, &den);
+        check("shuffle-val-songs", strcmp(v, "Songs") == 0);
+
+        check("act-shuffle-albums-none",
+              settings_activate(SETTINGS_PLAYBACK, &s, 0) == SETTINGS_ACTION_NONE);
+        check("shuffle-albums", s.shuffle == SHUFFLE_ALBUMS);
+        settings_value(SETTINGS_PLAYBACK, &s, 0, v, &tog, &on, &num, &den);
+        check("shuffle-val-albums", strcmp(v, "Albums") == 0);
+
+        check("act-shuffle-wrap-none",
+              settings_activate(SETTINGS_PLAYBACK, &s, 0) == SETTINGS_ACTION_NONE);
+        check("shuffle-wrap-off", s.shuffle == SHUFFLE_OFF);
+    }
 
     /* --- Test 3: activate() cycles Repeat OFF -> ALL -> ONE -> OFF --- */
     check("repeat-off", s.repeat == REPEAT_OFF);

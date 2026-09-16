@@ -157,7 +157,13 @@ static uint32_t g_slot_buf[CONFIG_SLOT_BYTES / 4u];
 
 /* Payload v1 field offsets (within the payload). One byte each, fixed width,
  * endian-free — NOT a struct dump, so compiler padding/ABI can never change
- * the on-disk format. */
+ * the on-disk format.
+ *
+ * P_SHUFFLE carries the three-way shuffle_mode_t (0 off, 1 songs, 2 albums),
+ * not a flag. It widened in place rather than taking a new byte because the
+ * two readings agree where it matters: a build that only knows 0/1 reads a 2
+ * as "shuffle on", which is Songs — the honest downgrade — and this build
+ * reads any value it does not know as Off. No offset moved, no version bump. */
 enum {
     P_SHUFFLE = 0, P_REPEAT, P_RESUME, P_CROSSFADE, P_VOLUME,
     P_BASS, P_TREBLE, P_BALANCE, P_BL_SECS, P_BL_BRIGHT, P_THEME, P_CLICKER,
@@ -321,7 +327,7 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
     wr32(&rec[CFG_OFF_SEQ],     seq);
 
     uint8_t *p = &rec[CFG_OFF_PAYLOAD];
-    p[P_SHUFFLE]   = (uint8_t)(s->shuffle ? 1 : 0);
+    p[P_SHUFFLE]   = (uint8_t)clampi((int)s->shuffle, 0, 2);
     p[P_REPEAT]    = (uint8_t)clampi((int)s->repeat, 0, 2);
     p[P_RESUME]    = (uint8_t)(s->resume_on_startup ? 1 : 0);
     p[P_CROSSFADE] = (uint8_t)(s->crossfade ? 1 : 0);
@@ -412,7 +418,11 @@ int config_decode(const uint8_t *rec, settings_t *s, uint32_t *seq)
     }
 
     const uint8_t *p = &rec[CFG_OFF_PAYLOAD];
-    s->shuffle           = p[P_SHUFFLE] ? 1 : 0;
+    /* An unknown mode means Off, not the nearest one — same precedent as
+     * the theme id below: clamping would hand the user Albums, which is
+     * not a setting they ever chose. */
+    s->shuffle           = (p[P_SHUFFLE] <= 2) ? (shuffle_mode_t)p[P_SHUFFLE]
+                                               : SHUFFLE_OFF;
     s->repeat            = (repeat_mode_t)clampi(p[P_REPEAT], 0, 2);
     s->resume_on_startup = p[P_RESUME] ? 1 : 0;
     s->crossfade         = p[P_CROSSFADE] ? 1 : 0;

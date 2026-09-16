@@ -87,7 +87,7 @@ const (
 // (tools/make_config.py). The sound tail at 44 IS a user preference, so it is
 // modelled like the rest.
 type Settings struct {
-	Shuffle         uint8 // 0/1
+	Shuffle         uint8 // 0 off, 1 songs, 2 albums
 	Repeat          uint8 // 0=off 1=all 2=one
 	ResumeOnStartup uint8 // 0/1
 	Crossfade       uint8 // 0/1

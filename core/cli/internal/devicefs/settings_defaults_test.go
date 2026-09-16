@@ -107,11 +107,11 @@ func TestDefaultSettingsMatchesFirmware(t *testing.T) {
 // an integer literal, or one of the enum names the firmware uses there.
 func cValue(s string) (int, error) {
 	switch s {
-	case "REPEAT_OFF", "RESUME_KIND_NONE", "EQ_OFF":
+	case "REPEAT_OFF", "RESUME_KIND_NONE", "EQ_OFF", "SHUFFLE_OFF":
 		return 0, nil
-	case "REPEAT_ALL":
+	case "REPEAT_ALL", "SHUFFLE_SONGS":
 		return 1, nil
-	case "REPEAT_ONE":
+	case "REPEAT_ONE", "SHUFFLE_ALBUMS":
 		return 2, nil
 	}
 	return strconv.Atoi(s)

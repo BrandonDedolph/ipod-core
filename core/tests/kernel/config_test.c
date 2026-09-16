@@ -251,7 +251,8 @@ static int settings_eq(const settings_t *a, const settings_t *b)
  * of its range, so a codec that drops or truncates a field is caught. */
 static void spicy(settings_t *s)
 {
-    s->shuffle = 1;  s->repeat = REPEAT_ONE; s->resume_on_startup = 1;
+    s->shuffle = SHUFFLE_ALBUMS;  /* the top of the byte's range */
+    s->repeat = REPEAT_ONE; s->resume_on_startup = 1;
     s->crossfade = 1; s->volume = 100;
     s->bass = -12;   s->treble = 12;  s->balance = -100;
     s->backlight_secs = 60; s->backlight_bright = 1;
@@ -336,6 +337,30 @@ static void test_file_lba(void)
     lba = 0xDEADBEEFu;
     check("file_lba rejects an unmounted fs",
           fat32_file_lba(&zero, 2, &lba, &run) != 0 && lba == 0);
+}
+
+/*
+ * Re-stamp a record's CRC after poking its bytes, so what we hand the decoder
+ * is genuinely valid and only its CONTENT is under test. Spelled out here
+ * rather than imported from config.c for the same reason the write trace
+ * spells out its opcodes: a test that reuses the implementation's CRC agrees
+ * with whatever the implementation happens to compute.
+ */
+static void recrc(uint8_t *rec)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < CONFIG_SLOT_BYTES - 4u; i++) {
+        crc ^= rec[i];
+        for (int b = 0; b < 8; b++) {
+            uint32_t m = (uint32_t)0u - (crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & m);
+        }
+    }
+    crc = ~crc;
+    rec[CONFIG_SLOT_BYTES - 4] = (uint8_t)crc;
+    rec[CONFIG_SLOT_BYTES - 3] = (uint8_t)(crc >> 8);
+    rec[CONFIG_SLOT_BYTES - 2] = (uint8_t)(crc >> 16);
+    rec[CONFIG_SLOT_BYTES - 1] = (uint8_t)(crc >> 24);
 }
 
 /* ---- 2. record codec --------------------------------------------------- */
@@ -450,55 +475,39 @@ static void test_codec(void)
     rec[12 + 5] = 0x80;   /* bass = -128       */
     rec[12 + 10] = 99;    /* theme — no such id: must land on Linen (0) */
     rec[12 + 8] = 7;      /* backlight_secs — not a legal step */
-    {
-        /* Recompute the CRC the same way config.c does, so this record is
-         * genuinely valid and only its VALUES are wrong. */
-        uint32_t crc = 0xFFFFFFFFu;
-        for (uint32_t i = 0; i < CONFIG_SLOT_BYTES - 4u; i++) {
-            crc ^= rec[i];
-            for (int b = 0; b < 8; b++) {
-                uint32_t m = (uint32_t)0u - (crc & 1u);
-                crc = (crc >> 1) ^ (0xEDB88320u & m);
-            }
-        }
-        crc = ~crc;
-        rec[CONFIG_SLOT_BYTES - 4] = (uint8_t)crc;
-        rec[CONFIG_SLOT_BYTES - 3] = (uint8_t)(crc >> 8);
-        rec[CONFIG_SLOT_BYTES - 2] = (uint8_t)(crc >> 16);
-        rec[CONFIG_SLOT_BYTES - 1] = (uint8_t)(crc >> 24);
-    }
+    rec[12 + 0] = 7;      /* shuffle — no such mode: Off, NOT the nearest one */
+    recrc(rec);   /* genuinely valid again; only its VALUES are wrong */
     check("codec clamps an in-range-CRC but out-of-range record",
           config_decode(rec, &out, &seq) == 1 &&
           out.volume == 100 && out.backlight_bright == 32 &&
           out.bass == -12 && out.theme == 0 &&
-          out.backlight_secs == 5);
+          out.backlight_secs == 5 && out.shuffle == SHUFFLE_OFF);
+
+    /*
+     * The three shuffle modes on the wire. Byte 0 widened from a 0/1 flag to
+     * shuffle_mode_t without a version bump, so what a record written by any
+     * build means here is the whole compatibility story: 0 and 1 are exactly
+     * what v0.1.3 wrote, 2 is the new mode, and encode must never put a
+     * fourth value on a user's disk.
+     */
+    for (int m = 0; m <= 2; m++) {
+        config_encode(rec, &in, 1);
+        rec[12 + 0] = (uint8_t)m;
+        recrc(rec);
+        check("codec reads each shuffle mode back as itself",
+              config_decode(rec, &out, &seq) == 1 && (int)out.shuffle == m);
+    }
+    {
+        settings_t hot;
+        defaults(&hot);
+        hot.shuffle = (shuffle_mode_t)9;        /* a mode no build knows */
+        config_encode(rec, &hot, 1);
+        check("encode never writes a shuffle byte above Albums",
+              rec[12 + 0] == 2);
+    }
 }
 
 /* ---- 2b. the v2 resume tail, and v1 compatibility ---------------------- */
-
-/*
- * Re-stamp a record's CRC after poking its bytes, so what we hand the decoder
- * is genuinely valid and only its CONTENT is under test. Spelled out here
- * rather than imported from config.c for the same reason the write trace
- * spells out its opcodes: a test that reuses the implementation's CRC agrees
- * with whatever the implementation happens to compute.
- */
-static void recrc(uint8_t *rec)
-{
-    uint32_t crc = 0xFFFFFFFFu;
-    for (uint32_t i = 0; i < CONFIG_SLOT_BYTES - 4u; i++) {
-        crc ^= rec[i];
-        for (int b = 0; b < 8; b++) {
-            uint32_t m = (uint32_t)0u - (crc & 1u);
-            crc = (crc >> 1) ^ (0xEDB88320u & m);
-        }
-    }
-    crc = ~crc;
-    rec[CONFIG_SLOT_BYTES - 4] = (uint8_t)crc;
-    rec[CONFIG_SLOT_BYTES - 3] = (uint8_t)(crc >> 8);
-    rec[CONFIG_SLOT_BYTES - 2] = (uint8_t)(crc >> 16);
-    rec[CONFIG_SLOT_BYTES - 1] = (uint8_t)(crc >> 24);
-}
 
 /* Offsets are restated as literals, not imported: this file is the
  * independent statement of the on-disk contract that config.c has to meet. */

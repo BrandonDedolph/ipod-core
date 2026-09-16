@@ -37,6 +37,21 @@ typedef struct {
     uint32_t art_size;                   /*   use the queue-level art (album play) */
     uint8_t  fmt;                        /* 0 = FLAC, 1 = MP3 (only when !is_dir) */
     uint8_t  is_dir;                     /* 1 = subdirectory                     */
+    /*
+     * What Shuffle Albums groups and orders by. Filled by whoever builds the
+     * row (kernel/main.c, at every queue builder); the player only reads them.
+     *
+     * album is a group id, not a name: the library's album index + 1 for a
+     * library-built queue, 1 for a folder listing (one folder is one album),
+     * 0 for "unknown", which makes the entry its own group so it can never be
+     * glued to an unrelated album. order_key places the entry WITHIN its
+     * album and is the index's (disc << 16) | track — the very key
+     * browse_bind() sorts a tracklist by, so an album plays in the order the
+     * tracklist shows it, filenames notwithstanding. 0xFFFFFFFF is "the index
+     * does not know this file" and sorts last; ties fall back to queue order.
+     */
+    uint16_t album;
+    uint32_t order_key;
 } browse_entry_t;
 
 /* FAT32 block callback: read absolute 512-byte LBAs off the disk, with a
@@ -76,14 +91,30 @@ void player_resume(void);
 void player_toggle_pause(void);
 int  player_paused(void);              /* 1 while paused */
 
-/* Playback order/looping (driven by Settings). shuffle: play the queue in a
- * random PERMUTATION — every playable entry once, then the queue ends (or,
- * under Repeat All, a new permutation is dealt). Turning it on mid-track keeps
- * that track current and shuffles the rest; turning it off resumes plain
- * queue order from the current entry; re-setting it while already on is a
- * no-op (no re-deal). repeat: 0 = off (stop at queue end), 1 = all (loop the
- * queue), 2 = one (replay the current track). */
-void player_set_shuffle(int on);
+/*
+ * Playback order/looping (driven by Settings).
+ *
+ * shuffle, one of PLAYER_SHUFFLE_*: OFF walks the queue; SONGS walks a seeded
+ * PERMUTATION of the playable entries — every one once, then the queue ends
+ * (or, under Repeat All, a new permutation is dealt); ALBUMS walks a seeded
+ * permutation of ALBUM GROUPS (browse_entry_t.album), each group played
+ * whole in (order_key, queue index) order, so the album you are on finishes
+ * before another album starts.
+ *
+ * Any CHANGE of mode over a non-empty queue re-deals with the current track
+ * pinned first — its whole album, under ALBUMS — so switching modes never
+ * restarts or changes the song. Re-pushing the mode already in force is a
+ * no-op: settings_apply() pushes this on every settings change, volume
+ * included, and a re-deal there would silently reorder the album mid-listen.
+ * The ids match ui/settings.h's shuffle_mode_t (main.c asserts it).
+ *
+ * repeat: 0 = off (stop at queue end), 1 = all (loop the queue), 2 = one
+ * (replay the current track).
+ */
+#define PLAYER_SHUFFLE_OFF     0
+#define PLAYER_SHUFFLE_SONGS   1
+#define PLAYER_SHUFFLE_ALBUMS  2
+void player_set_shuffle(int mode);
 void player_set_repeat(int mode);
 
 /*
@@ -101,6 +132,12 @@ void player_set_repeat(int mode);
  * immediately, whether or not shuffle is on (the order is simply unused
  * until it is), and is a no-op on an empty queue; a `keep` past the queue
  * end pins nothing.
+ *
+ * The MODE is the third input: the same pair under ALBUMS deals album groups
+ * where under SONGS it deals tracks. Nothing stores it alongside the pair
+ * because the record already carries the mode as a setting, and the boot path
+ * pushes that before it deals (kernel/main.c: settings_apply, then
+ * resume_restore).
  */
 #define PLAYER_KEEP_NONE   (-1)
 #define PLAYER_KEEP_QUEUE  (-2)

@@ -1067,6 +1067,27 @@ if target == 'sim'
   )
   test('player-shuffle', player_shuffle_test, suite: 'unit')
 
+  # player-album: Shuffle Albums — the deal whose unit is an ALBUM. The
+  # fixture interleaves three albums in the queue AND scrambles their track
+  # numbers, so a pass that only regroups (or only reorders) fails it. Same
+  # fakes as player-queue; what is asserted is the sequence of files that
+  # would actually play, never the order array.
+  player_album_test = executable(
+    'player_album_test',
+    sources: ['player/player_album_test.c',
+              'player/player_test_stubs.c',
+              'hw_mmio/mmio_mock.c',
+              '../player/player.c',
+              '../kernel/pcm_ring.c'],
+    include_directories: include_directories(
+      '../player', '../hal', '../hal/hw', '../fs', '../kernel',
+      '../codecs', '../codecs/dr_flac', '../codecs/dr_mp3',
+      'hw_mmio', 'player', '.'),
+    c_args: ['-DMMIO_MOCK', '-DCORE_FREESTANDING'],
+    override_options: test_opts,
+  )
+  test('player-album', player_album_test, suite: 'unit')
+
   # player-clock: the reported position against what can be heard. The DMA
   # feeder pulls whole ping-pong buffers out of the PCM ring, two of which are
   # in flight inside the HAL at any time, so "consumed from the ring" runs

@@ -59,6 +59,20 @@
 #include "../ui/jackwatch.h"
 #include "hw/volume.h"
 
+/*
+ * The Settings shuffle row and the player's playback order are the same three
+ * values, deliberately: the byte in the config record is the enum, and
+ * settings_apply() hands it straight to player_set_shuffle(). They are
+ * declared in two headers because the player must not depend on the UI, so
+ * this is the seam that holds them together.
+ */
+_Static_assert((int)SHUFFLE_OFF    == PLAYER_SHUFFLE_OFF,
+               "settings shuffle ids must be the player's");
+_Static_assert((int)SHUFFLE_SONGS  == PLAYER_SHUFFLE_SONGS,
+               "settings shuffle ids must be the player's");
+_Static_assert((int)SHUFFLE_ALBUMS == PLAYER_SHUFFLE_ALBUMS,
+               "settings shuffle ids must be the player's");
+
 /* Host-findable version stamp: `core info` scans the OSOS body for this tag
  * (see core/docs/design/companion-app-plan.md, S8). Never printed — not on the
  * UART (the clicky boot golden matches those lines exactly) and not on the
@@ -605,6 +619,11 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
         b->size   = 0;
         b->fmt    = 0;
         b->is_dir = 1;
+        /* A row is never memset, so every field has to be written or it keeps
+         * whatever the previous listing left there. A folder never plays, so
+         * it belongs to no album and has no place in one. */
+        b->album     = 0;
+        b->order_key = 0xFFFFFFFFu;
         return 0;
     }
 
@@ -621,6 +640,12 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
     b->fmt    = (uint8_t)fmt;
     b->is_dir = 0;
     b->art_clus = b->art_size = 0;                 /* album play: queue-level art */
+    /* One folder is one album, so every row here shares a group id. The place
+     * within it is the index's and browse_bind() writes it; "unbound" is the
+     * right value until then, and a listing whose directory read failed never
+     * gets that far. */
+    b->album     = 1;
+    b->order_key = 0xFFFFFFFFu;
     return 0;
 }
 
@@ -2719,6 +2744,34 @@ static void songview_build(int genre, const char *artist)
     g_song_sel = g_song_accum = 0;
 }
 
+/*
+ * Fill one queue entry from a library record. The Songs-view builder and the
+ * Shuffle Songs builder were two copies of the same nine lines, and
+ * browse_entry_t is never memset — a field one copy forgot would carry over
+ * from whatever listing used the struct last. One authority. (playlist_play
+ * fills its own: a playlist row is a playlist_track_t, not a lib_song_t.)
+ *
+ * The album grouping is the index's: album_by_clus() is already resolved here
+ * for the cover art, and +1 leaves 0 free to mean "the album table does not
+ * know this folder" — a stray, which Shuffle Albums plays on its own rather
+ * than folding in with other strays.
+ */
+static void queue_entry_from_song(browse_entry_t *e, const lib_song_t *s)
+{
+    int k = 0;
+    for (; s->file[k] && k < NAME_MAX; k++) e->name[k] = s->file[k];
+    e->name[k]  = '\0';
+    e->clus     = s->file_clus;
+    e->size     = s->file_size;
+    e->fmt      = 0;                       /* the library is FLAC */
+    e->is_dir   = 0;
+    int ai = album_by_clus(s->dir_clus);
+    e->art_clus = (ai >= 0) ? g_albums[ai].art_clus : 0;
+    e->art_size = (ai >= 0) ? g_albums[ai].art_size : 0;
+    e->album    = (ai >= 0) ? (uint16_t)(ai + 1) : 0;
+    e->order_key = ((uint32_t)s->disc << 16) | s->track;
+}
+
 /* Play a song picked on the Songs list: the queue is the ENTIRE current song
  * view (all songs, in the displayed order), started at the picked track — so
  * "N of M" is the song's position in the whole library and Prev/Next walk every
@@ -2755,16 +2808,7 @@ static int library_play_song(fat32_t *fs, int songview_idx)
         if (g_songview[i] == sel_song) start = added;
         if (!s->file_clus) continue;              /* unresolved on disk — skip */
         browse_entry_t e;
-        int k = 0;
-        for (; s->file[k] && k < NAME_MAX; k++) e.name[k] = s->file[k];
-        e.name[k]  = '\0';
-        e.clus     = s->file_clus;
-        e.size     = s->file_size;
-        e.fmt      = 0;
-        e.is_dir   = 0;
-        int ai = album_by_clus(s->dir_clus);
-        e.art_clus = (ai >= 0) ? g_albums[ai].art_clus : 0;
-        e.art_size = (ai >= 0) ? g_albums[ai].art_size : 0;
+        queue_entry_from_song(&e, s);
         player_queue_add(&e);
         added++;
     }
@@ -2817,16 +2861,7 @@ static int shuffle_songs_build(fat32_t *fs, uint32_t seed, int start_si)
         if (!s->file_clus) continue;       /* unresolved (missing on disk) — skip */
         if (ord[i] == start_si) start = added;
         browse_entry_t e;
-        int k = 0;
-        for (; s->file[k] && k < NAME_MAX; k++) e.name[k] = s->file[k];
-        e.name[k]  = '\0';
-        e.clus     = s->file_clus;
-        e.size     = s->file_size;
-        e.fmt      = 0;                     /* library is FLAC */
-        e.is_dir   = 0;
-        int ai = album_by_clus(s->dir_clus);
-        e.art_clus = (ai >= 0) ? g_albums[ai].art_clus : 0;
-        e.art_size = (ai >= 0) ? g_albums[ai].art_size : 0;
+        queue_entry_from_song(&e, s);
         player_queue_add(&e);
         added++;
     }
@@ -3195,6 +3230,15 @@ static int playlist_play(int start)
         int ai = album_by_clus(t->dir_clus);
         e.art_clus = (ai >= 0) ? g_albums[ai].art_clus : 0;
         e.art_size = (ai >= 0) ? g_albums[ai].art_size : 0;
+        /* Shuffle Albums grouping. A playlist row is not a library record —
+         * only the bind (g_pl_song) knows its disc/track, so a row the index
+         * never matched plays last within its album rather than pretending to
+         * be its track 0. */
+        e.album    = (ai >= 0) ? (uint16_t)(ai + 1) : 0;
+        e.order_key = (g_pl_song[i] >= 0)
+                        ? (((uint32_t)g_songs[g_pl_song[i]].disc << 16) |
+                            g_songs[g_pl_song[i]].track)
+                        : 0xFFFFFFFFu;
         player_queue_add(&e);
     }
     if (start < 0 || start >= g_pl_tracks_n) start = 0;
@@ -3670,11 +3714,20 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
     /* Compact shuffle / repeat / sleep tokens, right-aligned before the
      * battery. Built as ONE string and measured once, so the spacing between
      * them is the font's own kerning rather than three guessed offsets. Worst
-     * case "SHUF RPT1 SLEEP 120" is 107 px against the ~194 px of air this
-     * band has beside "Now Playing". */
+     * case "SHUF·ALB RPT1 SLEEP 120" is 128 px against the ~194 px of air this
+     * band has beside "Now Playing" (23 bytes into st[32], too). */
     {
         char st[32]; int p = 0;
-        if (g_settings.shuffle) { const char *s = "SHUF"; while (*s) st[p++] = *s++; }
+        if (g_settings.shuffle) {
+            /* SHUF·ALB only when albums is what is actually being walked: a
+             * Shuffle Songs queue IS its own song order (PLAYER_KEEP_QUEUE),
+             * and the setting does not regroup it, so the token must not
+             * claim otherwise. */
+            const char *s = (g_settings.shuffle == SHUFFLE_ALBUMS &&
+                             player_order_keep() != PLAYER_KEEP_QUEUE)
+                              ? "SHUF" UI_GLYPH_MIDDOT "ALB" : "SHUF";
+            while (*s) st[p++] = *s++;
+        }
         if (g_settings.repeat != REPEAT_OFF) {
             if (p) st[p++] = ' ';
             const char *s = (g_settings.repeat == REPEAT_ONE) ? "RPT1" : "RPT";
@@ -3961,6 +4014,8 @@ static void browse_bind(uint32_t dir_clus)
     for (int i = 0; i < n; i++) {
         g_browse_song[i] = -1;
         g_browse_key[i]  = 0xFFFFFFFFu;       /* unbound rows sort last */
+        g_browse[i].order_key = 0xFFFFFFFFu;  /* the row carries it into the
+                                               * queue (Shuffle Albums)      */
     }
     /* One pass over the library: the album's songs are the ones whose folder
      * is this one, and each finds its row by cluster among at most BROWSE_MAX.
@@ -3973,6 +4028,11 @@ static void browse_bind(uint32_t dir_clus)
             if (g_browse[i].is_dir || g_browse[i].clus != sg->file_clus) continue;
             g_browse_song[i] = (int16_t)s;
             g_browse_key[i]  = ((uint32_t)sg->disc << 16) | sg->track;
+            /* Written onto the row as well as into the sort key: the album
+             * queue is a copy of g_browse, and Shuffle Albums orders a group
+             * by exactly this. The swap loop below carries it along with the
+             * rest of the entry. */
+            g_browse[i].order_key = g_browse_key[i];
             break;
         }
     }
@@ -7221,6 +7281,16 @@ _Noreturn static void run_ui(fat32_t *fs)
                              * dirty and spin the drive up three seconds later to
                              * write a byte-identical record. */
                             settings_apply();
+                            /* Shuffle changed under a playing queue means the
+                             * player just dealt a NEW order; the record still
+                             * carries the old (seed, keep) until the next
+                             * capture edge (a track change, a pause, five
+                             * minutes), and a boot inside that window would
+                             * deal a valid but different order. Capture now.
+                             * resume_capture() is idempotent — it touches only
+                             * when something actually moved — so the rows that
+                             * are not about playback pay nothing. */
+                            resume_capture();
                             settings_touch();
                         }
                     }

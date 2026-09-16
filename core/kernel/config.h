@@ -83,6 +83,11 @@
  *         the field today) reads as "no volume limit, EQ off", which is what
  *         those devices already do.
  *
+ * Payload byte 0 (shuffle) widened from a 0/1 flag to the three-way
+ * shuffle_mode_t (0 off, 1 songs, 2 albums) WITHOUT a version bump: an older
+ * build reads a 2 as "on" (Songs) and this one reads an unknown value as Off,
+ * so both directions stay meaningful and the record keeps its length.
+ *
  * The v2 payload is v1's with fields APPENDED — no existing offset moved, so
  * the header and the first 12 payload bytes of a v1 record on a user's disk
  * still mean exactly what they meant. Compatibility runs both ways, and the
