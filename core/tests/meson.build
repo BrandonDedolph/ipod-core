@@ -199,6 +199,28 @@ if target == 'sim'
   )
   test('letterindex', letterindex_test, suite: 'unit')
 
+  # search: Music > Search (core/ui/search.c) — the SAME source the ARM build
+  # links into core.elf. It is the first screen here whose whole value is a
+  # JUDGEMENT rather than a fact — which of two matches the person meant — and
+  # none of that is visible from a screenshot: "Sunflower Bean" above "The
+  # Sun", the one artist above two hundred songs, an accented album reachable
+  # from an unaccented query, an apostrophe the 39-cell ring cannot type
+  # crossed anyway, and the cap admitting how much it hid. The library is
+  # injected, so the fixture is thirty names chosen for exactly those cases.
+  # §6-8 are the painter in chrome_test.c's style — render into console_fb()
+  # and read the pixels back — because the layout's claims (the status band is
+  # untouched, the scrollbar column is untouched in PICK, the footer appears
+  # only when something was hidden) are the ones a renderer breaks by accident.
+  search_test = executable(
+    'search_test',
+    sources: ['ui/search_test.c', '../ui/search.c', '../ui/chrome.c',
+              '../ui/text.c', '../ui/palette.c', '../library/fold.c',
+              '../library/names.c', '../kernel/console.c'],
+    include_directories: include_directories('../ui', '../kernel', '../hal', '.'),
+    override_options: test_opts,
+  )
+  test('search', search_test, suite: 'unit')
+
   # keyhold: tap-vs-hold press-length arbitration (core/ui/keyhold.c) — the
   # SAME source the ARM build links into core.elf, driving PLAY (tap = pause,
   # hold = sleep), MENU (tap = back, hold = the main menu) and, through
@@ -936,6 +958,24 @@ if target == 'sim'
     override_options: test_opts,
   )
   test('names', names_test, suite: 'unit')
+
+  # fold: the search fold (core/library/fold.c) — the SAME source the ARM
+  # build links into core.elf. It exists because name_hash() must NOT grow a
+  # diacritic rule (its output is the on-disk locator, computed independently
+  # by tools/build_index.py and pinned on both sides), and the price of a
+  # second folder is that it has to AGREE with the first on the rules they
+  # share — which §4 asserts through name_hash itself rather than by reading
+  # both functions. The rest is the 192-entry table, spot-checked at every
+  # seam including the two non-letters inside it, plus fold_ascii's bounds
+  # under sentinels and the 1:1 codepoint-to-byte property ui/search.c relies
+  # on, checked over the whole BMP.
+  fold_test = executable(
+    'fold_test',
+    sources: ['library/fold_test.c', '../library/fold.c', '../library/names.c'],
+    include_directories: include_directories('../library', '.'),
+    override_options: test_opts,
+  )
+  test('fold', fold_test, suite: 'unit')
 
   # playlist: the Playlists read path (core/library/playlist.c) — the SAME
   # source the ARM build links. Lists <library root>/Playlists/*.m3u8 and

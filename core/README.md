@@ -236,7 +236,10 @@ partition: boot + MMAP0 remap, LCD, click-wheel, backlight, WM8758B audio,
 DMA streaming playback, ATA + FAT32, and streaming FLAC off the device's disk
 (MP3 is parked — see "Audio path"), with the full menu / browser /
 now-playing UI, seven themes, persistent settings, resume-on-boot, sleep /
-power-off from the Play button, and the on-disk event log.
+power-off from the Play button, and the on-disk event log. Music → Search
+(a wheel-driven character ring over song titles, artists, albums and playlist
+names) and the A-Z locator plate on every long list are in the tree but have
+not been flashed.
 
 Not yet confirmed on hardware: gapless playback, playlists with real
 `.m3u8` files, and the post-fix FLAC seek timing (the fix is in — see

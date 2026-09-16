@@ -3,6 +3,109 @@
 The README is the canonical public story; this doc is the running list of
 what works, what doesn't, and what to pick up next.
 
+## 2026-09-16 — Music › Search, UNFLASHED
+
+The one thing this device could not do: find a track whose album you cannot
+remember. Music grows a seventh active row, **Search**.
+
+**How it works.** The wheel drives a 39-cell ring — A–Z, 0–9, SPACE, DEL,
+DONE — one cell a detent, wrapping, with fifteen cells on screen centred on
+the cursor. Select types; RIGHT is the space bar (it never jumps to Now
+Playing while the picker is up, which is the one place the global RIGHT rule
+is suspended) and LEFT is backspace, so the two dead keys on a list screen
+become the two keys a text field needs. Every keystroke rescans and the top
+four hits appear under the ring as you type; DONE hands the wheel to the full
+list, MENU comes back to the ring with the query intact, MENU again leaves.
+
+**The ranking is the feature.** A match anywhere in a name counts, but names
+that START with the query come first, and within a rank the order is
+few-to-many: artists, albums, playlists, songs. Without that, "sun" buries
+Sunflower Bean under every track with the word in it. Artists rank on their
+SORT key, past a leading "The", so "kid" puts The Kid LAROI at the top — the
+same rule that files it under K on the Artists list.
+
+**`library/fold.c`** is the new folding, and it is deliberately NOT
+`name_hash`. name_hash is the on-disk locator: its bytes are recomputed by
+`tools/build_index.py` and pinned by `tests/kernel/name_hash_vectors.h` on
+both sides, so growing it a diacritic rule would silently unbind every
+accented name in every library an older host tool built. fold.c keeps
+name_hash's case and dash rules, adds a 192-entry Latin-1 + Latin Extended-A
+table (`elan` finds Élan), and DROPS the quotes entirely — the ring has no
+apostrophe key and nowhere to put one, so "its over" has to find "It's Over".
+The invariant that matters is asserted through name_hash itself: every pair of
+spellings it calls one name, this folds to one string.
+
+**The scan is a plain linear walk** — every artist, album, playlist name and
+song title folded and substring-matched per keystroke, ~150 KB of text
+typical. A folded-title cache would cost 288 KB of .bss and is not bought
+until a bench says the scan is felt, so every scan prints what it cost:
+`core: search 3 chars 41 hits 27 ms`. The 25–55 ms estimate is a claim until
+that line is read off a real device.
+
+**Hits act like the rows they stand for.** A song plays in its ALBUM (not the
+6000-row Songs queue): it is what "play this one" means, it resumes through
+the existing `RESUME_KIND_ALBUM` path and it skips the LOADING SONGS bar. An
+artist opens their albums; an album opens its tracklist, and MENU from there
+returns to the results rather than revealing an album list that was never on
+screen (`g_br_from_search`); a playlist opens its tracks. A song the index
+lists but the disk no longer has is greyed and Select does nothing.
+
+**It fits the gestures that landed beside it.** PLAY in the picker is the
+transport it is everywhere else — a text field has no row under the cursor, and
+that is said the way `gesture.h` already says it, with a row count of 0. PLAY
+on a RESULT starts the row's queue exactly as PLAY on the list that row came
+from does: an artist's whole discography, an album or a playlist from its first
+track, a song in its album. The judgement lives in `ui/search.c`
+(`search_play_rows`) where the host can assert it, not in main.c's switch.
+RIGHT inside the picker is the space bar and never a skip. The drain's
+`seekhold_void()` for a RIGHT press off the player screens stays
+UNCONDITIONAL — it has to be, because the seek machines are fed from the live
+button state at the top of a pass and this drain reads the tick-latched event
+further down, so a press that begins between the two is invisible to the
+machine until the pass AFTER the jump, by which time the screen is Now Playing
+and `allowed` is 1. Without the void that press is a skip on release or a seek
+on a hold, on every list, not just Search. `gesture_test` now models that
+ordering and asserts both halves of it, the voided one and the one that would
+skip. A MENU hold reaches the main menu from
+Search like anywhere else — and `scr_pop_to_root` now resets the wheel gesture,
+which it did not, and which matters because letter mode outlives a pause.
+
+Also: `menu_render_list` finally scrolls, because Music is nine rows in an
+eight-row window and a menu that silently drops its last row is the worst way
+to find out it grew. Playlists are read once a session for the search rather
+than on every entry.
+
+66 host suites green (new: `fold`, `search` — the latter with a pixel-oracle
+painter test in `chrome_test.c`'s style — plus the Search shapes added to
+`gesture`), ARM `-Werror` + `verify-hw` clean. The three stages cost 7,792 B
+of text, 2,120 B of .bss and 40 B of .data against main (the .data is
+`g_letters_for`'s initialiser and `g_search_src`) — 36%, 83% and under 1% of
+their budgets, and no new MB-scale buffer. `docs/screens/render.py` gained `letter.png`, `search.png` and
+`search_results.png`.
+
+**Nothing here has run on the device.** The bench:
+1. Music shows nine rows with a scrollbar; Genres and Search are both
+   reachable and the last row is not cut off.
+2. Search opens with the cursor on A, an empty plate and the hint.
+3. Type S-U-N: hits appear as you type, artist first. RIGHT types a space,
+   LEFT deletes. DONE opens the results; MENU returns to the ring with SUN
+   still there; MENU again is Music.
+4. DONE on a query with no matches does nothing (and the rows say No matches).
+5. The four actions: a song plays in its album and MENU from Now Playing is
+   the results; an artist opens its albums; an album opens its tracklist and
+   MENU is the results, NOT the Albums list; a playlist opens its tracks.
+6. An accented or apostrophed title in the library is found by its plain
+   spelling.
+7. Read `core: search … ms` off `CORELOG.BIN` for a one-, two- and
+   three-character query on the full library — that is the real scan cost, and
+   the number this entry is missing.
+8. The first Search of a session after the drive has parked: the playlist
+   folder read spins it up once. Time it; it should be the only stall.
+9. PLAY in the picker pauses and resumes; PLAY on each of the four result
+   kinds starts the right queue, and MENU from Now Playing is the results.
+   Hold RIGHT in the picker: one space, no seek. Hold MENU: the main menu.
+10. Onyx: the ring's cursor pill and the query plate in a dark palette.
+
 ## 2026-09-16 — Steering by letter, UNFLASHED
 
 Two changes to `ui/wheel.c`, one of which alters how an existing device
@@ -33,7 +136,7 @@ and that a screen with no letters never reaches either.
 
 `wheel` suite extended (§4 split three ways, new §9 over the seam); the
 `letterindex` step cases are deliberately §6's, because this is the swap.
-61 host suites green, ARM `-Werror` + `verify-hw` clean.
+ARM `-Werror` + `verify-hw` clean.
 
 **Nothing here has run on the device.** The bench:
 - Spin Songs fast, stop half a second, one detent → the NEXT letter, plate
@@ -46,7 +149,7 @@ and that a screen with no letters never reaches either.
 - At either end of the alphabet a further detent does nothing and does not
   click.
 - A fast spin that ends in a SELECT does not carry the plate onto the screen
-  that SELECT opened.
+  that SELECT opened — nor does one that ends in a MENU hold.
 
 ## 2026-09-16 — The A-Z letter on every long list, UNFLASHED
 
@@ -98,7 +201,7 @@ by value in the suite so a bench can retune them in one line.
 `scr_push`/`scr_pop` now call `wheel_accel_reset()`, which `ui/wheel.h` has
 claimed they do since the extraction and they never did.
 
-61 host suites green (new: `letterindex`), ARM `-Werror` + `verify-hw` clean.
+`letterindex` is a new host suite; ARM `-Werror` + `verify-hw` clean.
 bss +456 B, text +1.2 KB.
 
 **Nothing here has run on the device.** The bench:
@@ -1155,7 +1258,10 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
    have is an in-place overwrite of one pre-allocated file's first cluster
    (`config.c`). The read path was a day; the write path is a filesystem
    project.
-2. **Search** — not implemented.
+2. **Search** — built (2026-09-16), **not yet flashed**; see that entry's
+   bench list. What is still not there: searching by genre or composer, art
+   chips on album hits, and any narrowing of the scan (a full library walk
+   per keystroke, timed onto the UART).
 3. **A screen-tuned font face.** Advances, kerning and tracking are all
    fixed and measured, and the type still reads wrong at 9–13 px. Nunito
    ships no hinting bytecode, so the next lever is swapping the face for

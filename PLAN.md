@@ -152,7 +152,10 @@ In the order they're worth doing.
    solid white until a reboot; two of the three stated preconditions
    (`bcm_init()` exists, the post-wake relight is deferred) have since been
    met.
-4. **Search.** Not implemented, and the index is already in RAM.
+4. **Search.** ~~Not implemented~~ — built, **not yet flashed**: Music →
+   Search, a 39-cell character ring over the in-RAM index, matching song
+   titles / artists / albums / playlist names through `library/fold.c`.
+   `core/ui/search.c` + `STATUS.md`'s 2026-09-16 entry carry the bench list.
 5. **Playlist writing — i.e. FAT32 cluster allocation.** The only write we
    have is an in-place overwrite of one pre-allocated file's first cluster,
    which touches zero filesystem metadata *by design*. Saving a playlist

@@ -5,6 +5,25 @@ the boot screen and Settings → About show the one the device runs.
 
 ## Unreleased
 
+- **Search.** Music → Search. The wheel moves along a strip of letters, digits and SPACE / DEL /
+  DONE, and Select types; Right is a space and Left deletes. It matches song titles, artist names,
+  album titles and playlist names as you type, showing the first four hits under the strip, and
+  DONE opens the whole list. Names that start with what you typed come first, and artists before
+  albums before playlists before songs, so one artist is never buried under two hundred tracks.
+  Capitals, accents and curly apostrophes are all ignored: `elan` finds *Élan* and `its over`
+  finds *It's Over* — which matters because the strip has no apostrophe key. Select or Play on a
+  result does what the same row does anywhere else: the song plays in its album, the artist,
+  album or playlist opens or plays. Above 200 matches it says how many there really are and asks
+  for another letter. What you typed survives leaving the screen until the device is powered off.
+- **The A–Z letter on every long list.** The big letter a fast spin puts on screen used to appear
+  on Songs alone; it is now on any alphabetical list of about six screens or more — Artists,
+  Albums, Playlists, Genres, an artist's All Songs, a genre's songs. It is the letter the list is
+  *sorted by*, so The Kid LAROI is under K and an album is under its own title. While the letter
+  is up a click moves a whole letter rather than a row, and it stays up — and stays in letter
+  mode — for just over a second after you stop, so pausing to read it no longer drops you back to
+  scrolling one row at a time.
+- **Genres are in alphabetical order.** They used to be listed in whatever order the library
+  happened to load them in.
 - **Shuffle Albums.** Settings → Playback → Shuffle is now Off, Songs or Albums. Songs is what
   Shuffle always did. Albums plays the album you are on to its end in track order, then another
   album from the same list at random, until every album in that list has played; Repeat All starts

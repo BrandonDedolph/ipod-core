@@ -442,6 +442,58 @@ int main(void)
     xpect(&c, "regain: the next press is a fresh one",
           step(&r, 1) == SEEKHOLD_NONE && step(&r, 0) == SEEKHOLD_SKIP);
 
+    /* ---- the drain's void, and the pass ordering it exists for ----------- *
+     *
+     * kernel/main.c feeds these machines from the LIVE button state at the top
+     * of a pass and drains the TICK-LATCHED event further down, so a press can
+     * begin BETWEEN the two. On a list screen the drain spends that press on
+     * the jump to Now Playing — and by the next pass the screen IS Now Playing,
+     * so `allowed` is 1 and the machine would see a perfectly ordinary
+     * down-edge. seekhold_void() is what stops it owning the press.
+     *
+     * Both halves are asserted, because a test that only ran the voided path
+     * would pass with the call deleted — which is exactly how it went missing.
+     */
+    {
+        rig_t v;
+
+        /* Voided: the drain got there first. */
+        rig_init(&v, +1, 100, 300);
+        v.allowed = 0;                       /* a list screen */
+        step(&v, 0);                         /* the feed samples: still up   */
+        seekhold_void(&v.s);                 /* ...the press arrives and the */
+        v.allowed = 1;                       /* drain pushes Now Playing     */
+        int quiet = (step(&v, 1) == SEEKHOLD_NONE) &&
+                    (step(&v, 0) == SEEKHOLD_NONE);
+        xpect(&c, "drain: a press voided by the jump is not a skip on release",
+              quiet);
+
+        rig_init(&v, +1, 100, 300);
+        v.allowed = 0;
+        step(&v, 0);
+        seekhold_void(&v.s);
+        v.allowed = 1;
+        int held_quiet = 1;
+        for (int i = 0; i < 200; i++) {      /* two seconds of holding it */
+            if (step(&v, 1) != SEEKHOLD_NONE) held_quiet = 0;
+        }
+        xpect(&c, "drain: ...and holding it never aims, however long",
+              held_quiet && !seekhold_active(&v.s));
+        xpect(&c, "drain: the release after that hold is silent too",
+              step(&v, 0) == SEEKHOLD_NONE);
+        xpect(&c, "drain: and the NEXT press is a fresh, ordinary one",
+              step(&v, 1) == SEEKHOLD_NONE && step(&v, 0) == SEEKHOLD_SKIP);
+
+        /* Not voided: the same timeline is a skip. This is the regression the
+         * assertions above are guarding, stated as the behaviour it would be. */
+        rig_init(&v, +1, 100, 300);
+        v.allowed = 0;
+        step(&v, 0);
+        v.allowed = 1;                       /* no void */
+        xpect(&c, "drain: WITHOUT the void that same press skips the track",
+              step(&v, 1) == SEEKHOLD_NONE && step(&v, 0) == SEEKHOLD_SKIP);
+    }
+
     /* ---- the PLAY-tap policy, screen by screen --------------------------- *
      * The manual's rule: Play on a highlighted list title plays that list.
      * Everywhere there is no title under the cursor it stays pause/resume —
@@ -476,6 +528,19 @@ int main(void)
         xpect(&c, "play tap: only a row that names or is a track starts one",
               ok_full);
         xpect(&c, "play tap: an empty list pauses or resumes instead", ok_empty);
+
+        /* Music > Search rides on these two rules rather than a context of its
+         * own. Its PICKER reports a count of 0 — a text field has no row under
+         * the cursor, so PLAY stays the transport it is everywhere else — and a
+         * RESULT row reports LIST_TRACK for a song and LIST_TITLE for an
+         * artist, album or playlist. ui/search.c's search_play_rows() is what
+         * kernel/main.c asks; these are the answers it gets back. */
+        xpect(&c, "play tap: Search's picker (no row, count 0) is pause/resume",
+              gesture_play_tap(GESTURE_CTX_LIST_TITLE, 0) == GESTURE_PLAY_PAUSE &&
+              gesture_play_tap(GESTURE_CTX_LIST_TRACK, 0) == GESTURE_PLAY_PAUSE);
+        xpect(&c, "play tap: a Search result starts its queue, song row or not",
+              gesture_play_tap(GESTURE_CTX_LIST_TRACK, 12) == GESTURE_PLAY_START &&
+              gesture_play_tap(GESTURE_CTX_LIST_TITLE, 12) == GESTURE_PLAY_START);
     }
 
     return xfail_done(&c);

@@ -23,8 +23,10 @@ New to the device? Read the [user guide](docs/USER_GUIDE.md).
 - **Loads the library in one read.** A host-built index (`CORELIB.IDX`) with up to 6000 songs,
   1024 albums, 512 artists and 128 genres, full UTF-8. Album-art sidecars for list chips and the
   Now Playing cover.
-- **Browses by playlist, artist, album, song and genre.** Two-line rows, art chips, a marquee for
-  long titles, an artist's whole discography as one list, `.m3u8` playlists read from the disk.
+- **Browses by playlist, artist, album, song and genre, and searches.** Two-line rows, art chips,
+  a marquee for long titles, an artist's whole discography as one list, `.m3u8` playlists read from
+  the disk, an A–Z letter on every long list, and a Search that types on the wheel and matches
+  titles, artists, albums and playlists — through accents and curly apostrophes.
 - **Draws real type.** A libc-free, gamma-correct text renderer with six Nunito atlases, kerned
   and tracked from measured ink.
 - **Has seven themes.** Linen, Onyx, Sage, Plaster, Olive, Umber, Mushroom. The selection bar is
@@ -58,6 +60,19 @@ on the sub-line.
     <td><img src="docs/screens/artists.png" width="260" alt="Artists"></td>
     <td><img src="docs/screens/allsongs.png" width="260" alt="An artist's songs"></td>
     <td><img src="docs/screens/playlists.png" width="260" alt="Playlists"></td>
+  </tr>
+</table>
+
+### Finding things
+
+Spin the wheel fast on any long list and the letter it is sorted by comes up; a click then moves a
+whole letter. Music → Search types on the wheel and matches as you go.
+
+<table>
+  <tr>
+    <td><img src="docs/screens/letter.png" width="260" alt="The A-Z letter on a long list"></td>
+    <td><img src="docs/screens/search.png" width="260" alt="Search"></td>
+    <td><img src="docs/screens/search_results.png" width="260" alt="Search results"></td>
   </tr>
 </table>
 
@@ -214,7 +229,8 @@ ROM; nothing this firmware writes can remove it. Reflash, or restore the partiti
 ## Status
 
 Runs on the device: direct boot, FLAC playback, the library, themes, settings and resume, sleep
-and power-off, the event log. Not there: MP3 in real time, writing playlists, search, podcasts.
+and power-off, the event log. Built but not yet flashed: Search and the A–Z letter on every list.
+Not there: MP3 in real time, writing playlists, podcasts.
 The running list of what works and what is next is [`STATUS.md`](STATUS.md).
 
 Versions are git tags, `v0.1.0` and up. The boot screen's bottom-right stamp and Settings → About

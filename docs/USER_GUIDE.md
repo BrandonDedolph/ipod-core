@@ -37,11 +37,11 @@ Playlists, Genres — spinning the wheel fast puts a big letter on screen so you
 stays for just over a second after you stop, and while it is up the wheel moves a **letter** per
 click, not a row — so you can stop, read it, and keep going letter by letter. Lift for longer than
 that and the letter goes away; the next click is one row again. It is the letter the list is
-**sorted by**, which is not always the letter the row starts with: Artists ignore a leading
-"The", so The Kid LAROI is under K, and an album is under its own title, not its artist's. Short lists have no letter: aiming
-only beats scrolling once a list is longer than about six screens. A name that starts with a digit,
-a bracket or an accented letter shows `#` — accented names sort after Z, so Élan is at the bottom
-of the list rather than under E.
+**sorted by**, which is not always the letter the row starts with: Artists ignore a leading "The",
+so The Kid LAROI is under K, and an album is under its own title, not its artist's. Short lists
+have no letter: aiming only beats scrolling once a list is longer than about six screens. A name
+that starts with a digit, a bracket or an accented letter shows `#` — accented names sort after Z,
+so Élan is at the bottom of the list rather than under E.
 
 Hold Play for two seconds to sleep. Keep holding past five seconds and the device powers off
 instead. Any button wakes a sleeping device where you left it. A powered-off device cold boots on
@@ -80,8 +80,8 @@ repeat are on, and SLEEP after them.
 **Main menu.** Music, Playlists, Settings, and Now Playing once something is loaded. Podcasts and
 Audiobooks are greyed placeholders.
 
-**Music.** Playlists, Artists, Albums, Songs, Shuffle Songs, Genres. Composers and Audiobooks are
-greyed placeholders.
+**Music.** Playlists, Artists, Albums, Songs, Shuffle Songs, Genres, Search. Composers and
+Audiobooks are greyed placeholders. The list is nine rows in an eight-row window, so it scrolls.
 
 **Albums** lists every album with its cover chip and artist. Select opens the album: cover, title,
 artist, track count and length, then the tracks with their numbers and durations. Select on a
@@ -98,6 +98,49 @@ it). Select one to see its tracks; Select a track to play the playlist from ther
 
 The header's right side shows where you are in the list, for example `6 / 17`. A long title
 scrolls while it is selected.
+
+### Search
+
+<table>
+  <tr>
+    <td><img src="screens/search.png" width="260" alt="Search"></td>
+    <td><img src="screens/search_results.png" width="260" alt="Search results"></td>
+  </tr>
+</table>
+
+Music → Search. The wheel moves along a strip of letters, digits and three words — SPACE, DEL and
+DONE — and Select types the one under the cursor. Every keystroke searches; the four best matches
+appear under the strip as you type, and the header counts them. DONE hands the wheel to the full
+list.
+
+| | In the picker | In the results |
+|---|---|---|
+| Wheel | Moves along the strip, wrapping | Moves the selection |
+| Select | Types the character. On DEL, deletes one. On DONE, opens the results | Opens the row |
+| Right | A space — never a skip, and holding it types one space, not a seek | Jumps to Now Playing |
+| Left | Deletes one character | Nothing |
+| Menu | Back to Music, keeping what you typed | Back to the picker, keeping the results |
+| Play | Pause or resume: there is no row under the cursor | Plays the row, as Play does on the list it came from |
+
+Play in the results starts the row's queue rather than opening it: an artist's whole discography,
+an album or a playlist from its first track, a song in its album. Holding Menu for a second still
+goes to the main menu, and what you typed is still there when you come back.
+
+It matches anywhere in a name, not just the start, but names that **start** with what you typed
+come first — and artists, then albums, then playlists, then songs, so one artist is never buried
+under two hundred tracks. Capitals do not matter, accents do not matter (`elan` finds *Élan*) and
+neither do apostrophes, which is just as well because the strip has no key for one: `its over`
+finds *It's Over*. A leading space and a double space are ignored.
+
+Select a result and it does what the same row would do anywhere else: a **song** plays, in its
+album, so Next is the rest of the record; an **artist** opens their albums; an **album** opens its
+tracklist; a **playlist** opens its tracks. Menu comes back to the results every time. A song the
+index lists but the disk no longer has is greyed, and Select does nothing on it.
+
+Above two hundred matches the list stops and the corner says how many there really are — type
+another letter. Your query survives leaving the screen and comes back when you return, until the
+device is powered off. The first time you open Search after a boot it reads the Playlists folder,
+which can wake a sleeping disk for a moment.
 
 ## Now Playing
 
