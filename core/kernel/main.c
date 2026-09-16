@@ -5842,6 +5842,15 @@ _Noreturn static void run_ui(fat32_t *fs)
             uint32_t nowp = mmio_read32(USEC_TIMER_ADDR);
             int      down = !g_locked &&
                             (clickwheel_buttons() & WHEEL_BTN_PLAY) != 0;
+            /* A hold does not suspend inline: it sets a flag and the stamp
+             * the escalation should be timed from, and ONE block below does
+             * the sleep and the bookkeeping after it. Nothing else can ask
+             * for a suspend yet — the sleep timer is what this is for — but
+             * the alternative was a second copy of the five-local re-seed,
+             * and the two would have drifted. */
+            int      want_suspend   = 0;
+            uint32_t suspend_origin = nowp;
+
             switch (keyhold_feed(&play_key, down, nowp, PLAY_HOLD_US)) {
             case KEYHOLD_TAP:
                 /* Transport: PLAY toggles pause from any screen, like a real
@@ -5852,7 +5861,17 @@ _Noreturn static void run_ui(fat32_t *fs)
                 }
                 break;
             case KEYHOLD_HOLD:
-                suspend_to_ram(keyhold_down_us(&play_key));  /* returns on wake */
+                /* Keep timing the escalation to PMU standby from the moment
+                 * the finger went down, not from now. */
+                want_suspend   = 1;
+                suspend_origin = keyhold_down_us(&play_key);
+                break;
+            case KEYHOLD_NONE:
+                break;
+            }
+
+            if (want_suspend) {
+                suspend_to_ram(suspend_origin);              /* returns on wake */
                 last_input   = mmio_read32(USEC_TIMER_ADDR);
                 last_present = last_input;      /* suspend just presented the wake
                                                  * frame: pace the loop's own
@@ -5867,9 +5886,6 @@ _Noreturn static void run_ui(fat32_t *fs)
                                                  * idempotent); don't wake it
                                                  * a second time below */
                 dirty      = 1;                 /* repaint the current screen */
-                break;
-            case KEYHOLD_NONE:
-                break;
             }
         }
 
