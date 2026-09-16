@@ -7,7 +7,8 @@
  * compile the SAME source. This proves the model contract main.c relies on:
  *   1. Defaults: the documented starting values.
  *   2. activate() SELECT: toggles Shuffle, cycles Repeat OFF->ALL->ONE->OFF,
- *      flips Crossfade / Resume, sets a theme.
+ *      flips Crossfade / Resume, cycles the Sleep Timer's durations, sets a
+ *      theme.
  *   3. adjust() wheel: clamps Volume/Bass and Display Brightness to range.
  *   4. Navigation: Root rows return the right ENTER_* / RESET action codes;
  *      value/kind reporting for a toggle and a slider row.
@@ -219,7 +220,7 @@ int main(void)
 
     /* --- Test 11: counts + generic value/kind reporting --- */
     check("count-root",  settings_count(SETTINGS_ROOT) == 9);
-    check("count-play",  settings_count(SETTINGS_PLAYBACK) == 3);
+    check("count-play",  settings_count(SETTINGS_PLAYBACK) == 4);
     check("count-sound", settings_count(SETTINGS_SOUND) == 4);
     check("count-theme", settings_count(SETTINGS_THEME) == 7);
 
@@ -261,6 +262,64 @@ int main(void)
               buf[0] == 'O' && buf[1] == 'f' && buf[2] == 'f');
         check("resume-label",
               settings_label(SETTINGS_PLAYBACK, 2)[0] == 'R');
+
+        /* Sleep Timer (Playback row 3): a SELECT row like the rest, reading
+         * Off out of settings_defaults because it is never restored from
+         * disk (settings.h — the field is runtime-only). */
+        check("sleep-label",
+              strcmp(settings_label(SETTINGS_PLAYBACK, 3), "Sleep Timer") == 0);
+        check("sleep-kind-select",
+              settings_kind(SETTINGS_PLAYBACK, 3) == SETTINGS_KIND_SELECT);
+        settings_defaults(&s);
+        check("sleep-default-off", s.sleep_timer_min == 0);
+        settings_value(SETTINGS_PLAYBACK, &s, 3, buf, &is_toggle, &on,
+                       &num, &den);
+        check("sleep-text-off", strcmp(buf, "Off") == 0);
+
+        /* SELECT walks the six options and wraps back to Off, and every step
+         * reports SLEEPTIMER — never NONE, which main.c would answer with a
+         * settings_touch() and a byte-identical sector on the user's disk. */
+        {
+            static const int want[6] = { 15, 30, 60, 90, 120, 0 };
+            static const char *const want_txt[6] = {
+                "15 min", "30 min", "60 min", "90 min", "120 min", "Off",
+            };
+            int cycle_ok = 1, code_ok = 1, text_ok = 1;
+            for (int i = 0; i < 6; i++) {
+                if (settings_activate(SETTINGS_PLAYBACK, &s, 3)
+                    != SETTINGS_ACTION_SLEEPTIMER) {
+                    code_ok = 0;
+                }
+                if (s.sleep_timer_min != want[i]) {
+                    cycle_ok = 0;
+                }
+                settings_value(SETTINGS_PLAYBACK, &s, 3, buf, &is_toggle, &on,
+                               &num, &den);
+                if (strcmp(buf, want_txt[i]) != 0) {
+                    text_ok = 0;
+                }
+            }
+            check("sleep-cycle", cycle_ok);
+            check("sleep-cycle-action", code_ok);
+            check("sleep-cycle-text", text_ok);
+        }
+
+        /* A duration not in the table cannot arise on the device (the field
+         * is runtime-only and only this cycle ever writes it), but the step
+         * must still land inside the table rather than running off the end:
+         * an unknown value indexes to Off, so SELECT gives the head of the
+         * list, exactly as bl_step does from an unknown backlight timeout. */
+        s.sleep_timer_min = 45;
+        settings_value(SETTINGS_PLAYBACK, &s, 3, buf, &is_toggle, &on,
+                       &num, &den);
+        check("sleep-unknown-text", strcmp(buf, "45 min") == 0);
+        settings_activate(SETTINGS_PLAYBACK, &s, 3);
+        check("sleep-unknown-steps-into-the-table", s.sleep_timer_min == 15);
+
+        /* Reset Settings routes through settings_defaults: the timer is off
+         * again (main.c re-applies the field to ui/sleeptimer.c after one). */
+        settings_defaults(&s);
+        check("sleep-reset-off", s.sleep_timer_min == 0);
     }
 
     /* --- Test 12: NOOP — SELECT that changes nothing must SAY so ---
@@ -341,6 +400,23 @@ int main(void)
         check("none-resume",
               settings_activate(SETTINGS_PLAYBACK, &s, 2) == SETTINGS_ACTION_NONE);
         check("none-changed", memcmp(&copy, &s, sizeof s) != 0);
+
+        /* THE THIRD CLASS. Sleep Timer changes the record like any toggle,
+         * so it must not report NOOP — main.c has to re-arm ui/sleeptimer.c
+         * from the new value. But the field is runtime-only (config.c neither
+         * encodes nor restores it), so NONE would spend a disk write on a
+         * byte-identical record. SLEEPTIMER is "changed, but only the runtime
+         * part": the record moved AND main.c must not persist it. */
+        settings_defaults(&s);
+        memcpy(&copy, &s, sizeof s);
+        check("sleeptimer-action",
+              settings_activate(SETTINGS_PLAYBACK, &s, 3)
+              == SETTINGS_ACTION_SLEEPTIMER);
+        check("sleeptimer-changed", memcmp(&copy, &s, sizeof s) != 0);
+        check("sleeptimer-changed-only-that-field",
+              s.sleep_timer_min == 15 &&
+              (copy.sleep_timer_min = s.sleep_timer_min,
+               memcmp(&copy, &s, sizeof s) == 0));
 
         /* NOOP was appended: the codes main.c switches on keep their values. */
         check("noop-appended-last",

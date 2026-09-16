@@ -119,6 +119,28 @@ static int bl_step(int secs, int dir, int wrap)
 }
 
 /* ---------------------------------------------------------------------------
+ * Sleep-timer discrete steps (0=off / 15 / 30 / 60 / 90 / 120 minutes)
+ * ------------------------------------------------------------------------- */
+static const int SLEEP_OPTS[6] = { 0, 15, 30, 60, 90, 120 };
+
+static int sleep_index(int mins)
+{
+    for (int i = 0; i < 6; i++) {
+        if (SLEEP_OPTS[i] == mins) {
+            return i;
+        }
+    }
+    return 0;                        /* an unknown duration reads as Off     */
+}
+
+/* Step to the next sleep-timer option, wrapping. SELECT-only (the wheel moves
+ * the selection on a SELECT row), so there is no clamping variant. */
+static int sleep_step(int mins)
+{
+    return SLEEP_OPTS[(sleep_index(mins) + 1) % 6];
+}
+
+/* ---------------------------------------------------------------------------
  * Row labels (stable .rodata tables, one per list screen)
  * ------------------------------------------------------------------------- */
 /* Only rows that actually do something are listed — the cosmetic placeholders
@@ -130,8 +152,11 @@ static const char *const ROOT_L[9] = {
 };
 /* Resume is back on this list: it was pulled with the other placeholders while
  * nothing could persist it, and it is now the switch that decides whether boot
- * re-opens the track you left off on (kernel/main.c resume_restore). */
-static const char *const PLAY_L[3] = { "Shuffle", "Repeat", "Resume" };
+ * re-opens the track you left off on (kernel/main.c resume_restore). Sleep
+ * Timer sits last: it is the only row here that does not change how music
+ * plays, and the one you reach for at night. */
+static const char *const PLAY_L[4] = { "Shuffle", "Repeat", "Resume",
+                                       "Sleep Timer" };
 static const char *const SOUND_L[4] = { "Volume", "Bass", "Treble", "Balance" };
 static const char *const DISP_L[2] = { "Backlight", "Brightness" };
 /* Theme picker rows, in THEME_* id order (ui/palette.h) — the id IS the row. */
@@ -180,13 +205,17 @@ void settings_defaults(settings_t *s)
     s->resume_order_seed = 0;
     s->resume_order_keep = 0;
     s->resume_ctx_hash   = 0;
+    /* Off, like every boot: the timer is never restored from disk. Reset
+     * Settings routes through here too, so it also disarms (main.c re-applies
+     * the field to ui/sleeptimer.c after a reset). */
+    s->sleep_timer_min   = 0;
 }
 
 int settings_count(int screen)
 {
     switch (screen) {
     case SETTINGS_ROOT:     return 9;
-    case SETTINGS_PLAYBACK: return 3;
+    case SETTINGS_PLAYBACK: return 4;
     case SETTINGS_SOUND:    return 4;
     case SETTINGS_DISPLAY:  return 2;
     case SETTINGS_ABOUT:    return 1;   /* non-interactive info page */
@@ -239,7 +268,7 @@ int settings_kind(int screen, int idx)
     case SETTINGS_CLICKER:
         return SETTINGS_KIND_SELECT;                  /* radio pick, marked active */
     case SETTINGS_PLAYBACK:
-        return SETTINGS_KIND_SELECT;       /* Shuffle + Repeat: cycling selects */
+        return SETTINGS_KIND_SELECT;       /* all four: cycling selects        */
     case SETTINGS_SOUND:
         return SETTINGS_KIND_SLIDER;       /* Volume / Bass / Treble / Balance  */
     case SETTINGS_DISPLAY:
@@ -286,6 +315,16 @@ void settings_value(int screen, const settings_t *s, int idx,
         case 1: scopy(buf, s->repeat == REPEAT_OFF ? "Off"
                          : s->repeat == REPEAT_ALL ? "All" : "One"); break;
         case 2: scopy(buf, s->resume_on_startup ? "On" : "Off"); break;
+        /* The CHOSEN duration, not the countdown — the minutes left live in
+         * the status strip's SLEEP token (kernel/main.c). */
+        case 3:
+            if (s->sleep_timer_min <= 0) {
+                scopy(buf, "Off");
+            } else {
+                int n = u_to_str(buf, (unsigned)s->sleep_timer_min);
+                scopy(buf + n, " min");
+            }
+            break;
         default: break;
         }
         break;
@@ -361,6 +400,13 @@ int settings_activate(int screen, settings_t *s, int idx)
          * forget). */
         case 2: s->resume_on_startup = !s->resume_on_startup;
                 return SETTINGS_ACTION_NONE;
+        /* Wraps through six options, so this is always a change — including
+         * the step that lands back on the duration already showing, which
+         * main.c treats as a deliberate restart of the countdown. Never NONE:
+         * nothing on disk stores this, and a touch would write a
+         * byte-identical record (settings.h, SETTINGS_ACTION_SLEEPTIMER). */
+        case 3: s->sleep_timer_min = sleep_step(s->sleep_timer_min);
+                return SETTINGS_ACTION_SLEEPTIMER;
         default: return SETTINGS_ACTION_NOOP;
         }
 

@@ -348,6 +348,12 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
     wr16(&p[P_RES_OKEEP], (uint16_t)(int16_t)okeep);
     wr16(&p[P_RES_PAD],   0);
 
+    /* settings_t.sleep_timer_min is deliberately ABSENT from the payload: a
+     * countdown armed before a power cut means nothing after one, so the
+     * field is runtime-only and decode() zeroes it (settings.h). Two records
+     * that differ only in it are byte-identical — which is what keeps arming
+     * the timer off the user's disk. */
+
     wr32(&rec[CFG_OFF_CRC], crc32_buf(rec, CFG_OFF_CRC));
 }
 
@@ -444,6 +450,12 @@ int config_decode(const uint8_t *rec, settings_t *s, uint32_t *seq)
         s->resume_order_keep = 0;
         s->resume_ctx_hash   = 0;
     }
+
+    /* Never on disk, and config_load() copies this whole decoded struct over
+     * the caller's record (`cand = tmp` below), so it has to be WRITTEN here
+     * or g_settings.sleep_timer_min would arrive holding whatever the stack
+     * held — an arbitrary sleep timer armed at boot. Off, every time. */
+    s->sleep_timer_min = 0;
 
     *seq = rd32(&rec[CFG_OFF_SEQ]);
     return 1;

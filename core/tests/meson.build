@@ -195,6 +195,24 @@ if target == 'sim'
   )
   test('keyhold', keyhold_test, suite: 'unit')
 
+  # sleeptimer: the sleep timer's countdown (core/ui/sleeptimer.c) — the SAME
+  # source the ARM build links into core.elf. Pure integer arithmetic over
+  # (clock) samples, and the reason it is a unit at all is the 1 MHz
+  # USEC_TIMER's ~71.6-minute 32-bit wrap: a 120-minute countdown crosses it
+  # TWICE, which nothing on the device can be asked to demonstrate. Asserts
+  # the minute boundaries, that FIRE happens exactly once and disarms, the
+  # full two-hour run across both wraps at 100 ms per feed, that coarse and
+  # irregular feeds carry their remainder instead of drifting, re-arming, the
+  # token's text and its bounds check, and that remaining is never 0 while
+  # armed.
+  sleeptimer_test = executable(
+    'sleeptimer_test',
+    sources: ['ui/sleeptimer_test.c', '../ui/sleeptimer.c'],
+    include_directories: include_directories('../ui', '.'),
+    override_options: test_opts,
+  )
+  test('sleeptimer', sleeptimer_test, suite: 'unit')
+
   # thumb: the freestanding nearest-neighbor RGB565 downscaler (core/ui/thumb.c)
   # — the SAME source the ARM build links into core.elf. Shrinks a loaded
   # folder.art to a list chip / album-detail cover when no folder.thm is present.
@@ -228,7 +246,10 @@ if target == 'sim'
   # it compiles with plain cc. Asserts defaults, that activate() toggles Shuffle
   # and cycles Repeat OFF->ALL->ONE->OFF, that adjust() clamps Volume/Bass and
   # Display Brightness to range, that Backlight cycles its discrete list, and that
-  # Root rows return the right ENTER_*/RESET action codes plus value/kind report.
+  # Root rows return the right ENTER_*/RESET action codes plus value/kind report,
+  # and that Sleep Timer cycles Off/15/30/60/90/120 reporting the SLEEPTIMER
+  # action — "changed, but runtime-only", the code that keeps arming it off the
+  # user's disk.
   settings_test = executable(
     'settings_test',
     sources: ['ui/settings_test.c', '../ui/settings.c'],
