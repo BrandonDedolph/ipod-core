@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
  * core/ui/jackwatch.h — the policy behind "pause when the headphones are
- * pulled out": one edge detector over the debounced jack level.
+ * pulled out": THE edge detector over the debounced jack level.
  *
  * WHY THIS FILE EXISTS
  *
@@ -50,15 +50,22 @@
 typedef struct {
     int8_t   last;        /* last believed debounced level: -1 unknown, 0/1 */
     int8_t   raw_last;    /* last raw level fed to jackwatch_note_raw, -1 none */
-    uint8_t  paused_by;   /* 1 from a PAUSE until the plug goes back in     */
     uint16_t raw_edges;   /* raw transitions since reset (About + evlog)    */
     uint16_t pauses;      /* PAUSE actions emitted since reset             */
     uint32_t edge_us;     /* `now_us` of the last DEBOUNCED edge            */
 } jackwatch_t;
 
+/*
+ * Only PAUSE is an instruction. IN and OUT are notifications — they exist so
+ * that the caller does not have to re-derive "an edge happened this pass"
+ * from the state, which is the sort of second edge detector that ends up
+ * inline in kernel/main.c where no test can see it.
+ */
 typedef enum {
-    JACKWATCH_NONE = 0,   /* nothing to do this pass                       */
-    JACKWATCH_PAUSE,      /* the plug just came out under a playing track  */
+    JACKWATCH_NONE = 0,   /* nothing moved this pass                       */
+    JACKWATCH_IN,         /* the plug went in (never an instruction)       */
+    JACKWATCH_OUT,        /* the plug came out, nothing was playing        */
+    JACKWATCH_PAUSE,      /* the plug came out under a playing track       */
 } jackwatch_action_t;
 
 /*
@@ -74,18 +81,22 @@ void jackwatch_reset(jackwatch_t *j);
  * 0 absent / 1 seated — once per main-loop pass, with whether the transport
  * is actually playing (player_active() && !player_paused()).
  *
- * Returns PAUSE on exactly the 1 -> 0 edge while playing, NONE otherwise.
- * The first level after a reset primes `last` and can never be an edge, so a
- * device booted with nothing in the jack cannot look like a pull-out.
+ * Returns PAUSE on exactly the 1 -> 0 edge while playing, OUT on that edge
+ * while not, IN on the 0 -> 1 edge, NONE when nothing moved. The first level
+ * after a reset primes `last` and can never be an edge, so a device booted
+ * with nothing in the jack cannot look like a pull-out.
+ *
+ * `pauses` and `edge_us` are bookkeeping: the module's own evidence that a
+ * pull pauses exactly once, which is what the unit test reads. Nothing on
+ * screen shows them.
  */
 jackwatch_action_t jackwatch_feed(jackwatch_t *j, int level, int playing,
                                   uint32_t now_us);
 
 /*
- * Re-prime from the live level with NO action — the wake path, which was not
- * running to see what happened during the suspend. A level of -1 leaves
- * `last` alone; a seated plug also clears `paused_by`, because whatever this
- * module paused has since been superseded by the wake's own resume decision.
+ * Re-prime from the live level with NO action and no counting — the backstop
+ * on the paths that leave a suspend without a final feed. A level of -1
+ * leaves `last` alone.
  */
 void jackwatch_prime(jackwatch_t *j, int level);
 

@@ -342,15 +342,17 @@ The HAL owns the debounce; `core/ui/jackwatch.c` owns the decision, and
 nothing else does. It is fed one debounced level per main-loop pass together
 with whether the transport is playing, and it is pure — no clock, no
 hardware, no screen state — so `core/tests/ui/jackwatch_test.c` pins every
-row of it on the host:
+row of it on the host. Only `PAUSE` is an instruction; `IN` and `OUT` are
+notifications, so the caller never has to re-derive "an edge happened this
+pass" from the state:
 
 | believed | new level | playing | result |
 |---|---|---|---|
 | any | -1 | any | nothing; -1 is "no answer", never a level, and never primes |
 | unknown | 0 or 1 | any | prime only — a boot with an empty jack is not a pull-out |
-| seated | absent | yes | **pause**, once |
-| seated | absent | no | nothing (already paused, or nothing loaded) |
-| absent | seated | any | nothing: re-inserting NEVER resumes |
+| seated | absent | yes | **`PAUSE`**, once |
+| seated | absent | no | `OUT` (already paused, or nothing loaded) |
+| absent | seated | any | `IN` — a notification, never a resume |
 
 The one-directionality is deliberate. The insertion switch closes before the
 audio contacts seat, so resuming on that edge would start playing into a
@@ -362,13 +364,23 @@ charging modal, so neither the lock switch nor a modal can swallow a yank in
 a pocket; ≤10 ms of loop period against a 200 ms window is ~20 samples per
 window, and 100 ms during a suspend is still two.
 
-**Wake.** The main loop is not running during a suspend, so the wake path
-re-primes the module from the current debounced answer before it decides
-whether to resume (`jackwatch_prime()`: new believed level, no action). That
-is what keeps a plug pulled while the device slept from reading as a fresh
-edge on the first pass back and pausing a player the wake had deliberately
-left paused. A plug pulled and re-inserted during the sleep leaves it paused
-as well — no auto-resume, even there.
+**Suspend and wake.** The main loop is not running during a suspend, so the
+suspend loop feeds the module itself, every 100 ms, with `playing` set to the
+transport state the sleep interrupted (the pause on the way down was the
+sleep's, not the listener's). A pull therefore answers `PAUSE` *while it
+happens*, and the suspend path answers that by declining to resume at wake —
+which is also why a plug pulled and then re-inserted before the wake leaves
+the device paused: the pull was already counted, and the seated plug at wake
+is only an `IN`. Nothing is printed from inside the low-power park, where
+SER0's clock may be gated; the wake says
+`core: jack out during suspend, staying paused` once the clocks are back.
+
+At wake the module is re-primed from the current debounced answer
+(`jackwatch_prime()`: new believed level, no action, no counting). That is
+the backstop for the paths that leave the suspend loop without a last feed —
+a refused PMU standby, a battery verdict — and it is what stops a level that
+moved on one of those paths from reading as a fresh edge on the first loop
+pass back.
 
 **The log.** Debounced edges print `core: jack in` / `core: jack out` /
 `core: jack out, pause`, at most one per genuine transition. Raw edges print

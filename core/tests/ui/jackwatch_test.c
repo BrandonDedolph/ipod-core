@@ -14,16 +14,17 @@
  * get wrong silently:
  *   - a -1 (the shipping build, where the detect line is not yet trusted)
  *     is NOT a level: it never primes and never pauses;
- *   - re-inserting the plug never resumes;
- *   - the wake re-prime moves the believed level with no action, which is
- *     what keeps a pull-during-sleep from pausing a player that the wake
- *     path already decided to leave paused.
+ *   - re-inserting the plug is a notification (IN), never an instruction;
+ *   - a pull is PAUSE only while something is playing, and OUT otherwise —
+ *     the distinction kernel/main.c's suspend loop turns into "do not resume
+ *     at wake".
  *
  * MUTATION CHECK: each of these breaks the suite —
  *   - priming `last` from a -1 level: unknown_never_primes and
  *     minus_one_mid_stream fail;
  *   - dropping the `playing` guard: pull_while_paused fails;
  *   - returning PAUSE on the 0 -> 1 edge: replug_never_resumes fails;
+ *   - collapsing OUT into PAUSE: pull_while_paused fails;
  *   - making jackwatch_prime act instead of prime: prime_on_wake fails;
  *   - counting the first raw sample as an edge: note_raw_counts_transitions
  *     fails.
@@ -81,8 +82,8 @@ int main(void)
     /* --- reset is the "nothing known yet" state ------------------------- */
     jackwatch_reset(&j);
     xpect(&c, "reset: no level believed, no raw sample, no counts",
-          j.last == -1 && j.raw_last == -1 && j.paused_by == 0 &&
-          j.raw_edges == 0 && j.pauses == 0 && j.edge_us == 0);
+          j.last == -1 && j.raw_last == -1 && j.raw_edges == 0 &&
+          j.pauses == 0 && j.edge_us == 0);
 
     /* --- -1 is not a level: the shipping (untrusted) build --------------- */
     jackwatch_reset(&j);
@@ -110,9 +111,8 @@ int main(void)
         uint32_t t_pull = now;
         xpect(&c, "pull while playing: PAUSE, once, on the edge",
               jackwatch_feed(&j, 0, 1, now) == JACKWATCH_PAUSE);
-        xpect(&c, "pull while playing: counted, claimed, and timestamped",
-              j.pauses == 1 && j.paused_by == 1 && j.edge_us == t_pull &&
-              j.last == 0);
+        xpect(&c, "pull while playing: counted and timestamped",
+              j.pauses == 1 && j.edge_us == t_pull && j.last == 0);
     }
     feed_n(&j, 0, 1, &now, 100, JACKWATCH_NONE, &c,
            "pull while playing: the level staying 0 is not a second pull");
@@ -123,10 +123,9 @@ int main(void)
     now += PASS_US;
     jackwatch_feed(&j, 1, 0, now);
     now += PASS_US;
-    xpect(&c, "pull while paused: silent",
-          jackwatch_feed(&j, 0, 0, now) == JACKWATCH_NONE);
-    xpect(&c, "pull while paused: nothing counted, nothing claimed",
-          j.pauses == 0 && j.paused_by == 0);
+    xpect(&c, "pull while paused: OUT, which is a notification, not a pause",
+          jackwatch_feed(&j, 0, 0, now) == JACKWATCH_OUT);
+    xpect(&c, "pull while paused: nothing counted", j.pauses == 0);
     xpect(&c, "pull while paused: the edge still moved the believed level",
           j.last == 0 && j.edge_us == now);
 
@@ -137,9 +136,8 @@ int main(void)
     now += PASS_US;
     jackwatch_feed(&j, 0, 1, now);              /* PAUSE */
     now += PASS_US;
-    xpect(&c, "replug: the plug going back in is silent",
-          jackwatch_feed(&j, 1, 0, now) == JACKWATCH_NONE);
-    xpect(&c, "replug: our claim on the pause is retired", j.paused_by == 0);
+    xpect(&c, "replug: the plug going back in is IN, never an instruction",
+          jackwatch_feed(&j, 1, 0, now) == JACKWATCH_IN);
     feed_n(&j, 1, 0, &now, 50, JACKWATCH_NONE, &c,
            "replug: and stays silent while it is seated");
     now += PASS_US;
@@ -157,10 +155,30 @@ int main(void)
     xpect(&c, "gap: the 0 after it is still an edge from 1",
           jackwatch_feed(&j, 0, 1, now) == JACKWATCH_PAUSE);
 
-    /* --- the wake re-prime ------------------------------------------------ */
+    /* --- the suspend loop, which feeds this module the same way ----------
+     *
+     * kernel/main.c keeps feeding the watcher through a suspend, with
+     * `playing` = the transport state the sleep interrupted, and answers a
+     * PAUSE by declining to resume at wake. These two sequences are the
+     * reason that works: a pull is seen WHILE it happens, so a plug that
+     * comes back before the wake cannot hide it. */
     jackwatch_reset(&j);
     now += PASS_US;
     jackwatch_feed(&j, 1, 1, now);              /* asleep with the plug in   */
+    now += PASS_US;
+    xpect(&c, "suspend: a pull during the sleep is a PAUSE (do not resume)",
+          jackwatch_feed(&j, 0, 1, now) == JACKWATCH_PAUSE);
+    now += PASS_US;
+    xpect(&c, "suspend: pulled and RE-INSERTED before the wake is only an IN "
+              "— the pull was already counted, so the wake still declines",
+          jackwatch_feed(&j, 1, 1, now) == JACKWATCH_IN && j.pauses == 1);
+    feed_n(&j, 1, 1, &now, 10, JACKWATCH_NONE, &c,
+           "suspend: and a seated plug stays silent afterwards");
+
+    /* --- the wake re-prime (the backstop) --------------------------------- */
+    jackwatch_reset(&j);
+    now += PASS_US;
+    jackwatch_feed(&j, 1, 1, now);
     jackwatch_prime(&j, 0);                     /* woken: it is out now      */
     xpect(&c, "wake: priming moves the believed level with no action",
           j.last == 0 && j.pauses == 0);
@@ -169,17 +187,9 @@ int main(void)
     jackwatch_prime(&j, -1);
     xpect(&c, "wake: priming with -1 leaves the believed level alone",
           j.last == 0);
-    /* Pulled AND re-inserted during the sleep: the wake sees 1 again. The
-     * player stays paused (main.c's resume gate, not ours), and the claim
-     * goes with the plug. */
-    jackwatch_reset(&j);
-    now += PASS_US;
-    jackwatch_feed(&j, 1, 1, now);
-    now += PASS_US;
-    jackwatch_feed(&j, 0, 1, now);              /* PAUSE, paused_by = 1      */
     jackwatch_prime(&j, 1);
-    xpect(&c, "wake: a seated prime clears the claim and never resumes",
-          j.last == 1 && j.paused_by == 0 && j.pauses == 1);
+    xpect(&c, "wake: priming never counts a pause and never acts",
+          j.last == 1 && j.pauses == 0);
 
     /* --- raw bookkeeping (the About token and the log lines) ------------- */
     jackwatch_reset(&j);
@@ -215,7 +225,8 @@ int main(void)
         ok &= pull_table(&b, &now);
         xpect(&c, "no hidden state: two fresh machines answer the pull table "
                   "identically", ok && a.pauses == b.pauses &&
-                  a.last == b.last && a.paused_by == b.paused_by);
+                  a.last == b.last && a.raw_last == b.raw_last &&
+                  a.raw_edges == b.raw_edges);
     }
 
     return xfail_done(&c);

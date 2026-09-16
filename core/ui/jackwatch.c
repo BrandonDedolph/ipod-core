@@ -14,7 +14,6 @@ void jackwatch_reset(jackwatch_t *j)
 {
     j->last      = -1;
     j->raw_last  = -1;
-    j->paused_by = 0;
     j->raw_edges = 0;
     j->pauses    = 0;
     j->edge_us   = 0;
@@ -48,20 +47,15 @@ jackwatch_action_t jackwatch_feed(jackwatch_t *j, int level, int playing,
 
     if (lvl == 0) {
         if (!playing) {
-            return JACKWATCH_NONE;      /* already paused, or nothing loaded */
+            return JACKWATCH_OUT;       /* already paused, or nothing loaded */
         }
-        j->paused_by = 1;
         if (j->pauses < JACKWATCH_COUNT_MAX) {
             j->pauses++;
         }
         return JACKWATCH_PAUSE;
     }
-
-    /* Plug back in. Deliberately silent (jackwatch.h): all it does is retire
-     * our claim on the pause, so a later resume from anywhere is not still
-     * attributed to a jack that is now seated. */
-    j->paused_by = 0;
-    return JACKWATCH_NONE;
+    /* Plug back in: something for the caller to say, never anything to do. */
+    return JACKWATCH_IN;
 }
 
 void jackwatch_prime(jackwatch_t *j, int level)
@@ -70,9 +64,6 @@ void jackwatch_prime(jackwatch_t *j, int level)
         return;
     }
     j->last = level ? (int8_t)1 : (int8_t)0;
-    if (j->last) {
-        j->paused_by = 0;
-    }
 }
 
 int jackwatch_note_raw(jackwatch_t *j, int raw)

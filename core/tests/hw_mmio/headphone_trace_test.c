@@ -18,7 +18,7 @@
  * accessor behind the About screen's on-screen probe.
  *
  *   hw-headphone-untrusted (-DHEADPHONE_DETECT_TRUSTED=0)
- *     Until the device transcript has confirmed the line, the driver must
+ *     Until the pin has been read on the device, the driver must
  *     answer -1 and must not touch the bus at all. The macro is spelled out
  *     by tests/meson.build rather than inherited from the header, so the
  *     bench flipping that default cannot silently turn this into a second

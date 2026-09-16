@@ -13,11 +13,11 @@
  * row matches every charger/backlight pin this firmware already runs on) puts
  * "Headphone attached (input)" on GPIO port A bit 7. The polarity is inferred
  * from that table's notation and has NOT been observed on this device. Until
- * the probe transcript has been seen, HEADPHONE_DETECT_TRUSTED stays 0 and
+ * the pin has been READ on hardware, HEADPHONE_DETECT_TRUSTED stays 0 and
  * hal_headphones_present() answers -1 ("unknown") without touching the bus —
  * a wrong polarity would pause playback every time headphones are plugged IN,
- * which is worse than no feature. Flip the three knobs below from the
- * transcript, nothing else.
+ * which is worse than no feature. That reading sets the two knobs below
+ * (TRUSTED, and ACTIVE_LOW if the levels come out inverted), nothing else.
  *
  * WHICH PROBE. The UART probe at the bottom of headphone.c is the thorough
  * one — all twelve ports, one diffable line per change — and it is unusable
@@ -25,7 +25,8 @@
  * (2026-07-17). So the probe that actually gets run is on the screen: the
  * Settings > About footer draws headphone_raw() and headphone_pin_cfg() live,
  * in every build, trusted or not, and the bench is "open About, plug, unplug,
- * read the digit". The UART probe stays for a bench that has a cable; both
+ * read the digit". The UART probe stays for a bench that has a cable — it is
+ * the better instrument, since it watches all twelve ports at once. Both
  * procedures are in 10-headphone-jack.md, "Confirming it on the device".
  *
  * The register constants live here rather than in pp5022.h only because this
@@ -51,7 +52,7 @@
 #ifndef HEADPHONE_DETECT_ACTIVE_LOW
 #define HEADPHONE_DETECT_ACTIVE_LOW  0
 #endif
-/* 0 until the probe transcript confirms line AND polarity on the device. */
+/* 0 until the pin has been read on the device: line AND polarity. */
 #ifndef HEADPHONE_DETECT_TRUSTED
 #define HEADPHONE_DETECT_TRUSTED     0
 #endif

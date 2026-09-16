@@ -695,8 +695,8 @@ if target == 'sim'
   #              bouncing switch yields exactly one transition, timed from the
   #              last bounce; sub-window glitches yield none; the first sample
   #              primes without waiting; a USEC_TIMER wrap mid-window is fine.
-  #   untrusted  (TRUSTED=0, what ships until the device transcript confirms
-  #              the line): answers -1 and never touches the bus.
+  #   untrusted  (TRUSTED=0, what ships until the pin has been read on the
+  #              device): answers -1 and never touches the bus.
   #
   # Both non-probe binaries also pin headphone_pin_cfg(), the two-read,
   # no-write accessor the About screen's on-screen probe draws from.

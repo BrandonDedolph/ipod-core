@@ -11,8 +11,14 @@ what works, what doesn't, and what to pick up next.
   own host suite — the same extraction `ui/keyhold.c` got. It closes a real
   hole: the suspend path never updated `g_hp_last`, so a plug pulled while the
   device slept left the first pass back looking at an edge the wake had already
-  accounted for. The wake now re-primes the module from the live level with no
-  action. main.c keeps the wiring only: sample, act, narrate.
+  accounted for. The suspend loop now feeds the module as it sleeps (with
+  `playing` = the transport state the sleep interrupted), so a pull is seen
+  while it happens and the wake simply declines to resume — which is also what
+  makes "pulled and plugged back in before waking it" stay paused. The wake
+  re-primes as a backstop for the paths that leave that loop early. main.c
+  keeps the wiring only: sample, act, narrate — the module reports `IN`/`OUT`
+  alongside `PAUSE` so there is exactly one edge detector, and it is the
+  tested one.
 
   **The feature ships INERT.** `HEADPHONE_DETECT_TRUSTED` is still 0, so
   `hal_headphones_present()` answers -1 with no bus traffic and the module
@@ -69,7 +75,10 @@ what works, what doesn't, and what to pick up next.
   13. Power-cycle with the jack **empty**, Resume on: boots paused as always,
       and no `core: jack out` line in the log for that boot.
   14. Playing with the plug in, hold PLAY 2 s (sleep), pull the plug while
-      asleep, press a button: wakes paused, no resume. Re-insert, PLAY: plays.
+      asleep, press a button: wakes paused, no resume, and the log carries
+      `core: jack out during suspend, staying paused`. Re-insert, PLAY: plays.
+  14b. Same again, but plug the headphones back IN before waking it: still
+      wakes paused (the suspend loop saw the pull as it happened).
   15. Playing, plug in, sleep, wake without touching the plug: resumes
       (unchanged).
   16. Dump `CORELOG.BIN`: `core: jack out, pause` / `core: jack in` at each step.

@@ -338,8 +338,8 @@ voltage on the About page is steadier.
   drive spins it up before the music starts.
 - **Sleep.** Hold Play two seconds. Playback pauses and the position is saved, the drive parks, the
   screen and backlight go off, the codec powers down. Any button wakes it back where it was. (Once
-  jack sensing is switched on — see Now Playing — headphones pulled out during the sleep make it
-  wake paused instead of resuming.)
+  jack sensing is switched on — see Now Playing — headphones pulled out while it sleeps make it
+  wake paused instead of resuming, even if you plug them back in before waking it.)
 - **Power off.** Hold Play past five seconds, or leave a sleeping device on battery for thirty
   minutes: it powers itself off. The next press cold boots; with Resume on you come back on the
   same track, paused.
