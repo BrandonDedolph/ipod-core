@@ -6416,6 +6416,18 @@ _Noreturn static void run_ui(fat32_t *fs)
                 g_vol_show.armed   = 0;
 
                 suspend_to_ram(suspend_origin);              /* returns on wake */
+                /* Every press this loop was timing is over: suspend_to_ram
+                 * does not return until the buttons are all up and the event
+                 * latch is drained. Forget them, or a RIGHT/LEFT hold that
+                 * the SLEEP TIMER interrupted mid-aim reads as a release on
+                 * the first pass back and commits a seek — from before the
+                 * nap — to a listener who only pressed a button to wake the
+                 * screen. (PLAY is the one exception and needs nothing: on
+                 * the path where IT triggered the sleep its hold has already
+                 * fired, so its release is silent by construction.) */
+                keyhold_reset(&menu_key);
+                seekhold_reset(&g_ff);
+                seekhold_reset(&g_rw);
                 last_input   = mmio_read32(USEC_TIMER_ADDR);
                 last_present = last_input;      /* suspend just presented the wake
                                                  * frame: pace the loop's own
