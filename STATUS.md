@@ -200,8 +200,9 @@ What changed (see `git log 054c722..`):
   Settings runs the same SOFT commit the tap exit does. The logic is a new
   host-testable `ui/gesture.c` (the skip-vs-seek machine, the ramp, the
   per-screen PLAY policy) plus `keyhold_void()` / `keyhold_held()`;
-  `kernel/main.c` only wires it. 59 host suites green (new `gesture` suite,
-  `keyhold` extended), ARM `-Werror` + `verify-hw` clean. **UNFLASHED.**
+  `kernel/main.c` only wires it. 61 host suites green (new `gesture` suite
+  beside the sleep timer's and the jack watch's, `keyhold` extended), ARM
+  `-Werror` + `verify-hw` clean. **UNFLASHED.**
   Bench list: (a) Albums: PLAY on an album row → Now Playing at track 1, MENU
   → the same album row, not the tracklist; (b) Artists → PLAY on an artist →
   its All Songs queue, `TRACK 1 OF n`, and the resume kind after a reboot is
@@ -225,7 +226,10 @@ What changed (see `git log 054c722..`):
   MENU hold with Hold switched on mid-press does nothing, MENU from a dark
   screen only lights it; (n) charging screen: MENU/RIGHT/LEFT dismiss it and,
   held, do nothing more, while PLAY held from it still sleeps; (o) Hold on,
-  then RIGHT/LEFT/MENU: banner only.
+  then RIGHT/LEFT/MENU: banner only; (p) hold RIGHT through the end of a track
+  — the next one starts at 0:00 and does NOT jump to where the aim had got to;
+  (q) a deliberate ~600 ms RIGHT press (long enough to be a hold, let go before
+  its first quarter-second tick) is silent: no hiccup, no jump backwards.
 - **Power-down** — PLAY is arbitrated by press length (`ui/keyhold.c`: tap
   = pause on release, hold = sleep; the down-edge no longer pauses).
   Suspend now: FLUSH + STANDBY + **SLEEP** on the drive (reset-to-wake),
