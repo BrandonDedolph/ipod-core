@@ -153,7 +153,9 @@ more than ten minutes).
 
 With **Resume** enabled, a cold boot reopens the track you were on, in that
 queue, and seeks to where you left off, **paused** — never surprising you
-with audio at boot.
+with audio at boot. `RESUME_KIND_OTG` is one of those queues: the On-The-Go
+list is not a file and has no name, so it stores no context hash and the boot
+path rebuilds it from the list `COREOTG.DAT` restored.
 
 ## Event log
 
@@ -221,7 +223,7 @@ fields plus a normalized-name hash that binds each record to its file on
 disk independent of quote/case style. If the index is absent the firmware
 falls back to a per-file tag scan.
 
-## Playlists — read only
+## Playlists
 
 Put `.m3u8` (or `.m3u`) files in `Music/Playlists/` — `Playlists/` at the
 volume root on a disk with no `Music/` folder. Entries may be absolute from
@@ -236,12 +238,38 @@ contain), `fat32_resolve_path()` walks each entry to its directory entry,
 and `library/playlist.c` turns the result into rows named and located
 exactly as an album's tracklist rows are, so they bind to the same index
 records. Entries that are missing, not audio, or unreadable are skipped and
-counted, never fatal. Caps: 64 playlists, 128 tracks per playlist — the
+counted, never fatal. Caps: 64 playlists, 512 tracks per playlist — the
 first that many, with the overflow reported. Host-tested end to end on an
 in-RAM volume (`tests/library/playlist_test.c`); **not yet flashed**.
 
-Playlist *writing* does not exist and cannot until the FAT driver can
-allocate clusters, which it cannot — it is read-only by design today.
+### On-The-Go
+
+Hold SELECT for 450 ms on a song — Songs, an artist's All Songs, a genre, an
+album's tracklist, another playlist's — and it joins the LIVE list; on an
+album row the whole album goes in, in its tracklist's order. Playlists pins
+**On-The-Go** as row 0: Clear Playlist, Save Playlist, then the tracks.
+SELECT on a track plays the list (`RESUME_KIND_OTG`, so a cold boot comes
+back into it); a hold removes the row. Save writes the lowest free one of
+five slot files and empties the live list; a saved slot is an ordinary
+playlist afterwards, and carries a Delete Playlist row so the slot can be
+freed again.
+
+The live list is 512 `(folder_hash, file_hash)` locator pairs — the same
+locator `CORELIB.IDX` binds a record to its file by, so an entry costs eight
+bytes and survives an index rebuild. It persists in `COREOTG.DAT`
+(`kernel/otg_store.c`, two CRC-32'd 5120-byte slots, the **third** writer to
+the user's disk). The five saved lists are ordinary extended M3U8 files
+carrying a `#CORE-OTG` header and trailer (`library/otg_slot.c`, the
+**fourth**), overwritten whole with the first stage written LAST so a torn
+save is detectable and is never believed. `../tools/make_otg.py --create`
+makes both, `--verify` is the mandatory pre-flight, and
+[`docs/design/on-the-go.md`](docs/design/on-the-go.md) is the format
+reference.
+
+Making a playlist FILE of your own on the device still does not exist and
+cannot until the FAT driver can allocate clusters, which it cannot — it is
+read-only by design, and every writer above only overwrites bytes inside a
+file the host already made.
 
 ## Status
 

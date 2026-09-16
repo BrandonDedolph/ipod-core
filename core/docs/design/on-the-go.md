@@ -177,7 +177,10 @@ A damaged slot is never believed: it is listed as "On-The-Go N", opens to
 ### Naming a row
 
 The device writes **exact on-disk names**, read back out of the directory
-entries at save time: `lib_song_t.file` has lost its extension and
+entries at save time — so the format is codec-agnostic by construction: a
+`.mp3` row is written `.mp3` and a `.fla` row `.fla`, and what a line PLAYS as
+is `classify_ext`'s answer on the read side, not anything the writer decided.
+The names come from the dirents because `lib_song_t.file` has lost its extension and
 `g_folder_map[].name` is capped at 63 characters, and a path that is not
 byte-exact names nothing. Both walks are cached on the last folder, so an
 album-grouped run costs one root walk plus one album walk.

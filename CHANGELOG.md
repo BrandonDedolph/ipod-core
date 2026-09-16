@@ -81,6 +81,22 @@ the boot screen and Settings → About show the one the device runs.
 - The settings record grew from 44 to 48 payload bytes for those two fields, under the same
   version: a record written by any earlier build still loads, and loads as "no limit, EQ off".
 
+## Unreleased
+
+- **On-The-Go.** Hold Select for half a second on a song and it joins a list you build as you go; on
+  an album row the whole album goes in. A banner across the top confirms it. Playlists pins
+  **On-The-Go** as its first row: Select a track to play the list, hold to take one out, Clear
+  Playlist (it asks twice), or Save Playlist into one of five saved lists. A saved list is an
+  ordinary `.m3u8` from then on — it shows up in Playlists, it plays like any other, you can copy it
+  off the iPod, and it carries a Delete Playlist row so the slot can be used again. The live list
+  survives a power cut, and a cold boot resumes into it on the same track.
+- A Select TAP on a list row now acts when you lift your finger, not when you press. That is what
+  makes room for the hold, and it is what the original iPod does.
+- `core sync`, `core install` and `tools/make_otg.py` create `COREOTG.DAT` and the five
+  `Music/Playlists/On-The-Go N.m3u8` slots the firmware writes into; an existing one is never reset,
+  `--prune` keeps them, and a source playlist named like a slot is refused rather than copied over
+  one. `core doctor` reports all six.
+
 ## v0.1.3 — 2026-09-15
 
 Since v0.1.2. The firmware change is one marker; the release is the host app.

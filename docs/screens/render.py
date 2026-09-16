@@ -984,6 +984,20 @@ LOCK_BM_OPEN = [
 ]
 
 
+# main.c OTG_BM_PLUS / OTG_BM_MINUS: a "+" and a "-" in a ring, 14 px wide —
+# what the On-The-Go banner puts where the padlock goes. Added and removed are
+# the only two things it ever says; a REFUSAL ("Not in the library") draws no
+# glyph at all, because a + on a refusal would be a lie.
+OTG_BM_PLUS = [
+    0x0000, 0x03F0, 0x07F8, 0x0E1C, 0x1806, 0x38C7, 0x30C3, 0x33F3,
+    0x33F3, 0x30C3, 0x38C7, 0x1806, 0x0E1C, 0x07F8, 0x03F0, 0x0000,
+]
+OTG_BM_MINUS = [
+    0x0000, 0x03F0, 0x07F8, 0x0E1C, 0x1806, 0x3807, 0x3003, 0x33F3,
+    0x33F3, 0x3003, 0x3807, 0x1806, 0x0E1C, 0x07F8, 0x03F0, 0x0000,
+]
+
+
 def draw_bitmap14(sc, x, y, rows, c):
     """main.c draw_bitmap14: blit a 14-wide row-mask bitmap at (x, y) as
     horizontal runs (bit 13 is the leftmost column)."""
@@ -1079,6 +1093,16 @@ def lock_banner(sc, locked, screen, **kw):
     else:
         top_banner(sc, False, LOCK_BM_OPEN, -1, "Unlocked", "HOLD OFF",
                    screen, **kw)
+
+
+def otg_banner(sc, sign, label, token, screen, **kw):
+    """main.c otg_banner_render: the same band as the Hold banner, with a + or
+    a - in a ring. `sign` is +1 added, -1 removed, 0 a refusal (no glyph, and
+    the label keeps the x every other banner puts it at). Unlike the LOCKED
+    banner it is not modal — the first real input dismisses it — so nothing is
+    ever applied behind it."""
+    bm = OTG_BM_PLUS if sign > 0 else OTG_BM_MINUS if sign < 0 else [0]
+    top_banner(sc, False, bm, 0, label, token, screen, **kw)
 
 
 def _lock_screen(locked, elapsed=73, glyph=False):
@@ -1609,20 +1633,82 @@ def screen_allsongs(sel=ALLSONGS_SEL):
 # single-line list (list_row, ROW_H) of the .m3u8 files in Music/Playlists,
 # each row a name + disclosure chevron — no sub-line, no per-row right value
 # (the count lives in the header only, like Artists).
+#
+# ROW 0 IS PINNED: On-The-Go, the list you build by holding Select, with how
+# many tracks are in it on the right. The original iPod puts it last; first is
+# chosen because 64 playlists is a long spin to the bottom and this is the row
+# that gets used. The scanned files therefore start at row 1, and an EMPTY
+# On-The-Go slot file is hidden from the list entirely (there are always five
+# of them on the disk — the host creates them — and an empty one is not a
+# playlist anybody made).
 PLAYLISTS = [
-    "Road Trip", "Late Night", "Sunday Morning", "Gym", "Favourites", "Focus",
+    "Road Trip", "Late Night", "On-The-Go 1", "Sunday Morning", "Gym", "Focus",
 ]
-PLAYLISTS_SEL = 1
+OTG_COUNT = 12
+PLAYLISTS_SEL = 0
 
 def screen_playlists(sel=PLAYLISTS_SEL):
     sc = Screen()
     status_strip(sc)
-    header(sc, "Playlists", "%d / %d" % (sel + 1, len(PLAYLISTS)), back=True)
-    for r in range(LIST_ROWS):
-        if r >= len(PLAYLISTS):
+    total = len(PLAYLISTS) + 1
+    header(sc, "Playlists", "%d / %d" % (sel + 1, total), back=True)
+    list_row(sc, LIST_Y0, 0, "On-The-Go", right=str(OTG_COUNT), chevron=True,
+             selected=(sel == 0))
+    for r in range(1, LIST_ROWS):
+        if r > len(PLAYLISTS):
             break
-        list_row(sc, LIST_Y0, r, PLAYLISTS[r], chevron=True, selected=(r == sel))
-    scrollbar(sc, LIST_Y0, 0, LIST_ROWS, len(PLAYLISTS))
+        list_row(sc, LIST_Y0, r, PLAYLISTS[r - 1], chevron=True,
+                 selected=(r == sel))
+    scrollbar(sc, LIST_Y0, 0, LIST_ROWS, total)
+    return sc.img
+
+
+# Playlists -> On-The-Go (main.c otg_render / otg_row_draw). Two action rows,
+# then the tracks in the Songs shape. Clear and Save are greyed when the list
+# is empty, and Save is greyed when all five saved slots are in use. An entry
+# whose file is no longer on the disk is KEPT and says so — a later sync may
+# bring it back, and silently dropping a row the user added is the data loss
+# this project refuses everywhere else.
+OTG_TRACKS = [
+    ("Something Real", "Post Malone", "3:02"),
+    ("STAY", "The Kid LAROI", "2:21"),
+    ("Malibu Nights", "LANY", "3:48"),
+    (None, None, None),                      # not on this iPod
+    ("Circles", "Post Malone", "3:35"),
+]
+OTG_SEL = 2                                  # the first track row
+
+def screen_otg(sel=OTG_SEL):
+    sc = Screen()
+    status_strip(sc)
+    n = len(OTG_TRACKS)
+    right = ("%d / %d" % (sel - 1, n)) if sel >= 2 else "1 MISSING"
+    header(sc, "On-The-Go", right, back=True)
+    list_row(sc, LIST_Y0, 0, "Clear Playlist", selected=(sel == 0), rh=ROW_H2,
+             title_priority=True)
+    list_row(sc, LIST_Y0, 1, "Save Playlist", selected=(sel == 1), rh=ROW_H2,
+             title_priority=True)
+    for r in range(2, LIST_ROWS2):
+        if r - 2 >= n:
+            break
+        t, a, dur = OTG_TRACKS[r - 2]
+        if t is None:
+            list_row(sc, LIST_Y0, r, "Not on this iPod", selected=(r == sel),
+                     greyed=True, rh=ROW_H2, title_priority=True)
+        else:
+            list_row(sc, LIST_Y0, r, t, sub=a, right=dur, selected=(r == sel),
+                     rh=ROW_H2, title_priority=True)
+    scrollbar(sc, LIST_Y0, 0, LIST_ROWS2, n + 2)
+    return sc.img
+
+
+def screen_otg_added():
+    """The confirmation over the Songs list: hold Select on a row for 450 ms
+    and the top chrome says so for a second. It is the only feedback the
+    gesture has — the list it joined is on another screen."""
+    sc = _as_screen(screen_songs())
+    otg_banner(sc, +1, "Added to On-The-Go", "12 SONGS", "list",
+               left="Something Real")
     return sc.img
 
 
@@ -2378,6 +2464,8 @@ def main():
     outputs.append(save_png(screen_songs(), "songs.png"))
     outputs.append(save_png(screen_allsongs(), "allsongs.png"))
     outputs.append(save_png(screen_playlists(), "playlists.png"))
+    outputs.append(save_png(screen_otg(), "otg.png"))
+    outputs.append(save_png(screen_otg_added(), "otg_added.png"))
     outputs.append(save_png(screen_letter(), "letter.png"))
     outputs.append(save_png(screen_search(), "search.png"))
     outputs.append(save_png(screen_search_results(), "search_results.png"))

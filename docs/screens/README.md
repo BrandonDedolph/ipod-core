@@ -129,7 +129,9 @@ A screenshot here is a claim about what the device draws. So:
 | `boot.png` `loading.png` `loading_onyx.png` | boot screen: splash, library load, in Onyx | `screen_boot`, `screen_loading`, `screen_loading_onyx` |
 | `mainmenu.png` `music.png` | main menu, Music menu | `screen_mainmenu`, `screen_music` |
 | `artists.png` `albums.png` `songs.png` `genres.png` `allsongs.png` | library lists | `screen_*` |
-| `playlists.png` | Music → Playlists list | `screen_playlists` |
+| `playlists.png` | Music → Playlists list, On-The-Go pinned as row 0 | `screen_playlists` |
+| `otg.png` | Playlists → On-The-Go: Clear / Save, then the tracks | `screen_otg` |
+| `otg_added.png` | The "Added to On-The-Go" banner over the Songs list | `screen_otg_added` |
 | `letter.png` | the A-Z plate over a long Artists list | `screen_letter` (`az_plate`) |
 | `search.png` `search_results.png` | Music → Search: typing, and the hits | `screen_search`, `screen_search_results` |
 | `detail.png` | album detail (tracklist) | `screen_detail` |

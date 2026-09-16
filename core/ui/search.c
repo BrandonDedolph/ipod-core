@@ -271,6 +271,22 @@ void search_scan(search_t *s, const search_source_t *src)
     }
 }
 
+int search_hold_rows(const search_t *s, int *addable, int *song_idx)
+{
+    int rows = 0, add = 0, si = -1;
+    if (s->mode == SEARCH_RESULTS && s->nhit > 0 &&
+        s->sel >= 0 && s->sel < s->nhit) {
+        rows = s->nhit;
+        if (s->hit[s->sel].type == SEARCH_T_SONG) {
+            add = 1;
+            si  = (int)s->hit[s->sel].idx;
+        }
+    }
+    if (addable)  *addable  = add;
+    if (song_idx) *song_idx = si;
+    return rows;
+}
+
 int search_play_rows(const search_t *s, int *is_track)
 {
     int rows  = 0;

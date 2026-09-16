@@ -30,13 +30,16 @@ New to the device? Read the [user guide](docs/USER_GUIDE.md).
   a marquee for long titles, an artist's whole discography as one list, `.m3u8` playlists read from
   the disk, an A–Z letter on every long list, and a Search that types on the wheel and matches
   titles, artists, albums and playlists — through accents and curly apostrophes.
+- **Builds an On-The-Go playlist.** Hold Select on a song — or an album — and it joins a list you
+  can play, clear, or save into one of five slots. A saved one is a plain `.m3u8` you can copy off
+  the iPod.
 - **Draws real type.** A libc-free, gamma-correct text renderer with six Nunito atlases, kerned
   and tracked from measured ink.
 - **Has seven themes.** Linen, Onyx, Sage, Plaster, Olive, Umber, Mushroom. The selection bar is
   always the theme's ink behind its surface, so every screen inverts with the theme.
-- **Remembers.** Settings, the resume position and the queue it was in persist to a pre-allocated
-  file on the disk, CRC-checked, never moving a cluster. A 4 MiB on-disk event log captures every
-  diagnostic line.
+- **Remembers.** Settings, the resume position, the queue it was in and the live On-The-Go list
+  persist to pre-allocated files on the disk, CRC-checked, never moving a cluster. A 4 MiB on-disk
+  event log captures every diagnostic line.
 - **Sleeps.** Hold Play to sleep, or set a sleep timer of 15 to 120 minutes; the drive parks, the
   panel and codec go down, the CPU idles. On battery, a sleeping device powers itself off after
   thirty minutes.
@@ -67,6 +70,11 @@ on the sub-line.
     <td><img src="docs/screens/artists.png" width="260" alt="Artists"></td>
     <td><img src="docs/screens/allsongs.png" width="260" alt="An artist's songs"></td>
     <td><img src="docs/screens/playlists.png" width="260" alt="Playlists"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screens/otg.png" width="260" alt="On-The-Go"></td>
+    <td><img src="docs/screens/otg_added.png" width="260" alt="Added to On-The-Go"></td>
+    <td><img src="docs/screens/songs.png" width="260" alt="Songs"></td>
   </tr>
 </table>
 
@@ -236,10 +244,12 @@ ROM; nothing this firmware writes can remove it. Reflash, or restore the partiti
 ## Status
 
 Runs on the device: direct boot, FLAC playback, the library, themes, settings and resume, sleep
-and power-off, the event log. Built but not yet flashed: MP3 playback, Search, and the A–Z letter
-on every list. Not there: writing playlists, podcasts. MP3 decodes correctly and within budget on
-the host; whether it holds real time on the device is the next bench. The running list of what
-works and what is next is [`STATUS.md`](STATUS.md).
+and power-off, the event log. Built but not yet flashed: MP3 playback, Search, the A–Z letter on
+every list, and On-The-Go. Not there: podcasts. MP3 decodes correctly and within budget on the
+host; whether it holds real time on the device is the next bench. Playlists are read from the disk
+and On-The-Go writes five saved slots the host pre-allocated; making a playlist file of your own on
+the device still needs a filesystem writer that does not exist. The running list of what works and
+what is next is [`STATUS.md`](STATUS.md).
 
 Versions are git tags, `v0.1.0` and up. The boot screen's bottom-right stamp and Settings → About
 show the version the device runs; an untagged build shows the nearest tag, the commit distance and

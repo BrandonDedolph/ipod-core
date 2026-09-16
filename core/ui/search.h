@@ -175,6 +175,22 @@ void search_scan(search_t *s, const search_source_t *src);
  */
 int  search_play_rows(const search_t *s, int *is_track);
 
+/*
+ * Rows the ROW-SELECT arbiter should see, for the same reason. A hold on a
+ * result adds it to On-The-Go, which only means anything for a hit that names
+ * ONE TRACK — an artist, an album or a playlist hit is a title row, and
+ * holding Select on those does nothing here exactly as it does nothing on
+ * Artists or Playlists. 0 in PICK: the ring is a text field, its SELECT types
+ * a character, and a press there must act on the down-edge like a key and
+ * never wait for a release.
+ *
+ * `*addable` is set when the selected hit is a track; `*song_idx` is its
+ * position in the caller's SORTED song order (search_hit_t.idx for a song
+ * hit), or -1. Split out of the caller so the rule has one home and the host
+ * can assert it — kernel/main.c is not host-built.
+ */
+int  search_hold_rows(const search_t *s, int *addable, int *song_idx);
+
 /* ---------- The screen -------------------------------------------------- */
 
 /* Draw the screen below the status strip (which the caller paints, along with

@@ -38,6 +38,7 @@
 #include "resume_ctx.h"
 #include "cfg_commit.h"
 #include "evlog.h"
+#include "otg_store.h"
 #include "core_version.h"       /* CORE_BUILD_ID: meson vcs_tag, git describe   */
 #include "core_version_tag.h"   /* CORE_VERSION:  meson vcs_tag, nearest tag    */
 #include "../ui/text.h"
@@ -53,6 +54,8 @@
 #include "../library/idx.h"
 #include "../library/sort.h"
 #include "../library/playlist.h"
+#include "../library/otg.h"
+#include "../library/otg_slot.h"
 #include "../ui/wheel.h"
 #include "../ui/letterindex.h"
 #include "../ui/search.h"
@@ -839,6 +842,7 @@ static int      g_bat_mv_filt = -1;          /* median of recent samples (policy
  * which sits with the status-strip state it feeds. */
 static void settings_commit(int mode);
 static void evlog_commit(int mode);
+static void otg_commit(int mode);
 static void resume_capture(void);
 static int  enter_standby(void);
 
@@ -1053,6 +1057,7 @@ static int battery_refresh(int force)
          */
         resume_capture();
         settings_commit(CFG_COMMIT_LAST);
+        otg_commit(CFG_COMMIT_LAST);      /* the live list, same exemption */
         /* The log's last write, exempt from the gate the same way: the
          * DISKSAFE line above and everything before it reach the disk;
          * the SHUTOFF that follows is narrated but, by design, never
@@ -2583,6 +2588,10 @@ static int idx_reject(int why)
  * Record (256B, LE): u32 dur, u16 track, u16 disc, folder[64], file[64],
  * title[48], artist[40], genre[24], u32 folder_hash, u32 file_hash. */
 static void library_finish(void);        /* sort + genre counts (shared)        */
+/* The On-The-Go list binds its locator pairs to songs, so it is re-bound
+ * whenever the library is (library_ensure's tail). Defined with the rest of
+ * the feature, below the Playlists section it shares state with. */
+static void otg_bind_all(void);
 
 /* The library root: the "Music" folder if present, else the volume root (kept
  * for back-compat). Music/ holds the album folders + CORELIB.IDX, so the FAT
@@ -2985,6 +2994,10 @@ static void library_ensure(fat32_t *fs)
      * error is in g_lib_load_err; a deliberate retry clears g_lib_scanned. */
     g_lib_scanned = 1;
     build_artists();                       /* so About/Artists count is live */
+    /* The On-The-Go list is locator pairs; what they resolve to is a function
+     * of the library that has just been (re)built, so it is re-bound here and
+     * nowhere else. Cheap: one hash lookup per entry. */
+    otg_bind_all();
     g_lib_load_ms = (mmio_read32(USEC_TIMER_ADDR) - t0) / 1000u;
 }
 
@@ -3386,6 +3399,44 @@ static void sleep_timer_apply(void)
  * entry, and hands the rows to the player. Caps and the empty states are
  * the library's (PLAYLIST_MAX playlists, PLAYLIST_TRACKS_MAX rows).
  * ------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+ * On-The-Go, the parts the Playlists screens need. The rest of the feature is
+ * a section of its own below (it needs the screen stack); these few things sit
+ * here because Playlists pins an On-The-Go row and a saved slot's tracklist
+ * carries a Delete row, and both are painted from here.
+ * ------------------------------------------------------------------------- */
+static otg_list_t g_otg;                  /* the live list, 4100 B of .bss   */
+static int16_t    g_otg_song[OTG_MAX];    /* the g_songs index each entry
+                                           * binds to, -1 = not on this iPod */
+static int        g_otg_missing;          /* how many of those there are     */
+
+/*
+ * A destructive row asks twice. The first press re-labels the row and starts a
+ * three-second window; the second press inside it acts. Two presses because
+ * the live list is the only copy of something assembled by hand and a saved
+ * slot is the only copy of something saved, and there is no undo — and a
+ * confirm the row itself carries needs no modal, no second screen and no new
+ * convention.
+ */
+#define OTG_CONFIRM_US 3000000u
+
+static ui_window_t g_otg_confirm;       /* Clear Playlist, on SCR_OTG        */
+static ui_window_t g_pl_confirm;        /* Delete Playlist, on a saved slot  */
+
+static int otg_confirm_up(ui_window_t *w)
+{
+    return ui_window_up(w, OTG_CONFIRM_US, mmio_read32(USEC_TIMER_ADDR));
+}
+
+/* Bounded string copy; nothing in lib/ has one and three little formatters
+ * below want it. */
+static void otg_str_copy(char *dst, uint32_t cap, const char *src)
+{
+    uint32_t i = 0;
+    for (; src && src[i] && i + 1u < cap; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
 static playlist_t         g_playlists[PLAYLIST_MAX];
 static int                g_playlists_n;
 static int                g_playlists_err;      /* FAT32_* when the list could
@@ -3405,6 +3456,9 @@ static int                g_pl_open = -1;       /* g_playlists index shown    */
 static int                g_pl_err;             /* negative: file unreadable  */
 static playlist_stats_t   g_pl_stats;
 static int                g_plt_sel, g_plt_accum; /* tracklist                */
+static int                g_pl_slot;    /* 1..OTG_SLOTS when the open playlist
+                                         * IS a saved On-The-Go slot, else 0  */
+static int                g_pl_damaged; /* ...and its save was torn           */
 static playlist_scratch_t g_pl_scratch;         /* ~35 KB of .bss, one copy   */
 
 /* Where the playlists folder is looked for, and what a relative entry in a
@@ -3439,7 +3493,7 @@ static void playlists_load(fat32_t *fs)
      * next boot, while Music > Playlists — which re-reads on every entry —
      * recovered on the next look. */
     if (n >= 0) g_playlists_scanned = 1;
-    if (g_pl_sel >= g_playlists_n) {
+    if (g_pl_sel >= g_playlists_n + 1) {      /* + the pinned On-The-Go row */
         g_pl_sel = 0;                     /* the row under the cursor is gone */
     }
     g_pl_accum = 0;
@@ -3488,7 +3542,10 @@ static void playlist_open(fat32_t *fs, int pi)
     g_pl_open     = pi;
     g_pl_tracks_n = 0;
     g_pl_err      = 0;
+    g_pl_slot     = 0;
+    g_pl_damaged  = 0;
     g_plt_sel = g_plt_accum = 0;
+    g_pl_confirm.armed = 0;
     if (pi < 0 || pi >= g_playlists_n) {
         return;
     }
@@ -3499,6 +3556,23 @@ static void playlist_open(fat32_t *fs, int pi)
     g_pl_tracks_n = (n < 0) ? 0 : n;
     for (int i = 0; i < g_pl_tracks_n; i++) {
         g_pl_song[i] = (int16_t)playlist_bind_row(&g_pl_tracks[i]);
+    }
+    /*
+     * A saved On-The-Go slot is an ordinary playlist in every way but two: it
+     * gets a Delete Playlist row (without it, five saves dead-end the feature
+     * until the next host sync), and it is checked for a TORN SAVE — a power
+     * cut during the write leaves a header whose gen disagrees with the
+     * trailer's, or a line count that disagrees with the header's. The parser
+     * has just produced that count, so the check is two small reads and no
+     * CRC pass. See library/otg_slot.h.
+     */
+    g_pl_slot = otg_slot_index(g_playlists[pi].name);
+    if (g_pl_slot > 0 && g_pl_err == 0) {
+        otg_slot_info_t info;
+        if (otg_slot_verify(fs, g_playlists[pi].clus, g_playlists[pi].size,
+                            g_pl_stats.listed, &info) == 0) {
+            g_pl_damaged = (info.present && info.damaged) ? 1 : 0;
+        }
     }
 }
 
@@ -3513,6 +3587,9 @@ static int playlist_play(int start)
 {
     if (g_pl_open < 0 || g_pl_tracks_n == 0) {
         return -1;
+    }
+    if (start >= g_pl_tracks_n) {
+        start = 0;                       /* the Delete row is not a track */
     }
     g_queue_kind     = RESUME_KIND_PLAYLIST;
     g_queue_seed     = 0;
@@ -3548,45 +3625,78 @@ static int playlist_play(int start)
     return start;
 }
 
+/*
+ * On-The-Go is PINNED as row 0, so the scanned files start at 1.
+ *
+ * The original iPod puts it last. First is chosen because 64 playlists is a
+ * long spin to the bottom and this is the row that is used most — it is the
+ * one the whole feature is reached through, and it is where a list you have
+ * just built lives.
+ */
+static int playlists_row_count(void) { return g_playlists_n + 1; }
+
 static void playlists_row_draw(int r, int idx)
 {
-    list_row(r, g_playlists[idx].name, 0, 0, 1 /*chevron*/, idx == g_pl_sel, 0, 0);
+    if (idx == 0) {
+        char n[12];
+        u32_to_dec(n, (unsigned)g_otg.n);
+        list_row(r, "On-The-Go", 0, g_otg.n ? n : 0, 1 /*chevron*/,
+                 idx == g_pl_sel, 0, 0);
+        return;
+    }
+    list_row(r, g_playlists[idx - 1].name, 0, 0, 1 /*chevron*/,
+             idx == g_pl_sel, 0, 0);
 }
 
 static void playlists_render(int sel)
 {
     console_clear(LINEN_SURFACE);
     status_strip_render();
+    int  total = playlists_row_count();
     char right[12];
-    if (g_playlists_n > 0) fmt_count(right, sel + 1, g_playlists_n);
-    else                   right[0] = '\0';
+    fmt_count(right, sel + 1, total);
     ui_header("Playlists", right, 1);
-    if (g_playlists_n == 0) {
-        /* Two different nothings: a folder that is not there or is empty,
-         * and a disk that would not say. */
-        if (g_playlists_err) {
-            ui_text(14, LIST_Y0 + 20, "Could not read Playlists", FONT_ROW, LINEN_MUTED);
-        } else {
-            ui_text(14, LIST_Y0 + 20, "No playlists", FONT_ROW, LINEN_MUTED);
-            ui_text(14, LIST_Y0 + 40, "Put .m3u8 files in Music/Playlists",
-                    FONT_SMALL, LINEN_MUTED2);
-        }
+    if (g_playlists_err) {
+        /* The pinned row is still real — On-The-Go lives in RAM and does not
+         * need the folder — so the failure is a line under it, not the whole
+         * screen. */
+        playlists_row_draw(0, 0);
+        ui_text(14, LIST_Y0 + ROW_H + 16, "Could not read Playlists",
+                FONT_ROW, LINEN_MUTED);
         return;
     }
-    int top = ui_scroll_window(sel, g_playlists_n, LIST_ROWS);
+    int top = ui_scroll_window(sel, total, LIST_ROWS);
     for (int r = 0; r < LIST_ROWS; r++) {
         int idx = top + r;
-        if (idx >= g_playlists_n) break;
+        if (idx >= total) break;
         playlists_row_draw(r, idx);
     }
-    ui_scrollbar(LIST_Y0, top, LIST_ROWS, g_playlists_n);
+    if (g_playlists_n == 0) {
+        ui_text(14, LIST_Y0 + ROW_H + 16, "No playlist files",
+                FONT_ROW, LINEN_MUTED);
+        ui_text(14, LIST_Y0 + ROW_H + 36, "Put .m3u8 files in Music/Playlists",
+                FONT_SMALL, LINEN_MUTED2);
+    }
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS, total);
 }
 
 /* One tracklist row: the Songs-list shape (tag title, artist sub-line,
  * duration on the right) for a row the library knows; the filename alone
  * for one it does not. */
+/* A saved On-The-Go slot carries one extra row under its tracks. */
+static int playlist_row_count(void)
+{
+    return g_pl_tracks_n + (g_pl_slot > 0 ? 1 : 0);
+}
+
 static void playlist_row_draw(int r, int idx)
 {
+    if (idx >= g_pl_tracks_n) {          /* the Delete row, saved slots only */
+        const char *label = otg_confirm_up(&g_pl_confirm) ? "Delete? Select again"
+                                                          : "Delete Playlist";
+        ui_list_row(LIST_Y0, r, label, 0, 0, 0, idx == g_plt_sel, 0, 0, 1, ROW_H2);
+        return;
+    }
     const playlist_track_t *t = &g_pl_tracks[idx];
     const char *title = track_display(t->name), *sub = 0;
     char dur[FMT_TIME_MAX];
@@ -3605,27 +3715,440 @@ static void playlist_render(int sel)
 {
     console_clear(LINEN_SURFACE);
     status_strip_render();
+    int  total = playlist_row_count();
     char right[12];
-    if (g_pl_tracks_n > 0) fmt_count(right, sel + 1, g_pl_tracks_n);
-    else                   right[0] = '\0';
+    if (g_pl_tracks_n > 0 && sel < g_pl_tracks_n) {
+        fmt_count(right, sel + 1, g_pl_tracks_n);
+    } else {
+        right[0] = '\0';
+    }
     ui_header(g_pl_open >= 0 ? g_playlists[g_pl_open].name : "Playlist", right, 1);
     if (g_pl_tracks_n == 0) {
-        /* Say which nothing this is: the file would not read, it listed
-         * tracks none of which are on the disk, or it lists none. */
+        /* Say which nothing this is: the file would not read, a save was torn
+         * part-way through, it listed tracks none of which are on the disk, or
+         * it lists none. */
         const char *why = g_pl_err            ? "Could not read playlist"
+                        : g_pl_damaged        ? "Playlist damaged - save again"
                         : g_pl_stats.listed   ? "No tracks found on disk"
                         : g_pl_stats.rejected ? "Entries not usable"
                         :                       "Empty playlist";
         ui_text(14, LIST_Y0 + 20, why, FONT_ROW, LINEN_MUTED);
+        if (g_pl_slot > 0) {
+            /* The Delete row is the way out of a damaged or emptied slot, so
+             * it survives the empty state. */
+            playlist_row_draw(1, g_pl_tracks_n);
+        }
         return;
     }
-    int top = ui_scroll_window(sel, g_pl_tracks_n, LIST_ROWS2);
+    int top = ui_scroll_window(sel, total, LIST_ROWS2);
     for (int r = 0; r < LIST_ROWS2; r++) {
         int idx = top + r;
-        if (idx >= g_pl_tracks_n) break;
+        if (idx >= total) break;
         playlist_row_draw(r, idx);
     }
-    ui_scrollbar(LIST_Y0, top, LIST_ROWS2, g_pl_tracks_n);
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS2, total);
+}
+
+/* ---------------------------------------------------------------------------
+ * On-The-Go: the playlist you build while walking around.
+ *
+ * Hold Select on a song (or an album) and it joins a LIVE list; Playlists >
+ * On-The-Go opens it, plays it, clears it or SAVES it into one of five slot
+ * playlists on the disk. The two on-disk halves are host-tested modules —
+ * kernel/otg_store.c for the live list (COREOTG.DAT) and library/otg_slot.c
+ * for the saved ones — and core/docs/design/on-the-go.md is the format
+ * reference. What lives HERE is only what needs g_songs and g_folder_map:
+ * turning a song into a locator pair, turning a locator pair back into a
+ * song, and the screen.
+ *
+ * An entry is a pair of folded name hashes, which is what makes the whole
+ * 512-entry list one 5 KB disk slot — see library/otg.h. The price is that an
+ * entry has to be BOUND to a song at every boot and after every library
+ * reload, and that an entry whose file is no longer on the disk resolves to
+ * nothing. Such an entry is KEPT, drawn greyed with "Not on this iPod",
+ * skipped when the queue is built and counted for the header: a later sync
+ * may bring the file back, and silently dropping a row the user added is the
+ * kind of data loss this project refuses everywhere else.
+ * ------------------------------------------------------------------------- */
+
+static int                g_otg_sel, g_otg_accum; /* the On-The-Go screen      */
+static otg_save_row_t     g_otg_rows[OTG_MAX];    /* Save's row array, 4 KB    */
+static otg_entry_t        g_otg_batch[OTG_MAX];   /* one album, in order, 4 KB */
+static int16_t            g_otg_order[OTG_MAX];   /* ...sorted first, 1 KB     */
+static otg_save_scratch_t g_otg_save_scr;         /* ~9.7 KB of .bss, one copy */
+static otg_save_stats_t   g_otg_save_stats;
+static int                g_otg_slot_lba_said;    /* the first-Save UART line  */
+
+/* The pending change to COREOTG.DAT. The gate itself is inside
+ * kernel/otg_store.c (as the event log's is inside evlog.c), so this file only
+ * gathers what the gate needs and narrates the verdict. */
+static void otg_touch(void)
+{
+    otg_store_touch(mmio_read32(USEC_TIMER_ADDR));
+}
+
+/* SCR_OTG's two action rows sit above the tracks, so a row index is
+ * `2 + entry`. Named rather than spelled 2 everywhere: every renderer, the
+ * list-view table and both Select bodies count in this space. */
+enum { OTG_ROW_CLEAR = 0, OTG_ROW_SAVE = 1, OTG_ROW_FIRST = 2 };
+
+static int otg_row_count(void) { return OTG_ROW_FIRST + (int)g_otg.n; }
+
+/* ---- the confirmation banner ------------------------------------------- */
+
+/*
+ * A one-second banner over the top chrome — the Hold banner's own primitive
+ * (top_banner_render) with a + or - in a circle instead of the padlock. It
+ * exists because a hold-to-add has no other feedback: the list is on another
+ * screen, and without this the user cannot tell a press that registered from
+ * one that did not.
+ *
+ * Unlike the LOCKED banner it is not modal: the first real input dismisses it
+ * (the UNLOCKED banner's rule), so nothing is ever applied unseen behind it.
+ */
+#define OTG_FLASH_US 900000u
+
+static ui_window_t g_otg_flash;
+static int8_t      g_otg_flash_sign;            /* +1 plus, -1 minus, 0 none  */
+static char        g_otg_flash_label[40];
+static char        g_otg_flash_token[16];
+
+/* "<n> SONGS" / "1 SONG" — the small-caps token where a list header's count
+ * would be. */
+static void otg_count_token(char *dst, int n)
+{
+    int i = u32_to_dec(dst, (unsigned)n);
+    otg_str_copy(dst + i, 16u - (uint32_t)i, n == 1 ? " SONG" : " SONGS");
+}
+
+static void otg_flash(int sign, const char *label, const char *token)
+{
+    g_otg_flash_sign = (int8_t)sign;
+    otg_str_copy(g_otg_flash_label, sizeof g_otg_flash_label, label);
+    otg_str_copy(g_otg_flash_token, sizeof g_otg_flash_token, token ? token : "");
+    ui_window_arm(&g_otg_flash);
+}
+
+/* ---- binding an entry to a song ---------------------------------------- */
+
+/*
+ * The locator pair for a library song: the folded hash of its album folder's
+ * FULL on-disk name, and of its own. Returns 0 when the song cannot be named
+ * that way — a lossy long name (no locator at all), or a library built by the
+ * TAG-SCAN fallback, which leaves g_folder_map empty and so has no folder
+ * hashes. The documented layout always has an index; the caller says "Not in
+ * the library" rather than storing a pair that binds to nothing.
+ */
+static int otg_entry_of_song(int si, otg_entry_t *e)
+{
+    if (si < 0 || si >= g_songs_n) return 0;
+    const lib_song_t *s = &g_songs[si];
+    if (s->file_hash == 0) return 0;
+    for (int i = 0; i < g_folder_n; i++) {
+        if (g_folder_map[i].clus != s->dir_clus) continue;
+        e->folder_hash = g_folder_map[i].hash;
+        e->file_hash   = s->file_hash;
+        return 1;                      /* file_hash != 0, so never the null pair */
+    }
+    return 0;
+}
+
+/* The song an entry names, or -1. The index's own binding rule: the folder
+ * hash resolves to a cluster, then the file hash within it. */
+static int otg_bind_one(int i)
+{
+    uint32_t fh = g_otg.e[i].file_hash;
+    uint32_t dc = folder_clus_h(g_otg.e[i].folder_hash, "");
+    if (dc == 0 || fh == 0) return -1;
+    for (int k = g_song_hh[fh & (SONG_HASH_BUCKETS - 1)]; k; k = g_song_hn[k - 1]) {
+        const lib_song_t *s = &g_songs[k - 1];
+        if (s->file_hash == fh && s->dir_clus == dc) return k - 1;
+    }
+    return -1;
+}
+
+/* Re-bind the whole list. Called after every library load and after every
+ * mutation, because both can change what an entry resolves to. */
+static void otg_bind_all(void)
+{
+    g_otg_missing = 0;
+    for (int i = 0; i < (int)g_otg.n; i++) {
+        g_otg_song[i] = (int16_t)otg_bind_one(i);
+        if (g_otg_song[i] < 0) g_otg_missing++;
+    }
+}
+
+/* ---- adding ------------------------------------------------------------ */
+
+/* Add one library song, with the banner that says so. Returns 1 when the list
+ * grew. */
+static int otg_add_song(int si)
+{
+    otg_entry_t e;
+    if (!otg_entry_of_song(si, &e)) {
+        otg_flash(0, "Not in the library", 0);
+        return 0;
+    }
+    if (!otg_add(&g_otg, e.folder_hash, e.file_hash)) {
+        otg_flash(0, "On-The-Go is full", "512");
+        return 0;
+    }
+    g_otg_song[g_otg.n - 1] = (int16_t)otg_bind_one((int)g_otg.n - 1);
+    if (g_otg_song[g_otg.n - 1] < 0) g_otg_missing++;
+    char tok[16];
+    otg_count_token(tok, (int)g_otg.n);
+    otg_flash(+1, "Added to On-The-Go", tok);
+    otg_touch();
+    return 1;
+}
+
+/*
+ * Add a whole album, in the order its tracklist shows it: (disc, track), the
+ * key browse_bind sorts by, with the index's own order as the tie-break. Runs
+ * over g_songs rather than a directory listing, so it costs no disk read —
+ * which is the point of holding Select on an album ROW.
+ */
+static uint32_t otg_track_key(int si)
+{
+    return ((uint32_t)g_songs[si].disc << 16) | g_songs[si].track;
+}
+
+static int otg_add_album(int ai)
+{
+    if (ai < 0 || ai >= g_albums_n) return 0;
+    uint32_t dc = g_albums[ai].clus;
+    int n = 0;
+    for (int i = 0; i < g_songs_n && n < (int)OTG_MAX; i++) {
+        if (g_songs[i].dir_clus != dc) continue;
+        /* Insertion sort by (disc, track), the key browse_bind sorts a
+         * tracklist by — so the album goes in the order its tracklist shows
+         * it, filenames notwithstanding. Indices, not entries: the key is
+         * read out of g_songs, so the sort needs no second array. An album is
+         * tens of tracks and this runs once per press. */
+        uint32_t key = otg_track_key(i);
+        int j = n;
+        while (j > 0 && otg_track_key(g_otg_order[j - 1]) > key) {
+            g_otg_order[j] = g_otg_order[j - 1];
+            j--;
+        }
+        g_otg_order[j] = (int16_t)i;
+        n++;
+    }
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (otg_entry_of_song(g_otg_order[i], &g_otg_batch[m])) m++;
+    }
+    if (m == 0) {
+        otg_flash(0, "Not in the library", 0);
+        return 0;
+    }
+    int before = (int)g_otg.n;
+    int added  = otg_add_many(&g_otg, g_otg_batch, m);
+    if (added == 0) {
+        otg_flash(0, "On-The-Go is full", "512");
+        return 0;
+    }
+    for (int i = before; i < (int)g_otg.n; i++) {
+        g_otg_song[i] = (int16_t)otg_bind_one(i);
+        if (g_otg_song[i] < 0) g_otg_missing++;
+    }
+    char label[40];
+    int  k = 0;
+    otg_str_copy(label, sizeof label, "Added ");
+    k = 6;
+    k += u32_to_dec(label + k, (unsigned)added);
+    otg_str_copy(label + k, sizeof label - (uint32_t)k,
+                 added == 1 ? " song" : " songs");
+    otg_flash(+1, label, "ON-THE-GO");
+    otg_touch();
+    return 1;
+}
+
+/* ---- playing ----------------------------------------------------------- */
+
+/*
+ * Play the live list as the queue, from entry `start`. Unresolved entries are
+ * skipped (they name no file), so the queue index the pick lands on is not the
+ * entry index — which is why this returns it. RESUME_KIND_OTG carries no
+ * context hash: the list is not a file and has no name, and the boot path
+ * rebuilds it from COREOTG.DAT.
+ */
+static int otg_play(int start)
+{
+    if (g_otg.n == 0) return -1;
+    g_queue_kind     = RESUME_KIND_OTG;
+    g_queue_seed     = 0;
+    g_queue_ctx_hash = 0;
+    player_set_shuffle(g_settings.shuffle);
+    player_queue_begin();
+    int added = 0, qi = 0;
+    for (int i = 0; i < (int)g_otg.n; i++) {
+        /* The start position is recorded BEFORE the resolved check, so a pick
+         * whose file is no longer on the disk lands on the NEXT entry that is
+         * rather than on the top of the list — library_play_song's rule. */
+        if (i == start) qi = added;
+        int si = g_otg_song[i];
+        if (si < 0 || g_songs[si].file_clus == 0) continue;
+        browse_entry_t e;
+        queue_entry_from_song(&e, &g_songs[si]);
+        player_queue_add(&e);
+        added++;
+    }
+    if (added == 0) return -1;
+    if (qi >= added) qi = added - 1;       /* nothing resolved after it */
+    player_queue_commit(qi);
+    return qi;
+}
+
+/* ---- the slot files ---------------------------------------------------- */
+
+/* Find the Playlists folder under the library root. 0 when there is none —
+ * which is what a volume the host never synced looks like. */
+typedef struct { const char *want; uint32_t clus; } otg_find_t;
+
+static int otg_find_dir_cb(void *ud, const fat32_dirent_t *e)
+{
+    otg_find_t *f = (otg_find_t *)ud;
+    if (e->is_dir && name_eq_ci(e->name, f->want)) { f->clus = e->first_clus; return 1; }
+    return 0;
+}
+
+static uint32_t otg_playlists_dir(fat32_t *fs)
+{
+    otg_find_t f;
+    f.want = PLAYLIST_DIR;
+    f.clus = 0;
+    if (fat32_readdir(fs, playlists_root_clus(fs), otg_find_dir_cb, &f) != 0) return 0;
+    return f.clus;
+}
+
+/*
+ * Locate slot file `n` (1..OTG_SLOTS) by name. Deliberately NOT through
+ * playlist_scan: the slot Save wants is the EMPTY one, and playlists_load
+ * hides exactly those. Two directory reads, no 5 KB array.
+ */
+static int otg_slot_file(fat32_t *fs, int n, uint32_t *clus, uint32_t *size)
+{
+    *clus = *size = 0;
+    uint32_t dir = otg_playlists_dir(fs);
+    if (dir == 0) return 0;
+    char name[OTG_SLOT_NAME_BYTES + 8];
+    otg_slot_name(name, n);
+    if (name[0] == '\0') return 0;
+    otg_str_copy(name + 11, sizeof name - 11u, ".m3u8");
+
+    /* The size has to come off the directory entry, and fat32_open_in gives
+     * it along with the cluster. */
+    uint32_t c = 0, sz = 0;
+    if (fat32_open_in(fs, dir, name, &c, &sz) != 0) return 0;
+    *clus = c;
+    *size = sz;
+    return 1;
+}
+
+/*
+ * The lowest slot Save may use: one that EXISTS, carries the directive (a
+ * foreign playlist at that name is the user's and is never written to), says
+ * count 0, and is a size the writer will take. 0 when there is none.
+ *
+ * A DAMAGED slot is not offered here. Deciding that a used slot is torn needs
+ * the parser's line count — a full read of all five on every Save and on every
+ * paint of the greyed Save row — and the recovery is one press away: the
+ * damaged slot opens to "Playlist damaged" with Delete Playlist under it.
+ */
+static int otg_slot_free_index(fat32_t *fs)
+{
+    for (int n = 1; n <= (int)OTG_SLOTS; n++) {
+        uint32_t clus = 0, size = 0;
+        if (!otg_slot_file(fs, n, &clus, &size)) continue;
+        if (size < OTG_SLOT_FILE_MIN || (size % OTG_SLOT_SIZE_GRAIN) != 0) continue;
+        otg_slot_info_t info;
+        if (otg_slot_probe(fs, clus, size, &info) != 0) continue;
+        if (info.present && info.count == 0) return n;
+    }
+    return 0;
+}
+
+/* ---- the On-The-Go screen ---------------------------------------------- */
+
+/*
+ * The slot Save would write into, 0 for none. Decided when the screen OPENS
+ * (five 512-byte reads) rather than at paint time: the partial-repaint path
+ * draws rows without going through otg_render, so a value recomputed there
+ * would be stale exactly when a row is redrawn on its own.
+ */
+static int g_otg_free_slot;
+
+static void otg_row_draw(int r, int idx)
+{
+    int sel = (idx == g_otg_sel);
+    if (idx == OTG_ROW_CLEAR) {
+        const char *label = otg_confirm_up(&g_otg_confirm) ? "Clear? Select again"
+                                                           : "Clear Playlist";
+        ui_list_row(LIST_Y0, r, label, 0, 0, 0, sel, g_otg.n == 0, 0, 1, ROW_H2);
+        return;
+    }
+    if (idx == OTG_ROW_SAVE) {
+        int greyed = (g_otg.n == 0) || (g_otg_free_slot == 0);
+        const char *sub = (g_otg.n > 0 && g_otg_free_slot == 0)
+                            ? "All five saved lists are in use" : 0;
+        ui_list_row(LIST_Y0, r, "Save Playlist", sub, 0, 0, sel, greyed, 0, 1, ROW_H2);
+        return;
+    }
+    int i  = idx - OTG_ROW_FIRST;
+    int si = g_otg_song[i];
+    if (si < 0) {
+        /* Kept, not dropped: a later sync may bring the file back. The row
+         * says why it cannot play instead of pretending it can. */
+        ui_list_row(LIST_Y0, r, "Not on this iPod", 0, 0, 0, sel, 1, 0, 1, ROW_H2);
+        return;
+    }
+    const lib_song_t *sg = &g_songs[si];
+    const char *title = sg->title[0] ? sg->title : track_display(sg->file);
+    const char *sub   = sg->artist[0] ? sg->artist : 0;
+    char dur[FMT_TIME_MAX];
+    dur[0] = '\0';
+    if (sg->duration_s) fmt_time(dur, sg->duration_s);
+    list_row_titled(r, title, sub, dur[0] ? dur : 0, sel, 0);
+}
+
+/* The header's right-hand value: "3 / 12" on a track row, "2 missing" on an
+ * action row when some entry names a file that is not here, else nothing. */
+static void otg_header_right(char *right, int sel)
+{
+    right[0] = '\0';
+    if (sel >= OTG_ROW_FIRST && g_otg.n > 0) {
+        fmt_count(right, sel - OTG_ROW_FIRST + 1, (int)g_otg.n);
+    } else if (g_otg_missing > 0) {
+        int k = u32_to_dec(right, (unsigned)g_otg_missing);
+        otg_str_copy(right + k, 12u - (uint32_t)k, " MISSING");
+    }
+}
+
+static void otg_render(int sel)
+{
+    console_clear(LINEN_SURFACE);
+    status_strip_render();
+    char right[12];
+    otg_header_right(right, sel);
+    ui_header("On-The-Go", right, 1);
+    if (g_otg.n == 0) {
+        /* The action rows are still there (greyed), but an empty list needs
+         * the sentence that says how one is made — nothing else on the device
+         * teaches the gesture. */
+        ui_text(14, LIST_Y0 + 20, "On-The-Go is empty", FONT_ROW, LINEN_MUTED);
+        ui_text(14, LIST_Y0 + 40, "Hold Select on a song to add it",
+                FONT_SMALL, LINEN_MUTED2);
+        return;
+    }
+    int total = otg_row_count();
+    int top   = ui_scroll_window(sel, total, LIST_ROWS2);
+    for (int r = 0; r < LIST_ROWS2; r++) {
+        int idx = top + r;
+        if (idx >= total) break;
+        otg_row_draw(r, idx);
+    }
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS2, total);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3744,6 +4267,39 @@ static void evlog_commit(int mode)
             uart_puts(" — log OFF for this session");
         }
         uart_putc('\n');
+        break;
+    default:
+        break;
+    }
+}
+
+/*
+ * The On-The-Go live list's commit, through the SAME gate with the same
+ * inputs — its cfg_commit_t lives inside kernel/otg_store.c, as the event
+ * log's lives inside evlog.c, so this is the whole of main.c's share.
+ * `mode` as settings_commit's.
+ */
+static void otg_commit(int mode)
+{
+    cfg_commit_env_t env;
+    env.now_us        = mmio_read32(USEC_TIMER_ADDR);
+    env.parked        = ata_is_parked();
+    env.player_active = player_active();
+    env.battery_ok    = battery_disk_writes_allowed();
+    env.writable      = 0;                /* otg_store knows its own */
+    switch (otg_store_commit(mode, &env, &g_otg)) {
+    case OTG_COMMIT_WROTE:
+        uart_puts("core: otg save rc 00000000 seq ");
+        uart_put_hex32(otg_store_seq());
+        uart_putc('\n');
+        break;
+    case OTG_COMMIT_DEFERRED:
+        uart_puts("core: otg save deferred — battery below disk-safe\n");
+        break;
+    case OTG_COMMIT_FAILED:
+        uart_puts("core: otg save rc ");
+        uart_put_hex32((uint32_t)otg_store_last_rc());
+        uart_puts(otg_store_pending() ? " (retry pending)\n" : " (given up)\n");
         break;
     default:
         break;
@@ -4221,12 +4777,14 @@ static void music_menu_render(void)
  * Screen stack
  * ------------------------------------------------------------------------- */
 typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_SONGS, SCR_GENRES,
-               SCR_PLAYLISTS, SCR_PLAYLIST, SCR_SEARCH,
+               SCR_PLAYLISTS, SCR_PLAYLIST, SCR_OTG, SCR_SEARCH,
                SCR_BROWSER, SCR_NOWPLAYING, SCR_QUEUE, SCR_SETTINGS,
                SCR_BATTERY, SCR_CHARGING } screen_t;
 /* The deepest legal path is 8: MENU, MUSIC, ARTISTS, BROWSER, SONGS,
  * NOWPLAYING, QUEUE, plus ONE modal (Search is no deeper: it sits where
- * ARTISTS does, and the BROWSER an album hit opens sits where BROWSER does) (scr_push_modal replaces a modal with a
+ * ARTISTS does, and the BROWSER an album hit opens sits where BROWSER does;
+ * On-The-Go is no deeper either — MENU, PLAYLISTS, OTG, NOWPLAYING, QUEUE
+ * plus a modal is 6) (scr_push_modal replaces a modal with a
  * modal, so BATTERY and CHARGING never stack). The headroom is deliberate:
  * this used to be exactly 8 without SONGS counted, and a DISKSAFE edge at
  * the bottom of that path retried the push every pass with dirty set — a
@@ -4285,6 +4843,7 @@ static void settings_leave(void)
     g_set_editing = 0;
     resume_capture();
     settings_commit(CFG_COMMIT_SOFT);
+    otg_commit(CFG_COMMIT_SOFT);          /* a list built before Settings, too */
 }
 
 /*
@@ -4540,7 +5099,8 @@ static play_tap_t play_tap_start(fat32_t *fs)
         break;
     case SCR_ARTISTS:   ctx = GESTURE_CTX_LIST_TITLE; count = g_artists_n;   break;
     case SCR_GENRES:    ctx = GESTURE_CTX_LIST_TITLE; count = g_genres_n;    break;
-    case SCR_PLAYLISTS: ctx = GESTURE_CTX_LIST_TITLE; count = g_playlists_n; break;
+    case SCR_PLAYLISTS: ctx = GESTURE_CTX_LIST_TITLE;
+                        count = playlists_row_count();                       break;
     case SCR_SONGS:     ctx = GESTURE_CTX_LIST_TRACK; count = g_songview_n;  break;
     case SCR_SEARCH: {
         /* The picker is a text field: nothing is highlighted, so PLAY stays
@@ -4554,6 +5114,10 @@ static play_tap_t play_tap_start(fat32_t *fs)
         break;
     }
     case SCR_PLAYLIST:  ctx = GESTURE_CTX_LIST_TRACK; count = g_pl_tracks_n; break;
+    /* On-The-Go is a list of tracks with two action rows on top; PLAY on an
+     * action row plays the list from its first track, which is what PLAY on
+     * any list title does. */
+    case SCR_OTG:       ctx = GESTURE_CTX_LIST_TRACK; count = otg_row_count(); break;
     case SCR_BROWSER:
         /* Depth 0 is the album list (rows that NAME a queue, plus the
          * artist's synthetic All Songs row); depth 1 is one album's tracks. */
@@ -4606,7 +5170,11 @@ static play_tap_t play_tap_start(fat32_t *fs)
         break;
 
     case SCR_PLAYLISTS:
-        playlist_open(fs, g_pl_sel);
+        if (g_pl_sel == 0) {              /* the pinned On-The-Go row */
+            if (otg_play(0) < 0) return PLAY_TAP_PASS;
+            break;
+        }
+        playlist_open(fs, g_pl_sel - 1);
         if (playlist_play(0) < 0) {
             /* Unreadable, or every file it names is gone. Show the tracklist
              * screen with the reason SELECT would have shown rather than
@@ -4618,8 +5186,16 @@ static play_tap_t play_tap_start(fat32_t *fs)
 
     case SCR_PLAYLIST:
         /* Unreachable with rows on screen, and it cannot have torn the old
-         * queue down: playlist_play() refuses before player_queue_begin(). */
+         * queue down: playlist_play() refuses before player_queue_begin().
+         * A saved slot's Delete row is not a track; playlist_play() starts
+         * from the top for it. */
         if (playlist_play(g_plt_sel) < 0) return PLAY_TAP_PASS;
+        break;
+
+    case SCR_OTG:
+        if (otg_play(g_otg_sel >= OTG_ROW_FIRST ? g_otg_sel - OTG_ROW_FIRST : 0) < 0) {
+            return PLAY_TAP_PASS;         /* nothing in it resolves to a file */
+        }
         break;
 
     case SCR_SEARCH: {
@@ -4669,6 +5245,427 @@ static play_tap_t play_tap_start(fat32_t *fs)
     hal_volume_set(g_volume);          /* re-apply over the codec re-init */
     scr_push(SCR_NOWPLAYING);
     return PLAY_TAP_STARTED;
+}
+
+/* ---------------------------------------------------------------------------
+ * On-The-Go: the actions that move between screens, and the row SELECT
+ * arbitration they hang off. Below play_tap_start because they push and pop
+ * screens and call the same builders it does.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Save the live list into the lowest free slot.
+ *
+ * A row that cannot be NAMED — its folder is not in the library root, its long
+ * name is lossy, the path would be over M3U_PATH_MAX — is counted, never
+ * silently dropped, so the banner can say "Saved 10 of 12" instead of the user
+ * finding out on a train.
+ */
+static int otg_save_to_slot(fat32_t *fs)
+{
+    int n = otg_slot_free_index(fs);
+    if (n == 0) {
+        otg_flash(0, "No free saved list", 0);
+        return 0;
+    }
+    uint32_t clus = 0, size = 0;
+    if (!otg_slot_file(fs, n, &clus, &size)) {
+        otg_flash(0, "Could not save", 0);
+        return 0;
+    }
+
+    /* The first Save of a session prints the address it is about to write,
+     * for the same reason the boot line prints COREOTG.DAT's: it has to be
+     * checked against tools/make_otg.py --verify before the first write on a
+     * device. Once per session — this is a blocking UART line. */
+    if (!g_otg_slot_lba_said) {
+        uint32_t lba = 0, run = 0;
+        if (fat32_file_lba(fs, clus, &lba, &run) == 0) {
+            uart_puts("core: otg slot ");
+            uart_dec(n);
+            uart_puts(" lba ");
+            uart_put_hex32(lba);
+            uart_putc('\n');
+        }
+        g_otg_slot_lba_said = 1;
+    }
+
+    /*
+     * Shown unconditionally, not through load_bar_progress's "only if it turns
+     * out to be slow" gate: this job has no progress to report (the writer
+     * does not call back) and it is never fast — the whole 128 KiB file is
+     * rewritten, plus one directory walk per album to read the exact on-disk
+     * names. A frozen screen for a second or two is worse than one frame of
+     * load bar.
+     */
+    load_bar("SAVING PLAYLIST", 0);
+    int rows = 0;
+    for (int i = 0; i < (int)g_otg.n; i++) {
+        int si = g_otg_song[i];
+        if (si < 0) continue;            /* names no file: nothing to write */
+        g_otg_rows[rows].dir_clus  = g_songs[si].dir_clus;
+        g_otg_rows[rows].file_clus = g_songs[si].file_clus;
+        rows++;
+    }
+    /* The folder every row's dir_clus is looked up in, and the absolute
+     * prefix that matches it: Music/ on the documented layout, the volume
+     * root on the back-compat one — the same pair playlists_base_dir()
+     * expresses for the read side. */
+    int rc = otg_slot_save(fs, clus, size, playlists_root_clus(fs),
+                           g_lib_root_clus ? "/Music/" : "/",
+                           g_otg_rows, rows, g_otg.gen,
+                           ata_write_sectors, &g_otg_save_scr, &g_otg_save_stats);
+    uart_puts("core: otg slot save rc ");
+    uart_put_hex32((uint32_t)rc);
+    uart_puts(" wrote ");
+    uart_dec((int)g_otg_save_stats.written);
+    uart_puts(" of ");
+    uart_dec((int)g_otg.n);
+    uart_putc('\n');
+    if (rc != 0) {
+        otg_flash(0, "Could not save", 0);
+        return 1;                        /* the screen changed: repaint */
+    }
+
+    if (g_otg_save_stats.written == 0) {
+        /* Every row was unsaveable. The slot now holds an empty list (which
+         * is what it held before), and the live list must NOT be thrown away
+         * for a save that saved nothing. */
+        otg_flash(0, "Nothing could be saved", 0);
+        return 1;
+    }
+
+    char label[40];
+    int  k = 0;
+    if (g_otg_save_stats.written == g_otg.n) {
+        otg_str_copy(label, sizeof label, "Saved as On-The-Go ");
+        k = 19;
+    } else {
+        otg_str_copy(label, sizeof label, "Saved ");
+        k  = 6;
+        k += u32_to_dec(label + k, g_otg_save_stats.written);
+        otg_str_copy(label + k, sizeof label - (uint32_t)k, " of ");
+        k += 4;
+        k += u32_to_dec(label + k, g_otg.n);
+        otg_str_copy(label + k, sizeof label - (uint32_t)k, " as On-The-Go ");
+        k += 14;
+    }
+    label[k++] = (char)('0' + n);
+    label[k]   = '\0';
+    char tok[16];
+    otg_count_token(tok, (int)g_otg_save_stats.written);
+    otg_flash(+1, label, tok);
+
+    /*
+     * The list that was just saved may be the one PLAYING. The player holds
+     * its own copy of the queue, so playback carries on either way — but the
+     * resume record must now name the file, not a live list that is about to
+     * be emptied. Re-point it; the next capture writes the playlist kind.
+     */
+    if (g_queue_kind == RESUME_KIND_OTG) {
+        char slot[OTG_SLOT_NAME_BYTES];
+        otg_slot_name(slot, n);
+        g_queue_kind     = RESUME_KIND_PLAYLIST;
+        g_queue_ctx_hash = name_hash(slot);
+    }
+
+    otg_clear(&g_otg);
+    otg_bind_all();
+    otg_touch();
+    /* The moment is right for the write and the drive is certainly spinning
+     * (we just wrote 128 KiB through it), so don't leave the emptied list to
+     * the idle debounce. */
+    otg_commit(CFG_COMMIT_SOFT);
+
+    /* Show the saved list where it now lives. playlists_load re-scans, so the
+     * new row is there and the emptied slot the save came from is gone. */
+    playlists_load(fs);
+    char want[OTG_SLOT_NAME_BYTES];
+    otg_slot_name(want, n);
+    for (int i = 0; i < g_playlists_n; i++) {
+        if (name_eq_ci(g_playlists[i].name, want)) { g_pl_sel = i + 1; break; }
+    }
+    scr_pop();                           /* On-The-Go -> Playlists */
+    return 1;
+}
+
+/* Delete Playlist on a saved slot: the empty form over the same file, which is
+ * what makes the slot free again. */
+static int otg_delete_slot(fat32_t *fs)
+{
+    if (g_pl_open < 0 || g_pl_slot <= 0) {
+        return 0;
+    }
+    load_bar("DELETING PLAYLIST", 0);    /* the same 128 KiB rewrite */
+    int rc = otg_slot_save(fs, g_playlists[g_pl_open].clus,
+                           g_playlists[g_pl_open].size, 0, "/",
+                           0, 0, g_otg.gen,
+                           ata_write_sectors, &g_otg_save_scr, &g_otg_save_stats);
+    uart_puts("core: otg slot erase rc ");
+    uart_put_hex32((uint32_t)rc);
+    uart_putc('\n');
+    if (rc != 0) {
+        otg_flash(0, "Could not delete", 0);
+        return 1;
+    }
+    otg_flash(-1, "Deleted", 0);
+    playlists_load(fs);
+    scr_pop();                           /* the tracklist -> Playlists */
+    return 1;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * SELECT on a list row: tap or hold.
+ *
+ * Every row that can be ADDED to On-The-Go is a row SELECT already did
+ * something to, so the two have to be told apart by press length — which is
+ * only known on the release or at the threshold. That is exactly the machine
+ * ui/keyhold.c is, and PLAY, MENU and RIGHT/LEFT already go through it; this
+ * is the fifth button and the first one whose meaning also depends on WHICH
+ * ROW was under the thumb when the press began.
+ *
+ * So the down-edge records the row and arms the machine, and a per-pass block
+ * in the main loop decides. Only the four screens with a hold action do this
+ * (Songs, both halves of the browser, a playlist's tracklist and On-The-Go);
+ * everywhere else SELECT still acts on the down-edge, because a delayed tap
+ * with no long action behind it would be latency for nothing. The recorded row is what acts: the thumb rocks the
+ * wheel during a 450 ms hold, and the row you pressed is the row you meant.
+ * The press is dropped if the screen changes, the list is rebuilt
+ * (g_list_epoch) or Hold engages under the finger.
+ *
+ * The cost is that a tap now acts on RELEASE — the original iPod's behaviour,
+ * and the same rule Now Playing's SELECT has always used.
+ */
+/* What a Search hit IS, defined with the rest of that screen below; declared
+ * here because the row arbitration is above it. */
+static int search_open_hit(fat32_t *fs);
+
+static struct {
+    int      pending;
+    int      scr;
+    int      sub;        /* the screen's own sub-state (rowsel_sub)         */
+    int      sel;        /* the row under the thumb at the down-edge        */
+    uint32_t epoch;      /* g_list_epoch: the list must not have been rebuilt */
+} g_rowsel;
+
+/*
+ * Two screens are really two lists behind one screen_t, and a press has to
+ * belong to the one it started on: SCR_BROWSER is the album list at depth 0
+ * and one album's tracks at depth 1, and SCR_SEARCH is the character ring
+ * (where SELECT types and never arbitrates) or the hits.
+ */
+static int rowsel_sub(void)
+{
+    switch (scr_cur()) {
+    case SCR_BROWSER: return g_dir_depth;
+    case SCR_SEARCH:  return g_search.mode;
+    default:          return 0;
+    }
+}
+
+static void rowsel_arm(int sel, keyhold_t *k, uint32_t now_us)
+{
+    g_rowsel.pending = 1;
+    g_rowsel.scr     = (int)scr_cur();
+    g_rowsel.sub     = rowsel_sub();
+    g_rowsel.sel     = sel;
+    g_rowsel.epoch   = g_list_epoch;
+    /* Fed here so the press is timed from the EVENT's own tick: the latch can
+     * be a pass ahead of clickwheel_buttons(), and a tap short enough to be
+     * over before the live sampler sees it would otherwise never be reported
+     * at all. */
+    (void)keyhold_feed(k, 1, now_us, SEL_HOLD_US);
+}
+
+static void rowsel_drop(keyhold_t *k)
+{
+    g_rowsel.pending = 0;
+    keyhold_reset(k);
+}
+
+/*
+ * The SELECT bodies that used to sit in the event switch, keyed on the
+ * RECORDED screen and row. The return is a little bitmask rather than a bool
+ * because the caller has two things to set: ROWSEL_DIRTY says the screen
+ * needs a repaint, ROWSEL_PLAYING says Now Playing was pushed over a track
+ * that has just started (np_first, which skips the first partial paint).
+ */
+#define ROWSEL_DIRTY   1
+#define ROWSEL_PLAYING 2
+
+static int row_select_tap(fat32_t *fs)
+{
+    int sel = g_rowsel.sel;
+    switch (g_rowsel.scr) {
+    case SCR_SONGS:
+        if (sel < 0 || sel >= g_songview_n) return 0;
+        g_song_sel = sel;                  /* the row that acted is the cursor */
+        (void)library_play_song(fs, sel);
+        hal_volume_set(g_volume);          /* re-apply over codec re-init */
+        scr_push(SCR_NOWPLAYING);
+        return ROWSEL_DIRTY | ROWSEL_PLAYING;
+
+    case SCR_PLAYLIST:
+        if (sel >= g_pl_tracks_n) {        /* the saved slot's Delete row */
+            if (g_pl_slot <= 0) return 0;
+            if (!otg_confirm_up(&g_pl_confirm)) {
+                ui_window_arm(&g_pl_confirm);   /* ask once */
+                return ROWSEL_DIRTY;
+            }
+            g_pl_confirm.armed = 0;
+            return otg_delete_slot(fs) ? ROWSEL_DIRTY : 0;
+        }
+        if (sel < 0 || g_pl_tracks_n == 0) return 0;
+        g_plt_sel = sel;
+        (void)playlist_play(sel);
+        hal_volume_set(g_volume);
+        scr_push(SCR_NOWPLAYING);
+        return ROWSEL_DIRTY | ROWSEL_PLAYING;
+
+    case SCR_OTG:
+        if (sel == OTG_ROW_CLEAR) {
+            if (g_otg.n == 0) return 0;
+            if (!otg_confirm_up(&g_otg_confirm)) {
+                ui_window_arm(&g_otg_confirm);  /* ask once */
+                return ROWSEL_DIRTY;
+            }
+            g_otg_confirm.armed = 0;
+            otg_clear(&g_otg);
+            otg_bind_all();
+            otg_touch();
+            g_otg_sel = g_otg_accum = 0;
+            otg_flash(-1, "Cleared", 0);
+            return ROWSEL_DIRTY;
+        }
+        if (sel == OTG_ROW_SAVE) {
+            if (g_otg.n == 0) return 0;
+            return otg_save_to_slot(fs) ? ROWSEL_DIRTY : 0;
+        }
+        g_otg_sel = sel;
+        if (otg_play(sel - OTG_ROW_FIRST) < 0) return 0;
+        hal_volume_set(g_volume);
+        scr_push(SCR_NOWPLAYING);
+        return ROWSEL_DIRTY | ROWSEL_PLAYING;
+
+    case SCR_SEARCH:
+        /* Only ever armed in RESULTS mode (the ring's SELECT types a
+         * character and must act on the down-edge), so the tap is
+         * unambiguously "open this hit" — which is all SEARCH_ACT_OPEN
+         * means. */
+        if (sel < 0 || sel >= g_search.nhit) return 0;
+        g_search.sel = sel;
+        return search_open_hit(fs) ? (ROWSEL_DIRTY | ROWSEL_PLAYING)
+                                   : ROWSEL_DIRTY;
+
+    case SCR_BROWSER:
+        if (g_rowsel.sub == 0) {
+            if (sel < 0 || sel >= albumlist_count()) return 0;
+            if (albumlist_album_at(sel) < 0) {
+                /* "All Songs" for the artist we are filtered to: the whole
+                 * discography in title order, so a track you remember but
+                 * cannot place to an album is reachable. */
+                songview_build(-1, g_artist_filter);
+                scr_push(SCR_SONGS);
+                return ROWSEL_DIRTY;
+            }
+            /* Enter the album: load its tracklist + art. g_br_sel stays on the
+             * album so backing out lands on it. */
+            {
+                lib_album_t *al = &g_albums[albumlist_album_at(sel)];
+                g_br_sel = sel;
+                split_artist_album(al->folder, g_album_artist, g_album_title);
+                g_dir_depth = 1;
+                browse_load(fs, al->clus);
+                detail_load_meta(fs);
+                g_det_sel = g_det_accum = 0;
+            }
+            return ROWSEL_DIRTY;
+        }
+        if (sel < 0 || sel >= g_browse_n) return 0;
+        g_det_sel = sel;
+        g_queue_kind = RESUME_KIND_ALBUM;
+        g_queue_seed = 0;
+        player_play_queue(g_browse, g_browse_n, sel, g_art_clus, g_art_size);
+        hal_volume_set(g_volume);
+        scr_push(SCR_NOWPLAYING);
+        return ROWSEL_DIRTY | ROWSEL_PLAYING;
+
+    default:
+        return 0;
+    }
+}
+
+/* The long press: add to On-The-Go, or remove from it. */
+static int row_select_hold(fat32_t *fs)
+{
+    (void)fs;
+    int sel = g_rowsel.sel;
+    switch (g_rowsel.scr) {
+    case SCR_SONGS:
+        if (sel < 0 || sel >= g_songview_n) return 0;
+        return otg_add_song(g_songview[sel]);
+
+    case SCR_PLAYLIST:
+        if (sel < 0 || sel >= g_pl_tracks_n) return 0;   /* not the Delete row */
+        if (g_pl_song[sel] < 0) {
+            otg_flash(0, "Not in the library", 0);
+            return 1;
+        }
+        return otg_add_song(g_pl_song[sel]);
+
+    case SCR_OTG:
+        if (sel < OTG_ROW_FIRST) return 0;               /* the action rows */
+        if (!otg_remove(&g_otg, sel - OTG_ROW_FIRST)) return 0;
+        otg_bind_all();
+        otg_touch();
+        if (g_otg_sel >= otg_row_count()) {
+            g_otg_sel = otg_row_count() - 1;             /* the last row went */
+        }
+        g_otg_accum = 0;
+        {
+            char tok[16];
+            otg_count_token(tok, (int)g_otg.n);
+            otg_flash(-1, "Removed", tok);
+        }
+        return 1;
+
+    case SCR_SEARCH: {
+        /* Which hits are addable is ui/search.c's rule (search_hold_rows),
+         * so the host can assert it; what a song index MEANS is this file's.
+         * The recorded row is what acts, so the selection is restored first. */
+        if (sel < 0 || sel >= g_search.nhit) return 0;
+        int saved = g_search.sel, addable = 0, si = -1;
+        g_search.sel = sel;
+        (void)search_hold_rows(&g_search, &addable, &si);
+        g_search.sel = saved;
+        if (!addable || si < 0 || si >= g_songs_n) return 0;
+        return otg_add_song(g_song_sorted[si]);
+    }
+
+    case SCR_BROWSER:
+        if (g_rowsel.sub == 0) {
+            int ai = (sel >= 0 && sel < albumlist_count()) ? albumlist_album_at(sel)
+                                                           : -1;
+            if (ai < 0) return 0;          /* the All Songs row: nothing to add */
+            return otg_add_album(ai);
+        }
+        /* One track out of the album's tracklist. A Disc header is not a row
+         * here — g_browse holds files only — but a file the index never
+         * matched has no locator. */
+        if (sel < 0 || sel >= g_browse_n) return 0;
+        {
+            int si = g_browse_song[sel];
+            if (si < 0) {
+                otg_flash(0, "Not in the library", 0);
+                return 1;
+            }
+            return otg_add_song(si);
+        }
+
+    default:
+        return 0;
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -4857,20 +5854,42 @@ static int list_view_current(list_view_t *v)
         fmt_count(v->right, player_queue_current() + 1, v->count);
         break;
     case SCR_PLAYLISTS:
+        /* The pinned row is always there, but a folder that is empty or would
+         * not read draws its sentence UNDER it — a placeholder, not a row —
+         * so those two states repaint whole. */
+        if (g_playlists_err || g_playlists_n == 0) return 0;
         v->title = "Playlists";
-        v->count = g_playlists_n;
+        v->count = playlists_row_count();   /* the pinned On-The-Go row is row 0 */
         v->sel   = g_pl_sel;
         v->row   = playlists_row_draw;
         fmt_count(v->right, v->sel + 1, v->count);
         break;
     case SCR_PLAYLIST:
+        /* Same: with no tracks the screen is a reason plus (on a saved slot)
+         * the Delete row, laid out by playlist_render and not by this table. */
+        if (g_pl_tracks_n == 0) return 0;
         v->title   = g_pl_open >= 0 ? g_playlists[g_pl_open].name : "Playlist";
-        v->count   = g_pl_tracks_n;
+        v->count   = playlist_row_count();  /* + the saved slot's Delete row */
         v->sel     = g_plt_sel;
         v->row     = playlist_row_draw;
         v->rh      = ROW_H2;
         v->visible = LIST_ROWS2;
-        fmt_count(v->right, v->sel + 1, v->count);
+        if (v->sel < g_pl_tracks_n) {
+            fmt_count(v->right, v->sel + 1, g_pl_tracks_n);
+        }
+        break;
+    case SCR_OTG:
+        /* An empty list draws only its two sentences — the greyed action rows
+         * are not drawn at all, because neither of them does anything — so it
+         * is not a partially-repaintable list. */
+        if (g_otg.n == 0) return 0;
+        v->title   = "On-The-Go";
+        v->count   = otg_row_count();
+        v->sel     = g_otg_sel;
+        v->row     = otg_row_draw;
+        v->rh      = ROW_H2;
+        v->visible = LIST_ROWS2;
+        otg_header_right(v->right, v->sel);
         break;
     case SCR_BROWSER:
         if (g_dir_depth == 0) {
@@ -5498,7 +6517,8 @@ static int resume_open_playlist(fat32_t *fs, int si)
     if (pi < 0) {
         return 0;                      /* renamed or deleted */
     }
-    g_pl_sel = pi;                     /* Playlists opens on it later */
+    g_pl_sel = pi + 1;                 /* Playlists opens on it later (row 0
+                                        * is the pinned On-The-Go row) */
     uint32_t rt0 = boot_ms_now();
     playlist_open(fs, pi);
     g_boot_res_dir_ms = boot_ms_now() - rt0;
@@ -5516,6 +6536,35 @@ static int resume_open_playlist(fat32_t *fs, int si)
     }
     g_plt_sel = idx;
     return playlist_play(idx) == idx && resume_landed();
+}
+
+/*
+ * The On-The-Go live list. Nothing has to be found: COREOTG.DAT was loaded and
+ * bound before this runs, so the queue is already describable. The only
+ * question is WHICH entry the saved track is, and the saved queue index is
+ * only a hint — it is the index into the QUEUE, which skips unresolved
+ * entries, so it equals the entry index only when nothing before it was
+ * missing. Check the hint, then scan.
+ */
+static int resume_open_otg(fat32_t *fs, int si)
+{
+    (void)fs;
+    if (g_otg.n == 0) {
+        return 0;                      /* nothing was restored, or it was cleared */
+    }
+    int idx = -1, hint = g_settings.resume_qidx;
+    if (hint < (int)g_otg.n && g_otg_song[hint] == (int16_t)si) {
+        idx = hint;
+    }
+    for (int i = 0; idx < 0 && i < (int)g_otg.n; i++) {
+        if (g_otg_song[i] == (int16_t)si) idx = i;
+    }
+    if (idx < 0) {
+        return 0;                      /* the list no longer holds it */
+    }
+    g_otg_sel   = OTG_ROW_FIRST + idx;  /* On-The-Go opens on it later */
+    g_otg_accum = 0;
+    return otg_play(idx) >= 0 && resume_landed();
 }
 
 /*
@@ -5572,6 +6621,7 @@ static void resume_restore(fat32_t *fs)
     case RESUME_KIND_GENRE:   ok = resume_open_view(fs, si, kind); break;
     case RESUME_KIND_SHUFFLE: ok = resume_open_shuffle(fs, si);    break;
     case RESUME_KIND_PLAYLIST: ok = resume_open_playlist(fs, si);  break;
+    case RESUME_KIND_OTG:     ok = resume_open_otg(fs, si);        break;
     default:                  break;   /* album or none: the fallback below */
     }
     if (!ok) {
@@ -5953,6 +7003,7 @@ static void paint_current_screen(void)
     case SCR_GENRES:  genres_render(g_genre_sel);   break;
     case SCR_PLAYLISTS: playlists_render(g_pl_sel); break;
     case SCR_PLAYLIST:  playlist_render(g_plt_sel); break;
+    case SCR_OTG:       otg_render(g_otg_sel);      break;
     case SCR_SEARCH:    search_render_cur(); break;
     case SCR_BROWSER: browse_render(g_dir_depth ? g_det_sel : g_br_sel); break;
     case SCR_QUEUE:   queue_render(g_queue_sel); break;
@@ -6143,6 +7194,41 @@ static void lock_banner_render(int locked)
     }
 }
 
+/* A "+" and a "-" in a ring, 14 px wide, drawn in the same rows-of-bits style
+ * as the padlock above: what the On-The-Go banner puts where the padlock goes.
+ * Added and removed are the only two things it ever says. */
+static const uint16_t OTG_BM_PLUS[16] = {
+    0x0000, 0x03F0, 0x07F8, 0x0E1C, 0x1806, 0x38C7, 0x30C3, 0x33F3,
+    0x33F3, 0x30C3, 0x38C7, 0x1806, 0x0E1C, 0x07F8, 0x03F0, 0x0000,
+};
+static const uint16_t OTG_BM_MINUS[16] = {
+    0x0000, 0x03F0, 0x07F8, 0x0E1C, 0x1806, 0x3807, 0x3003, 0x33F3,
+    0x33F3, 0x3003, 0x3807, 0x1806, 0x0E1C, 0x07F8, 0x03F0, 0x0000,
+};
+
+/*
+ * The On-The-Go banner. Same primitive as the Hold banner, same band, and
+ * deliberately not modal: a refusal ("Not in the library", "On-The-Go is
+ * full") has no glyph at all, because a + on a refusal would be a lie.
+ */
+static void otg_banner_render(void)
+{
+    const uint16_t *bm = (g_otg_flash_sign > 0) ? OTG_BM_PLUS
+                       : (g_otg_flash_sign < 0) ? OTG_BM_MINUS
+                       :                          0;
+    if (bm) {
+        top_banner_render(0, bm, 16, 0, g_otg_flash_label,
+                          g_otg_flash_token[0] ? g_otg_flash_token : 0);
+        return;
+    }
+    /* No glyph: an empty bitmap keeps the label's x where every other banner
+     * puts it, so the band does not jump between a confirmation and a
+     * refusal. */
+    static const uint16_t none[1] = { 0 };
+    top_banner_render(0, none, 1, 0, g_otg_flash_label,
+                      g_otg_flash_token[0] ? g_otg_flash_token : 0);
+}
+
 /*
  * Quiesce and enter PMU deep-sleep standby — the true "off" (holding PLAY
  * past ~5 s, the suspend timeout, or the battery policy's SHUTOFF edge).
@@ -6198,6 +7284,7 @@ static int enter_standby(void)
     player_stop();
     hal_audio_close();                    /* codec rails off, audio clocks gated */
     settings_commit(1);                   /* persist while the drive still spins */
+    otg_commit(CFG_COMMIT_FORCE);         /* ...and the On-The-Go list with it */
     uart_puts("core: standby: entering\n");
     evlog_commit(CFG_COMMIT_FORCE);       /* the log's last block, FINAL; same
                                            * gate — refused below disk-safe, as
@@ -6430,6 +7517,7 @@ static void suspend_to_ram(uint32_t play_down_us)
      * exact second the user stopped listening. */
     resume_capture();
     settings_commit(1);
+    otg_commit(CFG_COMMIT_FORCE);
     /* The log's last chance too, in the same breath: what is pending goes
      * out as a FINAL block while the drive is still up (the forced flush
      * wakes it if a parked-drive commit above did not). Narrated first, so
@@ -7017,6 +8105,33 @@ _Noreturn static void run_ui(fat32_t *fs)
     uart_putc('\n');
     g_diag_log_lba[0] = ev_lba0;          /* Boot Details, without a spin-up      */
     g_diag_log_lba[1] = ev_lban;
+
+    /*
+     * The On-The-Go live list: COREOTG.DAT's newest slot into g_otg, then the
+     * locator pairs bound to songs (the library is loaded by now). The two
+     * LBAs are this module's own first-flash gate and mean exactly what
+     * config.c's and evlog.c's do — they MUST equal what
+     * tools/make_otg.py --verify computed on the host, checked BEFORE the
+     * first add, or the write that follows lands somewhere else on the disk.
+     */
+    int otg_ok = otg_store_mount(fs, ata_write_sectors, ata_wakeup, &g_otg);
+    otg_bind_all();
+    uart_puts("core: otg load ");
+    uart_dec((int)g_otg.n);
+    uart_puts(" writable ");
+    uart_put_hex32((uint32_t)otg_store_writable());
+    uart_puts(" seq ");
+    uart_put_hex32(otg_store_seq());
+    uint32_t otg_lba0 = 0, otg_lba1 = 0;
+    (void)otg_store_probe_lba(0, &otg_lba0);
+    (void)otg_store_probe_lba(1, &otg_lba1);
+    uart_puts(" lba ");
+    uart_put_hex32(otg_lba0);
+    uart_putc('/');
+    uart_put_hex32(otg_lba1);
+    uart_putc('\n');
+    (void)otg_ok;                         /* the count above already says it */
+
     settings_apply();                     /* push shuffle/repeat/volume out       */
     /* Pick up where the user left off — after settings_apply (it needs the
      * saved volume, which the restore mutes across the open and puts back) and
@@ -7031,6 +8146,7 @@ _Noreturn static void run_ui(fat32_t *fs)
      * number means "time until the device was ready", not "+1 frame". */
     g_boot_total_ms    = boot_ms_now();
     cfg_commit_clear(&g_cfg_commit);      /* loading is not a change to save back */
+    otg_store_commit_clear();             /* ...nor is loading the On-The-Go list */
     if (clock_mark_unsaved) {
         /* ...but the clock's mark IS a change, and it did not reach the platter
          * above. Re-arm it for the idle path rather than let the line above
@@ -7054,14 +8170,17 @@ _Noreturn static void run_ui(fat32_t *fs)
     uint32_t last_mq = 0;                /* rate-limit the marquee scroll        */
     int      hold_prev = clickwheel_hold() ? 1 : 0;  /* seed hold-edge detect    */
     int      ext_prev  = power_is_external() ? 1 : 0; /* seed plug-in edge detect */
-    int      lock_flashing = 0;          /* the Hold banner is on screen         */
+    int      banner_up = 0;          /* a top-chrome banner is on screen     */
     char     az_prev = 0;                /* A-Z locator letter on screen         */
     int      toast_prev = 0;             /* low-battery toast on screen          */
     int      bat_glyph_prev = battery_glyph_key(g_bat_pct); /* strip gauge as drawn */
     keyhold_t play_key;                  /* PLAY: tap = pause, hold = sleep       */
     keyhold_t menu_key;                  /* MENU: hold = the main menu            */
+    keyhold_t row_key;                   /* SELECT on a row: tap acts, hold adds  */
     keyhold_reset(&play_key);            /* (g_ff/g_rw are statics: born idle)    */
     keyhold_reset(&menu_key);
+    keyhold_reset(&row_key);
+    g_rowsel.pending = 0;
     /* Nothing believed about the jack yet. The first pass primes it from the
      * HAL's own first (already primed) sample, so a boot with an empty jack
      * yields "out" with no edge and no pause. */
@@ -7589,13 +8708,14 @@ _Noreturn static void run_ui(fat32_t *fs)
             g_locked  = held;
             keyhold_reset(&play_key);     /* a press under the switch is void */
             keyhold_reset(&menu_key);
+            rowsel_drop(&row_key);
             seekhold_reset(&g_ff);
             seekhold_reset(&g_rw);
             /* Force the banner to REPAINT for the new state. Without this, a second
-             * edge (e.g. on->off within the 1 s window) leaves lock_flashing set
-             * from the first edge, so the render guard (!lock_flashing) suppresses
+             * edge (e.g. on->off within the 1 s window) leaves banner_up set
+             * from the first edge, so the render guard (!banner_up) suppresses
              * the new banner and the unlock one never shows. */
-            lock_flashing = 0;
+            banner_up = 0;
             ui_window_arm(&g_lock_flash);
             last_input = mmio_read32(USEC_TIMER_ADDR);   /* wake the backlight    */
             if (bl_state != BL_FULL) {
@@ -7622,7 +8742,7 @@ _Noreturn static void run_ui(fat32_t *fs)
              * silently: pocket friction on the wheel is exactly what Hold is
              * for, and it must not keep the backlight awake. */
             if (ev.buttons) {
-                lock_flashing = 0;
+                banner_up = 0;
                 ui_window_arm(&g_lock_flash);
                 last_input = mmio_read32(USEC_TIMER_ADDR);
                 if (bl_state != BL_FULL) {
@@ -7633,6 +8753,15 @@ _Noreturn static void run_ui(fat32_t *fs)
                 }
             }
             have_ev = 0;
+        } else if (have_ev && g_otg_flash.armed && !g_lock_flash.armed &&
+                   (ev.buttons || ev.wheel_delta)) {
+            /* The On-The-Go banner is confirmation, not a modal: the first
+             * real touch ends it and THIS pass falls through to the normal
+             * render with the event applied. Same rule as the UNLOCKED
+             * banner below, and the reason nothing is ever applied behind it. */
+            g_otg_flash.armed = 0;
+            banner_up     = 0;
+            dirty = 1;
         } else if (have_ev && g_lock_flash.armed && (ev.buttons || ev.wheel_delta)) {
             /* Hold has just come OFF and the unlock banner is still up: it is
              * confirmation, not a modal, so the first touch of the wheel or a
@@ -7647,11 +8776,15 @@ _Noreturn static void run_ui(fat32_t *fs)
              * banner is unaffected: input while locked is swallowed above (and
              * a button there re-arms the window), so it never reaches here. */
             g_lock_flash.armed = 0;       /* ui_window_arm's counterpart          */
-            lock_flashing = 0;
+            banner_up = 0;
             dirty = 1;
         }
         if (have_ev) {
             last_input = mmio_read32(USEC_TIMER_ADDR);
+            /* The tick the event is timed from: a row press's length is
+             * measured from HERE, not from the first pass the live sampler
+             * happens to see the button down on. */
+            const uint32_t ev_us = last_input;
             if (bl_state != BL_FULL) {
                 int was_off = (bl_state == BL_OFF);
                 /* A slept panel is lit by the "Panel wake" block, AFTER its
@@ -7671,9 +8804,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                     if (ev.buttons & WHEEL_BTN_PLAY) {
                         keyhold_swallow_tap(&play_key);   /* ...its release too */
                     }
-                    if (ev.buttons & WHEEL_BTN_MENU)  keyhold_void(&menu_key);
-                    if (ev.buttons & WHEEL_BTN_RIGHT) seekhold_void(&g_ff);
-                    if (ev.buttons & WHEEL_BTN_LEFT)  seekhold_void(&g_rw);
+                    if (ev.buttons & WHEEL_BTN_MENU)   keyhold_void(&menu_key);
+                    if (ev.buttons & WHEEL_BTN_SELECT) keyhold_void(&row_key);
+                    if (ev.buttons & WHEEL_BTN_RIGHT)  seekhold_void(&g_ff);
+                    if (ev.buttons & WHEEL_BTN_LEFT)   seekhold_void(&g_rw);
                     ev.buttons = 0;
                     ev.wheel_delta = 0;
                 }
@@ -7707,9 +8841,10 @@ _Noreturn static void run_ui(fat32_t *fs)
                 /* ...and the press that got the modal off the screen must not
                  * also walk the user home or seek, so those are voided whole
                  * (same rule as the backlight wake above). */
-                if (ev.buttons & WHEEL_BTN_MENU)  keyhold_void(&menu_key);
-                if (ev.buttons & WHEEL_BTN_RIGHT) seekhold_void(&g_ff);
-                if (ev.buttons & WHEEL_BTN_LEFT)  seekhold_void(&g_rw);
+                if (ev.buttons & WHEEL_BTN_MENU)   keyhold_void(&menu_key);
+                if (ev.buttons & WHEEL_BTN_SELECT) keyhold_void(&row_key);
+                if (ev.buttons & WHEEL_BTN_RIGHT)  seekhold_void(&g_ff);
+                if (ev.buttons & WHEEL_BTN_LEFT)   seekhold_void(&g_rw);
                 ev.buttons     = 0;
                 ev.wheel_delta = 0;
             }
@@ -7933,11 +9068,9 @@ _Noreturn static void run_ui(fat32_t *fs)
                     dirty = 1;
                 }
                 if ((ev.buttons & WHEEL_BTN_SELECT) && g_songview_n > 0) {
-                    (void)library_play_song(fs, g_song_sel);
-                    hal_volume_set(g_volume);          /* re-apply over codec re-init */
-                    scr_push(SCR_NOWPLAYING);
-                    np_first = 1;
-                    dirty = 1;
+                    /* Tap plays, hold adds to On-The-Go: the press length
+                     * decides, in the block beside Now Playing's. */
+                    rowsel_arm(g_song_sel, &row_key, ev_us);
                 }
                 if (ev.buttons & WHEEL_BTN_MENU) {
                     scr_pop();                          /* back (Music or Genres) */
@@ -7963,14 +9096,25 @@ _Noreturn static void run_ui(fat32_t *fs)
                 break;
 
             case SCR_PLAYLISTS:
-                if (ev.wheel_delta && g_playlists_n > 0) {
-                    g_pl_sel = wheel_move(g_pl_sel, g_playlists_n,
+                if (ev.wheel_delta) {
+                    g_pl_sel = wheel_move(g_pl_sel, playlists_row_count(),
                                           ev.wheel_delta, &g_pl_accum);
                     dirty = 1;
                 }
-                if ((ev.buttons & WHEEL_BTN_SELECT) && g_playlists_n > 0) {
-                    playlist_open(fs, g_pl_sel);        /* parse + resolve + bind */
-                    scr_push(SCR_PLAYLIST);
+                if (ev.buttons & WHEEL_BTN_SELECT) {
+                    /* Row 0 is the pinned On-The-Go list; the rest are the
+                     * files. No hold action here, so SELECT still acts on the
+                     * down-edge — a delayed tap would be latency for nothing. */
+                    if (g_pl_sel == 0) {
+                        g_otg_free_slot = otg_slot_free_index(fs);
+                        g_otg_sel = (g_otg.n > 0) ? OTG_ROW_FIRST : OTG_ROW_CLEAR;
+                        g_otg_accum = 0;
+                        g_otg_confirm.armed = 0;
+                        scr_push(SCR_OTG);
+                    } else {
+                        playlist_open(fs, g_pl_sel - 1); /* parse + resolve + bind */
+                        scr_push(SCR_PLAYLIST);
+                    }
                     dirty = 1;
                 }
                 if (ev.buttons & WHEEL_BTN_MENU) {
@@ -7980,17 +9124,34 @@ _Noreturn static void run_ui(fat32_t *fs)
                 break;
 
             case SCR_PLAYLIST:
-                if (ev.wheel_delta && g_pl_tracks_n > 0) {
-                    g_plt_sel = wheel_move(g_plt_sel, g_pl_tracks_n,
+                if (ev.wheel_delta && playlist_row_count() > 0) {
+                    g_plt_sel = wheel_move(g_plt_sel, playlist_row_count(),
                                            ev.wheel_delta, &g_plt_accum);
+                    g_pl_confirm.armed = 0;     /* moving off the row cancels it */
                     dirty = 1;
                 }
-                if ((ev.buttons & WHEEL_BTN_SELECT) && g_pl_tracks_n > 0) {
-                    (void)playlist_play(g_plt_sel);     /* whole playlist, from here */
-                    hal_volume_set(g_volume);          /* re-apply over codec re-init */
-                    scr_push(SCR_NOWPLAYING);
-                    np_first = 1;
+                if ((ev.buttons & WHEEL_BTN_SELECT) && playlist_row_count() > 0) {
+                    /* Tap plays (or deletes a saved slot); hold adds the track
+                     * to On-The-Go. */
+                    rowsel_arm(g_plt_sel, &row_key, ev_us);
+                }
+                if (ev.buttons & WHEEL_BTN_MENU) {
+                    scr_pop();                          /* back to Playlists */
                     dirty = 1;
+                }
+                break;
+
+            case SCR_OTG:
+                if (ev.wheel_delta && g_otg.n > 0) {
+                    g_otg_sel = wheel_move(g_otg_sel, otg_row_count(),
+                                           ev.wheel_delta, &g_otg_accum);
+                    g_otg_confirm.armed = 0;    /* moving off the row cancels it */
+                    dirty = 1;
+                }
+                if ((ev.buttons & WHEEL_BTN_SELECT) && g_otg.n > 0) {
+                    /* Tap plays from the row (or clears / saves); hold removes
+                     * the row. */
+                    rowsel_arm(g_otg_sel, &row_key, ev_us);
                 }
                 if (ev.buttons & WHEEL_BTN_MENU) {
                     scr_pop();                          /* back to Playlists */
@@ -8015,7 +9176,16 @@ _Noreturn static void run_ui(fat32_t *fs)
                 }
                 int act = SEARCH_ACT_NONE;
                 if (ev.buttons & WHEEL_BTN_SELECT) {
-                    act = search_key(&g_search, SEARCH_KEY_SELECT);
+                    /* A hit is a row: the tap opens it, and a hold on a SONG
+                     * hit adds it to On-The-Go like any other song row. The
+                     * ring is not a list — its SELECT types a character — so
+                     * search_hold_rows() reports no rows there and the press
+                     * keeps the down-edge, as a key must. */
+                    if (search_hold_rows(&g_search, 0, 0) > 0) {
+                        rowsel_arm(g_search.sel, &row_key, ev_us);
+                    } else {
+                        act = search_key(&g_search, SEARCH_KEY_SELECT);
+                    }
                 } else if (ev.buttons & WHEEL_BTN_MENU) {
                     act = search_key(&g_search, SEARCH_KEY_MENU);
                 } else if (ev.buttons & WHEEL_BTN_RIGHT) {
@@ -8058,32 +9228,9 @@ _Noreturn static void run_ui(fat32_t *fs)
                     dirty = 1;                    /* window derived at paint time  */
                 }
                 if ((ev.buttons & WHEEL_BTN_SELECT) && count > 0) {
-                    if (g_dir_depth == 0 && albumlist_album_at(g_br_sel) < 0) {
-                        /* "All Songs" for the artist we are filtered to: the
-                         * whole discography in title order, so a track you
-                         * remember but cannot place to an album is reachable. */
-                        songview_build(-1, g_artist_filter);
-                        scr_push(SCR_SONGS);
-                    } else if (g_dir_depth == 0) {
-                        /* Enter the selected album: load its tracklist + art. Keep
-                         * g_br_sel (the album) so backing out lands back on it. */
-                        lib_album_t *al = &g_albums[albumlist_album_at(g_br_sel)];
-                        split_artist_album(al->folder,
-                                           g_album_artist, g_album_title);
-                        g_dir_depth = 1;
-                        browse_load(fs, al->clus);
-                        detail_load_meta(fs);
-                        g_det_sel = g_det_accum = 0;
-                    } else {
-                        g_queue_kind = RESUME_KIND_ALBUM;
-                        g_queue_seed = 0;
-                        player_play_queue(g_browse, g_browse_n, g_det_sel,
-                                          g_art_clus, g_art_size);
-                        hal_volume_set(g_volume);  /* re-apply over codec re-init */
-                        scr_push(SCR_NOWPLAYING);
-                        np_first = 1;
-                    }
-                    dirty = 1;
+                    /* Tap enters the album (or plays the track); hold adds the
+                     * whole album, or that one track, to On-The-Go. */
+                    rowsel_arm(*sel, &row_key, ev_us);
                 }
                 if (ev.buttons & WHEEL_BTN_MENU) {
                     if (g_dir_depth > 0 && g_br_from_search) {
@@ -8367,6 +9514,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                              * DEVICE 2026-09-13: a whole test session
                              * arrived at the host as "prev unflushed". */
                             settings_commit(1);
+                            otg_commit(CFG_COMMIT_FORCE);
                             uart_puts("core: disk mode: entering\n");
                             evlog_commit(CFG_COMMIT_FORCE);
                             console_clear(LINEN_SURFACE);
@@ -8539,6 +9687,10 @@ _Noreturn static void run_ui(fat32_t *fs)
          * spinning it back up for a 1 KB write. Nothing happens here unless a
          * setting actually changed and the user has since gone quiet. */
         settings_commit(0);
+        /* The On-The-Go list rides the same idle pass and the same gate: a
+         * change made with the drive parked waits for the platters to turn
+         * for some other reason, or for one of the forced commits above. */
+        otg_commit(CFG_COMMIT_IDLE);
         /* The event log's idle flush, same placement for the same reason:
          * a full block lands while the platters still turn. Never wakes a
          * parked drive; at most one block per pass. */
@@ -8547,6 +9699,45 @@ _Noreturn static void run_ui(fat32_t *fs)
         const uint32_t disk_idle_us = 20000000u;   /* 20 s: saves ~100 mA, no thrash */
         if (!player_playing() && !ata_is_parked() && idle > disk_idle_us) {
             ata_standby();
+        }
+
+        /*
+         * SELECT press-length arbitration on a LIST ROW: the tap acts on
+         * release, the hold at SEL_HOLD_US adds to (or removes from)
+         * On-The-Go. See the rowsel_* block for why the row is recorded at the
+         * down-edge rather than read live.
+         *
+         * The machine is fed EVERY pass, pending or not, so a release is
+         * always seen: stop feeding it after an action and the next press
+         * would be timed from the old press's origin and fire HOLD instantly.
+         * Only the ACTING is conditional.
+         */
+        {
+            uint32_t nowr  = mmio_read32(USEC_TIMER_ADDR);
+            int      rdown = !g_locked &&
+                             (clickwheel_buttons() & WHEEL_BTN_SELECT) != 0;
+            keyhold_action_t ract = keyhold_feed(&row_key, rdown, nowr,
+                                                 SEL_HOLD_US);
+            if (g_rowsel.pending &&
+                ((int)scr_cur() != g_rowsel.scr || g_locked ||
+                 g_list_epoch != g_rowsel.epoch ||
+                 rowsel_sub() != g_rowsel.sub)) {
+                /* The press no longer belongs to the row it started on: MENU
+                 * popped the screen, the list was rebuilt under it, or Hold
+                 * engaged mid-press (which zeroes clickwheel_buttons() and
+                 * would read below as a release). Drop it. */
+                rowsel_drop(&row_key);
+            } else if (g_rowsel.pending) {
+                if (ract == KEYHOLD_TAP) {
+                    g_rowsel.pending = 0;
+                    int r = row_select_tap(fs);
+                    if (r & ROWSEL_DIRTY)   dirty = 1;
+                    if (r & ROWSEL_PLAYING) np_first = 1;
+                } else if (ract == KEYHOLD_HOLD) {
+                    g_rowsel.pending = 0;
+                    if (row_select_hold(fs)) dirty = 1;
+                }
+            }
         }
 
         /*
@@ -8658,6 +9849,14 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
         }
 
+        /* A two-press confirm that lapsed unpressed has to un-say itself: the
+         * row's label reverts to "Clear Playlist", so the screen it is on has
+         * to repaint. ui_window_up DISARMS an expired window, so polling it
+         * here is the edge — without this the row kept saying "Select again"
+         * until something else happened to redraw it. */
+        if (g_otg_confirm.armed && !otg_confirm_up(&g_otg_confirm)) dirty = 1;
+        if (g_pl_confirm.armed  && !otg_confirm_up(&g_pl_confirm))  dirty = 1;
+
         /* The Hold banner holds the top chrome for ~1s on a Hold edge (and on
          * a button press while locked). Paint the context + banner once, hold
          * it, then repaint underneath when it fades. Suppresses the normal
@@ -8669,10 +9868,19 @@ _Noreturn static void run_ui(fat32_t *fs)
          * dirty for the padlock, and a wake from dark has a stale panel — in
          * which case the whole frame goes, as it always did. */
         uint32_t now_us = mmio_read32(USEC_TIMER_ADDR);
-        if (ui_window_up(&g_lock_flash, LOCK_FLASH_US, now_us)) {
-            if (!lock_flashing && bl_state != BL_OFF) {
+        /* Two banners can want the band at once (a Hold edge during an
+         * On-The-Go confirmation). The lock one wins — it reports a state
+         * change the user must see — and the other expires underneath;
+         * nothing is applied unseen either way, because the input drain
+         * disarms the On-The-Go banner on the first press. Both windows are
+         * polled exactly once: ui_window_up DISARMS an expired one. */
+        int lock_up = ui_window_up(&g_lock_flash, LOCK_FLASH_US, now_us);
+        int otg_up  = ui_window_up(&g_otg_flash,  OTG_FLASH_US,  now_us);
+        if (lock_up || otg_up) {
+            if (!banner_up && bl_state != BL_OFF) {
                 paint_current_screen();
-                lock_banner_render(g_locked);
+                if (lock_up) lock_banner_render(g_locked);
+                else         otg_banner_render();
                 if (dirty) {
                     lcd_present_fb(console_framebuffer());
                     dirty = 0;
@@ -8681,7 +9889,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                                      top_banner_h());
                 }
             }
-            lock_flashing = 1;
+            banner_up = 1;
             /* The banner skips the render below — and with it the loop's two
              * halts, so it halts here itself. Idle (which includes paused: no
              * DMA to pace) parks the core for a tick, as the main 10 ms halt
@@ -8697,8 +9905,8 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
             continue;                     /* skip the normal render this pass      */
         }
-        if (lock_flashing) {              /* banner just faded: repaint underneath */
-            lock_flashing = 0;
+        if (banner_up) {              /* banner just faded: repaint underneath */
+            banner_up = 0;
             dirty = 1;
         }
 
@@ -8824,6 +10032,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                     case SCR_GENRES:  genres_render(g_genre_sel);    break;
                     case SCR_PLAYLISTS: playlists_render(g_pl_sel);  break;
                     case SCR_PLAYLIST:  playlist_render(g_plt_sel);  break;
+                    case SCR_OTG:       otg_render(g_otg_sel);       break;
                     case SCR_SEARCH:    search_render_cur();         break;
                     case SCR_BROWSER: browse_render(g_dir_depth ? g_det_sel : g_br_sel);   break;
                     case SCR_QUEUE:   queue_render(g_queue_sel);     break;
