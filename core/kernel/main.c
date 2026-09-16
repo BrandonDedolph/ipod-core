@@ -555,8 +555,9 @@ static settings_t g_settings;
  *     sleeptimer_total_min(&g_sleep) == g_settings.sleep_timer_min
  *
  * at every top of the main loop. Only sleep_timer_apply() below moves the
- * right side to match the left, and the two places that disarm — the shared
- * suspend block and the FIRE branch — zero both. .bss starts it disarmed, and
+ * right side to match the left. The FIRE branch only disarms the countdown;
+ * it is the shared suspend block, which every FIRE lands in, that zeroes the
+ * row as well, so both sides are 0 by the next pass. .bss starts it disarmed, and
  * nothing in the boot path arms it, so the invariant holds from the first
  * pass (config_decode zeroes the field for exactly that reason).
  */
