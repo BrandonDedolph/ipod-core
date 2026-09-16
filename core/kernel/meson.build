@@ -31,10 +31,14 @@
 # drives the whole ring, the boot scan and the flush policy on the host.
 
 #
-# datetime.c is the integer civil<->epoch calendar for 2000..2099 that
-# hal/hw/rtc.c decodes its BCD into and every screen will format from — the one
-# piece of the clock that can be proved exhaustively, which
-# tests/kernel/datetime_test.c does day by day across the whole century. It
-# touches no hardware and is host-built by tests/ rather than being reachable
-# only through main.c.
-kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c', 'datetime.c')
+# datetime.c, timesync.c and wallclock.c are the CLOCK's portable half, and
+# none of them touch hardware. datetime.c is the integer civil<->epoch calendar
+# for 2000..2099 that hal/hw/rtc.c decodes its BCD into and every screen
+# formats from — the one piece of this feature that can be proved exhaustively,
+# which tests/kernel/datetime_test.c does day by day across the whole century.
+# timesync.c is the boot decision about the clock stamp the host leaves in
+# CORECFG.DAT (apply it once, or judge it stale — never on a loop), and
+# wallclock.c carries the time between the rare RTC reads over the same
+# wrapping microsecond counter ui/sleeptimer.c counts minutes on. All three are
+# host-built by tests/ rather than being reachable only through main.c.
+kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c', 'datetime.c', 'timesync.c', 'wallclock.c')

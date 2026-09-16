@@ -1177,6 +1177,23 @@ if target == 'sim'
   )
   test('datetime', datetime_test, suite: 'unit')
 
+  # timesync: what the firmware does at boot with the clock stamp the host
+  # leaves in CORECFG.DAT (core/kernel/timesync.c), and the software clock that
+  # carries the time between the rare RTC reads (core/kernel/wallclock.c) —
+  # both the SAME sources the ARM build links. Neither is testable on the
+  # device: the decision's two failure modes (applying a stale stamp on every
+  # boot, a lost mark making a stamp immortal) only appear across boots days
+  # apart, and the wallclock's whole difficulty is the 1 MHz counter's ~71.6
+  # minute wrap, which a two-hour run here crosses twice in milliseconds.
+  timesync_test = executable(
+    'timesync_test',
+    sources: ['kernel/timesync_test.c', '../kernel/timesync.c',
+              '../kernel/wallclock.c'],
+    include_directories: include_directories('../kernel', '.'),
+    override_options: test_opts,
+  )
+  test('timesync', timesync_test, suite: 'unit')
+
   # sort: the stable index-array merge sort (core/library/sort.c) every
   # alphabetised list is built with — the SAME source the ARM build links.
   # main.c's only evidence for it was a comment saying it had been checked
