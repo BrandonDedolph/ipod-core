@@ -2,9 +2,9 @@
 /*
  * core/codecs/readahead.h — a buffering shim over a decoder_source_t.
  *
- * Why this exists: some decoders (notably dr_mp3, scanning an ID3v2 tag and
- * probing frame headers) issue thousands of tiny SEQUENTIAL reads — a few
- * bytes each. On hardware every one of those becomes a FAT cluster-walk plus a
+ * Why this exists: the MP3 path (skipping an ID3v2 tag, probing frame headers,
+ * stepping a byte at a time through junk to resync) issues thousands of tiny
+ * SEQUENTIAL reads — a few bytes each. On hardware every one of those becomes a FAT cluster-walk plus a
  * 512-byte sector fetch over PIO, so skipping a ~250 KB embedded-album-art tag
  * took ~27 s at boot. This shim reads the backing source in large BLOCKS into a
  * fixed RAM buffer and satisfies the small reads from RAM, collapsing N tiny
@@ -28,7 +28,7 @@
  *   - Seeks are lazy: they only move the logical cursor. A later read that
  *     lands inside the currently-buffered window costs nothing; one outside it
  *     refills. SEEK_END is delegated to the backing source (which knows the
- *     size) — dr_flac/dr_mp3 seek to END at open() to size the file.
+ *     size) — both decoders seek to END at open() to size the file.
  *
  * Freestanding-clean: no libc beyond memcpy (routed through lib/mem.h on the
  * bare-metal build), no allocation — the caller owns the buffer. Fully

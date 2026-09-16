@@ -23,8 +23,8 @@ core/
 ├── fs/          from-scratch read-only FAT32 reader (LFN → UTF-8) with a
 │                bounded path walk, plus an M3U8 playlist reader
 ├── lib/         freestanding mem.c (memcpy/memset)
-├── codecs/      dr_flac + dr_mp3 (freestanding), static arena, read-ahead
-│                disk source, FLAC metadata reader, unified decoder ABI
+├── codecs/      dr_flac + pvmp3 (freestanding), static arena, read-ahead
+│                disk source, FLAC/ID3 metadata readers, unified decoder ABI
 ├── library/     CORELIB.IDX loader, artists/genres, playlist rows
 ├── player/      queue + transport engine (open/next/prev/seek/end-of-queue)
 ├── ui/          gamma-correct AA text renderer + Nunito atlases, the
@@ -67,7 +67,7 @@ make sim        # configures + builds the HOST TEST SUITE (see note below)
 make verify-hw  # static checks against a fresh `make hw` (see below)
 make help       # all targets
 
-meson test -C build-sim     # 66 host unit + MMIO golden-trace suites
+meson test -C build-sim     # 70 host unit + MMIO golden-trace suites
 ```
 
 `make verify-hw` is the static half of the safety net — the checks that
@@ -184,18 +184,21 @@ proven alone on the device.
 
 ## Audio path
 
-`dr_flac` / `dr_mp3` are compiled freestanding (`-DCORE_FREESTANDING`) and
+`dr_flac` and `pvmp3` are compiled freestanding (`-DCORE_FREESTANDING`) and
 fed by a read-ahead disk source into an SPSC PCM ring drained by the
 DMA-completion ISR. Streaming, not preload — a full-length track plays off
-the iPod's own disk while the UI stays responsive.
-
-Only FLAC is reachable on the device today: `kernel/main.c` sets
-`CORE_ENABLE_MP3 0` and `classify_ext()` does not surface `.mp3` at all, so
-MP3 files are invisible in the browser. `dr_mp3` is still built and linked
-(and its decode path is covered by the host KATs) — it is parked, not
-removed, because its float synthesis filter cannot keep up on this FPU-less
-CPU and the ring starves. Output is always 16-bit
+the iPod's own disk while the UI stays responsive. Output is always 16-bit
 signed interleaved PCM (see [`codecs/README.md`](codecs/README.md)).
+
+Both formats are reachable. MP3 was parked for a long time because dr_mp3's
+float synthesis filter needed 24x the FLAC decoder's instructions on a CPU
+with no FPU, and the ring starved; the decoder is AOSP's fixed-point pvmp3
+now, at about 1.7x FLAC, and `CORE_ENABLE_MP3` is gone with it — a shipped
+format does not get a build switch. MPEG-1/2/2.5 Layer III, CBR and VBR;
+8–16 kHz streams are refused at open because the WM8758B cannot be clocked
+there. Whether 1.7x FLAC fits in real time on this 80 MHz core is the one
+thing the host cannot answer: Settings → About → Boot Details reports the
+decode cost as a percentage of the budget, and that is the gate.
 
 ## Library index
 
@@ -233,16 +236,18 @@ allocate clusters, which it cannot — it is read-only by design today.
 
 Runs on real iPod 5.5G hardware, booting directly from the firmware
 partition: boot + MMAP0 remap, LCD, click-wheel, backlight, WM8758B audio,
-DMA streaming playback, ATA + FAT32, and streaming FLAC off the device's disk
-(MP3 is parked — see "Audio path"), with the full menu / browser /
+DMA streaming playback, ATA + FAT32, and streaming FLAC off the device's disk,
+with the full menu / browser /
 now-playing UI, seven themes, persistent settings, resume-on-boot, sleep /
 power-off from the Play button, and the on-disk event log. Music → Search
 (a wheel-driven character ring over song titles, artists, albums and playlist
 names) and the A-Z locator plate on every long list are in the tree but have
 not been flashed.
 
-Not yet confirmed on hardware: gapless playback, playlists with real
-`.m3u8` files, and the post-fix FLAC seek timing (the fix is in — see
+Not yet confirmed on hardware: MP3 playback in real time (it is switched on
+and correct on the host — see "Audio path" — but the DECODE percentage has
+never been read off a device playing an MP3), gapless playback, playlists with
+real `.m3u8` files, and the post-fix FLAC seek timing (the fix is in — see
 [`codecs/README.md`](codecs/README.md) — but the improvement has not been
 re-measured on the device). The charger is held at 100 mA. See
 [`../STATUS.md`](../STATUS.md) for the running list.

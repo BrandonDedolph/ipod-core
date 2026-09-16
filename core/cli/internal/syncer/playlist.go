@@ -22,7 +22,7 @@ var PlaylistExts = []string{".m3u8", ".m3u"}
 // device path of the track it names.
 //
 // A playlist on the host points at the source tree; the device has a
-// different tree (Artist - Album, "NN. Title.flac"), so a line is only
+// different tree (Artist - Album, "NN. Title.flac" or ".mp3"), so a line is only
 // meaningful after it has been mapped through the scan. A line that maps to
 // nothing — a track outside the source tree, a file the scan skipped, a typo —
 // is dropped with a warning rather than written: the firmware would silently

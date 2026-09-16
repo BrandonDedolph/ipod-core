@@ -232,11 +232,11 @@ int main(void)
           classify_ext("a.ogg") == -1 && classify_ext("noext") == -1 &&
           classify_ext("a.") == -1 && classify_ext("a.fl") == -1);
     xpect(&c, "ext: only the LAST dot counts", classify_ext("x.flac.bak") == -1);
-#if CORE_ENABLE_MP3
-    xpect(&c, "ext: .mp3 is MP3 while enabled", classify_ext("a.mp3") == 1);
-#else
-    xpect(&c, "ext: .mp3 is skipped while MP3 is parked", classify_ext("a.mp3") == -1);
-#endif
+    xpect(&c, "ext: .mp3 in any case is MP3",
+          classify_ext("a.mp3") == 1 && classify_ext("a.MP3") == 1 &&
+          classify_ext("a.Mp3") == 1);
+    xpect(&c, "ext: an extension that merely starts with mp3 is not MP3",
+          classify_ext("a.mp3bak") == -1 && classify_ext("a.mp") == -1);
     /* The extension buffer holds four characters, so the match on "FLAC"
      * used to accept any longer extension beginning with those letters and
      * hand it to the decoder. classify_ext now rejects an extension it did

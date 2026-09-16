@@ -11,10 +11,14 @@
  * high-water mark so the on-device arena can be sized from a real decode.
  *
  * MP3 is lossy, so the reference is NOT external truth: it is PCM captured
- * from dr_mp3 itself on first generation. Decoding the same bytes through the
- * same dr_mp3 (only the byte source differs: memory-stream here vs whole-file
- * memory when the ref was captured) reproduces it bit-for-bit, so we assert an
- * exact match — any drift in dr_mp3 or our wrapper trips this.
+ * from pvmp3 through this very wrapper on first generation, so decoding the
+ * same bytes reproduces it bit-for-bit and we assert an exact match — any
+ * drift in the decoder or the wrapper trips this. Whether the decode is RIGHT
+ * is the mp3-accuracy suite's question, asked against ffmpeg to a tolerance.
+ *
+ * The arena assertion is the one that only this test can make: player.c sizes
+ * ARENA_BYTES for the hungriest codec, and the only way to know what MP3
+ * actually costs on device is to run the real open() against the real arena.
  *
  * The code under test (mp3.c + arena.c) is the SAME source the ARM build
  * compiles; only the byte source differs (memory vs fat32_stream). argv[1] is
@@ -153,6 +157,12 @@ int main(int argc, char **argv)
     printf("arena high-water: %zu bytes (of %zu)\n",
            arena.high_water, sizeof arena_buf);
     fails += check("arena never OOM'd", arena.oom == 0);
+    /* player.c gives every codec a 128 KB arena and FLAC's high-water is
+     * ~40 KB. MP3 has to stay in the same class or the budget comment there
+     * becomes a lie; 48 KB leaves headroom without leaving room for a
+     * regression that quietly doubles the decoder's footprint. */
+    fails += check("arena high-water stays inside the MP3 budget (48 KB)",
+                   arena.high_water < 48u * 1024u);
 
     free(out);
     free(mp3_bytes);

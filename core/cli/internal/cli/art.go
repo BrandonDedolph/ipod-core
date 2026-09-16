@@ -16,7 +16,7 @@ import (
 //
 // Three shapes, matching the reference script's three modes:
 //
-//	core art <in.flac> <out.art> [--size N]   one file  -> one sidecar
+//	core art <in.flac|in.mp3> <out.art> [--size N]  one file -> one sidecar
 //	core art --album <folder>                 folder.art + folder.thm in <folder>
 //	core art --batch <root>                   the same for every subfolder
 //
@@ -35,8 +35,8 @@ func newArtCmd() *cobra.Command {
 		doFetch bool
 	)
 	cmd := &cobra.Command{
-		Use:   "art [in.flac out.art]",
-		Short: "Bake embedded FLAC cover art into CoreArt RGB565 sidecars",
+		Use:   "art [in.flac|in.mp3 out.art]",
+		Short: "Bake embedded cover art into CoreArt RGB565 sidecars",
 		Long: `Renders an album's embedded cover into the two sidecars the firmware
 reads: folder.art (120x120) and folder.thm (28x28), both CoreArt
 containers holding raw little-endian RGB565.
@@ -49,18 +49,19 @@ downscale of the 120 — and the 28 must stay exactly 28 so the device
 copies it 1:1 instead of resampling it under the scroll wheel.
 
 Forms:
-  core art <in.flac> <out.art> [--size N]
-      One FLAC's cover to one sidecar. Default size 120.
+  core art <in.flac|in.mp3> <out.art> [--size N]
+      One file's cover — a FLAC PICTURE block or an MP3 APIC frame —
+      to one sidecar. Default size 120.
 
   core art --album <folder> [--art-size N] [--thumb-size N]
-      Take the folder's first FLAC and write folder.art + folder.thm
-      into that same folder.
+      Take the folder's first playable file and write folder.art +
+      folder.thm into that same folder.
 
   core art --batch <root> [--art-size N] [--thumb-size N]
       Do that for every immediate subfolder of <root>. Prints one line
       per album and a count; exits non-zero if any album failed. An
-      album with no FLAC, or whose first FLAC has no embedded picture,
-      is reported as skipped, not failed.
+      album with no playable file, or whose first one has no embedded
+      picture, is reported as skipped, not failed.
 
   core art --fetch <album folder>|--batch <root> [--write] [--yes]
            [--dry-run] [--min-score 0.9]
@@ -77,6 +78,13 @@ Forms:
       embedded in EVERY FLAC of the album, written beside them as
       cover.jpg, and baked into folder.art + folder.thm. --dry-run
       prints the decision and touches nothing.
+
+      --fetch is FLAC-only: it EMBEDS the cover it finds, and there is
+      no ID3 writer here, so an MP3-only album is reported as skipped.
+      Reading an MP3's existing cover works everywhere else — the
+      single-file form, --album, --batch and "core sync" all take it
+      from an APIC frame — and dropping a cover.jpg next to an MP3
+      album and running --album over it gets the same sidecars.
 
       The images belong to their rights-holders: they are written to
       your own files and your own cache (<user cache dir>/core/art)
@@ -105,7 +113,7 @@ Forms:
 				return runArtAlbum(cmd, album, artSize, thmSize)
 			default:
 				if len(args) != 2 {
-					return errors.New("need <in.flac> <out.art>, or --album <folder>, or --batch <root>")
+					return errors.New("need <in.flac|in.mp3> <out.art>, or --album <folder>, or --batch <root>")
 				}
 				return runArtOne(cmd, args[0], args[1], size)
 			}
@@ -136,11 +144,10 @@ func runArtOne(cmd *cobra.Command, in, out string, size int) error {
 	if err := checkDim("--size", size); err != nil {
 		return err
 	}
-	m, err := flac.ReadFile(in)
+	pic, err := coreart.ReadCover(in)
 	if err != nil {
 		return err
 	}
-	pic := m.FrontCover()
 	if pic == nil {
 		return fmt.Errorf("%s: no embedded picture", in)
 	}
@@ -185,21 +192,21 @@ func runArtAlbum(cmd *cobra.Command, dir string, artSize, thmSize int) error {
 
 func artOneAlbum(cmd *cobra.Command, dir string, artSize, thmSize int) (artAlbumOutcome, error) {
 	w := cmd.OutOrStdout()
-	src, err := coreart.FirstFLAC(dir)
+	src, err := coreart.FirstAudio(dir)
 	if err != nil {
 		fmt.Fprintf(w, "%s: FAIL (%v)\n", dir, err)
 		return artFailed, err
 	}
 	if src == "" {
-		fmt.Fprintf(w, "%s: skip (no FLAC)\n", dir)
+		fmt.Fprintf(w, "%s: skip (no FLAC or MP3)\n", dir)
 		return artSkipped, nil
 	}
-	m, err := flac.ReadFile(src)
+	pic, err := coreart.ReadCover(src)
 	if err != nil {
 		fmt.Fprintf(w, "%s: FAIL (%v)\n", dir, err)
 		return artFailed, err
 	}
-	res, err := writeSizedAlbum(dir, m, artSize, thmSize)
+	res, err := writeSizedAlbum(dir, pic, artSize, thmSize)
 	if err != nil {
 		fmt.Fprintf(w, "%s: FAIL (%v)\n", dir, err)
 		return artFailed, err
@@ -214,15 +221,14 @@ func artOneAlbum(cmd *cobra.Command, dir string, artSize, thmSize int) (artAlbum
 	return artWrote, nil
 }
 
-// writeSizedAlbum is coreart.WriteAlbum when the sizes are the firmware's, and
-// the same work at other sizes when the user overrode them. The override path
-// exists for experiments only; the device reads 120 and 28.
-func writeSizedAlbum(dir string, m *flac.Meta, artSize, thmSize int) (coreart.Result, error) {
+// writeSizedAlbum is coreart.WriteAlbumPicture when the sizes are the
+// firmware's, and the same work at other sizes when the user overrode them.
+// The override path exists for experiments only; the device reads 120 and 28.
+func writeSizedAlbum(dir string, pic *flac.Picture, artSize, thmSize int) (coreart.Result, error) {
 	if artSize == coreart.ArtSize && thmSize == coreart.ThumbSize {
-		return coreart.WriteAlbum(dir, m)
+		return coreart.WriteAlbumPicture(dir, pic)
 	}
 	res := coreart.Result{Dir: dir}
-	pic := m.FrontCover()
 	if pic == nil {
 		res.NoPicture = true
 		return res, nil

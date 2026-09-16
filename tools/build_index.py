@@ -8,7 +8,7 @@ and emits ONE binary index the firmware loads in a single read — no per-file
 tag scan at boot. The device falls back to scanning only if this file is absent.
 
 On-disk layout this must agree with: album folders are "Artist - Album", tracks
-are "NN. Title.flac", multi-disc flattened. (An earlier version of this
+are "NN. Title.flac" or "NN. Title.mp3", multi-disc flattened. (An earlier version of this
 docstring pointed at a companion `import_music.py` for the layout; that script
 is not in this repository, so the convention is written out here instead of
 being a dangling reference.)
@@ -16,7 +16,7 @@ being a dangling reference.)
 THE FILENAME IS A LOCATOR, THE TRACK NUMBER IS METADATA. Two different things
 that used to be conflated:
 
-  * `fname` ("NN. Title.flac") is the name the importer gave the file on the
+  * `fname` ("NN. Title.flac" / "NN. Title.mp3") is the name the importer gave the file on the
     device. NN is the file's position in the importer's enumeration — the
     Disc-folder-then-lexicographic order disc_tracks() reproduces — and the
     record's file_hash is computed over exactly that name. This enumeration is
@@ -153,6 +153,23 @@ def track_title(fname):
     return (" - ".join(parts[2:]) if len(parts) >= 3
             else parts[1] if len(parts) == 2 else stem).strip()
 
+# The extensions the device can play, which is what the firmware's
+# classify_ext() admits (core/library/names.c). Kept lower-case: the importer
+# writes the names on the device, so this is what it goes looking for.
+AUDIO_EXTS = (".flac", ".mp3")
+
+
+def audio_in(d):
+    """Playable files directly in `d`, in ONE lexicographic order across all
+    the extensions — not FLACs then MP3s. The position in this list is the NN
+    the file gets on the device, so grouping by extension would renumber a
+    mixed album every time a track changed format."""
+    out = []
+    for ext in AUDIO_EXTS:
+        out += glob.glob(os.path.join(d, "*" + ext))
+    return sorted(out)
+
+
 def disc_tracks(adir):
     """Return [(path, folder_disc)] in the IMPORTER'S ENUMERATION ORDER —
     "Disc N" folders ascending, files lexicographic within each — with disc
@@ -160,7 +177,7 @@ def disc_tracks(adir):
     decides then; see track_number()).
 
     The order is the filename contract described at the top of the file: the
-    position in this list is the NN in "NN. Title.flac" on the device. Do not
+    position in this list is the NN in "NN. Title.ext" on the device. Do not
     sort it any other way."""
     discs = sorted(d for d in glob.glob(os.path.join(adir, "Disc *")) if os.path.isdir(d))
     if discs:
@@ -168,10 +185,10 @@ def disc_tracks(adir):
         for d in discs:
             m = re.search(r"Disc\s+(\d+)", os.path.basename(d))
             dn = int(m.group(1)) if m else 1
-            for f in sorted(glob.glob(os.path.join(d, "*.flac"))):
+            for f in audio_in(d):
                 out.append((f, dn))
         return out
-    return [(f, 0) for f in sorted(glob.glob(os.path.join(adir, "*.flac")))]
+    return [(f, 0) for f in audio_in(adir)]
 
 def leadint(s):
     """Leading integer of a TAG value: "7", "7/12", " 3" -> 7, 7, 3; else 0.
@@ -271,6 +288,12 @@ def probe(path):
         return ("", "", "", "", 0, 0, 0)
 
     tags = {k.lower(): v for k, v in fmt.get("tags", {}).items()}
+    # TRUNCATED, not rounded, and taken from ffprobe's format.duration — which
+    # for an MP3 is the Xing/Info frame count times the samples per frame, less
+    # the LAME encoder delay and end padding. `core sync` computes exactly that
+    # rule itself (core/cli/internal/id3), because the two tools must stamp
+    # byte-identical indexes for the same tree and a one-second disagreement
+    # would break that.
     try:
         dur = int(float(fmt.get("duration", 0)))
     except (TypeError, ValueError):
@@ -311,7 +334,7 @@ def parse_args(argv=None):
                    help="don't print a line per album")
     p.add_argument("--show-drift", action="store_true",
                    help="list every track whose filename position (the NN in "
-                        "'NN. Title.flac') differs from its track number, "
+                        "'NN. Title.ext') differs from its track number, "
                         "with where the number came from")
     a = p.parse_args(argv)
     if not a.src or not a.out:
@@ -352,15 +375,18 @@ def main(argv=None):
         albums += 1
         album_recs = []                               # (sort key, packed record)
         for i, (t, folder_disc) in enumerate(tracks, 1):
-            # Destination filename convention: continuous "NN. Title.flac",
+            # Destination filename convention: continuous "NN. Title.ext",
             # NN = position in the importer's enumeration. This is the locator
             # contract with the files on the device (see the module docstring)
-            # and is deliberately NOT the track number below.
+            # and is deliberately NOT the track number below. The SOURCE
+            # extension is kept: nothing transcodes, so a .mp3 goes across as
+            # a .mp3 and the firmware picks its decoder from the name.
             stem = os.path.splitext(os.path.basename(t))[0]
+            ext = os.path.splitext(os.path.basename(t))[1].lower()
             ftitle = fat_safe(track_title(os.path.basename(t)))
-            fname = f"{i:02d}. {ftitle}.flac"
+            fname = f"{i:02d}. {ftitle}{ext}"
             while fname.lower() in seen:
-                fname = f"{i:02d}. {ftitle} ({len(seen)}).flac"
+                fname = f"{i:02d}. {ftitle} ({len(seen)}){ext}"
             seen.add(fname.lower())
             title, tartist, talbum, genre, dur, ttrk, tdisc = probe(t)
             disc, trk = track_number(stem, ttrk, tdisc, folder_disc, artist_f)

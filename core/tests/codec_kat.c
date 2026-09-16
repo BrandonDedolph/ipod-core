@@ -9,8 +9,10 @@
  *
  * Lossy codecs (MP3, AAC, Vorbis, Opus) compare against PCM captured
  * from our own decoder at fixture-creation time. That gives us
- * regression protection ("did dr_mp3 change its output?") without
- * requiring a perfect oracle (different MP3 decoders aren't bit-stable).
+ * regression protection ("did pvmp3 or our wrapper change its output?")
+ * without requiring a perfect oracle (different MP3 decoders aren't
+ * bit-stable). Whether the decode is RIGHT is a separate question, asked
+ * against ffmpeg to a tolerance by the mp3-accuracy suite.
  *
  * We reference *committed* PCM bytes rather than re-deriving them by
  * formula to avoid cross-libm bit-stability issues — `sin()` is not
@@ -21,7 +23,7 @@
 
 #include "../codecs/decoder.h"
 #include "../codecs/dr_flac/flac.h"
-#include "../codecs/dr_mp3/mp3.h"
+#include "../codecs/pvmp3/mp3.h"
 
 #include <stdio.h>
 #include <stdlib.h>

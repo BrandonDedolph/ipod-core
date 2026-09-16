@@ -235,6 +235,12 @@ int  player_seek_seconds(int delta);
  */
 typedef struct {
     uint32_t decode_us_per_kframe;  /* CPU microseconds per 1000 frames decoded */
+    uint32_t decode_rate;           /* the rate those frames play back at, Hz.  */
+                                    /*   The real-time budget is 1e9/rate us    */
+                                    /*   per 1000 frames — 22676 at 44.1 kHz,   */
+                                    /*   20833 at 48 — so the microseconds are   */
+                                    /*   meaningless without it. 0 = nothing     */
+                                    /*   has been decoded yet.                   */
     uint32_t ring_low_frames;       /* PCM ring low-water since the last present */
     uint32_t underruns;             /* times the ISR found the ring short        */
     uint32_t arena_high_water;      /* peak decoder-arena bytes this session      */

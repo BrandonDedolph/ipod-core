@@ -1760,6 +1760,13 @@ typedef struct {
     uint32_t duration_s;
     uint16_t track, disc;
     int16_t  genre;                       /* index into g_genres, -1 = none     */
+    uint8_t  fmt;                         /* classify_ext of the ON-DISK name:  */
+                                          /*   0 = FLAC, 1 = MP3. The index     */
+                                          /*   record does not carry it (the    */
+                                          /*   stored name is ext-trimmed), so  */
+                                          /*   it is set where the dirent is in  */
+                                          /*   hand: the resolve pass, or the   */
+                                          /*   no-index scan                     */
 } lib_song_t;
 
 static lib_song_t g_songs[LIB_MAX_SONGS];
@@ -1793,7 +1800,7 @@ static int        g_scan_dirs_n;
 /* hash: name_hash over the FULL on-disk name, taken while the directory entry
  * is in hand — the same locator the index path gets from the host, so the
  * resolve pass binds scanned songs the same way and needs no name compare. */
-typedef struct { char name[NAME_MAX + 1]; uint32_t clus, size, hash; } scan_file_t;
+typedef struct { char name[NAME_MAX + 1]; uint32_t clus, size, hash; uint8_t fmt; } scan_file_t;
 static scan_file_t g_scan_files[BROWSE_MAX];
 static int         g_scan_files_n;
 static uint32_t    g_scan_art_clus, g_scan_art_size;
@@ -1901,13 +1908,15 @@ static int scan_files_cb(void *ud, const fat32_dirent_t *e)
         g_scan_art_size = e->size;
         return 0;
     }
-    if (e->is_dir || classify_ext(e->name) < 0) return 0;   /* playable files */
+    int fmt = classify_ext(e->name);
+    if (e->is_dir || fmt < 0) return 0;                    /* playable files */
     if (g_scan_files_n < BROWSE_MAX) {
         scan_file_t *f = &g_scan_files[g_scan_files_n++];
         copy_display_name(f->name, e->name, 1);
         f->clus = e->first_clus;
         f->size = e->size;
         f->hash = name_hash(e->name);          /* the locator: FULL name, with ext */
+        f->fmt  = (uint8_t)fmt;                /* name[] is ext-trimmed: keep it   */
     }
     return 0;
 }
@@ -2263,6 +2272,9 @@ static int resolve_art_cb(void *ud, const fat32_dirent_t *e)
     if (!pick) return 0;
     pick->file_clus = e->first_clus;
     pick->file_size = e->size;
+    /* The record's stored name has no extension, so the DIRENT is the only
+     * place the format is knowable — and it is in hand exactly here. */
+    pick->fmt = (uint8_t)classify_ext(e->name);
     /* Bound. From here on the song is shown and located by its ON-DISK name:
      * the stem, capped exactly as a browse row is (same function, same
      * NAME_MAX), so the queue entry, the tracklist row and this field are
@@ -2607,6 +2619,7 @@ static void library_scan(fat32_t *fs)
             s->track      = (ok && m.have) ? (uint16_t)m.track : 0;
             s->disc       = 0;
             s->genre      = (ok && m.have) ? genre_intern(m.genre) : -1;
+            s->fmt        = g_scan_files[i].fmt;
         }
     }
     if (g_songs_n >= LIB_MAX_SONGS) g_lib_truncated = 1;   /* out of song slots */
@@ -2849,7 +2862,7 @@ static void queue_entry_from_song(browse_entry_t *e, const lib_song_t *s)
     e->name[k]  = '\0';
     e->clus     = s->file_clus;
     e->size     = s->file_size;
-    e->fmt      = 0;                       /* the library is FLAC */
+    e->fmt      = s->fmt;                  /* FLAC or MP3, from the on-disk name */
     e->is_dir   = 0;
     int ai = album_by_clus(s->dir_clus);
     e->art_clus = (ai >= 0) ? g_albums[ai].art_clus : 0;
@@ -3608,6 +3621,7 @@ static void settings_render_cur(void)
                              g_boot_res_dir_ms, g_boot_res_open_ms,
                              g_boot_res_seek_ms,
                              ps ? ps->decode_us_per_kframe : 0,
+                             ps ? ps->decode_rate : 0,
                              ps ? ps->underruns : 0,
                              config_writable(), config_seq(),
                              g_diag_cfg_lba[0], g_diag_cfg_lba[1],
@@ -5164,14 +5178,13 @@ static int resume_landed(void)
 /*
  * The track's ALBUM — the folder it lives in, as the browser would list it.
  * The one context that needs nothing but the song, so it is the fallback
- * for every other kind. Writes the entry's format to *fmt (the album can
- * hold an MP3; the library builders below only ever queue FLAC).
+ * for every other kind.
  *
  * browse_collect() only lists FILES at depth 1 (depth 0 is the album list),
  * so borrow the depth for the read and hand it straight back. The browser's
  * copy of the listing is the caller's to clear.
  */
-static int resume_open_album(fat32_t *fs, int si, int *fmt)
+static int resume_open_album(fat32_t *fs, int si)
 {
     int saved_depth = g_dir_depth;
     g_dir_depth = 1;
@@ -5193,7 +5206,6 @@ static int resume_open_album(fat32_t *fs, int si, int *fmt)
     if (idx < 0) {
         return 0;                      /* the folder no longer holds the file */
     }
-    *fmt = g_browse[idx].fmt;
     g_queue_kind = RESUME_KIND_ALBUM;
     g_queue_seed = 0;
     player_play_queue(g_browse, g_browse_n, idx, g_art_clus, g_art_size);
@@ -5319,10 +5331,11 @@ static int resume_open_playlist(fat32_t *fs, int si)
  *     no unambiguous song, neither the saved queue nor the album holding the
  *     file, an open falling through to a different track — leaves the device
  *     exactly as if nothing had been saved, codec powered down;
- *   - it does not seek an MP3. dr_mp3 has no seek table and scans from the
- *     start, which for a podcast resumed at 50 minutes is a multi-second
- *     freeze on the boot path. FLAC seeks through its SEEKTABLE in O(log n),
- *     so it gets the position and MP3 gets the track cued at 0:00.
+ *   - it does not guess a position it cannot reach cheaply. Both formats seek
+ *     in a couple of reads now — FLAC through its SEEKTABLE or a binary search,
+ *     MP3 through the Xing TOC — so both are cued to the saved second. MP3 was
+ *     cued at 0:00 for as long as dr_mp3's only seek was a scan from the start,
+ *     which for a podcast resumed at 50 minutes froze the boot path.
  */
 static void resume_restore(fat32_t *fs)
 {
@@ -5341,7 +5354,6 @@ static void resume_restore(fat32_t *fs)
     uint32_t ot0  = boot_ms_now();
     uint32_t seq0 = player_open_seq();   /* bumps iff a track was opened */
     int kind = g_settings.resume_kind;
-    int fmt  = 0;                      /* the library builders queue FLAC */
     int ok   = 0;
     switch (kind) {
     case RESUME_KIND_SONGS:
@@ -5352,7 +5364,7 @@ static void resume_restore(fat32_t *fs)
     default:                  break;   /* album or none: the fallback below */
     }
     if (!ok) {
-        ok = resume_open_album(fs, si, &fmt);
+        ok = resume_open_album(fs, si);
     }
     if (ok) {
         player_pause();
@@ -5392,7 +5404,7 @@ static void resume_restore(fat32_t *fs)
                                    g_settings.resume_order_keep);
     }
 
-    if (fmt == 0 && g_settings.resume_secs >= RESUME_MIN_SECS) {
+    if (g_settings.resume_secs >= RESUME_MIN_SECS) {
         /* Clamped to the track length inside player_seek_to, and a refusal is
          * simply "resumed at 0:00" — never a reason to abandon the track. */
         uint32_t st0 = boot_ms_now();

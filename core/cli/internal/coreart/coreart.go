@@ -49,6 +49,7 @@ import (
 	_ "image/png"
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/flac"
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/id3"
 	xdraw "golang.org/x/image/draw"
 )
 
@@ -266,10 +267,17 @@ func (r Result) Wrote() bool { return r.ArtPath != "" || r.ThumbPath != "" }
 // truncated prefix that would fail the firmware's length check and latch the
 // album as "no art" for the rest of the session.
 //
-// A FLAC with no picture returns a Result with NoPicture set and a nil error.
+// A file with no picture returns a Result with NoPicture set and a nil error.
 func WriteAlbum(dir string, first *flac.Meta) (Result, error) {
+	return WriteAlbumPicture(dir, first.FrontCover())
+}
+
+// WriteAlbumPicture is WriteAlbum given the cover directly, which is what the
+// callers that read it with ReadCover have — the source may be a FLAC PICTURE
+// block or an MP3's APIC frame, and by this point the difference is gone.
+// A nil picture returns a Result with NoPicture set and a nil error.
+func WriteAlbumPicture(dir string, pic *flac.Picture) (Result, error) {
 	res := Result{Dir: dir}
-	pic := first.FrontCover()
 	if pic == nil {
 		res.NoPicture = true
 		return res, nil
@@ -333,12 +341,12 @@ func writeAtomic(path string, b []byte) error {
 	return nil
 }
 
-// FirstFLAC returns the first FLAC in dir, matching tools/coreart.py's rule:
-// "*.flac" and "*.FLAC" globbed separately and the union sorted, so on a
-// case-sensitive filesystem every lowercase name sorts before every uppercase
-// one only by code point, exactly as Python's sorted() orders them. Returns ""
-// when the folder holds no FLAC.
-func FirstFLAC(dir string) (string, error) {
+// FirstAudio returns the first playable file in dir, matching
+// tools/coreart.py's rule: each extension globbed separately and the union
+// sorted, so on a case-sensitive filesystem every lowercase name sorts before
+// every uppercase one only by code point, exactly as Python's sorted() orders
+// them. Returns "" when the folder holds none.
+func FirstAudio(dir string) (string, error) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return "", err
@@ -349,8 +357,11 @@ func FirstFLAC(dir string) (string, error) {
 			continue
 		}
 		n := e.Name()
-		if strings.HasSuffix(n, ".flac") || strings.HasSuffix(n, ".FLAC") {
-			names = append(names, n)
+		for _, ext := range []string{".flac", ".FLAC", ".mp3", ".MP3"} {
+			if strings.HasSuffix(n, ext) {
+				names = append(names, n)
+				break
+			}
 		}
 	}
 	if len(names) == 0 {
@@ -358,4 +369,23 @@ func FirstFLAC(dir string) (string, error) {
 	}
 	sort.Strings(names)
 	return filepath.Join(dir, names[0]), nil
+}
+
+// ReadCover returns one file's embedded front cover, whatever format it is: a
+// FLAC PICTURE block or an MP3 APIC frame, both of which the rest of the art
+// pipeline sees as the same flac.Picture. Returns nil (and no error) when the
+// file parses but carries no picture.
+func ReadCover(path string) (*flac.Picture, error) {
+	if strings.EqualFold(filepath.Ext(path), ".mp3") {
+		m, err := id3.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		return m.FrontCover(), nil
+	}
+	m, err := flac.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return m.FrontCover(), nil
 }

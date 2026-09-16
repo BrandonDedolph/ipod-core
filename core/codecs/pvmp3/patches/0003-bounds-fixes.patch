@@ -1,0 +1,113 @@
+--- a/pvmp3_dec_defs.h
++++ b/pvmp3_dec_defs.h
+@@ -59,7 +59,15 @@
+ ; DEFINES
+ ; Include all pre-processor statements here.
+ ----------------------------------------------------------------------------*/
+-#define BUFSIZE   8192   // big enough to hold 4608 bytes == biggest mp3 frame
++/* Size of the bit-reservoir ring (mainDataBuffer[BUFSIZE]) and the wrap
++ * modulus fillMainDataBuf() applies to the input buffer. The live window is
++ * one frame's main data (<= 1441 B) plus the <= 511 B main_data_begin can
++ * back-reference = 1952 B, so 2048 is the smallest power of two that covers
++ * it AND stays above any single frame we hand in (so the input-side wrap is
++ * a no-op). Upstream's 8192 was 4x that and its comment misdescribed it as
++ * the biggest MP3 frame (1441 B compressed; 4608 is the decoded PCM size).
++ * -6 KB of decoder state per instance. */
++#define BUFSIZE   2048
+ 
+ #define CHAN           2
+ #define GRAN           2
+--- a/pvmp3_framedecoder.c
++++ b/pvmp3_framedecoder.c
+@@ -435,6 +435,28 @@
+          * during the decoded of the associated frame
+          */
+ 
++        /*
++         * Bound the side-info read. It happens BEFORE the predicted_frame_size
++         * check below, so nothing else guards it: the frame must hold the
++         * 4-byte header, the optional 2-byte CRC, the whole side info, and the
++         * 3 bytes past it that getNbits()'s unconditional 4-byte prefetch
++         * touches. A degenerate sub-side-info frame (8 kbps MPEG-2 stereo at
++         * 24 kHz is 24 bytes against 4+2+17 = 23) otherwise read past the
++         * caller's buffer.
++         */
++        {
++            int32 side_info_size = (info->version_x == MPEG_1)
++                                   ? ((info->mode == MPG_MD_MONO) ? 17 : 32)
++                                   : ((info->mode == MPG_MD_MONO) ?  9 : 17);
++            uint32 need = (uint32)(4 + (info->error_protection ? 2 : 0)
++                                     + side_info_size + 3);
++            if (pVars->inputStream.inputBufferCurrentLength < need)
++            {
++                pExt->outputFrameSize = 0;
++                return NO_ENOUGH_MAIN_DATA_ERROR;
++            }
++        }
++
+         errorCode = pvmp3_get_side_info(&pVars->inputStream,
+                                         &pVars->sideInfo,
+                                         info,
+@@ -543,6 +565,20 @@
+                       0,
+                       480*sizeof(pChVars[RIGHT]->circ_buffer[0]));
+ 
++            /*  ...and the IMDCT overlap-add history. Upstream left it holding
++             *  the previous frame's tail, so a "muted" frame still emitted
++             *  stale audio through its first granule AND the next real frame
++             *  overlap-added against wrong history — the two stacked into a
++             *  transient louder than the surrounding signal. Cleared, the
++             *  muted frame is exact silence and the next one fades in from
++             *  clean filterbank state. */
++            pv_memset((void*)pChVars[ LEFT]->overlap,
++                      0,
++                      SUBBANDS_NUMBER*FILTERBANK_BANDS*sizeof(pChVars[ LEFT]->overlap[0]));
++            pv_memset((void*)pChVars[RIGHT]->overlap,
++                      0,
++                      SUBBANDS_NUMBER*FILTERBANK_BANDS*sizeof(pChVars[RIGHT]->overlap[0]));
++
+             pChVars[ LEFT]->used_freq_lines = 575;
+             pChVars[RIGHT]->used_freq_lines = 575;
+ 
+--- a/pvmp3_huffman_parsing.c
++++ b/pvmp3_huffman_parsing.c
+@@ -167,9 +167,14 @@
+     }
+     else
+     {          /* Find region boundary for long block case. */
++        /* region0_count is 4 bits and region1_count 3, so the raw indices run
++         * to 16 and 24 while l[] holds 23 entries. Clamp both to the table. */
+         i = grInfo->region0_count + 1;
++        int32 r2 = i + grInfo->region1_count + 1;
++        if (i  > 22) i  = 22;
++        if (r2 > 22) r2 = 22;
+         region1Start = mp3_sfBandIndex[sfreq].l[i];
+-        region2Start = mp3_sfBandIndex[sfreq].l[i + grInfo->region1_count + 1];
++        region2Start = mp3_sfBandIndex[sfreq].l[r2];
+     }
+ 
+     /* Read bigvalues area. */
+@@ -290,17 +295,15 @@
+     }
+ 
+     if ((pMainData->usedBits < grBits) &&
+-            (i < FILTERBANK_BANDS*SUBBANDS_NUMBER))
++            (i <= FILTERBANK_BANDS*SUBBANDS_NUMBER - 4))
+     {
++        /* pvmp3_huffman_quad_decoding() writes is[i..i+3]. Upstream asked only
++         * for i < 576, so i == 574 wrote is[576..577] one int32 past
++         * work_buf_int32[576] into the adjacent circ_buffer (gcc 16 reports it
++         * as -Warray-bounds). Requiring room for the whole quad also makes
++         * upstream's (i-2) >= 576 fixup unreachable, so it is gone. */
+         pvmp3_huffman_quad_decoding(h, &is[i], pMainData);
+         i += 4;
+-
+-        if ((i - 2) >= FILTERBANK_BANDS*SUBBANDS_NUMBER)
+-        {
+-            i -= 2;
+-            is[i] = 0;
+-            is[(i+1)] = 0;
+-        }
+     }
+ 
+     if (pMainData->usedBits > grBits)

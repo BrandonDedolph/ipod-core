@@ -138,6 +138,68 @@ else
   error('Unknown target "@0@" (use -Dtarget=hw or -Dtarget=sim)'.format(target))
 endif
 
+# ---- pvmp3 source manifest -------------------------------------------------
+#
+# The vendored MP3 decoder (codecs/pvmp3/upstream/, AOSP PacketVideo,
+# Apache-2.0 — see codecs/pvmp3/README.md). Listed file by file rather than
+# globbed so that a re-vendor which adds or drops one is a visible diff, and
+# defined HERE rather than in codecs/meson.build because both targets need it:
+# the hw branch below never enters that subdir.
+#
+# Four translation units are special. Under -DPV_ARM_GCC_V4 their bodies are
+# #if'd out in favour of the hand-written ARMv4 assembly in upstream/asm/, so
+# on hw they would be EMPTY translation units (which -Wpedantic rejects) and
+# the .s files are listed instead. The host build has no assembly and compiles
+# the C.
+pvmp3_asm_replaced_c = files(
+  'codecs/pvmp3/upstream/pvmp3_dct_16.c',
+  'codecs/pvmp3/upstream/pvmp3_dct_9.c',
+  'codecs/pvmp3/upstream/pvmp3_mdct_18.c',
+  'codecs/pvmp3/upstream/pvmp3_polyphase_filter_window.c',
+)
+pvmp3_arm_asm = files(
+  'codecs/pvmp3/upstream/asm/pvmp3_dct_16_gcc.s',
+  'codecs/pvmp3/upstream/asm/pvmp3_dct_9_gcc.s',
+  'codecs/pvmp3/upstream/asm/pvmp3_mdct_18_gcc.s',
+  'codecs/pvmp3/upstream/asm/pvmp3_polyphase_filter_window_gcc.s',
+)
+pvmp3_common_c = files(
+  'codecs/pvmp3/upstream/pvmp3_alias_reduction.c',
+  'codecs/pvmp3/upstream/pvmp3_crc.c',
+  'codecs/pvmp3/upstream/pvmp3_dct_6.c',
+  'codecs/pvmp3/upstream/pvmp3_decode_header.c',
+  'codecs/pvmp3/upstream/pvmp3_decode_huff_cw.c',
+  'codecs/pvmp3/upstream/pvmp3_dequantize_sample.c',
+  'codecs/pvmp3/upstream/pvmp3_equalizer.c',
+  'codecs/pvmp3/upstream/pvmp3_framedecoder.c',
+  'codecs/pvmp3/upstream/pvmp3_get_main_data_size.c',
+  'codecs/pvmp3/upstream/pvmp3_get_scale_factors.c',
+  'codecs/pvmp3/upstream/pvmp3_get_side_info.c',
+  'codecs/pvmp3/upstream/pvmp3_getbits.c',
+  'codecs/pvmp3/upstream/pvmp3_huffman_decoding.c',
+  'codecs/pvmp3/upstream/pvmp3_huffman_parsing.c',
+  'codecs/pvmp3/upstream/pvmp3_imdct_synth.c',
+  'codecs/pvmp3/upstream/pvmp3_mdct_6.c',
+  'codecs/pvmp3/upstream/pvmp3_mpeg2_get_scale_data.c',
+  'codecs/pvmp3/upstream/pvmp3_mpeg2_get_scale_factors.c',
+  'codecs/pvmp3/upstream/pvmp3_mpeg2_stereo_proc.c',
+  'codecs/pvmp3/upstream/pvmp3_normalize.c',
+  'codecs/pvmp3/upstream/pvmp3_poly_phase_synthesis.c',
+  'codecs/pvmp3/upstream/pvmp3_reorder.c',
+  'codecs/pvmp3/upstream/pvmp3_seek_synch.c',
+  'codecs/pvmp3/upstream/pvmp3_stereo_proc.c',
+  'codecs/pvmp3/upstream/pvmp3_tables.c',
+)
+
+# Our own MP3 layer on top of it: the decoder_ops wrapper, the framing/Xing/
+# seek maths and the ID3 reader. First-party, so it stays under -Werror in a
+# static_library of its own while the vendored objects do not.
+pvmp3_wrapper_c = files(
+  'codecs/pvmp3/mp3.c',
+  'codecs/pvmp3/mp3_frame.c',
+  'codecs/pvmp3/id3_meta.c',
+)
+
 subdir('hal')         # hardware abstraction layer (sim or hw backend)
 
 if target == 'hw'
@@ -159,7 +221,7 @@ if target == 'hw'
     '-Wno-sign-compare', '-Wno-shadow', '-Wno-undef', '-Wno-cast-align',
     '-Wno-implicit-fallthrough', '-Wno-misleading-indentation',
   ]
-  codec_inc = include_directories('codecs', 'codecs/dr_flac', 'codecs/dr_mp3', 'lib')
+  codec_inc = include_directories('codecs', 'codecs/dr_flac', 'codecs/pvmp3', 'lib')
   flac_hw_lib = static_library(
     'core_codec_flac_hw',
     sources: ['codecs/dr_flac/flac.c'],
@@ -168,19 +230,33 @@ if target == 'hw'
     override_options: ['werror=false'],
   )
 
-  # MP3 decoder (dr_mp3) built freestanding, same recipe as flac_hw_lib.
-  # Unlike FLAC, MP3's synthesis filter is floating point, but dr_mp3 calls
-  # no libm — the float ops lower to libgcc soft-float (__aeabi_*), already
-  # linked via -lgcc below. Vendored source: warnings suppressed, werror off;
-  # sign-compare/type-limits are extra for dr_mp3 (mirrors codecs/meson.build).
-  mp3_hw_lib = static_library(
-    'core_codec_mp3_hw',
-    sources: ['codecs/dr_mp3/mp3.c'],
-    c_args: ['-DCORE_FREESTANDING'] + codec_warn_suppress + [
-      '-Wno-sign-compare', '-Wno-type-limits',
+  # MP3 decoder: AOSP's pvmp3, built freestanding for the target. Unlike
+  # dr_mp3 before it, this one is PURE INTEGER — its Q-format constants fold at
+  # compile time, so it needs no __aeabi_f* soft-float helper at all. (Compile
+  # any of these translation units on its own and `nm -u` lists none; the float
+  # symbols still in core.map are dr_flac's. LTO hides that from a check on the
+  # linked image, so it is documented in codecs/README.md rather than gated.)
+  # -DPV_ARM_GCC_V4 selects the smull/smlal inline ops and the four
+  # hand-written ARMv4 routines in upstream/asm/, whose C counterparts are
+  # therefore left out of the source list. Vendored: warnings suppressed,
+  # werror off.
+  pvmp3_hw_lib = static_library(
+    'core_codec_pvmp3_hw',
+    sources: pvmp3_common_c + pvmp3_arm_asm,
+    c_args: ['-DCORE_FREESTANDING', '-DPV_ARM_GCC_V4'] + codec_warn_suppress + [
+      '-Wno-type-limits',
     ],
     include_directories: codec_inc,
     override_options: ['werror=false'],
+  )
+
+  # Our MP3 layer over it (wrapper + framing/Xing/seek + ID3 reader). OURS, so
+  # unlike the block above it stays under -Werror.
+  mp3_hw_lib = static_library(
+    'core_codec_mp3_hw',
+    sources: pvmp3_wrapper_c,
+    c_args: ['-DCORE_FREESTANDING', '-DPV_ARM_GCC_V4'],
+    include_directories: codec_inc,
   )
 
   # Read-ahead byte-source shim (ours, not vendored): collapses a decoder's
@@ -204,6 +280,17 @@ if target == 'hw'
   flac_meta_hw_lib = static_library(
     'core_flac_meta_hw',
     sources: ['codecs/flac_meta.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+    include_directories: codec_inc,
+  )
+
+  # The tag-text policy the FLAC and ID3 readers share (ours): what bytes are
+  # allowed into a display field and how a field truncates. One library rather
+  # than a copy in each reader, and a library of its own rather than a member
+  # of one of them, so neither archive can shadow the other's copy at link.
+  meta_text_hw_lib = static_library(
+    'core_meta_text_hw',
+    sources: ['codecs/meta_text.c'],
     c_args: ['-DCORE_FREESTANDING'],
     include_directories: codec_inc,
   )
@@ -426,7 +513,7 @@ if target == 'hw'
   player_hw_lib = static_library(
     'core_player_hw',
     sources: ['player/player.c'],
-    include_directories: include_directories('hal', 'codecs', 'codecs/dr_flac', 'codecs/dr_mp3'),
+    include_directories: include_directories('hal', 'codecs', 'codecs/dr_flac', 'codecs/pvmp3'),
   )
 
   core_elf = executable(
@@ -434,7 +521,7 @@ if target == 'hw'
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c')
       + [core_version_h, core_version_tag_h],   # generated stamps; main.c includes both
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, letterindex_hw_lib, search_hw_lib, keyhold_hw_lib, gesture_hw_lib, sleeptimer_hw_lib, jackwatch_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
+    link_with: [flac_hw_lib, pvmp3_hw_lib, mp3_hw_lib, flac_meta_hw_lib, meta_text_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, letterindex_hw_lib, search_hw_lib, keyhold_hw_lib, gesture_hw_lib, sleeptimer_hw_lib, jackwatch_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

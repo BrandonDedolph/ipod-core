@@ -37,6 +37,7 @@
 #include "decoder.h"
 #include "flac.h"
 #include "mp3.h"
+#include "id3_meta.h"
 #include "flac_meta.h"
 #include "readahead.h"
 #include "diskbuf.h"
@@ -295,6 +296,14 @@ int flac_meta_read(decoder_source_t *src, flac_meta_t *out)
     out->duration_s  = 123;
     stub_meta_reads++;
     return 0;
+}
+
+/* The MP3 side of the same seam. player.c only reaches it when flac_meta_read
+ * declines, which the stub above never does — it exists so the link resolves
+ * and so a future stub that DOES decline gets the same answer either way. */
+int id3_meta_read(decoder_source_t *src, flac_meta_t *out)
+{
+    return flac_meta_read(src, out);
 }
 
 /* ---- fake decoder ----------------------------------------------------- */

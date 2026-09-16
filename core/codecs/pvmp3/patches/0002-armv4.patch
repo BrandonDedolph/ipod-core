@@ -1,0 +1,22 @@
+--- a/pvmp3_normalize.c
++++ b/pvmp3_normalize.c
+@@ -102,7 +102,7 @@
+ ----------------------------------------------------------------------------*/
+ 
+ #if (defined(PV_ARM_V5)||defined(PV_ARM_V4))
+-#elif (defined(PV_ARM_GCC_V5)||defined(PV_ARM_GCC_V4))
++#elif defined(PV_ARM_GCC_V5)
+ 
+ 
+ /* function is inlined in header file */
+--- a/pvmp3_normalize.h
++++ b/pvmp3_normalize.h
+@@ -71,7 +71,7 @@
+ }
+ 
+ 
+-#elif (defined(PV_ARM_GCC_V5)||defined(PV_ARM_GCC_V4))
++#elif defined(PV_ARM_GCC_V5)
+ 
+ __inline int32 pvmp3_normalize(int32 x)
+ {

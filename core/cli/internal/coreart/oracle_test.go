@@ -326,7 +326,7 @@ func mcSources(t *testing.T, root, tmp string) []oracleSource {
 	var noFLAC, noPic int
 	for _, name := range dirs {
 		dir := filepath.Join(root, name)
-		f, err := FirstFLAC(dir)
+		f, err := FirstAudio(dir)
 		if err != nil || f == "" {
 			noFLAC++
 			continue

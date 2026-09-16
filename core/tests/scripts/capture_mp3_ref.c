@@ -1,28 +1,29 @@
 /*
  * core/tests/scripts/capture_mp3_ref.c
  *
- * One-shot tool used by gen_codec_vectors.sh to capture dr_mp3's
- * decoded output for a given .mp3 fixture. Run once when a new MP3
- * vector is added; commit both the .mp3 and the captured .pcm.
+ * One-shot tool used by gen_codec_vectors.sh to capture OUR decoder's output
+ * for a given .mp3 fixture. Run once when a new MP3 vector is added; commit
+ * both the .mp3 and the captured .pcm.
  *
- * MP3 isn't bit-stable across decoder implementations, so the
- * captured PCM is "what dr_mp3 produces" — not external truth. The
- * KAT (codec_kat.c) re-decodes and memcmp's against this captured
- * reference, giving us regression protection: any change to dr_mp3
- * or our wrapper that alters output trips the test.
+ * MP3 isn't bit-stable across decoder implementations, so the captured PCM is
+ * "what core's decoder produces" — not external truth. The KAT (codec_kat.c)
+ * re-decodes and memcmp's against this captured reference, giving us
+ * regression protection: any change to pvmp3 or our wrapper that alters output
+ * trips the test. Whether the output is RIGHT is the separate question the
+ * mp3-accuracy suite asks against ffmpeg, to a tolerance.
  *
- * Compiled ad-hoc by the bash regenerator; not part of the meson
- * build. Self-contained — compiles with:
- *   gcc -O2 -o capture_mp3_ref capture_mp3_ref.c -lm
+ * It goes through the SAME mp3_decoder_ops() the firmware runs, on the HOST
+ * build of pvmp3 (the C-equivalent fixed-point ops). The ARM build rounds a
+ * hair differently in its smull assembly, which is why the ARM side is only
+ * ever held to the tolerance test — see tests/codec-vectors/README.md.
+ *
+ * Compiled ad-hoc by the bash regenerator; not part of the meson build.
  */
 
-#define DR_MP3_IMPLEMENTATION
-#define DR_MP3_NO_STDIO
-#include "../../codecs/dr_mp3/dr_mp3.h"
+#include "../../codecs/pvmp3/mp3.h"
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <stdint.h>
 
 int main(int argc, char **argv) {
@@ -45,44 +46,36 @@ int main(int argc, char **argv) {
     }
     fclose(fin);
 
-    drmp3 d;
-    if (!drmp3_init_memory(&d, buf, (size_t)n, NULL)) {
-        fprintf(stderr, "drmp3_init_memory failed\n");
-        free(buf);
-        return 1;
-    }
-    /* Match the runtime wrapper's channel guard so a 5.1 MP3 (which
-     * shouldn't ever exist in our test corpus) can't silently
-     * overflow our stereo-sized batch buffer below. */
-    if (d.channels > 2) {
-        fprintf(stderr, "channels=%u > 2; capture_mp3_ref only supports mono/stereo\n",
-                d.channels);
-        drmp3_uninit(&d);
+    const decoder_ops_t *ops = mp3_decoder_ops();
+    decoder_t d = {0};
+    int rc = ops->open(&d, buf, (size_t)n, /*alloc=*/NULL);
+    if (rc != DECODER_OK) {
+        fprintf(stderr, "open failed: %d\n", rc);
         free(buf);
         return 1;
     }
 
     FILE *fout = fopen(argv[2], "wb");
-    if (!fout) { perror("open output"); drmp3_uninit(&d); free(buf); return 1; }
+    if (!fout) { perror("open output"); ops->close(&d); free(buf); return 1; }
 
     enum { BATCH = 4096 };
-    int16_t pcm[BATCH * 2];           /* max 2 channels */
+    int16_t pcm[BATCH * 2];           /* the wrapper never emits > 2 channels */
     long total_frames = 0;
-    drmp3_uint64 got;
-    while ((got = drmp3_read_pcm_frames_s16(&d, BATCH, pcm)) > 0) {
-        size_t bytes = (size_t)got * d.channels * 2;
+    int  got;
+    while ((got = ops->decode(&d, pcm, BATCH)) > 0) {
+        size_t bytes = (size_t)got * d.channels * 2u;
         if (fwrite(pcm, 1, bytes, fout) != bytes) {
             perror("write");
-            fclose(fout); drmp3_uninit(&d); free(buf); return 1;
+            fclose(fout); ops->close(&d); free(buf); return 1;
         }
-        total_frames += (long)got;
+        total_frames += got;
     }
 
+    fprintf(stderr, "captured %ld frames at %u Hz, %u ch (tag length %llu) -> %s\n",
+            total_frames, d.sample_rate, d.channels,
+            (unsigned long long)d.total_frames, argv[2]);
     fclose(fout);
-    drmp3_uninit(&d);
+    ops->close(&d);
     free(buf);
-
-    fprintf(stderr, "captured %ld frames at %u Hz, %u ch -> %s\n",
-            total_frames, d.sampleRate, d.channels, argv[2]);
     return 0;
 }

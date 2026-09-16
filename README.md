@@ -17,9 +17,12 @@ New to the device? Read the [user guide](docs/USER_GUIDE.md).
 - **Boots as the firmware.** No chainloader, no boot menu. The image is the OSOS in the firmware
   partition; the boot ROM hands to `crt0.S`. Select + Play still reaches Apple's disk mode, so
   recovery is unconditional.
-- **Plays FLAC from the disk.** Streaming decode over an anti-skip buffer, DMA to the WM8758B, and
-  a track hand-over that does not stop the DAC. MP3 is compiled but switched off: the decoder
-  cannot hold real time on this CPU.
+- **Plays FLAC and MP3 from the disk.** Streaming decode over an anti-skip buffer, DMA to the
+  WM8758B, and a track hand-over that does not stop the DAC. MP3 is MPEG-1/2/2.5 Layer III, CBR and
+  VBR, through a fixed-point decoder (AOSP's pvmp3) — the 8–16 kHz rates are refused, because the
+  DAC cannot be clocked there. Whether MP3 holds real time on this 80 MHz ARM7TDMI has not yet
+  been measured on the device; Settings → About → Boot Details shows the decode cost as a
+  percentage of the budget.
 - **Loads the library in one read.** A host-built index (`CORELIB.IDX`) with up to 6000 songs,
   1024 albums, 512 artists and 128 genres, full UTF-8. Album-art sidecars for list chips and the
   Now Playing cover.
@@ -162,7 +165,7 @@ and newlib for the device.
 cd core
 make hw                        # build-hw/core.elf, core.bin
 make ipod                      # build-hw/core.ipod
-make sim && meson test -C build-sim   # host tests, 66 suites
+make sim && meson test -C build-sim   # host tests, 70 suites
 make verify-hw                 # layout, header/doc and size checks on the ARM image
 ```
 
@@ -229,9 +232,10 @@ ROM; nothing this firmware writes can remove it. Reflash, or restore the partiti
 ## Status
 
 Runs on the device: direct boot, FLAC playback, the library, themes, settings and resume, sleep
-and power-off, the event log. Built but not yet flashed: Search and the A–Z letter on every list.
-Not there: MP3 in real time, writing playlists, podcasts.
-The running list of what works and what is next is [`STATUS.md`](STATUS.md).
+and power-off, the event log. Built but not yet flashed: MP3 playback, Search, and the A–Z letter
+on every list. Not there: writing playlists, podcasts. MP3 decodes correctly and within budget on
+the host; whether it holds real time on the device is the next bench. The running list of what
+works and what is next is [`STATUS.md`](STATUS.md).
 
 Versions are git tags, `v0.1.0` and up. The boot screen's bottom-right stamp and Settings → About
 show the version the device runs; an untagged build shows the nearest tag, the commit distance and
@@ -258,6 +262,8 @@ STATUS.md     what works, what is pending, what is next
 
 ## License
 
-Apache-2.0 ([`core/LICENSE`](core/LICENSE)). Vendored decoders `dr_flac` and `dr_mp3` are public
-domain / MIT-0. Nunito is under the SIL Open Font License 1.1
-([`tools/fonts-src/OFL.txt`](tools/fonts-src/OFL.txt)).
+Apache-2.0 ([`core/LICENSE`](core/LICENSE)). The vendored FLAC decoder `dr_flac` is public domain /
+MIT-0; the MP3 decoder is PacketVideo's `pvmp3` from AOSP, Apache-2.0, vendored at a pinned commit
+with its NOTICE and its patent disclaimer
+([`core/codecs/pvmp3/`](core/codecs/pvmp3/README.md)). Nunito is under the SIL Open Font
+License 1.1 ([`tools/fonts-src/OFL.txt`](tools/fonts-src/OFL.txt)).

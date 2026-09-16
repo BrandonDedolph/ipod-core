@@ -1867,7 +1867,9 @@ def fmt_ms(ms):
 DIAG_TOTAL = 3300
 DIAG_LCD, DIAG_DISK, DIAG_LIB, DIAG_RESUME = 210, 1900, 610, 480
 DIAG_RES_DIR, DIAG_RES_OPEN, DIAG_RES_SEEK = 120, 300, 40
-DIAG_DECODE_PCT = 34          # of the 22676 us/kframe 44.1kHz real-time budget
+DIAG_DECODE_PCT = 34          # of the 1e9/rate us/kframe real-time budget
+                              # (22676 at 44.1 kHz, 20833 at 48) — the firmware
+                              # divides by the PLAYING stream's rate
 DIAG_SEQ = 500
 DIAG_LBA = (49236472, 49236474)     # CONFIG slot LBAs (config_save())
 DIAG_LOG_LBA = (49238456, 49238464)  # event log header / next-flush LBAs

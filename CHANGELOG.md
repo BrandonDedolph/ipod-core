@@ -5,6 +5,26 @@ the boot screen and Settings → About show the one the device runs.
 
 ## Unreleased
 
+- **MP3 plays.** It was compiled and switched off from the beginning because
+  `dr_mp3`'s decoder is floating point and this CPU has no FPU — it needed 24
+  times FLAC's work and the audio buffer starved. The decoder is now AOSP's
+  fixed-point `pvmp3` (Apache-2.0), at about 1.7x FLAC, and `.mp3` files appear
+  in the browser, in Songs, Genres and Shuffle, in the index and in `core sync`
+  like any other track. MPEG-1, MPEG-2 and MPEG-2.5 Layer III, constant or
+  variable bitrate; the low sample rates (8, 11.025, 12 and 16 kHz) are refused,
+  because the iPod's DAC cannot be clocked there.
+  **Not yet played on a device** — Settings → About → Boot Details shows the
+  decode cost as a percentage of real time, and that reading is the gate.
+- Titles, artists, albums, genres, track numbers and years come from an MP3's
+  ID3 tags, including tags written in UTF-16 by Windows software — those used
+  to be unreadable even when MP3 was enabled by hand. Album art can come from
+  an MP3's embedded cover.
+- Scrubbing and resume work on an MP3: the position maps through the file's own
+  Xing seek table, so resuming a podcast comes back where it was instead of at
+  the start.
+- Boot Details' DECODE percentage is measured against the playing track's own
+  sample rate. It had assumed 44.1 kHz, so a 48 kHz album read 8 % low.
+
 - **Search.** Music → Search. The wheel moves along a strip of letters, digits and SPACE / DEL /
   DONE, and Select types; Right is a space and Left deletes. It matches song titles, artist names,
   album titles and playlist names as you type, showing the first four hits under the strip, and
