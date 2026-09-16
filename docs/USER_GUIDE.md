@@ -62,7 +62,9 @@ goes away at once.
 
 The band at the top of every list and every Settings screen shows the playing track's name on the
 left and the battery on the right, with the padlock between them when Hold is on. When nothing is
-loaded the left side is blank. While the sleep timer is running, SLEEP and the minutes left sit
+loaded the left side is blank — or shows the time, if Time in Title is on (Settings > Date & Time).
+The track name always wins while something is playing: the clock then lives in the main menu's
+header instead, where it never has to share room with a title. While the sleep timer is running, SLEEP and the minutes left sit
 beside the battery and the track name shortens to make room. On Now Playing the band reads Now
 Playing or Paused, with SHUF (or SHUF·ALB for Shuffle Albums) and RPT tokens when shuffle or
 repeat are on, and SLEEP after them.
@@ -258,7 +260,31 @@ until the device sleeps or powers off, so leaving Settings never makes you wait.
 - **Display.** Backlight: Never, or 5, 10, 15, 30 or 60 seconds after the last input. At the
   timeout the light drops to a quarter of your brightness, and fifteen seconds later it goes off.
   Brightness: 1 to 32, shown as a percentage.
-- **Clicker.** The click the wheel makes: Off, Tick, Click, Pop, Blip, Tock, Double, Chirp.
+- **Date & Time.** The iPod has a clock that keeps running while it is off. Three rows:
+  - **Set Date & Time** opens the editor below: six plates (year, month, day, hour, minute, AM/PM,
+    or five in 24-hour mode). The wheel changes the selected plate, Select confirms it and moves to
+    the next, Select on the last one sets the clock, and **Menu cancels without changing anything**.
+    The year stops at 2001 and 2099; every other field wraps. The day follows the month — step
+    January's 31st into February and it becomes the 28th.
+  - **Time Format**: 12-hour or 24-hour. It changes every clock on the device.
+  - **Time in Title**: with it on, the time shows in the top band when nothing is playing, and in
+    the main menu's header always.
+
+  Normally you never open this: `core sync`, `core install` and `core eject` write the computer's
+  time into the iPod's settings file, and the iPod takes it at its **next boot** — it cannot be
+  told the time while it is plugged in, because on the cable it is Apple's disk mode answering the
+  computer, not this firmware. One exception: a clock that is already running more than ten minutes
+  AHEAD is left alone rather than dragged backwards by a stamp that might be days old, so if the
+  time is far in the future, set it by hand.
+
+<table>
+  <tr>
+    <td><img src="screens/datetime.png" width="260" alt="Date &amp; Time"></td>
+    <td><img src="screens/settime.png" width="260" alt="Set Date &amp; Time"></td>
+    <td><img src="screens/mainmenu_clock.png" width="260" alt="The clock in the main menu's header"></td>
+  </tr>
+</table>
+
 - **About.** The firmware version, model, song, album and artist counts, storage free, battery
   percentage and voltage, the event log's state, and the headphone jack's switch — `JACK 1` when a
   plug is seated, `JACK 0` when it is not, followed by `n` and the number of times it has changed
@@ -349,8 +375,9 @@ core eject D:
 converted, each file keeps its own format), writes `folder.art` and
 `folder.thm` beside it from the file's embedded cover, rewrites the playlists to device paths under
 `Music/Playlists/`, creates `CORECFG.DAT` and `CORELOG.BIN` in the volume root if they are missing
-(a valid one is never reset, so your settings survive), and writes `Music/CORELIB.IDX` last — last
-on purpose, so the index never names files a failed copy did not leave behind. A track already on
+(a valid one is never reset, so your settings survive), **sets the iPod's clock**, and writes
+`Music/CORELIB.IDX` last — last on purpose, so the index never names files a failed copy did not
+leave behind. A track already on
 the device is skipped when its size matches and its timestamp is within two seconds; `--verify`
 compares content instead.
 
@@ -360,6 +387,14 @@ core sync --src … --dst D:\ --prune --yes   # also remove what is on the devic
 ```
 
 Nothing is deleted without `--prune --yes`.
+
+**The clock.** `sync`, `install` and `eject` all write your computer's current time (and its time
+zone) into `CORECFG.DAT`, and the iPod picks it up at its **next boot**. It cannot be told the time
+while it is plugged in: on the cable it is Apple's disk mode answering, not this firmware. `eject`
+stamps last, immediately before the volume goes away, which is why it is the one that matters —
+unplug, the iPod reboots, and the clock is seconds old. Nothing else in the file is touched: the
+stamp rewrites one of its two records and copies everything else across byte for byte. `core doctor`
+prints the stamp and whether the device has taken it yet.
 
 **Firmware.**
 
@@ -495,5 +530,9 @@ audio counters. If you report a problem, that dump is what explains it.
 - **The library is missing or stale.** Rebuild `CORELIB.IDX`: `core sync`, or `tools/build_index.py`.
 - **Settings do not stick.** `CORECFG.DAT` must exist in the volume root; `core sync` creates it, or
   `tools/make_config.py --create <iPod>`.
+- **The clock says Not set, or is wrong.** A flat battery resets it — the clock runs off the same
+  cell. Plug the iPod in and run `core sync` or `core eject` (either sets it), then boot the device
+  once: the time arrives on that boot, not while it is on the cable. A clock running more than ten
+  minutes AHEAD is deliberately left alone by that path; set it in Settings > Date & Time.
 - **Something else.** Pull `CORELOG.BIN` in disk mode and dump it. Known issues and what is being
   worked on are in [STATUS.md](../STATUS.md).

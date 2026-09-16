@@ -32,6 +32,10 @@ Open `Rockbox Theme.html` in a browser. It loads a pan/zoom canvas with every sc
 | `system-screens.jsx` | Boot, shutdown, file browser, EQ, theme picker, WPS info pages, charging, locked, unlocked |
 | `interactive-ipod.jsx` | Live prototype — stack-based nav, click wheel, volume, hold |
 | `ipod-frame.jsx` | iPod 5G hardware frame — bezel, click wheel, hold switch |
+
+One screen has no jsx: **Settings > Date & Time's field editor**. Its design is the widget in
+`plans/14-clock.md` — a row of plates in the list's own language, the selected one inverted the
+way a selected row is — and `docs/screens/settime.png` is what it looks like.
 | `volume-demo.jsx` | Volume overlay + slider demo |
 | `design-canvas.jsx` | Pan/zoom canvas component |
 

@@ -132,14 +132,25 @@ between two slots so a power loss mid-write always leaves one good record.
 `--verify` prints the LBA the firmware must agree on and is the mandatory
 pre-flight before the first write on a given device.
 
-The record is v2 and 48 payload bytes: v1 held settings only, v2 appends a
+The record is v2 and 64 payload bytes: v1 held settings only, v2 appends a
 resume locator (name hash + elapsed seconds + track length), the kind of queue
-the track was playing in with the shuffle seeds, and the sound tail (volume
-limit + EQ preset). Each tail was appended under the same version with
-`length` gating it, so a record written by any earlier build still loads. The
-shuffle byte itself widened in place to carry the three-way mode (off / songs
-/ albums) since 2026-09-16 — same offset, same version: an older build reads
-an albums record as Songs, and this one reads a value it does not know as Off.
+the track was playing in with the shuffle seeds, the sound tail (volume
+limit + EQ preset) and the time block. Each tail was appended under the same
+version with `length` gating it, so a record written by any earlier build still
+loads. The shuffle byte itself widened in place to carry the three-way mode
+(off / songs / albums) since 2026-09-16 — same offset, same version: an older
+build reads an albums record as Songs, and this one reads a value it does not
+know as Off.
+
+The **time block** (payload 48..63) is the one part of this file the HOST also
+writes, and the reason is that the iPod cannot be told the time over the cable:
+in disk mode it is Apple's boot ROM answering the computer, not us. So
+`core sync` / `core install` / `core eject` patch their clock into the newest
+slot's copy and write it to the other slot with `seq+1`, everything else
+verbatim and no truncation, and the firmware decides at the next boot what that
+stamp is worth (`kernel/timesync.c`: once per stamp, and never backwards by
+more than ten minutes).
+
 With **Resume** enabled, a cold boot reopens the track you were on, in that
 queue, and seeks to where you left off, **paused** — never surprising you
 with audio at boot.

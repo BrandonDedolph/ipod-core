@@ -40,6 +40,10 @@ New to the device? Read the [user guide](docs/USER_GUIDE.md).
 - **Sleeps.** Hold Play to sleep, or set a sleep timer of 15 to 120 minutes; the drive parks, the
   panel and codec go down, the CPU idles. On battery, a sleeping device powers itself off after
   thirty minutes.
+- **Knows what time it is.** The PMIC's always-on clock, read at boot and carried in software, with
+  the time optionally in the title bar. The iPod cannot be told the time over the cable — on it,
+  Apple's disk mode is what answers the computer — so `core sync` and `core eject` leave the time in
+  the settings file and the device takes it at the next boot.
 
 ## Screens
 
@@ -111,8 +115,8 @@ Seven palettes, swapped live from Settings. Same layout, same type, different in
 
 ### Settings
 
-Playback, Sound (volume limit, EQ presets, tone), Theme, Display, Clicker, About, Boot Details,
-Disk Mode, Reset. Everything but the diagnostics is saved to the disk.
+Playback, Sound (volume limit, EQ presets, tone), Theme, Display, Clicker, Date & Time, About, Boot
+Details, Disk Mode, Reset. Everything but the diagnostics is saved to the disk.
 
 <p align="center"><img src="docs/screens/settings.gif" alt="a Sound slider, then the theme picker" width="360"></p>
 
@@ -120,8 +124,8 @@ Disk Mode, Reset. Everything but the diagnostics is saved to the disk.
   <tr>
     <td><img src="docs/screens/settings.png" width="260" alt="Settings"></td>
     <td><img src="docs/screens/playback.png" width="260" alt="Playback"></td>
+    <td><img src="docs/screens/settime.png" width="260" alt="Set Date &amp; Time"></td>
     <td><img src="docs/screens/about.png" width="260" alt="About"></td>
-    <td><img src="docs/screens/bootdetails.png" width="260" alt="Boot Details"></td>
   </tr>
 </table>
 
