@@ -20,12 +20,13 @@
  *     the console framebuffer, matching the jsx.
  *
  * FUNCTIONAL fields drive real hardware once main.c wires them: shuffle, repeat
- * (player), volume (mirrors hal_volume), backlight_secs + backlight_bright
- * (backlight HAL), resume_on_startup (kernel/main.c re-opens the saved track at
- * boot), sleep_timer_min (kernel/main.c arms ui/sleeptimer.c from it, and
- * sleeps the device when it runs out). COSMETIC fields render + store but
- * nothing consumes them yet
- * (crossfade, bass, treble, balance) — flagged at their declarations below.
+ * (player), volume + volume_limit (mirrors hal_volume), eq / bass / treble /
+ * balance (the codec's 5-band EQ and output gains), backlight_secs +
+ * backlight_bright (backlight HAL), resume_on_startup (kernel/main.c re-opens
+ * the saved track at boot), sleep_timer_min (kernel/main.c arms
+ * ui/sleeptimer.c from it, and sleeps the device when it runs out). Crossfade
+ * is the one field left that nothing consumes: it is still carried in the
+ * record, but no row shows it and there is no crossfade mixer to drive.
  *
  * Freestanding: integer-only, no libc/libm/malloc, no allocation. The model
  * half (settings.c) has no hardware or framebuffer dependency at all, so it
@@ -51,8 +52,30 @@ typedef struct {
     int  resume_on_startup;  /* 0/1 — FUNCTIONAL (boot re-opens the last track)*/
     int  crossfade;          /* 0/1 — COSMETIC (no crossfade mixer yet)       */
     int  volume;             /* 0..100 — FUNCTIONAL (mirrors hal_volume)      */
-    int  bass, treble;       /* -12..12 dB — COSMETIC (no EQ wired yet)       */
-    int  balance;            /* -100..100 — COSMETIC                          */
+    /*
+     * VOLUME LIMIT — the ceiling the Volume slider and the Now Playing wheel
+     * are held to, 10..100 with 100 meaning "no limit". The floor is 10, not
+     * 0: a limit of 0 would be a mute switch with no obvious way back.
+     * settings_volume_clamp() is the ONE place the rule is applied; nothing
+     * else may re-derive it, or the two wheels would disagree.
+     */
+    int  volume_limit;       /* 10..100 — FUNCTIONAL (caps volume)            */
+    /*
+     * EQ PRESET — 0 (EQ_OFF) or one of ui/eq.c's named curves. While a preset
+     * is selected it owns BOTH codec shelves, so bass/treble below are held
+     * (the rows render locked, showing the preset's shelf gains) and the
+     * user's own tone comes back untouched the moment EQ returns to Off.
+     *
+     * "Selected" means an id THIS BUILD HAS A CURVE FOR: a value from a newer
+     * build reads as Off in eq_effective_curve(), settings_row_locked() and
+     * config_decode() alike, so the shelves can never be locked over a curve
+     * the rows would then report as the user's own tone.
+     */
+    int  eq;                 /* 0..EQ_PRESET_COUNT-1 — FUNCTIONAL (ui/eq.c)   */
+    int  bass, treble;       /* -12..12 dB — FUNCTIONAL (codec shelving EQ,   */
+                             /* ignored while eq names a preset this build    */
+                             /* knows; an id it does not reads as Off)        */
+    int  balance;            /* -100..100 — FUNCTIONAL (pans the OUT1 gains)  */
     int  backlight_secs;     /* 0=never / 5/10/15/30/60 — FUNCTIONAL          */
     int  backlight_bright;   /* 1..32 — FUNCTIONAL                            */
     int  theme;              /* THEME_* id (ui/palette.h): 0 Linen, 1 Onyx,   */
@@ -143,8 +166,8 @@ enum {
     RESUME_KIND_MAX      = RESUME_KIND_PLAYLIST
 };
 
-/* Populate `s` with sensible defaults (shuffle off, repeat off, volume 70,
- * backlight 15 s at full brightness, Linen theme). */
+/* Populate `s` with sensible defaults (shuffle off, repeat off, volume 70 with
+ * no volume limit, EQ off, backlight 15 s at full brightness, Linen theme). */
 void settings_defaults(settings_t *s);
 
 /*
@@ -155,7 +178,7 @@ void settings_defaults(settings_t *s);
 typedef enum {
     SETTINGS_ROOT,       /* the top Settings menu                             */
     SETTINGS_PLAYBACK,   /* Shuffle / Repeat / Resume / Sleep Timer selects   */
-    SETTINGS_SOUND,      /* Volume / Bass / Treble / Balance / Width sliders  */
+    SETTINGS_SOUND,      /* Volume / Volume Limit / EQ / Bass / Treble / Bal  */
     SETTINGS_DISPLAY,    /* Backlight timeout (select) + Brightness (slider)  */
     SETTINGS_ABOUT,      /* device info key/value rows                        */
     SETTINGS_THEME,      /* theme picker (swatch rows)                        */
@@ -249,6 +272,31 @@ const char *settings_theme_name(int theme);
 /* The display name of clicker profile `profile` ("Off"/"Tick"/"Click"/"Pop"). */
 const char *settings_clicker_name(int profile);
 
+/* The display name of EQ preset `preset` ("Off", "Rock", …; ui/eq.c). A
+ * preset id outside the table names "Off", which is also what config.c
+ * decodes such a byte to. */
+const char *settings_eq_name(int preset);
+
+/*
+ * Apply the Volume Limit to a candidate volume: the value `v` clamped to
+ * [0, s->volume_limit]. THE single statement of the rule — the Volume slider
+ * (settings_adjust) and the Now Playing wheel (kernel/main.c) both go through
+ * here, so the ceiling cannot come out different on the two screens. A
+ * volume_limit outside its own 10..100 range is clamped first, so a hand-
+ * edited record cannot pin the user at 0.
+ */
+int settings_volume_clamp(const settings_t *s, int v);
+
+/*
+ * Is row (screen, idx) present but not adjustable right now? True only for
+ * Sound's Bass and Treble while an EQ preset is selected: the codec has one
+ * low shelf and one high shelf and the preset owns both, so those rows report
+ * the PRESET's shelf gains, render greyed (ui/screen_settings.c) and refuse
+ * the wheel (settings_adjust returns 0) until EQ goes back to Off. The
+ * stored bass/treble are never touched by any of this.
+ */
+int settings_row_locked(int screen, const settings_t *s, int idx);
+
 /* The settings_kind_t of row (screen, idx). */
 int settings_kind(int screen, int idx);
 
@@ -276,8 +324,14 @@ int settings_activate(int screen, settings_t *s, int idx);
 /*
  * Apply a wheel tick of `delta` to a SLIDER row (Sound values, Display
  * Brightness) or step a discrete SELECT (Display Backlight). Clamped to range.
- * Returns 1 if *s changed, 0 if not — at a rail, on a non-adjustable row, or
- * for delta 0 — so the caller can skip the persist (see settings_action_t).
+ * Returns 1 if *s changed, 0 if not — at a rail, on a locked row
+ * (settings_row_locked), on a non-adjustable row, or for delta 0 — so the
+ * caller can skip the persist (see settings_action_t).
+ *
+ * Two Sound rows are coupled: Volume is clamped to the limit through
+ * settings_volume_clamp(), and lowering Volume Limit below the current volume
+ * pulls the volume down in the same call. The invariant both halves keep is
+ * that *s never leaves here with volume > volume_limit.
  */
 int settings_adjust(int screen, settings_t *s, int idx, int delta);
 

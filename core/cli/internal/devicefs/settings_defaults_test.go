@@ -60,6 +60,8 @@ func TestDefaultSettingsMatchesFirmware(t *testing.T) {
 		{"backlight_bright", int(d.BacklightBright)},
 		{"theme", int(d.Theme)},
 		{"clicker", int(d.Clicker)},
+		{"volume_limit", int(d.VolumeLimit)},
+		{"eq", int(d.EQ)},
 	}
 	for _, w := range want {
 		raw, ok := got[w.field]
@@ -105,7 +107,7 @@ func TestDefaultSettingsMatchesFirmware(t *testing.T) {
 // an integer literal, or one of the enum names the firmware uses there.
 func cValue(s string) (int, error) {
 	switch s {
-	case "REPEAT_OFF", "RESUME_KIND_NONE":
+	case "REPEAT_OFF", "RESUME_KIND_NONE", "EQ_OFF":
 		return 0, nil
 	case "REPEAT_ALL":
 		return 1, nil

@@ -125,7 +125,7 @@ Mirrors how `CORELIB.IDX` is already found (`index_root_cb` in `main.c`):
 ```
 off   size  field
 0     4     magic     'C''O''R''E'  (0x45524F43 LE)
-4     2     version   layout version (1)
+4     2     version   layout version (2)
 6     2     length    meaningful payload bytes that follow (fwd-compat)
 8     4     seq       monotonic write counter, wrapping (newest wins)
 12    N     payload   the packed settings fields (see below), zero-padded
@@ -165,6 +165,37 @@ and `PAYLOAD_FIELDS` in `make_config.py`, which must stay in lockstep):
 10  theme              u8   (0=Linen 1=Onyx …)
 11  clicker            u8   (0=Off …)
 ```
+
+Everything after byte 11 was APPENDED under the same version 2, `length`
+growing each time (12 → 24 → 44 → 48) so that every record already written
+still reads and every older build still reads a newer record. As shipped:
+
+```
+12  resume_hash        u32  name_hash of the playing track's filename; 0 = none
+16  resume_secs        u32  elapsed seconds (<= 86400)
+20  resume_total       u32  that track's length (<= 86400)
+                            -- length 24 --
+24  resume_kind        u8   RESUME_KIND_* (unknown -> NONE)
+25  resume_flags       u8   reserved (0)
+26  resume_qidx        u16  queue index of the track
+28  resume_seed        u32  Shuffle Songs' library-order seed
+32  resume_order_seed  u32  the player's shuffle-deal seed
+36  resume_ctx_hash    u32  KIND_PLAYLIST: the playlist's name hash, else 0
+40  resume_order_keep  i16  the player's shuffle-deal pin
+42  (reserved)         u16  0
+                            -- length 44 --
+44  volume_limit       u8   10..100 (100 = no limit); 0 = UNSET -> 100
+45  eq                 u8   ui/eq.c preset id, 0 = Off (unknown -> Off)
+46  (reserved)         u16  0
+                            -- length 48, what this build writes --
+```
+
+The resume fields are zeroed together with the locator (no track, no
+position and no context, enforced on BOTH sides of the codec). The sound
+tail carries one cross-field rule: `volume` is clamped to `volume_limit` on
+decode, so a record cannot bring the device up louder than the ceiling the
+user set — and a 44-byte record, which is what every device in the field
+holds, decodes as "no limit, EQ off" with its volume untouched.
 
 Loader validates magic + version + length + crc32. Any mismatch → defaults
 (writes stay enabled if the *file* resolved — writing slot 0 is how we

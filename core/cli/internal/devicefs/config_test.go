@@ -19,33 +19,35 @@ import (
 //
 //	python3 tools/make_config.py --emit /tmp/cfg.bin
 //	python3 -c "b=open('/tmp/cfg.bin','rb').read()[:1024]; \
-//	           print(b[:56].hex(), b[1020:].hex())"
+//	           print(b[:60].hex(), b[1020:].hex())"
 //
-// on 2026-09-14 from the tree at 928727d. The slot is 1024 bytes of which
-// only the 56-byte record head and the 4-byte CRC tail are non-zero, so the
+// on 2026-09-16 from the tree at e891cd4. The slot is 1024 bytes of which
+// only the 60-byte record head and the 4-byte CRC tail are non-zero, so the
 // golden is spelled as head ++ zeros ++ crc rather than as 2048 characters
 // of mostly "00" — same bytes, readable diff.
 //
 // Head, field by field:
 //
-//	434f5245  magic 'CORE'          2c00      length 44
+//	434f5245  magic 'CORE'          3000      length 48
 //	0200      version 2             01000000  seq 1
 //	00 00 01 00 46 00 00 00 0f 20 00 01       the v1 payload:
 //	shuffle 0, repeat 0, resume 1, crossfade 0, volume 70, bass 0,
 //	treble 0, balance 0, backlight 15 s, brightness 32, theme 0, clicker 1
 //	then 32 zero bytes: the resume locator and queue context of a fresh file
+//	64 00 00 00                               the sound tail:
+//	volume limit 100 (no limit), EQ 0 (Off), two reserved bytes
 const (
-	configGoldenHead = "434f524502002c000100000000000100460000000f2000010000000000000000000000000000000000000000000000000000000000000000"
-	configGoldenCRC  = "c0bca495"
+	configGoldenHead = "434f5245020030000100000000000100460000000f200001000000000000000000000000000000000000000000000000000000000000000064000000"
+	configGoldenCRC  = "033929d4"
 )
 
 func configGolden() string {
-	return configGoldenHead + strings.Repeat("00", cfgOffCRC-56) + configGoldenCRC
+	return configGoldenHead + strings.Repeat("00", cfgOffCRC-60) + configGoldenCRC
 }
 
 func TestEncodeConfigSlotMatchesGolden(t *testing.T) {
-	if len(configGoldenHead) != 2*56 {
-		t.Fatalf("golden head is %d hex chars, want %d", len(configGoldenHead), 2*56)
+	if len(configGoldenHead) != 2*60 {
+		t.Fatalf("golden head is %d hex chars, want %d", len(configGoldenHead), 2*60)
 	}
 	slot := EncodeConfigSlot(DefaultSettings(), 1)
 	if got, want := hex.EncodeToString(slot[:]), configGolden(); got != want {
@@ -131,6 +133,7 @@ func TestDecodeConfigSlotRoundTrip(t *testing.T) {
 		Shuffle: 1, Repeat: 2, ResumeOnStartup: 1, Crossfade: 1, Volume: 100,
 		Bass: -12, Treble: 12, Balance: -100,
 		BacklightSecs: 30, BacklightBright: 1, Theme: 5, Clicker: 3,
+		VolumeLimit: 40, EQ: 12,
 	}
 	rec := EncodeConfigSlot(want, 0xDEADBEEF)
 	seq, got, ok := DecodeConfigSlot(rec[:])
@@ -177,6 +180,38 @@ func TestDecodeConfigSlotAcceptsV1Length12(t *testing.T) {
 	binary.LittleEndian.PutUint32(rec[cfgOffCRC:], crc32.ChecksumIEEE(rec[:cfgOffCRC]))
 	if _, _, ok := DecodeConfigSlot(rec[:]); !ok {
 		t.Error("a version-1 record was rejected")
+	}
+}
+
+// The 44-byte record: what every device in the field holds, written by the
+// build before the sound tail existed. It must still decode, and it must
+// report the values the FIRMWARE will use for the fields that are not there —
+// no volume limit, EQ off — rather than a zero limit, which would read as a
+// device pinned at the 10% floor.
+func TestDecodeConfigSlotAcceptsQueueContextLength44(t *testing.T) {
+	rec := EncodeConfigSlot(Settings{
+		Volume: 90, VolumeLimit: 40, EQ: 12,
+	}, 9)
+
+	binary.LittleEndian.PutUint16(rec[cfgOffLength:], cfgPayloadV2Q)
+	for i := cfgOffPayload + cfgPayloadV2Q; i < cfgOffCRC; i++ {
+		rec[i] = 0
+	}
+	binary.LittleEndian.PutUint32(rec[cfgOffCRC:], crc32.ChecksumIEEE(rec[:cfgOffCRC]))
+
+	seq, s, ok := DecodeConfigSlot(rec[:])
+	if !ok {
+		t.Fatal("a 44-byte (queue context) record was rejected")
+	}
+	if seq != 9 {
+		t.Errorf("seq = %d, want 9", seq)
+	}
+	if s.Volume != 90 {
+		t.Errorf("Volume = %d, want 90 (untouched by an absent sound tail)", s.Volume)
+	}
+	if s.VolumeLimit != 100 || s.EQ != 0 {
+		t.Errorf("absent sound tail decoded as limit %d / EQ %d, want 100 / 0",
+			s.VolumeLimit, s.EQ)
 	}
 }
 

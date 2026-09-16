@@ -132,9 +132,11 @@ between two slots so a power loss mid-write always leaves one good record.
 `--verify` prints the LBA the firmware must agree on and is the mandatory
 pre-flight before the first write on a given device.
 
-The record is v2: v1 held settings only, v2 appends a resume locator
-(name hash + elapsed seconds + track length) and, since the queue work, the
-kind of queue the track was playing in and the shuffle seeds. With
+The record is v2 and 48 payload bytes: v1 held settings only, v2 appends a
+resume locator (name hash + elapsed seconds + track length), the kind of queue
+the track was playing in with the shuffle seeds, and the sound tail (volume
+limit + EQ preset). Each tail was appended under the same version with
+`length` gating it, so a record written by any earlier build still loads. With
 **Resume** enabled, a cold boot reopens the track you were on, in that
 queue, and seeks to where you left off, **paused** — never surprising you
 with audio at boot.

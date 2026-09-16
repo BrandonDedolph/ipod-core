@@ -14,6 +14,7 @@
 
 #include "settings.h"
 #include "palette.h"                   /* THEME_* ids + THEME_COUNT (header only) */
+#include "eq.h"                       /* EQ preset names + the locked shelves   */
 
 /* ---------------------------------------------------------------------------
  * Small freestanding helpers
@@ -91,6 +92,45 @@ static void fmt_balance(char *d, int v)
 }
 
 /* ---------------------------------------------------------------------------
+ * Sound: the volume ceiling and the EQ-owned shelves
+ * ------------------------------------------------------------------------- */
+
+int settings_volume_clamp(const settings_t *s, int v)
+{
+    /* The limit itself is clamped first: the field's range is 10..100, and a
+     * record that somehow held 0 would otherwise mute the device with no row
+     * explaining why (config.c reads a 0 byte as "unset" for the same
+     * reason). */
+    return clampi(v, 0, clampi(s->volume_limit, 10, 100));
+}
+
+int settings_row_locked(int screen, const settings_t *s, int idx)
+{
+    /* Bass (3) and Treble (4) while a preset is on, and nothing else. The
+     * preset test is eq.c's: an id this build has no curve for reads as Off
+     * everywhere, so the rows must not lock over a value whose shelf gains
+     * they would then report as the user's own. */
+    return screen == SETTINGS_SOUND && (idx == 3 || idx == 4) &&
+           s->eq > EQ_OFF && s->eq < EQ_PRESET_COUNT;
+}
+
+const char *settings_eq_name(int preset)
+{
+    return eq_preset_name(preset);
+}
+
+/* The dB the Bass (band 0) / Treble (band 4) row should SHOW: the preset's
+ * shelf gain while one is active, the user's own value otherwise. One call
+ * into eq.c covers both — eq_effective_curve is where "who owns the shelves"
+ * is decided, and this row must never answer it differently. */
+static int shelf_db(const settings_t *s, int band)
+{
+    eq_curve_t c;
+    eq_effective_curve(s->eq, s->bass, s->treble, &c);
+    return c.gain_db[band];
+}
+
+/* ---------------------------------------------------------------------------
  * Backlight-timeout discrete steps (0=never / 5 / 10 / 15 / 30 / 60 seconds)
  * ------------------------------------------------------------------------- */
 static const int BL_OPTS[6] = { 0, 5, 10, 15, 30, 60 };
@@ -157,7 +197,11 @@ static const char *const ROOT_L[9] = {
  * plays, and the one you reach for at night. */
 static const char *const PLAY_L[4] = { "Shuffle", "Repeat", "Resume",
                                        "Sleep Timer" };
-static const char *const SOUND_L[4] = { "Volume", "Bass", "Treble", "Balance" };
+/* Volume Limit sits under Volume because it is the same bar; EQ sits above
+ * Bass/Treble because, while it is on, it owns them. */
+static const char *const SOUND_L[6] = {
+    "Volume", "Volume Limit", "EQ", "Bass", "Treble", "Balance",
+};
 static const char *const DISP_L[2] = { "Backlight", "Brightness" };
 /* Theme picker rows, in THEME_* id order (ui/palette.h) — the id IS the row. */
 static const char *const THEME_L[THEME_COUNT] = {
@@ -186,6 +230,8 @@ void settings_defaults(settings_t *s)
     s->resume_on_startup = 1;
     s->crossfade         = 0;
     s->volume            = 70;
+    s->volume_limit      = 100;            /* 100 = no limit                 */
+    s->eq                = EQ_OFF;
     s->bass              = 0;
     s->treble            = 0;
     s->balance           = 0;
@@ -216,7 +262,7 @@ int settings_count(int screen)
     switch (screen) {
     case SETTINGS_ROOT:     return 9;
     case SETTINGS_PLAYBACK: return 4;
-    case SETTINGS_SOUND:    return 4;
+    case SETTINGS_SOUND:    return 6;
     case SETTINGS_DISPLAY:  return 2;
     case SETTINGS_ABOUT:    return 1;   /* non-interactive info page */
     case SETTINGS_DIAG:     return 1;   /* non-interactive info page */
@@ -270,7 +316,8 @@ int settings_kind(int screen, int idx)
     case SETTINGS_PLAYBACK:
         return SETTINGS_KIND_SELECT;       /* all four: cycling selects        */
     case SETTINGS_SOUND:
-        return SETTINGS_KIND_SLIDER;       /* Volume / Bass / Treble / Balance  */
+        /* Every row is a slider but EQ, which cycles named presets. */
+        return (idx == 2) ? SETTINGS_KIND_SELECT : SETTINGS_KIND_SLIDER;
     case SETTINGS_DISPLAY:
         return (idx == 1) ? SETTINGS_KIND_SLIDER : SETTINGS_KIND_SELECT;
     case SETTINGS_THEME:
@@ -330,11 +377,22 @@ void settings_value(int screen, const settings_t *s, int idx,
         break;
 
     case SETTINGS_SOUND:
+        /* Bass/Treble read through shelf_db(), so a locked row shows the
+         * PRESET's shelf gain rather than a stored value that is not
+         * currently reaching the codec. */
         switch (idx) {
         case 0: fmt_pct(buf, s->volume); *num = s->volume;      *den = 100; break;
-        case 1: fmt_db(buf, s->bass);    *num = s->bass + 12;   *den = 24;  break;
-        case 2: fmt_db(buf, s->treble);  *num = s->treble + 12; *den = 24;  break;
-        case 3: fmt_balance(buf, s->balance);
+        case 1: { int lim = clampi(s->volume_limit, 10, 100);
+                  fmt_pct(buf, lim);     *num = lim;            *den = 100; }
+                break;
+        case 2: scopy(buf, settings_eq_name(s->eq)); break;
+        case 3: { int db = shelf_db(s, 0);
+                  fmt_db(buf, db);       *num = db + 12;        *den = 24; }
+                break;
+        case 4: { int db = shelf_db(s, EQ_BANDS - 1);
+                  fmt_db(buf, db);       *num = db + 12;        *den = 24; }
+                break;
+        case 5: fmt_balance(buf, s->balance);
                 *num = s->balance + 100; *den = 200; break;
         default: break;
         }
@@ -432,9 +490,20 @@ int settings_activate(int screen, settings_t *s, int idx)
         }
         return SETTINGS_ACTION_NOOP;       /* re-picking the active profile */
 
+    case SETTINGS_SOUND:
+        /* EQ cycles Off -> the 17 presets -> Off. Eighteen values is a long
+         * cycle for one row, but a picker screen needs MENU handling that
+         * main.c's ROOT/non-ROOT pop does not have yet. Every press lands on
+         * a different preset, so this branch is always a change. */
+        if (idx == 2) {
+            s->eq = (s->eq + 1) % EQ_PRESET_COUNT;
+            return SETTINGS_ACTION_NONE;
+        }
+        return SETTINGS_ACTION_NOOP;       /* the rest are wheel-adjusted */
+
     default:
-        /* SOUND (sliders, wheel-adjusted), ABOUT and DIAG (info pages), and
-         * anything out of range: SELECT does nothing, and says so. */
+        /* ABOUT and DIAG (info pages) and anything out of range: SELECT does
+         * nothing, and says so. */
         return SETTINGS_ACTION_NOOP;
     }
 }
@@ -450,14 +519,25 @@ int settings_adjust(int screen, settings_t *s, int idx, int delta)
     int old, nv;
     switch (screen) {
     case SETTINGS_SOUND:
+        if (settings_row_locked(SETTINGS_SOUND, s, idx)) {
+            return 0;        /* an EQ preset owns this shelf; wheel ignored */
+        }
         switch (idx) {
-        case 0: old = s->volume;  nv = clampi(old + delta, 0, 100);
+        case 0: old = s->volume;  nv = settings_volume_clamp(s, old + delta);
                 s->volume = nv;  return nv != old;
-        case 1: old = s->bass;    nv = clampi(old + delta, -12, 12);
+        /* Lowering the ceiling under the current volume pulls the volume down
+         * in the SAME call, so the caller's one settings_apply() pushes both
+         * to the codec and *s can never leave here with volume > limit. */
+        case 1: old = s->volume_limit; nv = clampi(old + delta, 10, 100);
+                s->volume_limit = nv;
+                if (s->volume > nv) { s->volume = nv; }
+                return nv != old;
+        case 2: return 0;                      /* EQ is a SELECT row       */
+        case 3: old = s->bass;    nv = clampi(old + delta, -12, 12);
                 s->bass = nv;    return nv != old;
-        case 2: old = s->treble;  nv = clampi(old + delta, -12, 12);
+        case 4: old = s->treble;  nv = clampi(old + delta, -12, 12);
                 s->treble = nv;  return nv != old;
-        case 3: old = s->balance; nv = clampi(old + delta, -100, 100);
+        case 5: old = s->balance; nv = clampi(old + delta, -100, 100);
                 s->balance = nv; return nv != old;
         default: return 0;
         }

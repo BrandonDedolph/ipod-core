@@ -22,7 +22,7 @@ import (
 //	off   size  field
 //	0     4     magic     'C''O''R''E'  (0x45524F43 LE)
 //	4     2     version   2
-//	6     2     length    meaningful payload bytes that follow (44)
+//	6     2     length    meaningful payload bytes that follow (48)
 //	8     4     seq       monotonic; the higher slot wins
 //	12    n     payload   see below
 //	1020  4     crc32     zlib CRC-32 over bytes [0, 1020)
@@ -49,7 +49,8 @@ const (
 	cfgPayloadMax = cfgOffCRC - cfgOffPayload // 1008
 	cfgPayloadV1  = 12                        // settings only
 	cfgPayloadV2  = cfgPayloadV1 + 12         // + resume locator = 24
-	cfgPayloadLen = cfgPayloadV2 + 20         // + queue context = 44
+	cfgPayloadV2Q = cfgPayloadV2 + 20         // + queue context = 44
+	cfgPayloadLen = cfgPayloadV2Q + 4         // + sound tail = 48
 )
 
 // Payload v1 field offsets — one byte each, in this order. Mirrors the P_*
@@ -70,13 +71,21 @@ const (
 	pClicker
 )
 
+// The SOUND TAIL, appended after the queue context under the same record
+// version (length 44 -> 48). Mirrors P_VOL_LIMIT.. in core/kernel/config.c.
+const (
+	pVolumeLimit = cfgPayloadV2Q + 0
+	pEQ          = cfgPayloadV2Q + 1
+)
+
 // Settings is the part of the firmware's settings_t that lives in the v1
 // payload — everything the host has any business writing.
 //
-// The v2 tail (resume locator at payload offset 12 and queue context at 24)
-// is written as zeros by the host and is not surfaced here: "where the user
-// was" is the device's to own, and a fresh file has nothing to resume
-// (tools/make_config.py:108-113).
+// The resume locator (payload offset 12) and queue context (24) are written
+// as zeros by the host and are not surfaced here: "where the user was" is the
+// device's to own, and a fresh file has nothing to resume
+// (tools/make_config.py). The sound tail at 44 IS a user preference, so it is
+// modelled like the rest.
 type Settings struct {
 	Shuffle         uint8 // 0/1
 	Repeat          uint8 // 0=off 1=all 2=one
@@ -90,6 +99,13 @@ type Settings struct {
 	BacklightBright uint8 // 1..32
 	Theme           uint8
 	Clicker         uint8 // 0..3
+
+	// The sound tail. VolumeLimit is 10..100 with 100 meaning "no limit";
+	// the firmware reads a 0 byte as UNSET and uses 100, so a file whose
+	// new bytes were never written cannot pin the user at the 10% floor.
+	// EQ is an index into core/ui/eq.c's preset table, 0 = Off.
+	VolumeLimit uint8
+	EQ          uint8
 }
 
 // DefaultSettings is settings_defaults() in core/ui/settings.c:157-183.
@@ -115,10 +131,12 @@ func DefaultSettings() Settings {
 		BacklightBright: 32,
 		Theme:           0,
 		Clicker:         1,
+		VolumeLimit:     100, // no limit
+		EQ:              0,   // EQ_OFF
 	}
 }
 
-// EncodeConfigSlot builds one 1024-byte slot: a v2 record (length 44) holding
+// EncodeConfigSlot builds one 1024-byte slot: a v2 record (length 48) holding
 // s, sequence seq, a zero resume locator and a zero queue context.
 //
 // Field values are written as given. The firmware clamps every field on
@@ -147,6 +165,9 @@ func EncodeConfigSlot(s Settings, seq uint32) [ConfigSlotBytes]byte {
 	p[pTheme] = s.Theme
 	p[pClicker] = s.Clicker
 	// p[12..44) — resume locator and queue context — stay zero.
+	p[pVolumeLimit] = s.VolumeLimit
+	p[pEQ] = s.EQ
+	// p[46..48) — the sound tail's reserved half-word — stays zero.
 
 	binary.LittleEndian.PutUint32(rec[cfgOffCRC:], crc32.ChecksumIEEE(rec[:cfgOffCRC]))
 	return rec
@@ -203,8 +224,21 @@ func DecodeConfigSlot(b []byte) (seq uint32, s Settings, ok bool) {
 		Clicker:         p[pClicker],
 	}
 	// length >= cfgPayloadV2 would carry the resume locator and, at
-	// length >= cfgPayloadLen, the queue context. Neither is part of
+	// length >= cfgPayloadV2Q, the queue context. Neither is part of
 	// Settings; the gate is preserved above so validity matches the device.
+	//
+	// The sound tail IS part of Settings, and it is gated the same way: a
+	// 44-byte record (what every device in the field holds) reports what the
+	// firmware will use for it, no limit and EQ off. Present bytes are
+	// reported verbatim, like every other field — including a 0 limit, which
+	// the firmware reads as unset.
+	if length >= cfgPayloadLen {
+		s.VolumeLimit = p[pVolumeLimit]
+		s.EQ = p[pEQ]
+	} else {
+		s.VolumeLimit = 100
+		s.EQ = 0
+	}
 	return binary.LittleEndian.Uint32(b[cfgOffSeq:]), s, true
 }
 

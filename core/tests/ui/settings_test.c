@@ -12,10 +12,13 @@
  *   3. adjust() wheel: clamps Volume/Bass and Display Brightness to range.
  *   4. Navigation: Root rows return the right ENTER_* / RESET action codes;
  *      value/kind reporting for a toggle and a slider row.
+ *   5. Sound: the Volume Limit couples to Volume in both directions, and an
+ *      EQ preset locks the two shelf rows without touching what they store.
  * No MMIO, no framebuffer — plain cc.
  */
 
 #include "settings.h"
+#include "eq.h"                  /* EQ_PRESET_COUNT + the preset names */
 
 #include <stdio.h>
 #include <string.h>
@@ -43,6 +46,8 @@ int main(void)
     check("def-bl-bright", s.backlight_bright == 32);
     check("def-theme",     s.theme == 0);
     check("def-bass-0",    s.bass == 0 && s.treble == 0 && s.balance == 0);
+    check("def-vol-limit", s.volume_limit == 100);   /* 100 = no limit */
+    check("def-eq-off",    s.eq == EQ_OFF);
     check("def-resume-on",  s.resume_on_startup == 1);
     /* A fresh (or freshly Reset) settings_t must carry NO resume locator —
      * "Reset Settings" routes through settings_defaults, so this is also what
@@ -90,9 +95,9 @@ int main(void)
 
     /* --- Test 4: Balance adjust clamps to [-100,100] --- */
     settings_defaults(&s);
-    settings_adjust(SETTINGS_SOUND, &s, 3, +10);
+    settings_adjust(SETTINGS_SOUND, &s, 5, +10);
     check("balance-right", s.balance == 10);
-    settings_adjust(SETTINGS_SOUND, &s, 3, -1000);
+    settings_adjust(SETTINGS_SOUND, &s, 5, -1000);
     check("balance-clamp-lo", s.balance == -100);
 
     /* --- Test 5: adjust() clamps Volume to [0,100] --- */
@@ -106,9 +111,9 @@ int main(void)
 
     /* --- Test 6: adjust() clamps Bass to [-12,12] --- */
     settings_defaults(&s);
-    settings_adjust(SETTINGS_SOUND, &s, 1, +100);
+    settings_adjust(SETTINGS_SOUND, &s, 3, +100);
     check("bass-clamp-hi", s.bass == 12);
-    settings_adjust(SETTINGS_SOUND, &s, 1, -100);
+    settings_adjust(SETTINGS_SOUND, &s, 3, -100);
     check("bass-clamp-lo", s.bass == -12);
 
     /* --- Test 7: adjust() clamps Display Brightness to [1,32] --- */
@@ -221,7 +226,23 @@ int main(void)
     /* --- Test 11: counts + generic value/kind reporting --- */
     check("count-root",  settings_count(SETTINGS_ROOT) == 9);
     check("count-play",  settings_count(SETTINGS_PLAYBACK) == 4);
-    check("count-sound", settings_count(SETTINGS_SOUND) == 4);
+    check("count-sound", settings_count(SETTINGS_SOUND) == 6);
+    /* Addressed BY LABEL, so re-ordering the screen cannot pass by
+     * renumbering the tests that index it. */
+    check("sound-labels",
+          settings_label(SETTINGS_SOUND, 0)[0] == 'V' &&
+          strcmp(settings_label(SETTINGS_SOUND, 1), "Volume Limit") == 0 &&
+          strcmp(settings_label(SETTINGS_SOUND, 2), "EQ") == 0 &&
+          strcmp(settings_label(SETTINGS_SOUND, 3), "Bass") == 0 &&
+          strcmp(settings_label(SETTINGS_SOUND, 4), "Treble") == 0 &&
+          strcmp(settings_label(SETTINGS_SOUND, 5), "Balance") == 0);
+    check("sound-kinds",
+          settings_kind(SETTINGS_SOUND, 0) == SETTINGS_KIND_SLIDER &&
+          settings_kind(SETTINGS_SOUND, 1) == SETTINGS_KIND_SLIDER &&
+          settings_kind(SETTINGS_SOUND, 2) == SETTINGS_KIND_SELECT &&
+          settings_kind(SETTINGS_SOUND, 3) == SETTINGS_KIND_SLIDER &&
+          settings_kind(SETTINGS_SOUND, 4) == SETTINGS_KIND_SLIDER &&
+          settings_kind(SETTINGS_SOUND, 5) == SETTINGS_KIND_SLIDER);
     check("count-theme", settings_count(SETTINGS_THEME) == 7);
 
     settings_defaults(&s);
@@ -236,7 +257,7 @@ int main(void)
               buf[0] == '7' && buf[1] == '0' && buf[2] == '%' && buf[3] == '\0');
 
         /* Balance slider reports "Center" at 0 and the mid fraction. */
-        settings_value(SETTINGS_SOUND, &s, 3, buf, &is_toggle, &on, &num, &den);
+        settings_value(SETTINGS_SOUND, &s, 5, buf, &is_toggle, &on, &num, &den);
         check("bal-slider-mid", is_toggle == 0 && num == 100 && den == 200);
         check("bal-text-center",
               buf[0] == 'C' && buf[1] == 'e' && buf[2] == 'n');
@@ -446,7 +467,7 @@ int main(void)
     check("adj-vol-rail-lo",  settings_adjust(SETTINGS_SOUND, &s, 0, -1) == 0);
     settings_adjust(SETTINGS_DISPLAY, &s, 1, -1000);        /* brightness 1 */
     check("adj-bright-rail-lo", settings_adjust(SETTINGS_DISPLAY, &s, 1, -1) == 0);
-    for (int row = 1; row <= 3; row++) {                    /* bass/treble/bal */
+    for (int row = 3; row <= 5; row++) {                    /* bass/treble/bal */
         check("adj-row-mid",  settings_adjust(SETTINGS_SOUND, &s, row, +1) == 1);
         settings_adjust(SETTINGS_SOUND, &s, row, +1000);
         check("adj-row-hi",   settings_adjust(SETTINGS_SOUND, &s, row, +1) == 0);
@@ -457,6 +478,189 @@ int main(void)
     check("adj-rails-vals",   s.bass == -12 && s.treble == -12 && s.balance == -100);
     check("adj-non-slider",   settings_adjust(SETTINGS_PLAYBACK, &s, 0, +1) == 0);
     check("adj-bad-row",      settings_adjust(SETTINGS_SOUND, &s, 9, +1) == 0);
+    check("adj-eq-row-is-select",
+          settings_adjust(SETTINGS_SOUND, &s, 2, +1) == 0 && s.eq == EQ_OFF);
+
+    /* --- Test 14: Volume Limit — the one rule, applied from both rows ---
+     * The invariant is that *s never leaves settings_adjust with
+     * volume > volume_limit, from EITHER row, and that a wheel that cannot
+     * move says so (main.c gates the disk write on that answer). */
+    settings_defaults(&s);
+    s.volume_limit = 40;
+    s.volume       = 38;
+    check("vol-stops-at-the-limit",
+          settings_adjust(SETTINGS_SOUND, &s, 0, +5) == 1 && s.volume == 40);
+    check("vol-rail-at-the-limit",
+          settings_adjust(SETTINGS_SOUND, &s, 0, +1) == 0 && s.volume == 40);
+    check("vol-below-the-limit-still-moves",
+          settings_adjust(SETTINGS_SOUND, &s, 0, -1) == 1 && s.volume == 39);
+
+    /* Lowering the ceiling under the current volume pulls the volume down in
+     * the SAME call — main.c's single settings_apply() then pushes both. */
+    settings_defaults(&s);                          /* volume 70, limit 100 */
+    check("limit-down-moves",
+          settings_adjust(SETTINGS_SOUND, &s, 1, -40) == 1 &&
+          s.volume_limit == 60 && s.volume == 60);
+    check("limit-down-again-drags-volume",
+          settings_adjust(SETTINGS_SOUND, &s, 1, -10) == 1 &&
+          s.volume_limit == 50 && s.volume == 50);
+    /* Raising it again leaves the volume where the user left it. */
+    check("limit-up-leaves-volume",
+          settings_adjust(SETTINGS_SOUND, &s, 1, +30) == 1 &&
+          s.volume_limit == 80 && s.volume == 50);
+
+    /* The limit's own rails: a 10% floor (a 0 would be a mute switch nobody
+     * can find) and 100 = no limit. */
+    settings_adjust(SETTINGS_SOUND, &s, 1, -1000);
+    check("limit-rail-lo", s.volume_limit == 10 && s.volume == 10);
+    check("limit-rail-lo-reports",
+          settings_adjust(SETTINGS_SOUND, &s, 1, -1) == 0);
+    settings_adjust(SETTINGS_SOUND, &s, 1, +1000);
+    check("limit-rail-hi", s.volume_limit == 100);
+    check("limit-rail-hi-reports",
+          settings_adjust(SETTINGS_SOUND, &s, 1, +1) == 0);
+
+    /* settings_volume_clamp is the rule itself; the Now Playing wheel calls
+     * the same function, which is the whole point of it existing. */
+    settings_defaults(&s);
+    s.volume_limit = 55;
+    check("clamp-under",  settings_volume_clamp(&s, 20) == 20);
+    check("clamp-over",   settings_volume_clamp(&s, 90) == 55);
+    check("clamp-at",     settings_volume_clamp(&s, 55) == 55);
+    check("clamp-neg",    settings_volume_clamp(&s, -5) == 0);
+    s.volume_limit = 100;
+    check("clamp-no-limit", settings_volume_clamp(&s, 100) == 100 &&
+                            settings_volume_clamp(&s, 140) == 100);
+    /* A limit outside its own range cannot drag the ceiling below the floor. */
+    s.volume_limit = 0;
+    check("clamp-bad-limit", settings_volume_clamp(&s, 100) == 10);
+
+    /* The Volume Limit row renders as its own percentage bar. */
+    settings_defaults(&s);
+    s.volume_limit = 40;
+    {
+        char buf[24];
+        int is_toggle = 0, on = 0, num = 0, den = 0;
+        settings_value(SETTINGS_SOUND, &s, 1, buf, &is_toggle, &on, &num, &den);
+        check("limit-slider-frac", num == 40 && den == 100);
+        check("limit-slider-text",
+              buf[0] == '4' && buf[1] == '0' && buf[2] == '%' && buf[3] == '\0');
+    }
+
+    /* --- Test 15: the EQ row cycles, and cycles ONLY the EQ field --- */
+    settings_defaults(&s);
+    {
+        settings_t copy;
+        int cycle_ok = 1, touch_ok = 1;
+        for (int i = 1; i <= EQ_PRESET_COUNT; i++) {
+            memcpy(&copy, &s, sizeof s);
+            if (settings_activate(SETTINGS_SOUND, &s, 2) != SETTINGS_ACTION_NONE) {
+                cycle_ok = 0;
+            }
+            int want = i % EQ_PRESET_COUNT;
+            if (s.eq != want) {
+                cycle_ok = 0;
+            }
+            /* Nothing but eq may move: patch the copy's eq and compare the
+             * whole record, so a stray write to bass (say) is caught. */
+            copy.eq = s.eq;
+            if (memcmp(&copy, &s, sizeof s) != 0) {
+                touch_ok = 0;
+            }
+        }
+        check("eq-cycles-through-every-preset-and-back", cycle_ok);
+        check("eq-cycle-touches-only-eq", touch_ok);
+    }
+    /* The row's value text is the preset's name, from the one table. */
+    {
+        char buf[24];
+        int is_toggle = 0, on = 0, num = 0, den = 0;
+        int names_ok = 1;
+        for (int i = 0; i < EQ_PRESET_COUNT; i++) {
+            s.eq = i;
+            settings_value(SETTINGS_SOUND, &s, 2, buf, &is_toggle, &on,
+                           &num, &den);
+            if (strcmp(buf, eq_preset_name(i)) != 0 || den != 0) {
+                names_ok = 0;
+            }
+            if (strcmp(settings_eq_name(i), eq_preset_name(i)) != 0) {
+                names_ok = 0;
+            }
+        }
+        check("eq-row-names-the-preset", names_ok);
+    }
+
+    /* --- Test 16: an EQ preset LOCKS Bass and Treble ---
+     * The codec has one low shelf and one high shelf and the preset owns
+     * both, so those rows show the preset's gains, refuse the wheel, and
+     * leave what the user stored alone. */
+    settings_defaults(&s);
+    s.bass = -4; s.treble = 7;
+    {
+        int unlocked_ok = 1;
+        for (int r = 0; r < 6; r++) {
+            if (settings_row_locked(SETTINGS_SOUND, &s, r)) unlocked_ok = 0;
+        }
+        check("no-row-locked-at-eq-off", unlocked_ok);
+    }
+    s.eq = 2;                                   /* Bass Booster: +6 / … / 0 */
+    check("locked-rows-are-bass-and-treble",
+          settings_row_locked(SETTINGS_SOUND, &s, 3) == 1 &&
+          settings_row_locked(SETTINGS_SOUND, &s, 4) == 1 &&
+          settings_row_locked(SETTINGS_SOUND, &s, 0) == 0 &&
+          settings_row_locked(SETTINGS_SOUND, &s, 1) == 0 &&
+          settings_row_locked(SETTINGS_SOUND, &s, 2) == 0 &&
+          settings_row_locked(SETTINGS_SOUND, &s, 5) == 0);
+    check("lock-is-a-sound-screen-rule",
+          settings_row_locked(SETTINGS_DISPLAY, &s, 1) == 0);
+    /* A preset id from a newer build reads as Off everywhere — including
+     * here, so the rows do not lock over a curve this build cannot show. */
+    s.eq = EQ_PRESET_COUNT;
+    check("unknown-preset-does-not-lock",
+          settings_row_locked(SETTINGS_SOUND, &s, 3) == 0 &&
+          settings_row_locked(SETTINGS_SOUND, &s, 4) == 0);
+    s.eq = 2;
+    check("locked-bass-refuses-the-wheel",
+          settings_adjust(SETTINGS_SOUND, &s, 3, +1) == 0 && s.bass == -4);
+    check("locked-treble-refuses-the-wheel",
+          settings_adjust(SETTINGS_SOUND, &s, 4, -1) == 0 && s.treble == 7);
+    {
+        char buf[24];
+        int is_toggle = 0, on = 0, num = 0, den = 0;
+        settings_value(SETTINGS_SOUND, &s, 3, buf, &is_toggle, &on, &num, &den);
+        check("locked-bass-shows-the-preset-shelf",
+              strcmp(buf, "+6 dB") == 0 && num == 18 && den == 24);
+        settings_value(SETTINGS_SOUND, &s, 4, buf, &is_toggle, &on, &num, &den);
+        check("locked-treble-shows-the-preset-shelf",
+              strcmp(buf, "0 dB") == 0 && num == 12 && den == 24);
+    }
+    /* Back to Off and the user's own tone is exactly where they left it. */
+    s.eq = EQ_OFF;
+    {
+        char buf[24];
+        int is_toggle = 0, on = 0, num = 0, den = 0;
+        settings_value(SETTINGS_SOUND, &s, 3, buf, &is_toggle, &on, &num, &den);
+        check("off-restores-the-users-bass",
+              s.bass == -4 && strcmp(buf, "-4 dB") == 0 && num == 8);
+        settings_value(SETTINGS_SOUND, &s, 4, buf, &is_toggle, &on, &num, &den);
+        check("off-restores-the-users-treble",
+              s.treble == 7 && strcmp(buf, "+7 dB") == 0 && num == 19);
+    }
+    check("unlocked-bass-moves-again",
+          settings_adjust(SETTINGS_SOUND, &s, 3, +1) == 1 && s.bass == -3);
+
+    /* SELECT on the new rows keeps the NOOP/NONE contract: only EQ writes. */
+    settings_defaults(&s);
+    {
+        settings_t copy;
+        memcpy(&copy, &s, sizeof s);
+        check("noop-volume-limit-row",
+              settings_activate(SETTINGS_SOUND, &s, 1) == SETTINGS_ACTION_NOOP);
+        check("noop-sound-rows-unchanged", memcmp(&copy, &s, sizeof s) == 0);
+        check("none-eq-row",
+              settings_activate(SETTINGS_SOUND, &s, 2) == SETTINGS_ACTION_NONE);
+        check("none-eq-changed", memcmp(&copy, &s, sizeof s) != 0);
+    }
 
     printf("settings_test: %s\n", g_fail ? "FAIL" : "OK");
     return g_fail ? 1 : 0;
