@@ -6415,19 +6415,27 @@ _Noreturn static void run_ui(fat32_t *fs)
                 g_lock_flash.armed = 0;
                 g_vol_show.armed   = 0;
 
-                suspend_to_ram(suspend_origin);              /* returns on wake */
-                /* Every press this loop was timing is over: suspend_to_ram
-                 * does not return until the buttons are all up and the event
-                 * latch is drained. Forget them, or a RIGHT/LEFT hold that
-                 * the SLEEP TIMER interrupted mid-aim reads as a release on
-                 * the first pass back and commits a seek — from before the
-                 * nap — to a listener who only pressed a button to wake the
-                 * screen. (PLAY is the one exception and needs nothing: on
-                 * the path where IT triggered the sleep its hold has already
-                 * fired, so its release is silent by construction.) */
+                /* And the presses this loop was timing, for the same reason
+                 * and in the same breath. A RIGHT/LEFT hold that the SLEEP
+                 * TIMER interrupts mid-aim would otherwise read as a release
+                 * on the first pass back — suspend_to_ram does not return
+                 * until every button is up and the latch is drained — and
+                 * commit a seek aimed before the nap, to a listener who
+                 * pressed a button only to light the screen.
+                 *
+                 * BEFORE the call, not after it: suspend_to_ram paints and
+                 * presents the wake frame itself, and np_aim_target() would
+                 * find a live aim and draw the pre-nap target over the
+                 * transport band for that frame. Nothing between here and the
+                 * call reads these. PLAY is the exception that stays where it
+                 * is: suspend WAITS on play_key's button, and on the path
+                 * where it triggered the sleep its hold has already fired, so
+                 * its release is silent by construction. */
                 keyhold_reset(&menu_key);
                 seekhold_reset(&g_ff);
                 seekhold_reset(&g_rw);
+
+                suspend_to_ram(suspend_origin);              /* returns on wake */
                 last_input   = mmio_read32(USEC_TIMER_ADDR);
                 last_present = last_input;      /* suspend just presented the wake
                                                  * frame: pace the loop's own
