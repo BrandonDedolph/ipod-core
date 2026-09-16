@@ -349,8 +349,11 @@ void hal_codec_restore(void)
 {
     volume_latch();          /* volume + balance -> OUT1VOL pair               */
     /* wm8758_init's init_seq_c has just put DACVOL back to full scale, so the
-     * codec holds no pre-cut whatever the curve says — say so, and eq_latch
-     * will re-cut BEFORE it re-boosts rather than after. */
+     * codec holds no pre-cut whatever the curve says. Belt and braces: with
+     * the cached curve's pre-cut equal to the one eq_latch believes is held,
+     * its tie-break already writes DACVOL first, so this line changes no
+     * write order today; it keeps the driver's belief true if that tie-break
+     * ever changes. */
     g_dac_precut = 0;
     eq_latch();              /* the cached curve -> DACVOL pair + EQ1..EQ5     */
 }
