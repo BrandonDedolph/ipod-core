@@ -169,7 +169,10 @@ v0.1.3 on, or build it from [`core/cli/`](core/cli/README.md).
 | `core-linux-arm64` | Linux, ARM |
 
 The same five come as `core-app-*`: a desktop window over the same code, for people who would
-rather press Sync than type it. Keep `core` beside it; it does the elevated flash on Windows.
+rather press Sync than type it. On Windows it asks for Administrator when it opens, then reads and
+flashes the iPod itself.
+
+<p align="center"><img src="docs/screens/core_app.png" alt="the core desktop app" width="640"></p>
 
 ```bash
 core info                                   # identify the iPod, in disk mode

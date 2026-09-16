@@ -191,6 +191,8 @@ Firmware card prints the command to run instead. The confirmations are the ones 
 path typed exactly before a flash, the word `prune` before anything is deleted. It has not been on
 a device yet; it drives the same code the commands below do.
 
+<p align="center"><img src="screens/core_app.png" alt="the core desktop app" width="640"></p>
+
 **Connect.** Put the iPod in disk mode — Settings, Disk Mode on the device, or hold Select + Play
 at power-on — plug it in, and ask what is there:
 
