@@ -239,6 +239,9 @@ static int settings_eq(const settings_t *a, const settings_t *b)
            a->resume_order_seed == b->resume_order_seed &&
            a->resume_order_keep == b->resume_order_keep &&
            a->resume_ctx_hash == b->resume_ctx_hash;
+    /* sleep_timer_min is deliberately NOT compared: it is runtime-only and
+     * never rides the record (settings.h), so decode always writes 0 into it
+     * whatever the encoded struct held. test_codec pins that directly. */
 }
 
 /* A settings_t with every field distinct from the defaults and at an extreme
@@ -343,6 +346,32 @@ static void test_codec(void)
     check("codec round-trip",
           config_decode(rec, &out, &seq) == 1 && seq == 0x12345678u &&
           settings_eq(&in, &out));
+
+    /*
+     * THE SLEEP TIMER IS NOT ON DISK. An armed timer means nothing after a
+     * power cut, so settings_t.sleep_timer_min is runtime-only: encode must
+     * ignore it (two records differing only in it are byte-identical, which
+     * is what keeps arming the timer off the user's disk), and decode must
+     * WRITE 0 into it — config_load() copies the whole decoded struct over
+     * the caller's record, so a field decode skips arrives holding stack
+     * garbage and would arm an arbitrary timer at boot.
+     */
+    {
+        uint8_t rec_off[CONFIG_SLOT_BYTES], rec_on[CONFIG_SLOT_BYTES];
+        settings_t s2 = in;
+
+        s2.sleep_timer_min = 0;
+        config_encode(rec_off, &s2, 0x0BADF00Du);
+        s2.sleep_timer_min = 90;
+        config_encode(rec_on, &s2, 0x0BADF00Du);
+        check("codec: the sleep timer never reaches the record",
+              memcmp(rec_off, rec_on, sizeof rec_off) == 0);
+
+        memset(&out, 0x5A, sizeof out);      /* the `cand = tmp` hazard */
+        check("codec: decode zeroes the sleep timer over a dirty struct",
+              config_decode(rec_on, &out, &seq) == 1 &&
+              out.sleep_timer_min == 0);
+    }
 
     /* Bad magic. */
     config_encode(rec, &in, 1);

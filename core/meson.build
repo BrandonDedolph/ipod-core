@@ -281,6 +281,16 @@ if target == 'hw'
     c_args: ['-DCORE_FREESTANDING'],
   )
 
+  # The sleep timer's countdown (ours): a wrap-safe minute accumulator over
+  # the 1 MHz USEC_TIMER, fed once per main-loop pass. Out of kernel/main.c so
+  # the host can run a whole 120-minute countdown across both 32-bit clock
+  # wraps; same sleeptimer.c the host sleeptimer_test compiles.
+  sleeptimer_hw_lib = static_library(
+    'core_sleeptimer_hw',
+    sources: ['ui/sleeptimer.c'],
+    c_args: ['-DCORE_FREESTANDING'],
+  )
+
   # Music-library model (ours; library/, not to be confused with lib/, the
   # freestanding libc). names.c is the name handling the library is built on:
   # the folded locator hash that binds a CORELIB.IDX record to its file, the
@@ -374,7 +384,7 @@ if target == 'hw'
     boot_sources + kernel_sources + fs_sources + files('codecs/arena.c')
       + [core_version_h, core_version_tag_h],   # generated stamps; main.c includes both
     dependencies: [hal_dep, mem_dep],   # hal/hw: SER0 UART; mem: freestanding memcpy/…
-    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, keyhold_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
+    link_with: [flac_hw_lib, mp3_hw_lib, flac_meta_hw_lib, readahead_hw_lib, diskbuf_hw_lib, text_hw_lib, chrome_hw_lib, wheel_hw_lib, keyhold_hw_lib, sleeptimer_hw_lib, library_hw_lib, thumb_hw_lib, screen_charging_hw_lib, artcache_hw_lib, settings_hw_lib, player_hw_lib, screen_battery_hw_lib],
     include_directories: codec_inc,
     link_args: [
       '-Wl,-T,' + (meson.current_source_dir() / 'boot' / 'linker.ld'),

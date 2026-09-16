@@ -67,7 +67,7 @@ make sim        # configures + builds the HOST TEST SUITE (see note below)
 make verify-hw  # static checks against a fresh `make hw` (see below)
 make help       # all targets
 
-meson test -C build-sim     # 58 host unit + MMIO golden-trace suites
+meson test -C build-sim     # 59 host unit + MMIO golden-trace suites
 ```
 
 `make verify-hw` is the static half of the safety net — the checks that
@@ -163,7 +163,16 @@ spins the drive,
 repaints while dark and only then lights the backlight. Hold past five
 seconds for PMU standby (a true off; any button cold-boots). Asleep on
 battery the device keeps sampling the cell and escalates to standby after
-thirty minutes or at the shut-off edge. The deeper savings (`SUSPEND_*`
+thirty minutes or at the shut-off edge.
+
+Settings > Playback > Sleep Timer takes the SAME path on a countdown
+(`ui/sleeptimer.c`, a wrap-safe minute accumulator over the 1 MHz
+USEC_TIMER — a 120-minute timer crosses the 32-bit wrap twice, which is
+why it is a host-tested unit). The only difference is that the expiry
+pauses the player BEFORE calling `suspend_to_ram`, so `was_playing` is 0
+and the wake comes back paused rather than resuming. The chosen duration
+is runtime-only: it never reaches `CORECFG.DAT`, so arming it costs no
+disk write and it reads Off after every boot. The deeper savings (`SUSPEND_*`
 switches at the top of `kernel/main.c`: PLL park, peripheral clock gates,
 ATA SLEEP instead of STANDBY, panel sleep) are compiled out until each is
 proven alone on the device.

@@ -32,8 +32,9 @@ New to the device? Read the [user guide](docs/USER_GUIDE.md).
 - **Remembers.** Settings, the resume position and the queue it was in persist to a pre-allocated
   file on the disk, CRC-checked, never moving a cluster. A 4 MiB on-disk event log captures every
   diagnostic line.
-- **Sleeps.** Hold Play to sleep; the drive parks, the panel and codec go down, the CPU idles. On
-  battery, a sleeping device powers itself off after thirty minutes.
+- **Sleeps.** Hold Play to sleep, or set a sleep timer of 15 to 120 minutes; the drive parks, the
+  panel and codec go down, the CPU idles. On battery, a sleeping device powers itself off after
+  thirty minutes.
 
 ## Screens
 
@@ -100,6 +101,7 @@ the diagnostics is saved to the disk.
 <table>
   <tr>
     <td><img src="docs/screens/settings.png" width="260" alt="Settings"></td>
+    <td><img src="docs/screens/playback.png" width="260" alt="Playback"></td>
     <td><img src="docs/screens/about.png" width="260" alt="About"></td>
     <td><img src="docs/screens/bootdetails.png" width="260" alt="Boot Details"></td>
   </tr>
@@ -145,7 +147,7 @@ and newlib for the device.
 cd core
 make hw                        # build-hw/core.elf, core.bin
 make ipod                      # build-hw/core.ipod
-make sim && meson test -C build-sim   # host tests, 58 suites
+make sim && meson test -C build-sim   # host tests, 59 suites
 make verify-hw                 # layout, header/doc and size checks on the ARM image
 ```
 

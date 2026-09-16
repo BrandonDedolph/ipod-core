@@ -29,7 +29,7 @@ you can aim. The letter stays for just over a second after you stop.
 
 Hold Play for two seconds to sleep. Keep holding past five seconds and the device powers off
 instead. Any button wakes a sleeping device where you left it. A powered-off device cold boots on
-the next press.
+the next press. Settings, Playback, Sleep Timer does the same thing on a countdown.
 
 <p align="center"><img src="screens/jump.gif" alt="Right jumps to Now Playing, Menu returns" width="360"></p>
 
@@ -46,8 +46,9 @@ goes away at once.
 
 The band at the top of every list and every Settings screen shows the playing track's name on the
 left and the battery on the right, with the padlock between them when Hold is on. When nothing is
-loaded the left side is blank. On Now Playing the band reads Now Playing or Paused, with SHUF and
-RPT tokens when shuffle or repeat are on.
+loaded the left side is blank. While the sleep timer is running, SLEEP and the minutes left sit
+beside the battery and the track name shortens to make room. On Now Playing the band reads Now
+Playing or Paused, with SHUF and RPT tokens when shuffle or repeat are on, and SLEEP after them.
 
 ## Browsing
 
@@ -106,7 +107,7 @@ is next, with the playing row marked. Select a row to jump to it; Menu returns t
 Left and Right skip here as well.
 
 **Shuffle and repeat** are in Settings, Playback. They show as SHUF and RPT (or RPT1) in the top
-band.
+band, followed by SLEEP and the minutes left when the sleep timer is running.
 
 **When a track ends** while you are browsing, the name in the status strip changes. Nothing pops
 up.
@@ -116,19 +117,25 @@ up.
 <table>
   <tr>
     <td><img src="screens/settings.png" width="260" alt="Settings"></td>
+    <td><img src="screens/playback.png" width="260" alt="Playback"></td>
     <td><img src="screens/about.png" width="260" alt="About"></td>
     <td><img src="screens/bootdetails.png" width="260" alt="Boot Details"></td>
   </tr>
 </table>
 
 Select a row to open it. On a slider, Select starts editing, the wheel changes the value, and
-Select or Menu finishes. Every change is saved to the disk; if the drive happens to be asleep the
-save waits until it next spins, or until the device sleeps or powers off, so leaving Settings
-never makes you wait.
+Select or Menu finishes. Every change is saved to the disk — except the sleep timer, which only
+ever lives in memory; if the drive happens to be asleep the save waits until it next spins, or
+until the device sleeps or powers off, so leaving Settings never makes you wait.
 
 - **Playback.** Shuffle on or off. Repeat Off, All, or One. Resume on or off: with Resume on, the
   next boot comes back on the track you were on, paused at the same position, in the same queue.
-  Turning Resume off also forgets the stored position.
+  Turning Resume off also forgets the stored position. Sleep Timer: Off, 15, 30, 60, 90 or 120
+  minutes. Select cycles the value and starts the countdown at once, so it takes six presses to
+  get back to Off. While it runs, SLEEP and the minutes left show in the top band. When it runs
+  out, playback pauses and the device sleeps as if you had held Play; the next press wakes it
+  paused, where you left off. It is not remembered across a restart, and any sleep or a Reset
+  turns it off.
 - **Sound.** Volume, Bass and Treble (plus or minus 12 dB), and Balance. These drive the WM8758B
   directly.
 - **Theme.** Seven palettes. The current one is marked; Select switches at once.
@@ -329,6 +336,13 @@ voltage on the About page is steadier.
   drive spins it up before the music starts.
 - **Sleep.** Hold Play two seconds. Playback pauses and the position is saved, the drive parks, the
   screen and backlight go off, the codec powers down. Any button wakes it back where it was.
+- **Sleep timer.** Settings, Playback, Sleep Timer arms a countdown of 15 to 120 minutes; SLEEP and
+  the minutes left show in the top band. It runs whatever the device is doing — playing, paused,
+  or with Hold on and the thing in your pocket — and nothing you press resets it: it is a duration,
+  not an idle timeout. When it runs out the device does exactly what a held Play does, except that
+  it wakes **paused**: you fell asleep, so the next press is where was I, not play. Thirty minutes
+  later, on battery, it powers itself off like any sleeping device. Waking it with Hold on needs
+  Hold off first, as always. The timer reads Off again afterwards, and after any restart.
 - **Power off.** Hold Play past five seconds, or leave a sleeping device on battery for thirty
   minutes: it powers itself off. The next press cold boots; with Resume on you come back on the
   same track, paused.

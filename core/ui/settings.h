@@ -22,7 +22,9 @@
  * FUNCTIONAL fields drive real hardware once main.c wires them: shuffle, repeat
  * (player), volume (mirrors hal_volume), backlight_secs + backlight_bright
  * (backlight HAL), resume_on_startup (kernel/main.c re-opens the saved track at
- * boot). COSMETIC fields render + store but nothing consumes them yet
+ * boot), sleep_timer_min (kernel/main.c arms ui/sleeptimer.c from it, and
+ * sleeps the device when it runs out). COSMETIC fields render + store but
+ * nothing consumes them yet
  * (crossfade, bass, treble, balance) — flagged at their declarations below.
  *
  * Freestanding: integer-only, no libc/libm/malloc, no allocation. The model
@@ -104,6 +106,28 @@ typedef struct {
     uint32_t resume_order_seed;  /* player_order_seed() — 0 = no deal         */
     int      resume_order_keep;  /* player_order_keep(); PLAYER_KEEP_*        */
     uint32_t resume_ctx_hash;/* KIND_PLAYLIST: the playlist's name hash       */
+
+    /*
+     * SLEEP TIMER — runtime state too, and the only field here that is NEVER
+     * WRITTEN TO DISK. It rides along in settings_t for the same reason the
+     * resume locator does (this is the record the Settings model is pure
+     * over, so the row's value has to live in it), but kernel/config.c
+     * deliberately neither encodes it nor restores it: config_decode() zeroes
+     * it, so it reads Off after every boot.
+     *
+     * Why not persist it. A countdown is relative to the moment it was armed
+     * and a boot means the device was off, so a stored countdown means
+     * nothing; only the last-picked duration could persist, and that would
+     * make arming — which happens right before sleep, with the drive parked —
+     * a disk write for one saved SELECT a night. Apple's own timer resets to
+     * Off after it fires.
+     *
+     * The countdown itself is NOT here: ui/sleeptimer.c owns it, and
+     * kernel/main.c keeps `sleeptimer_total_min(&g_sleep) == sleep_timer_min`
+     * at every loop top. This side is only what the row shows.
+     */
+    int  sleep_timer_min;    /* 0 (off) / 15 / 30 / 60 / 90 / 120 minutes —
+                              * RUNTIME ONLY, never persisted                 */
 } settings_t;
 
 /* What kind of queue the resume locator's track was playing in. On disk as
@@ -130,7 +154,7 @@ void settings_defaults(settings_t *s);
  */
 typedef enum {
     SETTINGS_ROOT,       /* the top Settings menu                             */
-    SETTINGS_PLAYBACK,   /* Shuffle / Repeat / Crossfade / … toggles+selects  */
+    SETTINGS_PLAYBACK,   /* Shuffle / Repeat / Resume / Sleep Timer selects   */
     SETTINGS_SOUND,      /* Volume / Bass / Treble / Balance / Width sliders  */
     SETTINGS_DISPLAY,    /* Backlight timeout (select) + Brightness (slider)  */
     SETTINGS_ABOUT,      /* device info key/value rows                        */
@@ -178,7 +202,16 @@ typedef enum {
     /* Appended LAST so every value above keeps its number: main.c switches on
      * these and the config record does not store them, but nothing is gained
      * by renumbering either. */
-    SETTINGS_ACTION_NOOP
+    SETTINGS_ACTION_NOOP,
+    /*
+     * "The record changed, but only its RUNTIME part — apply it, do not
+     * persist it." Today that is exactly Sleep Timer: sleep_timer_min moved,
+     * so NOOP would be a lie (main.c must re-arm ui/sleeptimer.c from it),
+     * but nothing on disk stores it, so NONE would make main.c touch the
+     * config and write a byte-identical record three seconds later — the
+     * spurious write NOOP exists to prevent. Also appended last.
+     */
+    SETTINGS_ACTION_SLEEPTIMER
 } settings_action_t;
 
 /*

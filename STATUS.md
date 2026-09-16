@@ -3,6 +3,84 @@
 The README is the canonical public story; this doc is the running list of
 what works, what doesn't, and what to pick up next.
 
+## 2026-09-16 — Sleep timer, UNFLASHED
+
+Settings > Playback has a fourth row, **Sleep Timer**: Off / 15 / 30 / 60 /
+90 / 120 min. SELECT cycles it and arms a countdown at once; while it runs,
+`SLEEP <minutes left>` sits in the right-hand cluster of every list and
+Settings strip and after SHUF / RPT on the Now Playing band, dropping once a
+minute. At expiry the player is paused and the device takes the existing
+`suspend_to_ram()` path — the same one a two-second PLAY hold takes: position
+force-committed, drive parked, panel dark, and on battery the 30-minute
+escalation to PMU standby. The wake comes back **paused**, unlike a PLAY-hold
+wake, because the person fell asleep and the next press is "where was I".
+
+The countdown is a pure module, `ui/sleeptimer.c`, because the arithmetic is
+the whole problem: the 1 MHz USEC_TIMER wraps every ~71.6 minutes, so a
+120-minute timer crosses it twice. Deltas are taken between consecutive feeds
+(so a wrap cancels) and the sub-minute remainder is carried, never truncated.
+The host suite runs the full two hours — 72 000 feeds starting 30 s before the
+wrap — and asserts a TICK on every minute boundary and the FIRE on the 120th,
+not the 119th, not the 121st, not twice.
+
+`kernel/main.c` got thin wiring only: one feed call, one action-code branch,
+the token at the three strip paint sites, one more term in `chrome_key()`, and
+the PLAY-hold suspend refactored into flags plus ONE shared block, which is
+where the disarm-on-any-suspend rule now lives. `suspend_to_ram` itself is
+unchanged. The shared block also clears `cpu_idled` and the two transient UI
+windows (Hold banner, volume plate) on the way in: this is the first suspend
+that can be entered from the dark, idled state, and the first that can be
+entered while a banner is up without a button press behind it.
+
+Paths that leave the loop WITHOUT disarming — disk mode, the low-battery
+shut-off — never return to it; they come back through a boot, where both sides
+start at 0 (`.bss` and `config_decode`).
+
+**The invariant.** `sleeptimer_total_min(&g_sleep) == g_settings.sleep_timer_min`
+at every loop top: the settings field is what the ROW shows, `g_sleep` is what
+RUNS, and only `sleep_timer_apply()` (plus the shared suspend block and the
+FIRE branch, which zero both) ever moves them.
+
+**Never on disk.** `sleep_timer_min` is a runtime-only field in `settings_t`:
+`config_encode` ignores it, `config_decode` writes 0 into it (`config_load`
+copies the whole decoded struct, so a field decode skipped would arrive
+holding stack garbage), and arming returns the new `SETTINGS_ACTION_SLEEPTIMER`
+so main.c applies without a `settings_touch()`. Bedtime is the one moment the
+drive is parked for the night; arming must not spin it up for a byte-identical
+record. Payload length stays 44 and `CONFIG_VERSION` stays 2, so the host
+tools and the `verify-hw` resume-parity check are untouched.
+
+59 host suites green, ARM `-Werror` + `verify-hw` clean, `docs/screens/render.py`
+regenerated (one new still, `playback.png`).
+
+**Bench list when this is flashed** — none of it has run on the device:
+- Arm 15 on Now Playing → the token counts down once a minute → the panel goes
+  dark at 0 → a press wakes it paused, on the same track and screen, with the
+  row reading Off and no token.
+- PLAY-hold while a timer is armed → the wake shows the row at Off.
+- Reset Settings while armed → Off, and no token.
+- Hold switch on with a timer armed → it still sleeps; waking needs Hold off
+  and then a press.
+- Leave a timer-initiated sleep on battery for thirty minutes → it escalates to
+  PMU standby like any other sleep.
+- **The idle-boost case.** Arm 30, let the album END (or pause) and the
+  backlight time off, so the loop has dropped the core to 30 MHz
+  (`cpu_idled`), then let the timer fire. On wake, the core must still drop
+  back to 30 MHz the next time the screen goes off with nothing playing — this
+  is the one path that can enter `suspend_to_ram` from the dark, idled state
+  (a PLAY hold cannot: the press relights and re-boosts a pass earlier), and
+  an unbalanced boost refcount would silently pin it at 80 MHz until a reboot.
+  The shared re-seed clears `cpu_idled` for exactly this.
+- Boot Details' CFG seq must NOT move when the row is cycled.
+- How the token reads on the panel next to a long track name (the name's clip
+  loses 28–42 px while the timer is armed; if it reads cramped, the fallback is
+  to drop the token from the list strip and keep it on Now Playing, which is
+  one call site).
+
+If a fired timer wakes badly, the first bisect is to enter the suspend with a
+synthetic 2 s "hold" origin (`suspend_origin = nowp - PLAY_HOLD_US`) — it
+changes nothing in the loop and proves whether the origin matters.
+
 ## 2026-09-13 — issue sweep landed on `main`, NOT yet flashed
 
 Six read-only audits over the whole tree, then six fix branches merged;
@@ -744,7 +822,7 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
 
 ## Testing
 
-`meson test -C build-sim` from `core/` (**58/58** green):
+`meson test -C build-sim` from `core/` (**59/59** green):
 
 - **Codec KAT** — FLAC + MP3 decoders bit-exact against reference PCM.
 - **MMIO golden traces** — each freestanding hw driver is host-compiled against a
@@ -765,6 +843,11 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
   check against the host side.
 - **Settings persistence** — the config record layout, CRC, slot alternation,
   LBA resolution and the ATA write bus grammar.
+- **Sleep timer** — `core/ui/sleeptimer.c`'s minute accumulator, including the
+  full 120-minute countdown across TWO 32-bit microsecond wraps (72 000 feeds),
+  that it fires exactly once and disarms itself, and that coarse or irregular
+  feeds carry their remainder instead of drifting. None of that can be run on
+  the device: the clock wrap is ~71.6 minutes apart.
 - **Event log** — `kernel/evlog.c` on a RAM disk with a deliberately
   fragmented `CORELOG.BIN`: the block format and every rejection, the host
   tool's `--emit` fixture decoded by the firmware, every mount refusal, the

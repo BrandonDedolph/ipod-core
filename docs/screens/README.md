@@ -123,7 +123,7 @@ A screenshot here is a claim about what the device draws. So:
 | `detail.png` | album detail (tracklist) | `screen_detail` |
 | `nowplaying.png` `volume.png` | Now Playing, volume plate | `screen_nowplaying`, `screen_volume` |
 | `hold_unlocked.png` `hold_locked.png` `hold_locked_list.png` | Hold-switch banners (Now Playing row / list chrome) | `screen_lock`, `screen_locked`, `screen_locked_list` |
-| `settings.png` `sound.png` `clicker.png` `theme.png` | Settings | `screen_settings`, `screen_sound`, `screen_clicker`, `screen_theme` |
+| `settings.png` `playback.png` `sound.png` `clicker.png` `theme.png` | Settings (the Playback still carries the strip's `SLEEP` token) | `screen_settings`, `screen_playback`, `screen_sound`, `screen_clicker`, `screen_theme` |
 | `about.png` `bootdetails.png` | About dashboard, Boot Details | `screen_about`, `screen_diag` |
 | `nowplaying_onyx.png` `albums_onyx.png` | the Onyx theme | `with_palette(ONYX, …)` |
 | `nowplaying_sage.png` | the Sage theme | `screen_nowplaying_sage` |
