@@ -26,7 +26,6 @@ import (
 	xdraw "golang.org/x/image/draw"
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/coreart"
-	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/flac"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/syncer"
 )
 
@@ -287,15 +286,14 @@ func AlbumThumbnail(dir string) (image.Image, error) {
 			}
 		}
 	}
-	first, err := coreart.FirstFLAC(dir)
+	first, err := coreart.FirstAudio(dir)
 	if err != nil || first == "" {
 		return nil, ErrNoThumb
 	}
-	m, err := flac.ReadFile(first)
+	pic, err := coreart.ReadCover(first)
 	if err != nil {
 		return nil, err
 	}
-	pic := m.FrontCover()
 	if pic == nil {
 		return nil, ErrNoThumb
 	}

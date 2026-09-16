@@ -33,10 +33,18 @@ lets it load the whole library in one read instead of probing every
 track's tags at boot.
 
 The output is byte-identical to tools/build_index.py, which stays as the
-reference implementation and the parity oracle.
+reference implementation and the parity oracle. One exception, and only
+one: an MP3 with no Xing or VBRI header states no length, so both tools
+ESTIMATE it from the first frame's bitrate. That is exact for a constant
+bitrate file and only that; for a variable-bitrate file with no header
+(lame -t and little else produces one) the two estimates differ and so
+do the two indexes. The device reads the duration off the record either
+way, so the effect is a wrong time on one track, not a track that will
+not play.
 
 Two different things live in each record. The FILENAME is a locator: the
-NN in "NN. Title.flac" is the file's position in this tool's enumeration
+NN in "NN. Title.flac" (or ".mp3" — nothing transcodes) is the file's
+position in this tool's enumeration
 (Disc folders in order, files sorted within each), and the record's hash
 is computed over exactly that name — change it and tracks stop resolving
 on a device that already holds the files. The TRACK NUMBER is metadata:

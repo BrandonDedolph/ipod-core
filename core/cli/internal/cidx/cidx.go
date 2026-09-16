@@ -48,7 +48,7 @@ type Record struct {
 	DurationS   uint32
 	Track, Disc uint16
 	Folder      string // "Artist - Album" for DISPLAY
-	File        string // "NN. Title.flac" — the locator
+	File        string // "NN. Title.flac" / "NN. Title.mp3" — the locator
 	Title       string
 	Artist      string
 	Genre       string

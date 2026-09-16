@@ -286,25 +286,104 @@ func TestWriteAlbumNoPictureIsNotAnError(t *testing.T) {
 	}
 }
 
-func TestFirstFLAC(t *testing.T) {
+func TestFirstAudio(t *testing.T) {
 	dir := t.TempDir()
 	for _, n := range []string{"cover.jpg", "02. B.flac", "01. A.flac", "notes.txt"} {
 		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	got, err := FirstFLAC(dir)
+	got, err := FirstAudio(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if filepath.Base(got) != "01. A.flac" {
-		t.Errorf("FirstFLAC = %q, want 01. A.flac", filepath.Base(got))
+		t.Errorf("FirstAudio = %q, want 01. A.flac", filepath.Base(got))
+	}
+
+	// An MP3-only album has an art source too — the sidecars come from an
+	// APIC frame exactly as they come from a PICTURE block.
+	mp3dir := t.TempDir()
+	for _, n := range []string{"folder.jpg", "02. B.mp3", "01. A.mp3"} {
+		if err := os.WriteFile(filepath.Join(mp3dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err = FirstAudio(mp3dir)
+	if err != nil || filepath.Base(got) != "01. A.mp3" {
+		t.Errorf("FirstAudio(mp3 album) = %q, %v; want 01. A.mp3", got, err)
 	}
 
 	empty := t.TempDir()
-	got, err = FirstFLAC(empty)
+	got, err = FirstAudio(empty)
 	if err != nil || got != "" {
-		t.Errorf("FirstFLAC(empty) = %q, %v; want \"\", nil", got, err)
+		t.Errorf("FirstAudio(empty) = %q, %v; want \"\", nil", got, err)
+	}
+}
+
+// TestReadCoverFromAPIC is the MP3 half of the art pipeline: an ID3 APIC frame
+// has to reach the sidecars exactly as a FLAC PICTURE block does, since a
+// library that came from a CD rip and one that came from a download must end
+// up with the same folder.art on the device.
+func TestReadCoverFromAPIC(t *testing.T) {
+	png := twoByTwoPNG(t)
+
+	body := append([]byte{0}, []byte("image/png")...)
+	body = append(body, 0, 3) // NUL, picture type 3 = front cover
+	body = append(body, 0)    // empty description
+	body = append(body, png...)
+
+	var tag []byte
+	tag = append(tag, 'I', 'D', '3', 3, 0, 0, 0, 0, 0, 0)
+	frame := append([]byte("APIC"), byte(len(body)>>24), byte(len(body)>>16),
+		byte(len(body)>>8), byte(len(body)), 0, 0)
+	frame = append(frame, body...)
+	tag = append(tag, frame...)
+	n := len(tag) - 10
+	tag[6] = byte(n>>21) & 0x7f
+	tag[7] = byte(n>>14) & 0x7f
+	tag[8] = byte(n>>7) & 0x7f
+	tag[9] = byte(n) & 0x7f
+	// Two real MPEG-1 128 kbps 44.1 kHz frames, so the file is an MP3.
+	for i := 0; i < 2; i++ {
+		f := make([]byte, 417)
+		f[0], f[1], f[2], f[3] = 0xff, 0xfb, 0x90, 0x00
+		tag = append(tag, f...)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "01. A.mp3")
+	if err := os.WriteFile(path, tag, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pic, err := ReadCover(path)
+	if err != nil {
+		t.Fatalf("ReadCover: %v", err)
+	}
+	if pic == nil || pic.MIME != "image/png" || len(pic.Data) != len(png) {
+		t.Fatalf("ReadCover returned %+v, want the embedded PNG", pic)
+	}
+
+	res, err := WriteAlbumPicture(dir, pic)
+	if err != nil {
+		t.Fatalf("WriteAlbumPicture: %v", err)
+	}
+	if res.NoPicture || !res.Wrote() {
+		t.Fatalf("no sidecars written from an APIC cover: %+v", res)
+	}
+	for _, name := range []string{ArtName, ThumbName} {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		size := ArtSize
+		if name == ThumbName {
+			size = ThumbSize
+		}
+		if !Valid(b, size) {
+			t.Errorf("%s is not a valid %dx%d CoreArt sidecar", name, size, size)
+		}
 	}
 }
 

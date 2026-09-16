@@ -9,7 +9,13 @@ import (
 	"strings"
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/flac"
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/id3"
 )
+
+// AudioExts are the extensions the device can play, which is what the
+// firmware's classify_ext() admits (core/library/names.c) and what
+// tools/build_index.py globs. Lower-case on purpose: see audioIn.
+var AudioExts = []string{".flac", ".mp3"}
 
 // Track is one source file and everything the index record needs from it.
 //
@@ -24,7 +30,7 @@ type Track struct {
 	SrcPath string // absolute path of the source file
 	Pos     int    // enumeration position, 1-based (= the NN in DeviceName)
 
-	DeviceName   string // "NN. Title.flac" — THE locator contract
+	DeviceName   string // "NN. Title.flac" / "NN. Title.mp3" — THE locator
 	DeviceFolder string // the album's FAT-safe folder, for the drift report
 
 	Title     string
@@ -68,13 +74,18 @@ type Scan struct {
 }
 
 // Options configure ScanTree. The zero value is usable: no genre map (tag
-// genres only) and flac.ReadFile for metadata.
+// genres only), flac.ReadFile for FLACs and id3.ReadFile for MP3s.
 type Options struct {
 	// GenreMap is the per-artist primary genre, keyed by the FOLDER artist.
 	GenreMap map[string]string
-	// Meta reads one file's metadata. Defaults to flac.ReadFile; tests
+	// Meta reads one FLAC's metadata. Defaults to flac.ReadFile; tests
 	// substitute their own.
 	Meta func(path string) (*flac.Meta, error)
+	// MP3Meta reads one MP3's tags and duration. Defaults to id3.ReadFile.
+	// Separate from Meta rather than one interface because the two readers
+	// return different types and a test that stubs one usually wants the
+	// other left alone.
+	MP3Meta func(path string) (*id3.Meta, error)
 }
 
 // SongCount is the number of records the scan will produce.
@@ -110,6 +121,9 @@ func ScanTree(src string, o Options) (*Scan, error) {
 	if o.Meta == nil {
 		o.Meta = flac.ReadFile
 	}
+	if o.MP3Meta == nil {
+		o.MP3Meta = id3.ReadFile
+	}
 	st, err := os.Stat(src)
 	if err != nil || !st.IsDir() {
 		return nil, fmt.Errorf("source tree not found: %s  (pass --src)", src)
@@ -138,7 +152,7 @@ func ScanTree(src string, o Options) (*Scan, error) {
 		}
 		scan.Warnings = append(scan.Warnings, warns...)
 		if len(files) == 0 {
-			scan.Skipped = append(scan.Skipped, folder+" (no .flac files)")
+			scan.Skipped = append(scan.Skipped, folder+" (no .flac or .mp3 files)")
 			continue
 		}
 
@@ -181,21 +195,24 @@ func scanAlbum(adir, artistF, albumF string, files []srcFile, o Options, scan *S
 		stem, _ := splitExt(base)
 		ftitle := FatSafe(TrackTitle(base))
 
-		// Destination filename convention: continuous "NN. Title.flac", NN =
+		// Destination filename convention: continuous "NN. Title.ext", NN =
 		// position in the importer's enumeration. Deliberately NOT the track
-		// number. The de-duplication below cannot actually fire (NN is unique
+		// number. The SOURCE extension is kept: nothing transcodes, so an MP3
+		// goes across as an MP3 and the firmware picks its decoder from the
+		// name. The de-duplication below cannot actually fire (NN is unique
 		// within the album), but it is what the reference tool does, so it
 		// stays — bounded, because the reference loop is not.
-		fname := fmt.Sprintf("%02d. %s.flac", pos, ftitle)
+		ext := strings.ToLower(filepath.Ext(base))
+		fname := fmt.Sprintf("%02d. %s%s", pos, ftitle, ext)
 		for tries := 0; seen[strings.ToLower(fname)]; tries++ {
 			if tries > 99 {
 				return Album{}, fmt.Errorf("%s: cannot find a unique device name for %q", dest, base)
 			}
-			fname = fmt.Sprintf("%02d. %s (%d).flac", pos, ftitle, len(seen))
+			fname = fmt.Sprintf("%02d. %s (%d)%s", pos, ftitle, len(seen), ext)
 		}
 		seen[strings.ToLower(fname)] = true
 
-		p := probeFile(f.path, o.Meta, scan)
+		p := probeFile(f.path, o, scan)
 
 		disc, trk := TrackNumber(stem, p.track, p.disc, f.folderDisc, artistF)
 		numberFrom := "position"
@@ -286,8 +303,27 @@ type probed struct {
 	track, disc                 int
 }
 
-func probeFile(path string, read func(string) (*flac.Meta, error), scan *Scan) probed {
-	m, err := read(path)
+// probeFile reads one file's tags and duration, picking the reader from the
+// extension. Both readers key their tags by ffprobe's names, so everything
+// below this point is format-agnostic — which is the whole reason the ID3
+// reader normalises its frame ids rather than handing back TIT2 and TPE1.
+func probeFile(path string, o Options, scan *Scan) probed {
+	var (
+		tags map[string]string
+		dur  uint32
+		err  error
+	)
+	if strings.EqualFold(filepath.Ext(path), ".mp3") {
+		var m *id3.Meta
+		if m, err = o.MP3Meta(path); err == nil {
+			tags, dur = m.Tags, m.DurationSeconds()
+		}
+	} else {
+		var m *flac.Meta
+		if m, err = o.Meta(path); err == nil {
+			tags, dur = m.Tags, m.DurationSeconds()
+		}
+	}
 	if err != nil {
 		// A single unreadable file must not abort a 1000-track build, but the
 		// failure is RECORDED: its record carries duration 0 and a
@@ -297,7 +333,7 @@ func probeFile(path string, read func(string) (*flac.Meta, error), scan *Scan) p
 	}
 	get := func(keys ...string) string {
 		for _, k := range keys {
-			if v, ok := m.Tags[k]; ok {
+			if v, ok := tags[k]; ok {
 				return v
 			}
 		}
@@ -312,7 +348,7 @@ func probeFile(path string, read func(string) (*flac.Meta, error), scan *Scan) p
 		artist:   get("artist", "albumartist", "album_artist", "album artist"),
 		album:    get("album"),
 		genre:    get("genre"),
-		duration: m.DurationSeconds(),
+		duration: dur,
 		// ffprobe renames TRACKNUMBER -> track and DISCNUMBER -> disc.
 		track: LeadInt(get("tracknumber", "track")),
 		disc:  LeadInt(get("discnumber", "disc")),
@@ -324,7 +360,7 @@ func probeFile(path string, read func(string) (*flac.Meta, error), scan *Scan) p
 // the folder (ground truth) or 0 for a flat album (the tag decides then).
 //
 // The order is the filename contract: the position in this list is the NN in
-// "NN. Title.flac" on the device. Do not sort it any other way.
+// "NN. Title.ext" on the device. Do not sort it any other way.
 func discTracks(adir string) ([]srcFile, []string, error) {
 	names, err := readDirNames(adir)
 	if err != nil {
@@ -347,7 +383,7 @@ func discTracks(adir string) ([]srcFile, []string, error) {
 			if m := discDirRe.FindStringSubmatch(d); m != nil {
 				dn = atoi(m[1])
 			}
-			sub, w, err := flacsIn(filepath.Join(adir, d))
+			sub, w, err := audioIn(filepath.Join(adir, d))
 			if err != nil {
 				return nil, nil, err
 			}
@@ -358,7 +394,7 @@ func discTracks(adir string) ([]srcFile, []string, error) {
 		}
 		return out, warns, nil
 	}
-	flat, w, err := flacsIn(adir)
+	flat, w, err := audioIn(adir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -370,12 +406,17 @@ func discTracks(adir string) ([]srcFile, []string, error) {
 	return out, warns, nil
 }
 
-// flacsIn lists the *.flac entries of one directory, sorted, mirroring
-// glob.glob(dir + "/*.flac"): a leading "." hides an entry from a wildcard
-// pattern, and the extension match is CASE-SENSITIVE. A ".FLAC" file is
-// therefore not in the index — the reference tool would not have put it there
-// either, and a track that silently is not in the library is worth a word.
-func flacsIn(dir string) ([]string, []string, error) {
+// audioIn lists the playable entries of one directory, sorted, mirroring
+// build_index.py's audio_in(): a leading "." hides an entry from a wildcard
+// pattern, and the extension match is CASE-SENSITIVE. A ".FLAC" or ".MP3"
+// file is therefore not in the index — the reference tool would not have put
+// it there either, and a track that silently is not in the library is worth a
+// word.
+//
+// ONE sorted list across both extensions, not FLACs then MP3s: the position in
+// it is the NN the file gets on the device, so grouping by extension would
+// renumber a mixed album the moment a track changed format.
+func audioIn(dir string) ([]string, []string, error) {
 	names, err := readDirNames(dir)
 	if err != nil {
 		return nil, nil, err
@@ -385,13 +426,24 @@ func flacsIn(dir string) ([]string, []string, error) {
 		if strings.HasPrefix(n, ".") {
 			continue
 		}
-		switch {
-		case strings.HasSuffix(n, ".flac"):
-			out = append(out, filepath.Join(dir, n))
-		case strings.EqualFold(filepath.Ext(n), ".flac"):
-			warns = append(warns, fmt.Sprintf("%s: extension is not lower-case .flac; skipped (the reference tool skips it too, so the track would be missing from the device either way)", filepath.Join(dir, n)))
+		ext := filepath.Ext(n)
+		matched := false
+		for _, want := range AudioExts {
+			switch {
+			case ext == want:
+				out = append(out, filepath.Join(dir, n))
+				matched = true
+			case strings.EqualFold(ext, want):
+				warns = append(warns, fmt.Sprintf("%s: extension is not lower-case %s; skipped (the reference tool skips it too, so the track would be missing from the device either way)", filepath.Join(dir, n), want))
+				matched = true
+			}
+			if matched {
+				break
+			}
 		}
 	}
+	// readDirNames already sorted the names, so appending in that order gives
+	// the single lexicographic list the enumeration contract asks for.
 	return out, warns, nil
 }
 

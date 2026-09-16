@@ -130,7 +130,11 @@ func fetchOneAlbum(ctx context.Context, cmd *cobra.Command, client *artfetch.Cli
 		return artFetchSkipped, err
 	}
 	if len(files) == 0 {
-		fmt.Fprintf(w, "%s: skip (no FLAC)\n", dir)
+		// FLAC-only on purpose: --fetch EMBEDS what it finds and there is no
+		// ID3 writer in this tree, so an MP3 album has nowhere to put the
+		// cover. Reading an MP3's existing APIC works everywhere else (see
+		// coreart.ReadCover); this is the one art path MP3 does not reach.
+		fmt.Fprintf(w, "%s: skip (no FLAC — --fetch embeds, and MP3 has no writer here)\n", dir)
 		return artFetchSkipped, nil
 	}
 	m, err := flac.ReadFile(files[0])
@@ -279,7 +283,8 @@ func queryText(q artfetch.Query) string {
 	return fmt.Sprintf("%q by %q", q.Album, q.Artist)
 }
 
-// albumFLACs lists an album's FLACs: the folder's own, then each
+// albumFLACs lists an album's FLACs — FLACs only, because its caller embeds
+// the fetched cover and there is no ID3 writer here. The folder's own, then each
 // "Disc N" subfolder's, each group sorted the way library.ScanTree
 // enumerates them. A multi-disc album keeps its art in the folder that
 // holds folder.art, so the first file of disc 1 is the art source.

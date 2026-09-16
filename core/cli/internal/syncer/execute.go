@@ -13,7 +13,6 @@ import (
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/coreart"
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/devicefs"
-	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/flac"
 )
 
 // Report is what a sync did. Counts, bytes, and Written — every path the sync
@@ -336,14 +335,14 @@ func groupOps(p *Plan) map[string]*albumOps {
 // writeArt renders the two sidecars. It returns false (with no error) when the
 // album's source file has no embedded picture.
 func writeArt(op ArtOp) (bool, error) {
-	m, err := flac.ReadFile(op.SrcFLAC)
+	pic, err := coreart.ReadCover(op.SrcFLAC)
 	if err != nil {
 		return false, err
 	}
 	if err := os.MkdirAll(op.Dir, 0o777); err != nil {
 		return false, err
 	}
-	res, err := coreart.WriteAlbum(op.Dir, m)
+	res, err := coreart.WriteAlbumPicture(op.Dir, pic)
 	if err != nil {
 		return false, err
 	}

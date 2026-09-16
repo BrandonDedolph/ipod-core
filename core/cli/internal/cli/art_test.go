@@ -92,7 +92,7 @@ func TestArtBatch(t *testing.T) {
 	for _, want := range []string{
 		"folder.art 120x120 + folder.thm 28x28",
 		"skip (no embedded art",
-		"skip (no FLAC)",
+		"skip (no FLAC or MP3)",
 		"2/4 folder(s) got art, 2 skipped, 0 failed",
 	} {
 		if !strings.Contains(out, want) {

@@ -81,6 +81,12 @@ TAGS = {
     "C.flac": ("C", 1, 2), "D.flac": ("D", 2, 2),
     # Disc folders: the folder wins over a (wrong) tag.
     "x.flac": ("x", 0, 9), "y.flac": ("y", 0, 9),
+    # A MIXED album: two MP3s and a FLAC. Nothing transcodes, so each keeps
+    # its own extension on the device, and the enumeration is one
+    # lexicographic order across both — not FLACs first.
+    "Echo.mp3":   ("Echo",   2, 0),
+    "Delta.mp3":  ("Delta",  1, 0),
+    "Foxtrot.flac": ("Foxtrot", 3, 0),
 }
 
 # SOURCE folders are "Album - Artist" (split_album_artist takes the artist from
@@ -94,6 +100,7 @@ TREE = {
     "Double - Band":        ["A.flac", "B.flac", "C.flac", "D.flac"],
     "Boxed - Band/Disc 1":  ["x.flac"],
     "Boxed - Band/Disc 2":  ["y.flac"],
+    "Mixed - Band":         ["Delta.mp3", "Echo.mp3", "Foxtrot.flac"],
 }
 
 
@@ -264,6 +271,22 @@ def main():
     cent = by_folder(recs, "50 Cent - Get Rich")[0]
     check("'50 Cent - In Da Club' is not track 50", cent["track"] == 1)
 
+    # -- a mixed-format album ------------------------------------------------
+    mixed = by_folder(recs, "Band - Mixed")
+    check("an album of MP3s and FLACs is indexed whole", len(mixed) == 3)
+    check("every track keeps its source extension (nothing transcodes)",
+          sorted(r["file"] for r in mixed) ==
+          ["01. Delta.mp3", "02. Echo.mp3", "03. Foxtrot.flac"])
+    check("the enumeration is one order across both extensions, not FLACs first",
+          {r["title"]: r["file"] for r in mixed} ==
+          {"Delta": "01. Delta.mp3", "Echo": "02. Echo.mp3",
+           "Foxtrot": "03. Foxtrot.flac"})
+    check("an MP3's file_hash is over the name WITH its extension",
+          all(r["file_hash"] == bi.name_hash(r["file"]) for r in mixed))
+    check("MP3 tags come back on the same keys as FLAC's",
+          {r["title"]: r["track"] for r in mixed} ==
+          {"Delta": 1, "Echo": 2, "Foxtrot": 3})
+
     # -- discs -------------------------------------------------------------------
     dbl = by_folder(recs, "Band - Double")
     check("a flat album's disc tags are read",
@@ -275,7 +298,9 @@ def main():
           (box["x"]["track"], box["y"]["track"]) == (1, 2))
 
     # -- the drift report: the evidence for the "52 tracks" question ----------
-    # Alpha (pos 1, track 2), Bravo (2, 1), Whatever (2, 3), C (3, 1), D (4, 2).
+    # Alpha (pos 1, track 2), Bravo (2, 1), Whatever (2, 3), C (3, 1), D (4, 2),
+    # Delta (pos 1... no: Delta is track 1 at position 1) — Echo (2, 2) and
+    # Foxtrot (3, 3) are on their positions too, so the mixed album adds none.
     check("the run reports how many tracks are numbered off their position",
           "5 track(s) are numbered differently" in report)
     check("--show-drift names them",

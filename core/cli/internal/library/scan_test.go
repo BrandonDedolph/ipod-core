@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/flac"
+	"github.com/BrandonDedolph/ipod_theme/core/cli/internal/id3"
 )
 
 // fakeMeta is a metadata reader driven by a table, so the scan rules can be
@@ -287,5 +288,78 @@ func TestScanTreeMissingSource(t *testing.T) {
 	_, err := ScanTree(filepath.Join(t.TempDir(), "nope"), Options{})
 	if err == nil || !strings.Contains(err.Error(), "source tree not found") {
 		t.Errorf("err = %v, want a 'source tree not found' message", err)
+	}
+}
+
+// fakeID3 is the MP3 side of fakeMeta: the same table, shaped as an id3.Meta.
+func fakeID3(tags map[string]map[string]string, secs map[string]int) func(string) (*id3.Meta, error) {
+	return func(path string) (*id3.Meta, error) {
+		base := filepath.Base(path)
+		t, ok := tags[base]
+		if !ok {
+			return nil, fmt.Errorf("no tags for %s", base)
+		}
+		return &id3.Meta{
+			Tags:         t,
+			SampleRate:   44100,
+			TotalSamples: uint64(secs[base])*44100 + 4,
+			Tagged:       true,
+		}, nil
+	}
+}
+
+// TestScanTreeMixedFormats pins what a mixed album does: MP3s and FLACs are one
+// enumeration, each keeps its own extension on the device (nothing transcodes),
+// and an MP3's tags reach the record on the same keys a FLAC's do.
+func TestScanTreeMixedFormats(t *testing.T) {
+	src := t.TempDir()
+	writeTree(t, src, []string{
+		"Mixed - Band/Delta.mp3",
+		"Mixed - Band/Echo.mp3",
+		"Mixed - Band/Foxtrot.flac",
+		// Upper-case extensions are skipped, with a warning, exactly as the
+		// reference tool's case-sensitive glob skips them.
+		"Mixed - Band/Golf.MP3",
+	})
+	tags := map[string]map[string]string{
+		"Delta.mp3":    {"title": "Delta", "tracknumber": "1", "genre": "Rock"},
+		"Echo.mp3":     {"title": "Echo", "track": "2"},
+		"Foxtrot.flac": {"title": "Foxtrot", "tracknumber": "3"},
+	}
+	secs := map[string]int{"Delta.mp3": 61, "Echo.mp3": 62, "Foxtrot.flac": 63}
+
+	scan, err := ScanTree(src, Options{
+		Meta:    fakeMeta(tags, secs),
+		MP3Meta: fakeID3(tags, secs),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan.Albums) != 1 {
+		t.Fatalf("got %d albums, want 1", len(scan.Albums))
+	}
+	got := scan.Albums[0].Tracks
+	if len(got) != 3 {
+		t.Fatalf("got %d tracks, want 3: %+v", len(got), got)
+	}
+	want := []struct{ name, title string }{
+		{"01. Delta.mp3", "Delta"},
+		{"02. Echo.mp3", "Echo"},
+		{"03. Foxtrot.flac", "Foxtrot"},
+	}
+	for i, w := range want {
+		if got[i].DeviceName != w.name || got[i].Title != w.title {
+			t.Errorf("track %d = %q/%q, want %q/%q",
+				i, got[i].DeviceName, got[i].Title, w.name, w.title)
+		}
+	}
+	if got[0].Genre != "Rock" {
+		t.Errorf("an MP3's genre did not reach the record: %q", got[0].Genre)
+	}
+	if got[0].DurationS != 61 {
+		t.Errorf("an MP3's duration did not reach the record: %d", got[0].DurationS)
+	}
+	if len(scan.Warnings) != 1 || !strings.Contains(scan.Warnings[0], "Golf.MP3") {
+		t.Errorf("an upper-case .MP3 should warn: %v", scan.Warnings)
 	}
 }
