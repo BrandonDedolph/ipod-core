@@ -1294,7 +1294,13 @@ static void clock_resync(const char *why, int trust_timer)
                                             &drift);
     g_clock_resync_us = now;
     g_clock_tick_us   = now;
-    g_clock_retry     = 0;
+    /* A bus that did not answer is asked again in a minute whatever else this
+     * call decided — including the wake, where the clock was just dropped
+     * because the park's delta could not be carried. Thirty minutes without a
+     * time, after a wake, for one I2C collision is not a cadence, it is an
+     * outage (STATUS.md, bench step 5). A chip that answered "no time" is not
+     * a retry: it will say the same thing in a minute. */
+    g_clock_retry     = (rc < 0) ? 1 : 0;
 
     uart_puts("core: rtc ");
     uart_puts(why);
@@ -6840,20 +6846,6 @@ _Noreturn static void run_ui(fat32_t *fs)
     g_diag_cfg_lba[1] = cfg_lba1;
 
     /*
-     * The cell, BEFORE the clock block below can ask for a disk write.
-     *
-     * It primes the status-strip gauge, which is why it used to sit after the
-     * library load — but it is also the only thing that gives
-     * battery_disk_writes_allowed() a reading to answer with: `bat_level`
-     * starts at BATTERY_LEVEL_OK and battery_init() takes no sample, so a
-     * commit gated "below the disk-safe line" would have been gated on a
-     * default. One ADC conversion (a 2 ms settle and two I2C transactions) on
-     * a bus that is already up; a read failure leaves the level alone, so the
-     * worst case is exactly the behaviour this replaces.
-     */
-    battery_refresh(1);
-
-    /*
      * THE CLOCK, decided once, here, while the drive is still spinning from
      * the mount and before anything else can go wrong.
      *
@@ -6901,6 +6893,7 @@ _Noreturn static void run_ui(fat32_t *fs)
         wallclock_anchor(&g_wclock, rtc_rc == 1, rtc_epoch, now_us);
         g_clock_tick_us   = now_us;
         g_clock_resync_us = now_us;
+        g_clock_retry     = (rtc_rc < 0);   /* no answer: ask again in a minute */
 
         timesync_state_t ts = {
             g_settings.host_epoch, g_settings.host_off_min,
@@ -6925,14 +6918,29 @@ _Noreturn static void run_ui(fat32_t *fs)
             g_settings.utc_off_min   = ts.utc_off_min;
             settings_touch();
             settings_commit(CFG_COMMIT_FORCE);
-            /* FORCE is not a promise: the gate can still refuse (a cell below
-             * the disk-safe line — a real verdict here, since the sample above
-             * precedes this) and a write can still fail, and either way the
-             * change stays PENDING — which cfg_commit_clear() at the end of
-             * this boot would then throw away with the load's own dirt. Carry
-             * the fact forward so the mark is re-armed instead of lost; a lost
-             * mark means this stamp is applied again on the next boot, and on
-             * the one after that, for as long as the writes keep failing. */
+            /*
+             * THIS WRITE IS PRE-POLICY, deliberately. battery_disk_writes_
+             * allowed() answers from `bat_level`, and the policy cannot move
+             * that until its median ring holds BATTERY_FILTER_N samples — five
+             * of them, 5 s apart, so roughly 20 s into a boot that is still
+             * spinning the drive up (hal/hw/battery.c). Sampling the cell here
+             * would not change that: five conversions microseconds apart are
+             * not a median over time, they are one spin-up-sagged reading with
+             * a quorum, which is the decision the filter exists to refuse.
+             *
+             * That is acceptable for exactly this write: the platters are
+             * already up for the mount and the index load, it is one sector,
+             * and SHUTOFF cannot have fired yet (nothing has been able to
+             * judge the cell). Every later save meets the armed gate.
+             *
+             * What CAN still happen is a refusal for another reason, or a
+             * failed write — and either leaves the change PENDING, which
+             * cfg_commit_clear() at the end of this boot would throw away with
+             * the load's own dirt. Carry the fact forward so the mark is
+             * re-armed instead of lost; a lost mark means this stamp is
+             * applied again on the next boot, and on the one after that, for
+             * as long as the writes keep failing.
+             */
             clock_mark_unsaved = g_cfg_commit.dirty;
         }
 
@@ -6967,6 +6975,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                                            * spinning) so Songs/Albums/Artists/
                                            * Genres open INSTANTLY, like Apple —
                                            * not a multi-second stall on first use */
+    battery_refresh(1);                   /* prime the status-strip gauge         */
     g_volume = hal_volume_get();          /* reflect the codec's default gain      */
     g_dir_depth = 0;
     g_browse_n  = 0;

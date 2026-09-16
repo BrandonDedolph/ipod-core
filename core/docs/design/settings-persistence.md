@@ -213,6 +213,19 @@ ROM answering the host, not our firmware), so `core sync`, `core install` and
 the pair of them is what makes "apply a stamp AT MOST ONCE" expressible at all
 (`core/kernel/timesync.h` has the rules).
 
+**The boot write that marks a stamp is PRE-POLICY.** Every other save meets
+the commit gate's battery test with a real verdict; this one cannot. The
+low-battery policy answers from a level it only moves once its median ring
+holds five samples taken 5 s apart (`hal/hw/battery.c`), which is about twenty
+seconds into a boot that is still spinning the drive up — and sampling harder
+at boot would not help, because five conversions microseconds apart are one
+spin-up-sagged reading with a quorum rather than a median over time. So the
+mark is written against the policy's default. That is acceptable for this write
+specifically: the platters are already up for the mount and the index load, it
+is one sector, and the shut-off line cannot have been crossed yet because
+nothing has been able to judge the cell. It is not a licence for any other
+early write.
+
 Why a field in this record rather than a second file: the mark has to live
 somewhere the firmware can write, and this is the only such place; a second
 file would put the two halves of one state machine in two places, cost a second

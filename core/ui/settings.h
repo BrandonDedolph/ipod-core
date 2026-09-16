@@ -343,6 +343,10 @@ const char *settings_label(int screen, int idx);
  * suite can assert for every screen, so the code and the still cannot say
  * different things again. A screen with no title of its own answers
  * "Settings"; an out-of-range screen answers "" (there is nothing to draw).
+ *
+ * EVERY painter reads it, the two dashboards (About, Boot Details) included:
+ * they draw their own bodies but not their own headers, or the assertions in
+ * the host suite would be pinning a string nothing on screen uses.
  */
 const char *settings_title(int screen);
 

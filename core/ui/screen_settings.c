@@ -410,7 +410,7 @@ void settings_about_render(int battery_pct, int battery_mv, int battery_raw,
                            const char *version, const about_jack_t *jack)
 {
     console_clear(S_SURFACE);
-    ui_header("About", "", 1);
+    ui_header(settings_title(SETTINGS_ABOUT), "", 1);
 
     /* v holds the footer, which is the longest string this screen builds:
      * three tokens, the last of which can carry a pin-configuration tail. */
@@ -661,7 +661,8 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
      * F_HEADER, the longest plausible stamp ("v0.10.12-123-g1234567-dirty")
      * 145 px at F_SMALL, and 24 + 80 + 8 + 145 + 12 = 269 < 320, so neither
      * is clipped. */
-    ui_header("Boot Details", (build_id && build_id[0]) ? build_id : "", 1);
+    ui_header(settings_title(SETTINGS_DIAG),
+              (build_id && build_id[0]) ? build_id : "", 1);
 
     /* --- headline: label left, total right, on one line --- */
     st_text(16, 60, "COLD BOOT", F_SMALL, S_MUTED);
