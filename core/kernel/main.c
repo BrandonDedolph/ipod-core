@@ -4070,10 +4070,22 @@ static void detail_load_meta(fat32_t *fs)
  * list title plays that list"). Tapping Play on the album already playing
  * restarts it from track 1, exactly as the original does.
  */
+/*
+ * PLAY_TAP_CONSUMED is the tap that was acted on and started nothing: a
+ * playlist whose file cannot be read or whose tracks have all gone missing
+ * (its tracklist screen is now up carrying the reason), an album folder that
+ * could not be read (the same), or a view whose every song has vanished off
+ * the disk since the index was built. That last one is the reason this is not
+ * simply PASS: library_play_song() and shuffle_songs_build() clear the old
+ * queue BEFORE they discover there is nothing to add, so the music has
+ * already stopped and the status strip's track name has to repaint away. In
+ * all of them the screen changed, and PLAY must not ALSO toggle a transport
+ * that is no longer there.
+ */
 typedef enum {
     PLAY_TAP_PASS = 0,   /* not a title: PLAY still means pause/resume        */
     PLAY_TAP_STARTED,    /* a queue started and Now Playing is up             */
-    PLAY_TAP_SHOWN,      /* it could not be played; its own screen says why   */
+    PLAY_TAP_CONSUMED,   /* acted on, started nothing: repaint, do not toggle */
 } play_tap_t;
 
 static play_tap_t play_tap_start(fat32_t *fs)
@@ -4117,7 +4129,10 @@ static play_tap_t play_tap_start(fat32_t *fs)
     switch (scr_cur()) {
     case SCR_MUSIC:                                  /* Shuffle Songs */
         shuffle_songs_play(fs);
-        if (!player_active()) return PLAY_TAP_PASS;  /* nothing could be dealt */
+        /* g_songs_n > 0 got us here, so a deal that produced nothing means
+         * every song in the library is unresolved on disk — and the build has
+         * already stopped whatever was playing. */
+        if (!player_active()) return PLAY_TAP_CONSUMED;
         break;
 
     case SCR_ARTISTS: {
@@ -4129,17 +4144,17 @@ static play_tap_t play_tap_start(fat32_t *fs)
         }
         g_artist_filter[k] = '\0';
         songview_build(-1, g_artist_filter);
-        if (library_play_song(fs, 0) < 0) return PLAY_TAP_PASS;
+        if (library_play_song(fs, 0) < 0) return PLAY_TAP_CONSUMED;
         break;
     }
 
     case SCR_GENRES:
         songview_build(g_genre_sel, 0);
-        if (library_play_song(fs, 0) < 0) return PLAY_TAP_PASS;
+        if (library_play_song(fs, 0) < 0) return PLAY_TAP_CONSUMED;
         break;
 
     case SCR_SONGS:
-        if (library_play_song(fs, g_song_sel) < 0) return PLAY_TAP_PASS;
+        if (library_play_song(fs, g_song_sel) < 0) return PLAY_TAP_CONSUMED;
         break;
 
     case SCR_PLAYLISTS:
@@ -4149,11 +4164,13 @@ static play_tap_t play_tap_start(fat32_t *fs)
              * screen with the reason SELECT would have shown rather than
              * silently pausing whatever was playing. */
             scr_push(SCR_PLAYLIST);
-            return PLAY_TAP_SHOWN;
+            return PLAY_TAP_CONSUMED;
         }
         break;
 
     case SCR_PLAYLIST:
+        /* Unreachable with rows on screen, and it cannot have torn the old
+         * queue down: playlist_play() refuses before player_queue_begin(). */
         if (playlist_play(g_plt_sel) < 0) return PLAY_TAP_PASS;
         break;
 
@@ -4165,7 +4182,7 @@ static play_tap_t play_tap_start(fat32_t *fs)
                               g_art_clus, g_art_size);
         } else if (albumlist_album_at(g_br_sel) < 0) {
             songview_build(-1, g_artist_filter);     /* the All Songs row   */
-            if (library_play_song(fs, 0) < 0) return PLAY_TAP_PASS;
+            if (library_play_song(fs, 0) < 0) return PLAY_TAP_CONSUMED;
         } else {
             /* Read the album's tracklist to build the queue from, without
              * ENTERING it: browse_collect only lists files at depth 1, so
@@ -4182,7 +4199,7 @@ static play_tap_t play_tap_start(fat32_t *fs)
                 /* Keep the depth: the tracklist screen is now up and says
                  * whether the folder could not be read or is simply empty —
                  * what SELECT would have shown. */
-                return PLAY_TAP_SHOWN;
+                return PLAY_TAP_CONSUMED;
             }
             g_queue_kind = RESUME_KIND_ALBUM;
             g_queue_seed = 0;
@@ -6091,6 +6108,9 @@ _Noreturn static void run_ui(fat32_t *fs)
      * restored) and as a fresh capture of a position we only just loaded. */
     int was_active = player_active();     /* detect the active->idle edge          */
     int last_qidx  = was_active ? player_queue_current() : -1;
+    /* Which track is open, for the seek-aim cancel below. Keyed on the OPEN
+     * and not on last_qidx because repeat-one re-opens the same queue index. */
+    uint32_t last_oseq = player_open_seq();
     g_resume_open_seq   = player_open_seq();
     g_resume_was_paused = player_paused();
     /* Seeded AFTER resume_restore: a restore that had to skip a broken track
@@ -6120,6 +6140,26 @@ _Noreturn static void run_ui(fat32_t *fs)
             dirty = 1;
         }
         last_qidx = now_qidx;
+
+        /* A RIGHT/LEFT aim belongs to the track it was aimed at, and THIS is
+         * the only place that can see that track go. ui/gesture.c is fed a
+         * position and a length, and the next track has both, so an aim that
+         * survived an auto-advance would go on stepping and then commit a
+         * position measured against a track nobody is playing any more — a
+         * rewind held through the end of a 4:00 track landing 3:23 into the
+         * next one, which the listener has heard none of. Keyed on
+         * player_open_seq(), which bumps on every track open (auto-advance,
+         * the gapless hand-over, a skip, a queue-view jump and repeat-one's
+         * re-open of the SAME index) and not on a seek, so our own committed
+         * seek does not look like a track change. The repaint is the dirty
+         * above; where it is the queue ENDING, `allowed` drops and the feed
+         * would cancel anyway — this just gets there first. */
+        uint32_t now_oseq = player_open_seq();
+        if (now_oseq != last_oseq || now_active != was_active) {
+            last_oseq = now_oseq;
+            (void)seekhold_cancel(&g_ff);
+            (void)seekhold_cancel(&g_rw);
+        }
 
         /* RESUME POSITION — the edges worth a kilobyte of disk (see the block
          * comment above resume_capture): the track changed, pause flipped,
@@ -6302,8 +6342,8 @@ _Noreturn static void run_ui(fat32_t *fs)
                     np_first = 1;
                     dirty    = 1;
                     break;
-                case PLAY_TAP_SHOWN:
-                    dirty = 1;           /* the row's screen says why, no toggle */
+                case PLAY_TAP_CONSUMED:
+                    dirty = 1;           /* started nothing, but not a toggle   */
                     break;
                 case PLAY_TAP_PASS:
                     if (player_active()) {
@@ -6628,19 +6668,38 @@ _Noreturn static void run_ui(fat32_t *fs)
             }
             /* RIGHT/LEFT are transport ONLY on the player screens (Now Playing
              * and the queue view, which lists the live queue with the playing
-             * row marked), and their transport is decided by press length in
-             * the seekhold block above, not here — a tap skips, a hold seeks.
-             * What is left here is the OTHER screens: a skip from a list you
-             * were merely browsing changed the music under you, so instead
-             * RIGHT jumps to Now Playing — PUSHED over the current screen, so
-             * MENU from there lands back exactly where you were (inside an
-             * album's tracklist, mid-browse) — and LEFT does nothing (MENU is
-             * already "back" on every screen; a second back key is a second
-             * convention). Nothing here ever runs on a press that woke the
-             * backlight, dismissed a modal or landed under Hold — all three
-             * zeroed ev.buttons. */
-            if (scr_cur() != SCR_NOWPLAYING && scr_cur() != SCR_QUEUE &&
-                (ev.buttons & WHEEL_BTN_RIGHT)) {
+             * row marked), and WHAT the transport is comes from press length
+             * in the seekhold block above, not from here — a tap skips, a hold
+             * seeks. This drain has two jobs left. On the player screens it
+             * hands over a down-edge the live sampler never got to see. On
+             * every other screen it owns the press outright: a skip from a
+             * list you were merely browsing changed the music under you, so
+             * instead RIGHT jumps to Now Playing — PUSHED over the current
+             * screen, so MENU from there lands back exactly where you were
+             * (inside an album's tracklist, mid-browse) — and LEFT does
+             * nothing (MENU is already "back" on every screen; a second back
+             * key is a second convention). Nothing here ever runs on a press
+             * that woke the backlight, dismissed a modal or landed under Hold
+             * — all three zeroed ev.buttons. */
+            if (scr_cur() == SCR_NOWPLAYING || scr_cur() == SCR_QUEUE) {
+                /* The latch's promise, kept for the transport too. A tap whose
+                 * press AND release both fell inside one blocked pass — the
+                 * second RIGHT of a double-skip, landing while player_next()
+                 * opens a file on a drive the spin-down parked — is never seen
+                 * by the 100 Hz live sampler the seek machines read, but the
+                 * tick latched its down-edge and it is in this event. Hand it
+                 * over; the machine reports it as a skip on the next feed, so
+                 * the skip keeps exactly one implementation. A button still
+                 * down is not a missed tap — that press is simply one the next
+                 * feed will pick up. */
+                uint32_t live = clickwheel_buttons();
+                if (ev.buttons & WHEEL_BTN_RIGHT) {
+                    seekhold_missed_tap(&g_ff, (live & WHEEL_BTN_RIGHT) != 0);
+                }
+                if (ev.buttons & WHEEL_BTN_LEFT) {
+                    seekhold_missed_tap(&g_rw, (live & WHEEL_BTN_LEFT) != 0);
+                }
+            } else if (ev.buttons & WHEEL_BTN_RIGHT) {
                 /* This press is the jump and nothing else. The seek machine
                  * latches "not allowed" at its own down-edge, which covers the
                  * pass ordering where it sampled the press first; this covers

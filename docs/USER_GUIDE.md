@@ -17,7 +17,7 @@ bottom, Left and Right at the sides. The Hold switch is on the top edge.
 | Wheel | Moves the selection | Volume. After a Select tap, seeks |
 | Select | Opens the row. On a track, plays it | Tap: scrub mode. Hold: the queue |
 | Menu | Back one screen. Hold one second: the main menu | Back to the screen you came from. Hold: the main menu |
-| Play | On an album, artist, genre, playlist or song: plays it. Elsewhere, tap: pause or resume. Hold two seconds: sleep. Hold longer: power off | Tap: pause or resume. Hold: sleep, then power off |
+| Play | Tap on an album, artist, genre, playlist or song: plays it. Tap elsewhere: pause or resume. Hold two seconds anywhere: sleep. Hold longer: power off | Tap: pause or resume. Hold: sleep, then power off |
 | Right | Jumps to Now Playing if a track is loaded, playing or paused | Tap: next track. Hold: fast forward |
 | Left | Nothing but the click | Tap: previous track. Hold: rewind |
 
@@ -114,9 +114,11 @@ tenths of a second. Leave it alone for four seconds and the wheel goes back to v
 heading and the right time how far that is, as a signed figure. It moves five seconds a quarter
 second at first, then fifteen after two seconds of holding, thirty after five and sixty after ten,
 so a long recording is crossable without letting go. It stops at the ends of the track and goes no
-further. Let go and it seeks there, once — the audio does not move while you hold. A quick tap
-skips a track instead, and because the length of the press is what tells the two apart, the skip
-happens when you let go.
+further. Let go and it seeks there, once — the audio does not move while you hold. Let go before it
+has moved anywhere, or while it is sitting against an end, and nothing happens at all. If the track
+ends under your thumb and the next one starts, the seek is dropped rather than carried into a track
+you have not heard. A quick tap skips instead, and because the length of the press is what tells the
+two apart, the skip happens when you let go.
 
 **The queue.** Hold Select for about half a second. The queue view lists what is playing and what
 is next, with the playing row marked. Select a row to jump to it; Menu returns to Now Playing.

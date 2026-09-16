@@ -188,8 +188,14 @@ What changed (see `git log 054c722..`):
   (target on the left, signed delta on the right, playhead on the bar) at 5 s
   a quarter-second, then 15 / 30 / 60 as the hold passes 2 s / 5 s / 10 s,
   clamped to the track; one `player_seek_to()` on release, so a long
-  fast-forward costs one seek. A tap still skips — now decided on the release,
-  like PLAY's pause. (c) **Hold MENU one second jumps to the main menu** from
+  fast-forward costs one seek. A hold that moved nothing (let go before its
+  first tick, or pinned against an end its whole life) seeks nothing, the way
+  the wheel scrubber refuses an unmoved commit; a track change under the aim
+  drops it, so a hold across an auto-advance cannot land the old track's
+  target in the new one. A tap still skips — decided on the release, like
+  PLAY's pause, and a tap whose whole press fell inside one blocked pass is
+  recovered from the latched down-edge, so the transport keeps the wheel
+  latch's "no tap is ever lost" promise. (c) **Hold MENU one second jumps to the main menu** from
   anywhere; the tap still backs one screen at the down-edge, and a jump out of
   Settings runs the same SOFT commit the tap exit does. The logic is a new
   host-testable `ui/gesture.c` (the skip-vs-seek machine, the ramp, the
