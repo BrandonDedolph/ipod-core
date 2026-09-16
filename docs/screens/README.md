@@ -74,6 +74,14 @@ A screenshot here is a claim about what the device draws. So:
     so Settings carries the same strip as the lists;
   - low-battery screens and the charging screen: `core/ui/screen_battery.c`,
     `core/ui/screen_charging.c`;
+  - Music > Search, both modes: `core/ui/search.h` (every geometry constant
+    the stills use — the query plate, the ring's cell widths and window, the
+    hairline, the two row origins, the footer baseline) and `core/ui/search.c`
+    (`search_render`). The A-Z plate over a long list is `main.c`'s
+    `az_overlay_render`, and whether a list HAS a letter at all is
+    `core/ui/letterindex.h`'s two thresholds — `letter.png` shows a list long
+    enough to pass them, because a still of a ten-row list with a plate over
+    it would be a screen the device never draws;
   - everything else — status strip, main menu, Music menu, Artists/Albums/
     Songs/Genres/Playlists lists, album detail, Now Playing, the volume
     plate, the Hold banner: `core/kernel/main.c`
@@ -122,6 +130,8 @@ A screenshot here is a claim about what the device draws. So:
 | `mainmenu.png` `music.png` | main menu, Music menu | `screen_mainmenu`, `screen_music` |
 | `artists.png` `albums.png` `songs.png` `genres.png` `allsongs.png` | library lists | `screen_*` |
 | `playlists.png` | Music → Playlists list | `screen_playlists` |
+| `letter.png` | the A-Z plate over a long Artists list | `screen_letter` (`az_plate`) |
+| `search.png` `search_results.png` | Music → Search: typing, and the hits | `screen_search`, `screen_search_results` |
 | `detail.png` | album detail (tracklist) | `screen_detail` |
 | `nowplaying.png` `volume.png` `volume_limit.png` | Now Playing, volume plate, the plate at a Volume Limit (triangle marker) | `screen_nowplaying`, `screen_volume`, `screen_volume_limit` |
 | `hold_unlocked.png` `hold_locked.png` `hold_locked_list.png` | Hold-switch banners (Now Playing row / list chrome) | `screen_lock`, `screen_locked`, `screen_locked_list` |

@@ -10,13 +10,15 @@
 
 #include "wheel.h"
 
-static wheel_clock_fn   g_clock;
-static wheel_initial_fn g_initial_at;
-static wheel_click_fn   g_click;
+static wheel_clock_fn       g_clock;
+static wheel_initial_fn     g_initial_at;
+static wheel_click_fn       g_click;
+static wheel_letter_step_fn g_letter_step;
 
 void wheel_set_clock(wheel_clock_fn fn)        { g_clock = fn; }
 void wheel_set_initial_at(wheel_initial_fn fn) { g_initial_at = fn; }
 void wheel_set_click(wheel_click_fn fn)        { g_click = fn; }
+void wheel_set_letter_step(wheel_letter_step_fn fn) { g_letter_step = fn; }
 
 static uint32_t now_us(void)
 {
@@ -65,9 +67,25 @@ int wheel_accel_step(int delta)
     g_wheel_last_us = now;
 
     if (dt > WHEEL_IDLE_US) {         /* new gesture: forget the old one */
-        g_wheel_vel     = 1;
-        g_wheel_letters = 0;
-        g_wheel_tps     = 0;
+        g_wheel_vel = 1;
+        g_wheel_tps = 0;
+        /*
+         * ...except the letter latch, while the PLATE is still up. The plate
+         * is the control surface in letter mode, not a hint, so the thing on
+         * screen and the thing the wheel does have to share one clock: a
+         * quarter-second pause used to drop the wheel back to rows (200 ms)
+         * while the plate stayed up for a second more, so the next detent
+         * both moved one row and took the plate down — the control changing
+         * meaning under a thumb that had only paused to read it.
+         *
+         * So the latch outlives a pause shorter than WHEEL_AZ_HOLD_LETTER,
+         * which is the hold the guide already describes ("the letter stays for
+         * just over a second"). Speed still resets: lift for 300 ms and the
+         * next detent is ONE letter, not eight rows' worth of them.
+         */
+        if (!g_wheel_letters || dt >= WHEEL_AZ_HOLD_LETTER) {
+            g_wheel_letters = 0;
+        }
         return 1;
     }
     if (dt < 1000u) {
@@ -225,7 +243,14 @@ int wheel_move(int sel, int count, int8_t delta, int *accum)
         int dir  = (move > 0) ? 1 : -1;
         int step = (move > 0) ? move : -move;
         for (int i = 0; i < step; i++) {
-            int next = list_letter_step(sel, count, dir);
+            /* The index when the screen has one (ui/letterindex.c, registered
+             * by kernel_main): O(log runs) instead of the walk's O(rows in
+             * this letter), which on a 6000-song library is the difference
+             * between a detent and a stutter. Unset falls back to the walk,
+             * which needs nothing but initial_at — so an unregistered seam is
+             * slower, never wrong. */
+            int next = g_letter_step ? g_letter_step(sel, count, dir)
+                                     : list_letter_step(sel, count, dir);
             if (next == sel) break;              /* ran out of letters */
             sel = next;
         }

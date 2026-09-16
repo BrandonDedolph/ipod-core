@@ -163,6 +163,14 @@ progress), the play queue, Settings (with a scrolling list + scrollbar),
 About / Boot Details, the volume and lock/unlock modals, the charging screen,
 and the boot splash.
 
+**Built, with no jsx behind it — Music → Search.** The prototype has no search
+screen, so its layout is derived rather than traced: `menus.jsx`'s ScreenHeader
+and Row (the query plate is the volume plate's `PLATE` token at list width, the
+hits are ordinary two-line rows) with the type eyebrow in the Now Playing
+eyebrow's style — `FONT_SMALL`, `MUTED2`, `SONG · Artist`. The character ring is
+new: a 39-cell carousel centred on the cursor, the cursor drawn as an inverted
+pill in the selection bar's colours. `core/ui/search.h` carries the geometry.
+
 **In the design but not the firmware** — Playlists, Podcasts, Audiobooks and
 Composers exist as *greyed-out* menu entries (`active = 0` in
 `core/kernel/main.c`) and lead nowhere. An M3U8 parser exists in

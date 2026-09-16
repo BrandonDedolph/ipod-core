@@ -53,6 +53,8 @@
 #include "../library/sort.h"
 #include "../library/playlist.h"
 #include "../ui/wheel.h"
+#include "../ui/letterindex.h"
+#include "../ui/search.h"
 #include "../ui/keyhold.h"
 #include "../ui/gesture.h"
 #include "../ui/sleeptimer.h"
@@ -436,6 +438,15 @@ static uint32_t g_list_epoch;
  * backing out of an album returns the cursor to that album in the list rather
  * than jumping to the top. */
 static int g_br_sel, g_br_accum;      /* album list (depth 0)  */
+/* This tracklist was opened straight from a Search hit, so the album list
+ * underneath it was never on screen: MENU must go back to the results, not
+ * reveal a list the user did not ask for. Cleared by every other push. */
+static int g_br_from_search;
+
+/* Music > Search's whole state, one instance. Up here rather than with the
+ * rest of the screen because play_tap_start's policy switch reads it, and
+ * that sits above the loaders the Search section is built on. */
+static search_t g_search;
 static int g_det_sel, g_det_accum;    /* tracklist   (depth 1) */
 
 /* Index-derived album list — the source of truth is CORELIB.IDX, so an album
@@ -2621,11 +2632,73 @@ static int album_key_cmp_idx(uint16_t a, uint16_t b)
     return title_cmp(g_album_key[a], g_album_key[b]);
 }
 
+static int genre_cmp_idx(uint16_t a, uint16_t b)
+{
+    return title_cmp(g_genres[a], g_genres[b]);
+}
+
+/* The genre sort's order array. Its own, not g_sort_tmp: that is the scratch
+ * merge_sort_idx needs, and the inverse permutation is built into it. */
+static uint16_t g_genre_order[LIB_MAX_GENRES];
+
+/*
+ * Alphabetise the genre table A->Z.
+ *
+ * genre_intern() appends in FIRST-SEEN order, which is the order the index
+ * records happen to arrive in, so Music > Genres was the one long list on the
+ * device with no order at all to read down or to locate within. Sorting it is
+ * also what lets the A-Z plate appear there: the letter index rejects a list
+ * whose initial changes on nearly every row.
+ *
+ * A genre is identified by its INDEX (lib_song_t.genre, songview_build's
+ * argument), so the sort has to remap every song's field through the inverse
+ * permutation. That is safe here and nowhere else: library_finish is the last
+ * thing the load does, before any screen or the resume restore can capture an
+ * index. Nothing on disk holds one — the resume record stores the song, and
+ * rebuilds the genre view from the song's own field.
+ */
+static void genres_sort(void)
+{
+    int n = g_genres_n;
+    if (n <= 1) {
+        return;
+    }
+    for (int i = 0; i < n; i++) g_genre_order[i] = (uint16_t)i;
+    merge_sort_idx(g_genre_order, n, g_sort_tmp, genre_cmp_idx);
+
+    /* inv[old] = new: both the remap the song fields need and the SCATTER
+     * permutation the in-place apply below follows — the sort hands back a
+     * gather order, exactly as in the album sort above. g_sort_tmp is free
+     * again now the sort is done, and the apply consumes it. */
+    uint16_t *inv = g_sort_tmp;
+    for (int k = 0; k < n; k++) inv[g_genre_order[k]] = (uint16_t)k;
+    for (int i = 0; i < g_songs_n; i++) {
+        int g = g_songs[i].genre;
+        if (g >= 0 && g < n) g_songs[i].genre = (int16_t)inv[g];
+    }
+    for (int i = 0; i < n; i++) {
+        while (inv[i] != (uint16_t)i) {
+            int j = inv[i];
+            for (int k = 0; k < LIB_GENRE_MAX; k++) {
+                char ck = g_genres[i][k];
+                g_genres[i][k] = g_genres[j][k];
+                g_genres[j][k] = ck;
+            }
+            uint16_t tk = inv[i];
+            inv[i] = inv[j];
+            inv[j] = tk;
+        }
+    }
+}
+
 /* Shared post-load: title-sort the index array + precompute per-genre counts. */
 static void library_finish(void)
 {
     for (int i = 0; i < g_songs_n; i++) g_song_sorted[i] = (uint16_t)i;
     merge_sort_idx(g_song_sorted, g_songs_n, g_sort_tmp, song_title_cmp_idx);
+    /* Before the counts: the sort renumbers the genres the counts are indexed
+     * by, so counting first would mean permuting g_genre_count[] as well. */
+    genres_sort();
     for (int i = 0; i < g_genres_n; i++) g_genre_count[i] = 0;
     for (int i = 0; i < g_songs_n; i++) {
         int g = g_songs[i].genre;
@@ -2663,6 +2736,19 @@ static void library_finish(void)
                 lib_album_t t = g_albums[i];
                 g_albums[i] = g_albums[j];
                 g_albums[j] = t;
+                /* The KEY travels with its album. It did not, and nothing
+                 * noticed because after this loop g_album_key[] was never read
+                 * again — it existed only to make the comparator cheap. The
+                 * A-Z locator reads it (the album initial is the initial of
+                 * the album title, and re-splitting the folder name per row
+                 * under a spinning wheel is exactly the string scan this array
+                 * was introduced to stop), so a stale key is now a wrong
+                 * letter on the plate rather than a dead array. */
+                for (int k = 0; k <= NAME_MAX; k++) {
+                    char ck = g_album_key[i][k];
+                    g_album_key[i][k] = g_album_key[j][k];
+                    g_album_key[j][k] = ck;
+                }
                 uint16_t tk = g_sort_tmp[i];
                 g_sort_tmp[i] = g_sort_tmp[j];
                 g_sort_tmp[j] = tk;
@@ -3103,6 +3189,11 @@ static int                g_playlists_err;      /* FAT32_* when the list could
                                                  * not be read (not "none")    */
 static int                g_playlists_truncated;
 static int                g_pl_sel, g_pl_accum; /* Playlists list             */
+/* Whether the Playlists folder has been read since boot. Search wants playlist
+ * NAMES without making the user visit the list first, and the disk is
+ * read-only while the firmware runs, so one read a session is exact — the
+ * alternative is spinning a parked drive on every Search entry. */
+static int                g_playlists_scanned;
 
 static playlist_track_t   g_pl_tracks[PLAYLIST_TRACKS_MAX];
 static int16_t            g_pl_song[PLAYLIST_TRACKS_MAX]; /* g_songs index, -1 */
@@ -3137,6 +3228,11 @@ static void playlists_load(fat32_t *fs)
                           PLAYLIST_MAX, &dir, &g_playlists_truncated);
     g_playlists_err = (n < 0) ? n : 0;
     g_playlists_n   = (n < 0) ? 0 : n;
+    /* Only a read that WORKED counts as the session's one read. A transient
+     * disk error would otherwise leave Search with no playlist hits until the
+     * next boot, while Music > Playlists — which re-reads on every entry —
+     * recovered on the next look. */
+    if (n >= 0) g_playlists_scanned = 1;
     if (g_pl_sel >= g_playlists_n) {
         g_pl_sel = 0;                     /* the row under the cursor is gone */
     }
@@ -3805,8 +3901,10 @@ static void nowplaying_render(const char *name, uint32_t elapsed_s,
  *
  * Both are the same widget over a small {label, active} item list. Inactive
  * items render greyed and SELECT does nothing (features not yet built). The
- * renderer reuses the list row geometry (LIST_Y0/ROW_H); neither menu exceeds
- * LIST_ROWS, so no scrolling window is needed.
+ * renderer reuses the list row geometry (LIST_Y0/ROW_H) and, since Search
+ * took Music past LIST_ROWS, the same scroll window and scrollbar every other
+ * list has. A menu that silently drops its ninth row is the worst way to find
+ * out it grew.
  * ------------------------------------------------------------------------- */
 typedef struct { const char *label; uint8_t active; } menu_item_t;
 
@@ -3827,7 +3925,7 @@ static int g_main_sel;
 /* Music sub-menu. ACTIVE: Playlists, Artists, Albums, Songs, Shuffle Songs,
  * Genres; Composers and Audiobooks are greyed (no backing implementation). */
 enum { MU_PLAYLISTS, MU_ARTISTS, MU_ALBUMS, MU_SONGS, MU_SHUFFLE, MU_GENRES,
-       MU_COMPOSERS, MU_AUDIOBOOKS, MU_COUNT };
+       MU_SEARCH, MU_COMPOSERS, MU_AUDIOBOOKS, MU_COUNT };
 static const menu_item_t g_music_menu[MU_COUNT] = {
     { "Playlists",     1 },
     { "Artists",       1 },
@@ -3835,6 +3933,7 @@ static const menu_item_t g_music_menu[MU_COUNT] = {
     { "Songs",         1 },
     { "Shuffle Songs", 1 },
     { "Genres",        1 },
+    { "Search",        1 },
     { "Composers",     0 },
     { "Audiobooks",    0 },
 };
@@ -3865,9 +3964,13 @@ static void menu_render_list(const char *title, const menu_item_t *items,
     console_clear(LINEN_SURFACE);
     status_strip_render();
     ui_header(title, "", back);
-    for (int i = 0; i < n && i < LIST_ROWS; i++) {
-        menu_row_draw(i, i);
+    int top = ui_scroll_window(sel, n, LIST_ROWS);
+    for (int r = 0; r < LIST_ROWS; r++) {
+        int idx = top + r;
+        if (idx >= n) break;
+        menu_row_draw(r, idx);
     }
+    ui_scrollbar(LIST_Y0, top, LIST_ROWS, n);
 }
 
 /* Visible main-menu row count: "Now Playing" (the last item) only appears while
@@ -3893,11 +3996,12 @@ static void music_menu_render(void)
  * Screen stack
  * ------------------------------------------------------------------------- */
 typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_SONGS, SCR_GENRES,
-               SCR_PLAYLISTS, SCR_PLAYLIST,
+               SCR_PLAYLISTS, SCR_PLAYLIST, SCR_SEARCH,
                SCR_BROWSER, SCR_NOWPLAYING, SCR_QUEUE, SCR_SETTINGS,
                SCR_BATTERY, SCR_CHARGING } screen_t;
 /* The deepest legal path is 8: MENU, MUSIC, ARTISTS, BROWSER, SONGS,
- * NOWPLAYING, QUEUE, plus ONE modal (scr_push_modal replaces a modal with a
+ * NOWPLAYING, QUEUE, plus ONE modal (Search is no deeper: it sits where
+ * ARTISTS does, and the BROWSER an album hit opens sits where BROWSER does) (scr_push_modal replaces a modal with a
  * modal, so BATTERY and CHARGING never stack). The headroom is deliberate:
  * this used to be exactly 8 without SONGS counted, and a DISKSAFE edge at
  * the bottom of that path retried the push every pass with dirty set — a
@@ -3909,10 +4013,18 @@ typedef enum { SCR_MENU, SCR_MUSIC, SCR_ARTISTS, SCR_SONGS, SCR_GENRES,
 static screen_t g_scr[SCR_STACK_MAX];
 static int      g_scr_n;
 
+/* Both ends of the stack forget the wheel gesture, which is what ui/wheel.h
+ * has always said a screen change does. It matters more now than it read:
+ * letter mode survives a pause shorter than the plate's hold (1.2 s), so
+ * without this a fast spin that ended in a SELECT would carry letter mode —
+ * and the plate — onto the screen that SELECT opened, where one detent would
+ * jump a letter on a list the user had not even seen yet. */
 static void      scr_push(screen_t s) { g_list_epoch++;
+                                        wheel_accel_reset();
                                         if (g_scr_n < SCR_STACK_MAX) g_scr[g_scr_n++] = s;
                                         else uart_puts("core: scr_push overflow, dropped\n"); }
 static void      scr_pop(void)        { g_list_epoch++;
+                                        wheel_accel_reset();
                                         if (g_scr_n > 1) g_scr_n--; }
 static screen_t  scr_cur(void)        { return g_scr[g_scr_n - 1]; }
 static int       scr_is_modal(screen_t s) { return s == SCR_BATTERY || s == SCR_CHARGING; }
@@ -3959,9 +4071,11 @@ static void settings_leave(void)
  * Returns 1 if anything moved: at the root this is a true no-op, not even a
  * repaint. Everything dropped here is state that belongs to a screen the
  * stack no longer holds — the browser's depth, the root list's wheel
- * remainder, a SELECT press still being timed on Now Playing and the wheel
- * scrubber. The seek holds need nothing: `allowed` goes with the screen and
- * they cancel themselves on the next feed.
+ * remainder, a SELECT press still being timed on Now Playing, the wheel
+ * scrubber, and the wheel gesture itself (letter mode outlives a pause now,
+ * so a spin that ended in this hold would otherwise arrive at the main menu
+ * still stepping letters). The seek holds need nothing: `allowed` goes with
+ * the screen and they cancel themselves on the next feed.
  */
 static int scr_pop_to_root(void)
 {
@@ -3971,6 +4085,7 @@ static int scr_pop_to_root(void)
     if (scr_cur() == SCR_SETTINGS) settings_leave();
     g_scr_n = 1;
     g_list_epoch++;
+    wheel_accel_reset();               /* a screen change, as scr_pop is */
     g_dir_depth   = 0;
     g_menu_accum  = 0;
     g_sel_pending = 0;
@@ -4181,6 +4296,10 @@ typedef enum {
     PLAY_TAP_CONSUMED,   /* acted on, started nothing: repaint, do not toggle */
 } play_tap_t;
 
+/* Defined with the rest of Music > Search, which needs the album and playlist
+ * loaders and so lands below this. */
+static play_tap_t search_play_hit(fat32_t *fs);
+
 static play_tap_t play_tap_start(fat32_t *fs)
 {
     gesture_ctx_t ctx;
@@ -4198,6 +4317,17 @@ static play_tap_t play_tap_start(fat32_t *fs)
     case SCR_GENRES:    ctx = GESTURE_CTX_LIST_TITLE; count = g_genres_n;    break;
     case SCR_PLAYLISTS: ctx = GESTURE_CTX_LIST_TITLE; count = g_playlists_n; break;
     case SCR_SONGS:     ctx = GESTURE_CTX_LIST_TRACK; count = g_songview_n;  break;
+    case SCR_SEARCH: {
+        /* The picker is a text field: nothing is highlighted, so PLAY stays
+         * the transport it is everywhere else — a count of 0 is exactly how
+         * gesture_play_tap is told that. In RESULTS every row names music,
+         * and which KIND it is decides the queue, as it does on the list the
+         * row came from. ui/search.c owns that judgement. */
+        int is_track = 0;
+        count = search_play_rows(&g_search, &is_track);
+        ctx   = is_track ? GESTURE_CTX_LIST_TRACK : GESTURE_CTX_LIST_TITLE;
+        break;
+    }
     case SCR_PLAYLIST:  ctx = GESTURE_CTX_LIST_TRACK; count = g_pl_tracks_n; break;
     case SCR_BROWSER:
         /* Depth 0 is the album list (rows that NAME a queue, plus the
@@ -4266,6 +4396,12 @@ static play_tap_t play_tap_start(fat32_t *fs)
          * queue down: playlist_play() refuses before player_queue_begin(). */
         if (playlist_play(g_plt_sel) < 0) return PLAY_TAP_PASS;
         break;
+
+    case SCR_SEARCH: {
+        play_tap_t r = search_play_hit(fs);
+        if (r != PLAY_TAP_STARTED) return r;
+        break;                         /* the shared tail pushes Now Playing */
+    }
 
     case SCR_BROWSER:
         if (g_dir_depth != 0) {                      /* a track in an album */
@@ -4660,34 +4796,117 @@ static int list_repaint_partial(void)
 #define CHIP_WHEEL_SETTLE_US   150000u
 #define CHIP_SPINUP_QUIET_US   500000u
 
-/* The selected row's initial on the alphabetised lists (songs / artists /
- * albums), read straight off the already-sorted arrays; 0 on screens where an
- * A-Z cue would mean nothing. */
-/*
- * The A-Z locator letter for a row, or 0 on screens that have no alphabetical
- * order to locate WITHIN.
+/* ---------------------------------------------------------------------------
+ * The A-Z locator: which letter a row is under, on whichever list is up
  *
- * SONGS ONLY, deliberately. Letter stepping is worth its cost on the one list
- * that is thousands of entries long and sorted by title; on a fixed six-row
- * menu it is meaningless, and on Artists/Albums the lists are short enough that
- * row acceleration already gets you there. Returning 0 here is also what stops
- * wheel_move() from trying to letter-step a list that cannot be letter-stepped
- * — see the guard there.
- */
-static char list_initial_at(int idx)
+ * This used to be SONGS ONLY, for one reason: the locator's only tool was a
+ * linear walk of the rows, which is affordable exactly once. ui/letterindex.c
+ * turns the per-row answer into a run index built once per list, so every
+ * long alphabetised list can have the plate and the letter stepping —
+ * Songs, a genre's songs, an artist's All Songs, Artists, Albums (all and one
+ * artist's), Playlists and Genres.
+ *
+ * What differs per screen is the KEY the list is sorted BY, and that is the
+ * only thing main.c has to answer: Artists sort past a leading "The " (so
+ * "The Kid LAROI" is under K), Albums by the album half of the folder name,
+ * Songs/Playlists/Genres by the name itself. Returning 0 for a row (or for a
+ * whole screen) is what keeps the queue, the tracklists, the menus and
+ * Settings out of it — and it is the same 0 wheel_move()'s guard reads to
+ * fall through to row scrolling.
+ * ------------------------------------------------------------------------- */
+
+/* The initial of the key row `row` is SORTED BY, or 0 for a row that is not
+ * part of the order (the album list's synthetic "All Songs" row) and for
+ * every screen that has no alphabetical order to locate within. */
+static char screen_initial_raw(int row)
 {
-    if (scr_cur() != SCR_SONGS) {
+    switch (scr_cur()) {
+    case SCR_SONGS:
+        if (row >= 0 && row < g_songview_n) {
+            return initial_of(g_songs[g_songview[row]].title);
+        }
+        return 0;
+    case SCR_ARTISTS:
+        if (row >= 0 && row < g_artists_n) {
+            return initial_of(artist_key(g_artists[row].name));
+        }
+        return 0;
+    case SCR_GENRES:
+        if (row >= 0 && row < g_genres_n) {
+            return initial_of(g_genres[row]);
+        }
+        return 0;
+    case SCR_PLAYLISTS:
+        if (row >= 0 && row < g_playlists_n) {
+            return initial_of(g_playlists[row].name);
+        }
+        return 0;
+    case SCR_BROWSER: {
+        /* Depth 0 is the album list; depth 1 is one album's tracklist, which
+         * is in track order and has no letters. albumlist_album_at answers -1
+         * for the "All Songs" row and for a row off the end. */
+        if (g_dir_depth != 0) return 0;
+        int a = albumlist_album_at(row);
+        return (a >= 0) ? initial_of(g_album_key[a]) : 0;
+    }
+    default:
         return 0;
     }
-    if (idx >= 0 && idx < g_songview_n) {
-        return initial_of(g_songs[g_songview[idx]].title);
-    }
-    return 0;
 }
 
+/* The index, and the list it was built for. g_list_epoch already bumps on
+ * every content rebuild and every push/pop, so this is one compare per call
+ * in the common case and a single walk when the list underneath changes. */
+static letteridx_t g_letters;
+static struct { int scr, depth, count; uint32_t epoch; } g_letters_for = {
+    -1, -1, -1, 0
+};
+
+/* Bring the index up to date with whatever list is on screen, and hand back
+ * that list's view (count 0 on a screen that is not a list). */
+static void letters_ensure(list_view_t *v)
+{
+    v->count = 0;
+    v->sel   = 0;
+    (void)list_view_current(v);
+    int scr = (int)scr_cur();
+    if (g_letters_for.scr   == scr        && g_letters_for.depth == g_dir_depth &&
+        g_letters_for.count == v->count   && g_letters_for.epoch == g_list_epoch) {
+        return;
+    }
+    g_letters_for.scr   = scr;
+    g_letters_for.depth = g_dir_depth;
+    g_letters_for.count = v->count;
+    g_letters_for.epoch = g_list_epoch;
+    (void)letteridx_build(&g_letters, v->count, screen_initial_raw);
+}
+
+/* The ui/wheel.h seam: the locator letter for row `idx`, 0 where there is
+ * none. Also the guard that decides whether this screen letter-steps at all. */
+static char list_initial_at(int idx)
+{
+    list_view_t v;
+    letters_ensure(&v);
+    return letteridx_letter_at(&g_letters, idx);
+}
+
+/* The letter the plate shows: the selected row's. */
 static char list_sel_initial(void)
 {
-    return (scr_cur() == SCR_SONGS) ? list_initial_at(g_song_sel) : 0;
+    list_view_t v;
+    letters_ensure(&v);
+    return letteridx_letter_at(&g_letters, v.sel);
+}
+
+/* The ui/wheel.h letter-step seam: where one letter detent lands. `count` is
+ * the wheel's view of the list and the index's own is the same number (both
+ * come from list_view_current), so the index carries it. */
+static int list_letter_step_idx(int sel, int count, int dir)
+{
+    list_view_t v;
+    (void)count;
+    letters_ensure(&v);
+    return letteridx_step(&g_letters, sel, dir);
 }
 
 /* The wheel's clock (the ui/wheel.h seam): the free-running USEC_TIMER. */
@@ -5187,6 +5406,317 @@ static void resume_restore(fat32_t *fs)
     g_main_sel = MM_NOWPLAYING;
 }
 
+/* ---------------------------------------------------------------------------
+ * Music > Search (ui/search.c)
+ *
+ * The module owns the query, the ring, the match and the screen; main.c owns
+ * the two things only it knows — WHAT to scan and how a hit reads as a row —
+ * and what a chosen hit does, which is always "the thing the ordinary list
+ * would have done", so a search result is never a second-class way in.
+ * ------------------------------------------------------------------------- */
+/* The name each source list is ORDERED by, which is also what its row shows.
+ * Songs are addressed by SORTED position, so song hits arrive in title order
+ * and the row lookup is one array step. */
+static const char *search_name_of(int type, int i)
+{
+    switch (type) {
+    case SEARCH_T_ARTIST:
+        return (i >= 0 && i < g_artists_n)   ? g_artists[i].name   : 0;
+    case SEARCH_T_ALBUM:
+        return (i >= 0 && i < g_albums_n)    ? g_album_key[i]      : 0;
+    case SEARCH_T_PLAYLIST:
+        return (i >= 0 && i < g_playlists_n) ? g_playlists[i].name : 0;
+    case SEARCH_T_SONG:
+        return (i >= 0 && i < g_songs_n) ? g_songs[g_song_sorted[i]].title : 0;
+    default:
+        return 0;
+    }
+}
+
+/* The key that list is SORTED by: for artists, past a leading "The ", so
+ * typing "laroi" ranks The Kid LAROI as a prefix hit rather than burying it
+ * under every title with the word in the middle. A pointer INTO the name, as
+ * ui/search.h requires. */
+static const char *search_artist_key_of(int type, int i)
+{
+    const char *n = search_name_of(type, i);
+    if (!n) return 0;
+    return (type == SEARCH_T_ARTIST) ? artist_key(n) : n;
+}
+
+static search_source_t g_search_src = {
+    { 0, 0, 0, 0 }, search_name_of, search_artist_key_of
+};
+
+/* A hit's index only means anything against the list the scan ran over. The
+ * library cannot change while the firmware runs, but the hits outlive the
+ * screen, so every use of one is bounds-checked rather than trusted. */
+static int search_hit_ok(const search_hit_t *h)
+{
+    int i = (int)h->idx;
+    switch (h->type) {
+    case SEARCH_T_ARTIST:   return i < g_artists_n;
+    case SEARCH_T_ALBUM:    return i < g_albums_n;
+    case SEARCH_T_PLAYLIST: return i < g_playlists_n;
+    case SEARCH_T_SONG:     return i < g_songs_n;
+    default:                return 0;
+    }
+}
+
+static void sr_copy(char *dst, int cap, const char *src)
+{
+    int n = 0;
+    while (src && src[n] && n < cap - 1) { dst[n] = src[n]; n++; }
+    dst[n] = '\0';
+}
+
+static int sr_cat(char *dst, int n, int cap, const char *src)
+{
+    while (src && *src && n < cap - 1) dst[n++] = *src++;
+    dst[n] = '\0';
+    return n;
+}
+
+/* Title, eyebrow and right-hand value for one hit. The eyebrow is the Now
+ * Playing "TRACK n OF m" style — FONT_SMALL, muted — because the row has to
+ * say WHAT it is before it says which: four kinds share one list here. */
+static void search_row_fill(const search_hit_t *h, char *title, char *sub,
+                            char *right, int *greyed)
+{
+    if (!search_hit_ok(h)) {
+        return;                        /* left empty; the caller pre-cleared */
+    }
+    switch (h->type) {
+    case SEARCH_T_ARTIST:
+        sr_copy(title, SEARCH_ROW_MAX, g_artists[h->idx].name);
+        sr_copy(sub,   SEARCH_ROW_MAX, "ARTIST");
+        break;
+    case SEARCH_T_ALBUM: {
+        char artist[NAME_MAX + 1], album[NAME_MAX + 1];
+        split_artist_album(g_albums[h->idx].folder, artist, album);
+        sr_copy(title, SEARCH_ROW_MAX, g_album_key[h->idx]);
+        int n = sr_cat(sub, 0, SEARCH_ROW_MAX, "ALBUM");
+        if (artist[0]) {
+            n = sr_cat(sub, n, SEARCH_ROW_MAX, " " UI_GLYPH_MIDDOT " ");
+            (void)sr_cat(sub, n, SEARCH_ROW_MAX, artist);
+        }
+        break;
+    }
+    case SEARCH_T_PLAYLIST:
+        sr_copy(title, SEARCH_ROW_MAX, g_playlists[h->idx].name);
+        sr_copy(sub,   SEARCH_ROW_MAX, "PLAYLIST");
+        break;
+    default: {                                         /* SEARCH_T_SONG */
+        const lib_song_t *sg = &g_songs[g_song_sorted[h->idx]];
+        sr_copy(title, SEARCH_ROW_MAX, sg->title[0] ? sg->title : sg->file);
+        int n = sr_cat(sub, 0, SEARCH_ROW_MAX, "SONG");
+        if (sg->artist[0]) {
+            n = sr_cat(sub, n, SEARCH_ROW_MAX, " " UI_GLYPH_MIDDOT " ");
+            (void)sr_cat(sub, n, SEARCH_ROW_MAX, sg->artist);
+        }
+        if (sg->duration_s) fmt_time(right, sg->duration_s);
+        /* A record the disk no longer backs cannot be played. Greyed, and
+         * SELECT clicks without acting — the row is still evidence the song
+         * was there, which is worth more than hiding it. */
+        *greyed = (sg->file_clus == 0);
+        break;
+    }
+    }
+}
+
+/*
+ * Rerun the match, and say what it cost. The estimate in ui/search.h is
+ * 25-55 ms per keystroke on this CPU and nothing has measured it on the
+ * device; the UART line is what turns that into a number the bench can read,
+ * and it costs one timer read either side of the scan.
+ */
+static void search_rescan(void)
+{
+    g_search_src.count[SEARCH_T_ARTIST]   = g_artists_n;
+    g_search_src.count[SEARCH_T_ALBUM]    = g_albums_n;
+    g_search_src.count[SEARCH_T_PLAYLIST] = g_playlists_n;
+    g_search_src.count[SEARCH_T_SONG]     = g_songs_n;
+    uint32_t t0 = mmio_read32(USEC_TIMER_ADDR);
+    search_scan(&g_search, &g_search_src);
+    uint32_t us = mmio_read32(USEC_TIMER_ADDR) - t0;
+    uart_puts("core: search ");  uart_dec(g_search.qlen);
+    uart_puts(" chars ");        uart_dec(g_search.total);
+    uart_puts(" hits ");         uart_dec((int)(us / 1000u));
+    uart_puts(" ms\n");
+}
+
+static void search_render_cur(void)
+{
+    console_clear(LINEN_SURFACE);
+    status_strip_render();
+    search_render(&g_search, search_row_fill);
+}
+
+/*
+ * Load album `ai`'s tracklist into g_browse, its metadata and its art, and
+ * point the album list at it. Unfiltered, so there is no synthetic All Songs
+ * row and the list row for album `ai` IS `ai` — the album the user picked is
+ * the one the list would land on if they ever backed out to it. The depth is
+ * borrowed for the read the way resume_open_album does it: browse_collect
+ * only lists files at depth 1.
+ */
+static void search_load_album(fat32_t *fs, int ai)
+{
+    g_artist_filter[0] = '\0';
+    albumview_build(0);
+    g_br_sel    = ai;
+    g_br_accum  = 0;
+    g_dir_depth = 1;
+    split_artist_album(g_albums[ai].folder, g_album_artist, g_album_title);
+    browse_load(fs, g_albums[ai].clus);
+    detail_load_meta(fs);
+    g_det_sel = g_det_accum = 0;
+}
+
+/*
+ * Start a song hit in its ALBUM, at that song. 1 when the queue is running.
+ *
+ * The album and not the six-thousand-row Songs view: "play this one" means
+ * this one in its record, it resumes through the existing RESUME_KIND_ALBUM
+ * path, and it skips the LOADING SONGS bar. That reuses g_browse, which is
+ * only safe while no tracklist is on the stack underneath — Search is
+ * reachable from Music alone, so it is; the UART line is what will say so if
+ * that ever stops being true.
+ */
+static int search_play_song(fat32_t *fs, const search_hit_t *h)
+{
+    const lib_song_t *sg = &g_songs[g_song_sorted[h->idx]];
+    if (!sg->file_clus) {
+        return 0;                       /* greyed: nothing on the disk to play */
+    }
+    for (int i = 0; i < g_scr_n; i++) {
+        if (g_scr[i] == SCR_BROWSER) {
+            uart_puts("core: search play under a browser, tracklist lost\n");
+            break;
+        }
+    }
+    int saved_depth = g_dir_depth;
+    g_dir_depth = 1;                /* browse_collect lists FILES at depth 1 */
+    browse_load(fs, sg->dir_clus);
+    g_dir_depth = saved_depth;
+    /* The row is the file the record bound to: same cluster, never the name
+     * (see resume_open_album, which binds the same way). */
+    int row = -1;
+    for (int i = 0; i < g_browse_n; i++) {
+        if (!g_browse[i].is_dir && g_browse[i].clus == sg->file_clus) {
+            row = i;
+            break;
+        }
+    }
+    if (row < 0) {
+        return 0;                   /* the folder no longer holds the file */
+    }
+    g_queue_kind = RESUME_KIND_ALBUM;
+    g_queue_seed = 0;
+    player_play_queue(g_browse, g_browse_n, row, g_art_clus, g_art_size);
+    return 1;
+}
+
+/*
+ * Act on the selected hit. Every case is the block the ordinary list runs, so
+ * a result behaves exactly like the row it stands for. Returns 1 when Now
+ * Playing was pushed (the caller arms its first-paint flag).
+ */
+static int search_open_hit(fat32_t *fs)
+{
+    if (g_search.sel < 0 || g_search.sel >= g_search.nhit) return 0;
+    const search_hit_t *h = &g_search.hit[g_search.sel];
+    if (!search_hit_ok(h)) return 0;
+
+    switch (h->type) {
+    case SEARCH_T_ARTIST: {
+        int k = 0;
+        for (; g_artists[h->idx].name[k] && k < NAME_MAX; k++) {
+            g_artist_filter[k] = g_artists[h->idx].name[k];
+        }
+        g_artist_filter[k] = '\0';
+        g_dir_depth = 0;
+        albumview_build(g_artist_filter);
+        albumlist_queue_chips();
+        g_br_sel = g_br_accum = 0;
+        g_br_from_search = 0;           /* the album list IS the screen here */
+        scr_push(SCR_BROWSER);
+        return 0;
+    }
+    case SEARCH_T_ALBUM:
+        search_load_album(fs, h->idx);
+        g_br_from_search = 1;
+        scr_push(SCR_BROWSER);
+        return 0;
+    case SEARCH_T_PLAYLIST:
+        playlist_open(fs, h->idx);
+        scr_push(SCR_PLAYLIST);
+        return 0;
+    default:                                           /* SEARCH_T_SONG */
+        if (!search_play_song(fs, h)) {
+            return 0;
+        }
+        hal_volume_set(g_volume);   /* re-apply over the codec re-init */
+        scr_push(SCR_NOWPLAYING);
+        return 1;
+    }
+}
+
+/*
+ * PLAY on a result row — the gesture, not the button. Every case is what PLAY
+ * does on the list that row came from: an artist plays their whole
+ * discography, an album plays from its first track, a playlist from its
+ * first, a song plays in its album. Returns PLAY_TAP_STARTED with the queue
+ * running and the push left to play_tap_start's shared tail.
+ */
+static play_tap_t search_play_hit(fat32_t *fs)
+{
+    if (g_search.sel < 0 || g_search.sel >= g_search.nhit) return PLAY_TAP_PASS;
+    const search_hit_t *h = &g_search.hit[g_search.sel];
+    if (!search_hit_ok(h)) return PLAY_TAP_PASS;
+
+    switch (h->type) {
+    case SEARCH_T_ARTIST: {
+        int k = 0;
+        for (; g_artists[h->idx].name[k] && k < NAME_MAX; k++) {
+            g_artist_filter[k] = g_artists[h->idx].name[k];
+        }
+        g_artist_filter[k] = '\0';
+        songview_build(-1, g_artist_filter);
+        if (library_play_song(fs, 0) < 0) return PLAY_TAP_CONSUMED;
+        break;
+    }
+    case SEARCH_T_ALBUM:
+        search_load_album(fs, h->idx);
+        if (g_browse_err != 0 || g_browse_n == 0) {
+            /* Unreadable or empty: put the tracklist screen up with the reason,
+             * exactly as SELECT would, and do not ALSO toggle a transport that
+             * never started. */
+            g_br_from_search = 1;
+            scr_push(SCR_BROWSER);
+            return PLAY_TAP_CONSUMED;
+        }
+        g_queue_kind = RESUME_KIND_ALBUM;
+        g_queue_seed = 0;
+        player_play_queue(g_browse, g_browse_n, 0, g_art_clus, g_art_size);
+        g_dir_depth = 0;            /* no BROWSER under this: Search is */
+        break;
+    case SEARCH_T_PLAYLIST:
+        playlist_open(fs, h->idx);
+        if (playlist_play(0) < 0) {
+            scr_push(SCR_PLAYLIST); /* the screen that says why, as SELECT */
+            return PLAY_TAP_CONSUMED;
+        }
+        break;
+    default:                                           /* SEARCH_T_SONG */
+        /* Greyed, or the folder no longer holds the file: the press was aimed
+         * at this row and declined, and the player was never touched. */
+        if (!search_play_song(fs, h)) return PLAY_TAP_CONSUMED;
+        break;
+    }
+    return PLAY_TAP_STARTED;
+}
+
 /* Render whatever screen is on top of the stack into the framebuffer (no
  * present) — used to paint context behind the Hold banner. */
 static void paint_current_screen(void)
@@ -5200,6 +5730,7 @@ static void paint_current_screen(void)
     case SCR_GENRES:  genres_render(g_genre_sel);   break;
     case SCR_PLAYLISTS: playlists_render(g_pl_sel); break;
     case SCR_PLAYLIST:  playlist_render(g_plt_sel); break;
+    case SCR_SEARCH:    search_render_cur(); break;
     case SCR_BROWSER: browse_render(g_dir_depth ? g_det_sel : g_br_sel); break;
     case SCR_QUEUE:   queue_render(g_queue_sel); break;
     case SCR_SETTINGS: settings_render_cur(); break;
@@ -6815,13 +7346,39 @@ _Noreturn static void run_ui(fat32_t *fs)
                     seekhold_missed_tap(&g_rw, (live & WHEEL_BTN_LEFT) != 0);
                 }
             } else if (ev.buttons & WHEEL_BTN_RIGHT) {
-                /* This press is the jump and nothing else. The seek machine
-                 * latches "not allowed" at its own down-edge, which covers the
-                 * pass ordering where it sampled the press first; this covers
-                 * the other one, where the drain got there first and the
-                 * sampler will only see the press once Now Playing is up. */
+                /*
+                 * Off the player screens this press is spent on whatever the
+                 * drain does with it and is never a transport, so the seek
+                 * machine is told so UNCONDITIONALLY, before anything else
+                 * decides what the press was for.
+                 *
+                 * It has to be unconditional because the two things that look
+                 * at this press run in a fixed order and can straddle it: the
+                 * machine is fed from the LIVE button state at the top of the
+                 * pass, and this drain reads the TICK-LATCHED event further
+                 * down. A press that begins between those two — any press
+                 * during a long pass, a cover read, a spin-up, a present —
+                 * was not down when the machine sampled, so it latched
+                 * nothing; the drain then pushes Now Playing, and the NEXT
+                 * pass shows the machine a fresh down-edge with `allowed`
+                 * now 1. Without the void it owns that press outright: a
+                 * release under GESTURE_SEEK_HOLD_US skips the track the user
+                 * was only trying to look at, and a hold seeks it. The void
+                 * is what makes the press dead for the rest of its life.
+                 *
+                 * It touches only the machine, never ev.buttons, so Search's
+                 * picker still gets its RIGHT below: the space bar is the one
+                 * place off the player screens where the press means something
+                 * to a screen, and a 39-cell ring has nowhere else to put one.
+                 * (In PICK the press is safe from the machine either way — it
+                 * began on a non-player screen, so the feed latches
+                 * allowed_at_down = 0 — but a hold that reaches Now Playing by
+                 * some other route must not wake up as a seek.) In RESULTS the
+                 * global rule below applies again.
+                 */
                 seekhold_void(&g_ff);
-                if (player_active()) {
+                if (player_active() &&
+                    !(scr_cur() == SCR_SEARCH && g_search.mode == SEARCH_PICK)) {
                     /* Now Playing is never beneath a list today (only MENU or a
                      * SELECT-hold leave it, and modals eat every press), so this
                      * is insurance against a future screen that could sit above
@@ -6887,6 +7444,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                         albumview_build(0);
                         albumlist_queue_chips();       /* start loading covers   */
                         g_br_sel = g_br_accum = 0;
+                        g_br_from_search = 0;
                         scr_push(SCR_BROWSER);
                     } else if (g_music_sel == MU_ARTISTS) {
                         library_ensure(fs);            /* index -> g_albums      */
@@ -6912,6 +7470,21 @@ _Noreturn static void run_ui(fat32_t *fs)
                     } else if (g_music_sel == MU_PLAYLISTS) {
                         playlists_load(fs);            /* Music/Playlists/NAME.m3u8 */
                         scr_push(SCR_PLAYLISTS);
+                    } else if (g_music_sel == MU_SEARCH) {
+                        library_ensure(fs);
+                        /* Artists are derived, not loaded: Search wants them
+                         * without making the user open the Artists list
+                         * first. Both this and the playlist folder read are
+                         * once a session — the disk cannot change under a
+                         * running firmware — so only the FIRST Search entry
+                         * can spin a parked drive. */
+                        if (g_artists_n == 0)     build_artists();
+                        if (!g_playlists_scanned) playlists_load(fs);
+                        /* The query survives leaving the screen, so re-scan
+                         * on the way back in: the hits then always name rows
+                         * of the lists as they are now. */
+                        if (g_search.qlen > 0) search_rescan();
+                        scr_push(SCR_SEARCH);
                     }
                     /* other items are greyed: SELECT does nothing yet */
                     dirty = 1;
@@ -6940,6 +7513,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                     albumview_build(g_artist_filter);
                     albumlist_queue_chips();
                     g_br_sel = g_br_accum = 0;
+                    g_br_from_search = 0;
                     scr_push(SCR_BROWSER);
                     dirty = 1;
                 }
@@ -7021,6 +7595,54 @@ _Noreturn static void run_ui(fat32_t *fs)
                 }
                 break;
 
+            case SCR_SEARCH: {
+                if (ev.wheel_delta) {
+                    if (g_search.mode == SEARCH_PICK) {
+                        /* One cell a detent, wrapping; the click is ours
+                         * because the ring is not a list and does not go
+                         * through wheel_move. */
+                        if (search_ring_move(&g_search, ev.wheel_delta)) {
+                            dirty = 1;
+                        }
+                    } else if (g_search.nhit > 0) {
+                        g_search.sel = wheel_move(g_search.sel, g_search.nhit,
+                                                  ev.wheel_delta, &g_search.accum);
+                        dirty = 1;
+                    }
+                }
+                int act = SEARCH_ACT_NONE;
+                if (ev.buttons & WHEEL_BTN_SELECT) {
+                    act = search_key(&g_search, SEARCH_KEY_SELECT);
+                } else if (ev.buttons & WHEEL_BTN_MENU) {
+                    act = search_key(&g_search, SEARCH_KEY_MENU);
+                } else if (ev.buttons & WHEEL_BTN_RIGHT) {
+                    act = search_key(&g_search, SEARCH_KEY_RIGHT);
+                } else if (ev.buttons & WHEEL_BTN_LEFT) {
+                    act = search_key(&g_search, SEARCH_KEY_LEFT);
+                }
+                switch (act) {
+                case SEARCH_ACT_RESCAN:
+                    search_rescan();
+                    dirty = 1;
+                    break;
+                case SEARCH_ACT_TO_RESULTS:
+                case SEARCH_ACT_TO_PICK:
+                    dirty = 1;
+                    break;
+                case SEARCH_ACT_POP:
+                    scr_pop();                          /* back to Music menu */
+                    dirty = 1;
+                    break;
+                case SEARCH_ACT_OPEN:
+                    if (search_open_hit(fs)) np_first = 1;
+                    dirty = 1;
+                    break;
+                default:
+                    break;
+                }
+                break;
+            }
+
             case SCR_BROWSER: {
                 /* Depth 0 scrolls the album list (g_br_sel); depth 1 the loaded
                  * tracklist (g_det_sel) — separate so backing out restores the
@@ -7061,7 +7683,16 @@ _Noreturn static void run_ui(fat32_t *fs)
                     dirty = 1;
                 }
                 if (ev.buttons & WHEEL_BTN_MENU) {
-                    if (g_dir_depth > 0) {              /* tracklist -> album list */
+                    if (g_dir_depth > 0 && g_br_from_search) {
+                        /* Opened straight from a Search hit: back is the
+                         * results, not an album list that was never shown.
+                         * The depth goes with the screen, as it does in
+                         * scr_pop_to_root — this is the one exit from depth 1
+                         * that leaves no BROWSER on the stack to own it. */
+                        g_br_from_search = 0;
+                        g_dir_depth      = 0;
+                        scr_pop();
+                    } else if (g_dir_depth > 0) {       /* tracklist -> album list */
                         g_dir_depth = 0;
                         albumlist_queue_chips();        /* g_br_sel kept (the album) */
                     } else {                            /* album list -> Music menu */
@@ -7684,6 +8315,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                     case SCR_GENRES:  genres_render(g_genre_sel);    break;
                     case SCR_PLAYLISTS: playlists_render(g_pl_sel);  break;
                     case SCR_PLAYLIST:  playlist_render(g_plt_sel);  break;
+                    case SCR_SEARCH:    search_render_cur();         break;
                     case SCR_BROWSER: browse_render(g_dir_depth ? g_det_sel : g_br_sel);   break;
                     case SCR_QUEUE:   queue_render(g_queue_sel);     break;
                     case SCR_SETTINGS: settings_render_cur();        break;
@@ -7978,6 +8610,11 @@ _Noreturn void kernel_main(void) {
      */
     wheel_set_clock(wheel_clock);
     wheel_set_initial_at(list_initial_at);
+    wheel_set_letter_step(list_letter_step_idx);
+    /* .bss zeros happen to be Search's start state (PICK, the cursor on 'A',
+     * an empty query); saying so means a field added to search_t later cannot
+     * quietly start as something else. */
+    search_reset(&g_search);
     wheel_set_click(ui_click);
 
     /* Hex-path self-test: if this doesn't read 1234ABCD on the terminal,

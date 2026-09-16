@@ -28,7 +28,10 @@
  *
  * Unset is always safe: no clock reads as 0, no initial-letter source means
  * no screen has letters (so nothing ever letter-steps), no click is silent.
- * kernel_main registers all three before the UI loop runs.
+ * kernel_main registers all three before the UI loop runs. A fourth seam is
+ * an optimisation rather than a capability: wheel_set_letter_step hands the
+ * letter detent to ui/letterindex.c's run index, and unset simply leaves the
+ * row-by-row walk below in charge — slower, never different.
  *
  * DEPENDENCIES: pp5022.h for CW_WHEEL_SENSITIVITY only (a constants header;
  * no MMIO). No hw/ access, no globals from main.c.
@@ -56,12 +59,17 @@
  * events measures the main loop's period, not the wheel. See wheel_accel_step.) */
 #define WHEEL_IDLE_US   200000u            /* > this gap => new gesture, reset  */
 #define WHEEL_AZ_VEL    3                  /* velocity at which the letter shows */
-/* How long the plate stays up after the last detent. The plate shows only in
- * letter mode (wheel_accel_step latches letter mode at WHEEL_AZ_VEL, the same
- * speed the plate appears at, so there is no "fast but not letters" state and
- * no shorter hold for one). In letter mode the plate is the control surface,
- * not a hint, so it lingers well past the last detent — it must not blink out
- * while you are still deciding which letter to stop on. */
+/* How long the plate stays up after the last detent, AND how long the letter
+ * latch outlives a pause. The plate shows only in letter mode (wheel_accel_step
+ * latches letter mode at WHEEL_AZ_VEL, the same speed the plate appears at, so
+ * there is no "fast but not letters" state and no shorter hold for one). In
+ * letter mode the plate is the control surface, not a hint, so it lingers well
+ * past the last detent — it must not blink out while you are still deciding
+ * which letter to stop on, and for the same reason the wheel must still be
+ * stepping letters when you make up your mind. One window, both facts: while
+ * the letter is on screen a detent moves a letter; once it is gone a detent is
+ * one row again (WHEEL_IDLE_US still resets the SPEED at a fifth of a second,
+ * so a pause never leaves eight rows per detent armed). */
 #define WHEEL_AZ_HOLD_LETTER 1200000u
 
 /* Print the measured wheel speed (ticks/s) under the letter — a tuning aid for
@@ -83,6 +91,13 @@ void wheel_set_initial_at(wheel_initial_fn fn);
 typedef void (*wheel_click_fn)(void);
 void wheel_set_click(wheel_click_fn fn);
 
+/* Where one letter detent from `sel` lands on the current screen's list, with
+ * the same contract as list_letter_step below (and `sel` back at either end).
+ * Registered by kernel_main over ui/letterindex.c's run index; unset leaves
+ * list_letter_step's walk in charge. */
+typedef int (*wheel_letter_step_fn)(int sel, int count, int dir);
+void wheel_set_letter_step(wheel_letter_step_fn fn);
+
 /* ---------- The state machine ------------------------------------------ */
 
 /* Called once per wheel event with that event's RAW tick delta; returns the
@@ -93,7 +108,9 @@ int wheel_accel_step(int delta);
 /* 1 while a detent should move a whole letter rather than a run of rows. */
 int wheel_letter_mode(void);
 
-/* Forget the gesture entirely (backlight off, panel wake, screen change). */
+/* Forget the gesture entirely (backlight off, panel wake, screen change —
+ * kernel/main.c's scr_push/scr_pop, which is the only way letter mode can be
+ * made to end early now that it outlives a pause). */
 void wheel_accel_reset(void);
 
 /* True while the list is flying past fast enough to want the letter cue. */

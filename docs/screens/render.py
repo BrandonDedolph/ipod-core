@@ -1229,21 +1229,28 @@ MAIN_MENU = [   # (label, active) — idle: "Now Playing" row is hidden
     ("Music", True), ("Playlists", True), ("Podcasts", False),
     ("Audiobooks", False), ("Settings", True),
 ]
+# Nine rows since Search landed, which is one more than the panel has room
+# for: main.c menu_render_list windows and scrollbars them like every other
+# list now.
 MUSIC_MENU = [
     ("Playlists", True), ("Artists", True), ("Albums", True), ("Songs", True),
-    ("Shuffle Songs", True), ("Genres", True), ("Composers", False),
-    ("Audiobooks", False),
+    ("Shuffle Songs", True), ("Genres", True), ("Search", True),
+    ("Composers", False), ("Audiobooks", False),
 ]
 
 def screen_menu(title, items, sel, back):
     sc = Screen()
     status_strip(sc)
     header(sc, title, back=back)
-    for i, (label, active) in enumerate(items):
-        if i >= LIST_ROWS:
+    top = scroll_window(sel, len(items), LIST_ROWS)
+    for r in range(LIST_ROWS):
+        i = top + r
+        if i >= len(items):
             break
-        list_row(sc, LIST_Y0, i, label, chevron=True, selected=(i == sel),
+        label, active = items[i]
+        list_row(sc, LIST_Y0, r, label, chevron=True, selected=(i == sel),
                  greyed=not active)
+    scrollbar(sc, LIST_Y0, top, LIST_ROWS, len(items))
     return sc.img
 
 
@@ -1601,6 +1608,191 @@ def screen_playlists(sel=PLAYLISTS_SEL):
             break
         list_row(sc, LIST_Y0, r, PLAYLISTS[r], chevron=True, selected=(r == sel))
     scrollbar(sc, LIST_Y0, 0, LIST_ROWS, len(PLAYLISTS))
+    return sc.img
+
+
+# ---------------------------------------------------------------------------
+# The A-Z locator plate (core/kernel/main.c az_overlay_render) over a long
+# list, and Music > Search (core/ui/search.c — the geometry constants below
+# are that file's, and its header says so).
+# ---------------------------------------------------------------------------
+def az_plate(sc, ch):
+    """The 66x66 rounded plate with the letter, centred — up while the wheel
+    is stepping letters (main.c az_overlay_render)."""
+    PW = PH = 66
+    px, py = (W - PW) // 2, (H - PH) // 2
+    sc.fill_round_rect_aa(px - 1, py - 1, PW + 2, PH + 2, 13, BORDER)
+    sc.fill_round_rect_aa(px, py, PW, PH, 12, PLATE)
+    w = text_width(ch, FONT_TITLE)
+    sc.text(px + (PW - w) // 2, py + PH // 2 + 8, ch, FONT_TITLE, INK)
+
+
+# The plate only appears on a list long enough that aiming beats scrolling
+# (core/ui/letterindex.h: LETTERIDX_MIN_ROWS rows, LETTERIDX_MIN_RUNS runs), so
+# this still needs a library-sized Artists list rather than the ten-row one
+# above. Sorted by the SORT KEY — past a leading "The " — which is why The Kid
+# LAROI sits under K and the plate over it reads K, not T.
+LETTER_ARTISTS = sorted([
+    "Alvvays", "Arctic Monkeys", "Beach House", "Big Thief", "blackbear",
+    "Bon Iver", "Boygenius", "Caroline Polachek", "Charli XCX", "Clairo",
+    "Daniel Caesar", "Doja Cat", "Faye Webster", "Fleet Foxes", "Fontaines D.C.",
+    "Frank Ocean", "Half Moon Run", "Hozier", "Japanese Breakfast",
+    "Juice WRLD", "Justin Bieber", "Khruangbin", "King Krule", "LANY",
+    "Lil Yachty", "Lorde", "Mac Miller", "Mitski", "Morgan Wallen",
+    "Nilüfer Yanya", "Olivia Rodrigo", "Parcels", "Phoebe Bridgers",
+    "Post Malone", "Rex Orange County", "Rosalía", "SZA", "Snail Mail",
+    "Soccer Mommy", "Steely Dan", "Sufjan Stevens", "Sunflower Bean",
+    "Tame Impala", "The 1975", "The Kid LAROI", "The Marías", "The National",
+    "The Strokes", "The Weeknd", "Tyler, the Creator", "Wet Leg",
+    "XXXTENTACION",
+], key=lambda a: (a[4:] if a[:4].lower() == "the " else a).lower())
+# Parked on the first artist under S, which is where a letter detent lands.
+LETTER_SEL = next(
+    i for i, a in enumerate(LETTER_ARTISTS)
+    if (a[4:] if a[:4].lower() == "the " else a).upper().startswith("S"))
+
+
+def screen_letter():
+    """A fast spin on a long Artists list: the plate names the letter the
+    selection bar is sitting on, and a detent moves a whole letter."""
+    sc = Screen()
+    status_strip(sc)
+    n = len(LETTER_ARTISTS)
+    header(sc, "Artists", "%d / %d" % (LETTER_SEL + 1, n), back=True)
+    top = scroll_window(LETTER_SEL, n, LIST_ROWS)
+    for r in range(LIST_ROWS):
+        i = top + r
+        if i >= n:
+            break
+        list_row(sc, LIST_Y0, r, LETTER_ARTISTS[i], chevron=True,
+                 selected=(i == LETTER_SEL))
+    scrollbar(sc, LIST_Y0, top, LIST_ROWS, n)
+    az_plate(sc, "S")
+    return sc.img
+
+
+# core/ui/search.h geometry, verbatim.
+SEARCH_PLATE_X, SEARCH_PLATE_Y = 12, 44
+SEARCH_PLATE_W, SEARCH_PLATE_H = 296, 26
+SEARCH_QUERY_X, SEARCH_QUERY_BASE = 20, 62
+SEARCH_RING_Y, SEARCH_RING_H = 76, 22
+SEARCH_RING_CELL_W, SEARCH_RING_WORD_W = 20, 40
+SEARCH_RING_WINDOW = 15
+SEARCH_RULE_Y = 102
+SEARCH_PICK_Y0, SEARCH_PICK_ROWS = 104, 4
+SEARCH_RESULTS_Y0, SEARCH_RESULTS_ROWS = 76, 5
+SEARCH_FOOTER_BASE = 238
+SEARCH_RING_N = 39
+SEARCH_CELL_SPACE, SEARCH_CELL_DEL, SEARCH_CELL_DONE = 36, 37, 38
+
+# What "SUN" finds, in the order ui/search.c ranks it: prefix hits first,
+# few-to-many by type (artist, album, playlist, song), then substring hits.
+SEARCH_QUERY = "sun"
+SEARCH_HITS = [
+    ("Sunflower Bean", "ARTIST", ""),
+    ("Sun Leads Me On", "ALBUM " + MIDDOT + " Half Moon Run", ""),
+    ("Sunday Morning", "PLAYLIST", ""),
+    ("Sunflower", "SONG " + MIDDOT + " Post Malone", "2:38"),
+    ("Sunflower (Spider-Man: Into the Spider-Verse)",
+     "SONG " + MIDDOT + " Post Malone, Swae Lee", "2:41"),
+    ("Sunny Afternoon", "SONG " + MIDDOT + " The Kinks", "3:35"),
+    ("The Sun", "SONG " + MIDDOT + " Parcels", "4:12"),
+]
+
+
+def _search_ring_cell_w(cell):
+    return SEARCH_RING_WORD_W if cell >= SEARCH_CELL_SPACE else SEARCH_RING_CELL_W
+
+
+def _search_ring_cell(sc, cell, x, cursor):
+    w = _search_ring_cell_w(cell)
+    if x < 0 or x + w > W - 4:          # UI_SB_X: whole cells only
+        return
+    ink = INK
+    if cursor:
+        sc.fill_round_rect(x + 1, SEARCH_RING_Y + 1, w - 2, SEARCH_RING_H - 2,
+                           4, INK)
+        ink = SURFACE
+    if cell >= SEARCH_CELL_SPACE:
+        word = ("SPACE", "DEL", "DONE")[cell - SEARCH_CELL_SPACE]
+        ww = text_width(word, FONT_SMALL)
+        sc.text(x + (w - ww) // 2, SEARCH_RING_Y + 15, word, FONT_SMALL,
+                ink if cursor else MUTED2)
+    else:
+        g = chr(ord("A") + cell) if cell < 26 else chr(ord("0") + cell - 26)
+        gw = text_width(g, FONT_HEADER)
+        sc.text(x + (w - gw) // 2, SEARCH_RING_Y + 16, g, FONT_HEADER, ink)
+
+
+def _search_ring(sc, cur):
+    half = SEARCH_RING_WINDOW // 2
+    cx = W // 2 - _search_ring_cell_w(cur) // 2
+    x = cx
+    for k in range(1, half + 1):
+        cell = (cur - k + SEARCH_RING_N) % SEARCH_RING_N
+        x -= _search_ring_cell_w(cell)
+        _search_ring_cell(sc, cell, x, False)
+    _search_ring_cell(sc, cur, cx, True)
+    x = cx + _search_ring_cell_w(cur)
+    for k in range(1, half + 1):
+        cell = (cur + k) % SEARCH_RING_N
+        _search_ring_cell(sc, cell, x, False)
+        x += _search_ring_cell_w(cell)
+
+
+def _search_plate(sc, query, results):
+    sc.fill_round_rect(SEARCH_PLATE_X, SEARCH_PLATE_Y, SEARCH_PLATE_W,
+                       SEARCH_PLATE_H, 4, PLATE)
+    if not query:
+        sc.text(SEARCH_QUERY_X, SEARCH_QUERY_BASE, "Type with the wheel",
+                FONT_SMALL, MUTED2)
+        return 0
+    pen = sc.text(SEARCH_QUERY_X, SEARCH_QUERY_BASE, query.upper(),
+                  FONT_HEADER, MUTED if results else INK)
+    if not results:
+        sc.fill_rect(pen + 2, SEARCH_QUERY_BASE - 12, 1, 15, INK)
+        return pen + 3
+    return pen
+
+
+def _search_rows(sc, y0, rows, hits, sel):
+    top = scroll_window(sel, len(hits), rows) if sel is not None else 0
+    for r in range(rows):
+        i = top + r
+        if i >= len(hits):
+            break
+        title, sub, right = hits[i]
+        list_row(sc, y0, r, title, sub=sub, right=(right or None),
+                 selected=(sel is not None and i == sel), rh=ROW_H2,
+                 title_priority=True)
+    return top
+
+
+def screen_search(cur=18, query=SEARCH_QUERY):
+    """PICK: the query plate with its caret, the character ring centred on the
+    cursor, and a live preview of the first four hits under a hairline."""
+    sc = Screen()
+    status_strip(sc)
+    n = len(SEARCH_HITS) if query else 0
+    header(sc, "Search", ("%d hits" % n) if n else None, back=True)
+    _search_plate(sc, query, False)
+    _search_ring(sc, cur)
+    sc.fill_rect(SEARCH_PLATE_X, SEARCH_RULE_Y, W - 2 * SEARCH_PLATE_X, 1, BORDER)
+    _search_rows(sc, SEARCH_PICK_Y0, SEARCH_PICK_ROWS, SEARCH_HITS, None)
+    return sc.img
+
+
+def screen_search_results(sel=0):
+    """RESULTS: the ring is gone, the plate is the record of what was searched,
+    and the wheel drives the hits."""
+    sc = Screen()
+    status_strip(sc)
+    n = len(SEARCH_HITS)
+    header(sc, "Search", "%d / %d" % (sel + 1, n), back=True)
+    _search_plate(sc, SEARCH_QUERY, True)
+    top = _search_rows(sc, SEARCH_RESULTS_Y0, SEARCH_RESULTS_ROWS,
+                       SEARCH_HITS, sel)
+    scrollbar(sc, SEARCH_RESULTS_Y0, top, SEARCH_RESULTS_ROWS, n)
     return sc.img
 
 
@@ -2102,6 +2294,9 @@ def main():
     outputs.append(save_png(screen_songs(), "songs.png"))
     outputs.append(save_png(screen_allsongs(), "allsongs.png"))
     outputs.append(save_png(screen_playlists(), "playlists.png"))
+    outputs.append(save_png(screen_letter(), "letter.png"))
+    outputs.append(save_png(screen_search(), "search.png"))
+    outputs.append(save_png(screen_search_results(), "search_results.png"))
     # --- new: settings ---
     outputs.append(save_png(screen_settings(), "settings.png"))
     outputs.append(save_png(screen_diag(), "bootdetails.png"))
