@@ -225,7 +225,7 @@ static const char *const CLICK_L[8] = {
 
 void settings_defaults(settings_t *s)
 {
-    s->shuffle           = 0;
+    s->shuffle           = SHUFFLE_OFF;
     s->repeat            = REPEAT_OFF;
     s->resume_on_startup = 1;
     s->crossfade         = 0;
@@ -358,7 +358,9 @@ void settings_value(int screen, const settings_t *s, int idx,
 
     case SETTINGS_PLAYBACK:
         switch (idx) {
-        case 0: scopy(buf, s->shuffle ? "On" : "Off"); break;
+        case 0: scopy(buf, s->shuffle == SHUFFLE_SONGS  ? "Songs"
+                         : s->shuffle == SHUFFLE_ALBUMS ? "Albums" : "Off");
+                break;
         case 1: scopy(buf, s->repeat == REPEAT_OFF ? "Off"
                          : s->repeat == REPEAT_ALL ? "All" : "One"); break;
         case 2: scopy(buf, s->resume_on_startup ? "On" : "Off"); break;
@@ -449,7 +451,11 @@ int settings_activate(int screen, settings_t *s, int idx)
 
     case SETTINGS_PLAYBACK:
         switch (idx) {
-        case 0: s->shuffle = !s->shuffle; return SETTINGS_ACTION_NONE;
+        /* Off -> Songs -> Albums -> Off. Three states rather than a toggle
+         * since Albums arrived, so — like Repeat below — every press is a
+         * change and there is no NOOP step to report. */
+        case 0: s->shuffle = (shuffle_mode_t)((s->shuffle + 1) % 3);
+                return SETTINGS_ACTION_NONE;
         case 1: s->repeat = (repeat_mode_t)((s->repeat + 1) % 3);
                 return SETTINGS_ACTION_NONE;
         /* Turning Resume OFF does not clear the stored locator here — this

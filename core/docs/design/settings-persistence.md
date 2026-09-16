@@ -152,7 +152,7 @@ As shipped (offsets are within the payload; see the `P_*` enum in `config.c`
 and `PAYLOAD_FIELDS` in `make_config.py`, which must stay in lockstep):
 
 ```
-0   shuffle            u8   (0/1)
+0   shuffle            u8   (0=off 1=songs 2=albums)
 1   repeat             u8   (0=off 1=all 2=one)
 2   resume_on_startup  u8   (0/1)
 3   crossfade          u8   (0/1)
@@ -165,6 +165,11 @@ and `PAYLOAD_FIELDS` in `make_config.py`, which must stay in lockstep):
 10  theme              u8   (0=Linen 1=Onyx …)
 11  clicker            u8   (0=Off …)
 ```
+
+Byte 0 widened from a 0/1 flag to the three-way shuffle mode **without a
+version bump**: a build that predates Shuffle Albums reads a 2 as "shuffle on"
+(Songs), and this one reads any value it does not know as Off. Nothing moved,
+nothing grew — the only kind of change an existing field is allowed to make.
 
 Everything after byte 11 was APPENDED under the same version 2, `length`
 growing each time (12 → 24 → 44 → 48) so that every record already written

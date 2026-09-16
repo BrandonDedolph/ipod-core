@@ -85,7 +85,7 @@ OFF_CRC = SLOT_BYTES - 4          # 1020; the CRC covers bytes [0, OFF_CRC)
 # Payload v1: one byte per field, in this order. Mirrors the P_* enum in
 # config.c — order and width are the on-disk contract.
 PAYLOAD_FIELDS = [
-    ("shuffle",           0),
+    ("shuffle",           0),     # 0=off 1=songs 2=albums
     ("repeat",            0),     # 0=off 1=all 2=one
     # MUST match settings_defaults() in core/ui/settings.c (which has this on).
     # These are not "the tool's defaults" — the record this writes is the one the
