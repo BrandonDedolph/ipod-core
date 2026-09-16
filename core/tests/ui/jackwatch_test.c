@@ -170,7 +170,8 @@ int main(void)
           jackwatch_feed(&j, 0, 1, now) == JACKWATCH_PAUSE);
     now += PASS_US;
     xpect(&c, "suspend: pulled and RE-INSERTED before the wake is only an IN "
-              "— the pull was already counted, so the wake still declines",
+              "— the PAUSE already dropped main.c's was_playing, so the wake "
+              "still declines",
           jackwatch_feed(&j, 1, 1, now) == JACKWATCH_IN && j.pauses == 1);
     feed_n(&j, 1, 1, &now, 10, JACKWATCH_NONE, &c,
            "suspend: and a seated plug stays silent afterwards");

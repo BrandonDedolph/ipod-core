@@ -23,13 +23,13 @@
  * WHAT IT DECIDES, AND WHAT IT REFUSES TO
  *
  *   pull while playing  -> PAUSE, once, on the edge.
- *   plug back in        -> NOTHING. The insertion switch closes before the
- *                          audio contacts seat, so resuming on that edge
- *                          would start playing into a half-made connection at
- *                          whatever the volume happened to be, while the user
- *                          still has hold of the plug. Every reference player
- *                          waits for Play.
- *   pull while paused   -> nothing to pause.
+ *   plug back in        -> IN, an observation only: nothing resumes. The
+ *                          insertion switch closes before the audio contacts
+ *                          seat, so resuming on that edge would start playing
+ *                          into a half-made connection at whatever the volume
+ *                          happened to be, while the user still has hold of
+ *                          the plug. Every reference player waits for Play.
+ *   pull while paused   -> OUT, an observation only: nothing to pause.
  *   level -1            -> no answer, not a level: never an edge, never a
  *                          prime. This is what makes the whole feature inert
  *                          while HEADPHONE_DETECT_TRUSTED is 0.

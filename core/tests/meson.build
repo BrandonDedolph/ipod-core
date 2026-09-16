@@ -202,7 +202,7 @@ if target == 'sim'
   # has ever had: -1 ("the detect line is not trusted on this device") is not
   # a level and can neither prime nor pause; a boot with an empty jack is a
   # prime, not a pull-out; a pull while playing is exactly one PAUSE; a pull
-  # while paused is silent; re-inserting NEVER resumes; the wake re-prime
+  # while paused is only an OUT; re-inserting is only an IN, NEVER a resume; the wake re-prime
   # moves the believed level with no action; raw-edge bookkeeping counts
   # transitions but not the first reading; and the module does no timing of
   # its own (a pull across the 32-bit clock wrap still pauses).
