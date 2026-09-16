@@ -433,10 +433,23 @@ if target == 'hw'
   # named and located exactly as browse rows are; the record binding stays
   # in main.c. Same playlist.c the host playlist test compiles against an
   # in-RAM volume.
+  #
+  # otg.c is the On-The-Go LIVE list: a fixed 512-entry array of
+  # (folder_hash, file_hash) locator pairs with a mutation counter, plus the
+  # CRC-32 both of the feature's on-disk formats checksum with. otg_slot.c is
+  # the saved half — the five Music/Playlists/On-The-Go N.m3u8 files: slot
+  # naming, the fixed-width #CORE-OTG header and trailer, the probe/verify
+  # that tells an empty slot from a used, damaged or foreign one, and the
+  # staged in-place M3U8 writer that names every row out of its own directory
+  # entry and writes its first stage LAST so a torn save is detectable. It is
+  # the FOURTH writer to the user's disk and the only one whose file is read
+  # back through fs/fat32.c's caches, which is why fat32_cache_drop() exists.
+  # Same two files the host otg and otg-slot tests compile.
   library_hw_lib = static_library(
     'core_library_hw',
     sources: ['library/names.c', 'library/idx.c', 'library/sort.c',
-              'library/playlist.c', 'library/fold.c'],
+              'library/playlist.c', 'library/fold.c',
+              'library/otg.c', 'library/otg_slot.c'],
     c_args: ['-DCORE_FREESTANDING'],
   )
 

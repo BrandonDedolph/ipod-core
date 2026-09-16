@@ -11,6 +11,7 @@
 
 #include "playlist.h"
 #include "names.h"
+#include "otg_slot.h"
 
 #include "../lib/mem.h"
 
@@ -97,7 +98,7 @@ static int collect_cb(void *ud, const fat32_dirent_t *e)
 
 int playlist_scan(fat32_t *fs, uint32_t lib_root_clus,
                   playlist_t *out, int max,
-                  uint32_t *dir_clus, int *truncated)
+                  uint32_t *dir_clus, int *truncated, int hide_empty_slots)
 {
     if (!fs || !dir_clus || !truncated || (max > 0 && !out)) {
         return FAT32_EINVAL;
@@ -140,6 +141,36 @@ int playlist_scan(fat32_t *fs, uint32_t lib_root_clus,
             j--;
         }
         memcpy(&out[j + 1], &v, sizeof v);
+    }
+
+    /*
+     * Drop the empty On-The-Go slots, after the sort so the surviving order
+     * is the same order the caller would have seen anyway.
+     *
+     * Only a name that IS a slot name is probed, so a library of 64 ordinary
+     * playlists costs nothing, and a probe reads one 512-byte head. A probe
+     * that fails to READ leaves the entry listed: a file we could not look
+     * inside is not a file we may hide.
+     */
+    if (hide_empty_slots) {
+        int keep = 0;
+        for (int i = 0; i < c.n; i++) {
+            int drop = 0;
+            if (otg_slot_index(out[i].name) > 0) {
+                otg_slot_info_t info;
+                if (otg_slot_probe(fs, out[i].clus, out[i].size, &info) == 0 &&
+                    info.present && info.count == 0) {
+                    drop = 1;
+                }
+            }
+            if (!drop) {
+                if (keep != i) {
+                    memcpy(&out[keep], &out[i], sizeof out[0]);
+                }
+                keep++;
+            }
+        }
+        c.n = keep;
     }
     return c.n;
 }

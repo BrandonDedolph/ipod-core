@@ -41,4 +41,12 @@
 # wallclock.c carries the time between the rare RTC reads over the same
 # wrapping microsecond counter ui/sleeptimer.c counts minutes on. All three are
 # host-built by tests/ rather than being reachable only through main.c.
-kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c', 'datetime.c', 'timesync.c', 'wallclock.c')
+#
+# otg_store.c is the THIRD writer: the On-The-Go live list (512 locator pairs)
+# in two CRC-32'd 5120-byte slots inside the pre-allocated COREOTG.DAT, through
+# the same gate as config_save and with every slot's cluster runs re-resolved
+# per write (a slot is bigger than a small cluster, so it can straddle one).
+# Hardware-free like evlog.c — the write and the wake are injected — so
+# tests/kernel/otg_store_test.c drives the codec, the addressing, the mount
+# and the commit policy on the host.
+kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c', 'otg_store.c', 'datetime.c', 'timesync.c', 'wallclock.c')

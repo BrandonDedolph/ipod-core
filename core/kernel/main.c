@@ -3427,8 +3427,11 @@ static void playlists_load(fat32_t *fs)
     g_list_epoch++;
     library_ensure(fs);                   /* sets g_lib_root_clus, binds songs */
     uint32_t dir = 0;
+    /* hide_empty_slots = 1: the five On-The-Go slot files always exist (the
+     * host creates them — the firmware cannot), and an EMPTY one is not a
+     * playlist the user made. A used, damaged or foreign one is listed. */
     int n = playlist_scan(fs, playlists_root_clus(fs), g_playlists,
-                          PLAYLIST_MAX, &dir, &g_playlists_truncated);
+                          PLAYLIST_MAX, &dir, &g_playlists_truncated, 1);
     g_playlists_err = (n < 0) ? n : 0;
     g_playlists_n   = (n < 0) ? 0 : n;
     /* Only a read that WORKED counts as the session's one read. A transient

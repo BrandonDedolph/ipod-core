@@ -414,6 +414,21 @@ static void test_context(void)
         check("leaving the playlist drops the context hash",
               resume_ctx_store(&s, &pl) == 1 && s.resume_ctx_hash == 0);
 
+        /* The On-The-Go live list is a kind with NO context to store: it is
+         * not a file and has no name, and the boot path rebuilds it from
+         * COREOTG.DAT. So a ctx hash handed in under that kind is dropped,
+         * exactly as it is for the album — only KIND_PLAYLIST keeps one. */
+        resume_ctx_t otg = { H("07 Track"), 12, 245, RESUME_KIND_OTG, 2,
+                             0, 0, 0, H("Gym") };
+        check("an On-The-Go capture stores the kind",
+              resume_ctx_store(&s, &otg) == 1 &&
+              s.resume_kind == RESUME_KIND_OTG && s.resume_qidx == 2);
+        check("...and stores NO context hash, whatever was passed",
+              s.resume_ctx_hash == 0);
+        check("RESUME_KIND_OTG is inside the ceiling the codec writes",
+              RESUME_KIND_OTG <= RESUME_KIND_MAX &&
+              RESUME_KIND_MAX == RESUME_KIND_OTG);
+
         /* Out-of-range values never reach the record as such: a kind this
          * build has no builder for is NONE (the album fallback), an index
          * outside u16 is pinned. */

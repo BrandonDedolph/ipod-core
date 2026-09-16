@@ -204,7 +204,9 @@ enum {
 #define P_RES_CTX       (CFG_PAYLOAD_V2 + 12u)   /* 36: u32 context hash: the
                                                   *     playlist's name hash
                                                   *     for KIND_PLAYLIST,
-                                                  *     else 0              */
+                                                  *     else 0 — including
+                                                  *     KIND_OTG (7), whose
+                                                  *     list is not a file  */
 #define P_RES_OKEEP     (CFG_PAYLOAD_V2 + 16u)   /* 40: i16 player order keep */
 #define P_RES_PAD       (CFG_PAYLOAD_V2 + 18u)   /* 42: u16 reserved (0)      */
 #define CFG_PAYLOAD_V2Q (CFG_PAYLOAD_V2 + 20u)   /* = 44                      */

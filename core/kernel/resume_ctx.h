@@ -66,7 +66,10 @@ typedef struct {
                              * playlist's ext-trimmed filename — the one
                              * word that says WHICH playlist, since nothing
                              * in the song's own record does. Stored as 0
-                             * for every other kind, whatever is passed.   */
+                             * for every other kind, whatever is passed —
+                             * RESUME_KIND_OTG included: the live On-The-Go
+                             * list is not a file and has no name, and the
+                             * boot path rebuilds it from COREOTG.DAT.     */
 } resume_ctx_t;
 
 /*
