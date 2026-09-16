@@ -77,8 +77,9 @@ than on every entry.
 
 66 host suites green (new: `fold`, `search` — the latter with a pixel-oracle
 painter test in `chrome_test.c`'s style — plus the Search shapes added to
-`gesture`), ARM `-Werror` + `verify-hw` clean. The three stages cost 7,792 B
-of text, 2,120 B of .bss and 40 B of .data against main (the .data is
+`gesture`), ARM `-Werror` + `verify-hw` clean. The three stages cost about
+7.8 KB of text (7,756–7,792 B depending on the build-stamp string in the
+baseline), 2,120 B of .bss and 40 B of .data against main (the .data is
 `g_letters_for`'s initialiser and `g_search_src`) — 36%, 83% and under 1% of
 their budgets, and no new MB-scale buffer. `docs/screens/render.py` gained `letter.png`, `search.png` and
 `search_results.png`.
