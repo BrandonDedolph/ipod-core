@@ -19,7 +19,8 @@
  *   /Music/Playlists/Empty.m3u8           size 0
  *   /Music/Playlists/Sub/                 a folder: ignored
  *   /Music/Playlists/Bad.m3u8             only missing entries
- *   /Music/Playlists/Big.m3u8             130 entries, over the row cap
+ *   /Music/Playlists/Big.m3u8             PLAYLIST_TRACKS_MAX + 2 entries,
+ *                                         over the row cap
  *
  * Long names are real VFAT runs (checksum-bound, 0xFFFF padded) so the
  * resolve goes through the same LFN decode a device does. BytesPerSector
@@ -55,7 +56,11 @@ static int check(const char *label, int cond)
 /* ---- the volume --------------------------------------------------------- */
 
 #define BPS   512u
-#define NSEC  32u
+/* Big.m3u8 is PLAYLIST_TRACKS_MAX + 2 lines of 35 bytes, so the image has to
+ * be big enough to hold it: the cap went from 128 to 512 (library/playlist.h)
+ * when a saved On-The-Go list had to open whole. */
+#define BIG_CLUS ((((PLAYLIST_TRACKS_MAX + 2) * 35) + BPS - 1) / BPS)
+#define NSEC  (48u + BIG_CLUS)
 static uint8_t g_mem[NSEC * BPS];
 
 /* Sector / cluster map (cluster N == sector N). */
@@ -63,7 +68,8 @@ enum {
     S_BOOT = 0, S_FAT = 1, C_ROOT = 2, C_MUSIC = 3, C_ALBUM = 4, C_PLDIR = 5,
     C_SONG1 = 6, C_SONG2 = 7, C_ART = 8, C_NOTES = 9,
     C_FAV = 10, C_ROAD = 11, C_README = 12, C_BAD = 14, C_ROOTFLAC = 15,
-    C_BIG = 16, C_BIG_END = 27, C_SUB = 28, C_PLDIR2 = 29
+    C_SUB = 16, C_PLDIR2 = 17,
+    C_BIG = 18, C_BIG_END = C_BIG + BIG_CLUS
 };
 
 #define NO_FAIL 0xFFFFFFFFu
@@ -171,7 +177,7 @@ static const char BAD_TEXT[] =
     "../gone.flac\n";
 
 #define BIG_LINE  "/Music/Artist - Album/01 Song.flac\n"
-#define BIG_LINES 130
+#define BIG_LINES (PLAYLIST_TRACKS_MAX + 2)
 
 static uint32_t g_big_size;
 
@@ -294,7 +300,7 @@ static void test_scan(void)
 {
     uint32_t dir = 0;
     int trunc = -1;
-    int n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc);
+    int n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc, 0);
 
     check("scan finds the Playlists folder under the library root",
           dir == C_PLDIR);
@@ -325,7 +331,7 @@ static void test_scan(void)
      * overflow is reported, then those are sorted. Directory order is
      * Favourites, road trip, Empty, Bad, Big. */
     dir = 0; trunc = -1;
-    n = playlist_scan(&g_fs, C_MUSIC, g_pl, 3, &dir, &trunc);
+    n = playlist_scan(&g_fs, C_MUSIC, g_pl, 3, &dir, &trunc, 0);
     check("scan at a cap of 3 returns 3 and reports the overflow",
           n == 3 && trunc == 1);
     check("...the first three in directory order, sorted",
@@ -333,30 +339,30 @@ static void test_scan(void)
           strcmp(g_pl[0].name, "Empty") == 0 &&
           strcmp(g_pl[1].name, "Favourites") == 0 &&
           strcmp(g_pl[2].name, "road trip") == 0);
-    n = playlist_scan(&g_fs, C_MUSIC, g_pl, 5, &dir, &trunc);
+    n = playlist_scan(&g_fs, C_MUSIC, g_pl, 5, &dir, &trunc, 0);
     check("scan at a cap equal to the count is not truncated",
           n == 5 && trunc == 0);
 
     /* No Playlists folder (the album has none): zero, not an error. */
     dir = 99; trunc = -1;
-    n = playlist_scan(&g_fs, C_ALBUM, g_pl, PLAYLIST_MAX, &dir, &trunc);
+    n = playlist_scan(&g_fs, C_ALBUM, g_pl, PLAYLIST_MAX, &dir, &trunc, 0);
     check("a library root with no Playlists folder lists nothing, no error",
           n == 0 && dir == 0 && trunc == 0);
 
     /* A root that cannot be read is an error, not an empty list. */
     g_fail_lba = C_MUSIC;
-    n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc);
+    n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc, 0);
     check("an unreadable library root is FAT32_EIO", n == FAT32_EIO);
     g_fail_lba = C_PLDIR;
-    n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc);
+    n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc, 0);
     check("an unreadable Playlists folder is FAT32_EIO", n == FAT32_EIO);
     g_fail_lba = NO_FAIL;
 
     check("null arguments are refused",
-          playlist_scan(0, C_MUSIC, g_pl, 1, &dir, &trunc) == FAT32_EINVAL &&
-          playlist_scan(&g_fs, C_MUSIC, 0, 1, &dir, &trunc) == FAT32_EINVAL &&
-          playlist_scan(&g_fs, C_MUSIC, g_pl, 1, 0, &trunc) == FAT32_EINVAL &&
-          playlist_scan(&g_fs, C_MUSIC, g_pl, 1, &dir, 0) == FAT32_EINVAL);
+          playlist_scan(0, C_MUSIC, g_pl, 1, &dir, &trunc, 0) == FAT32_EINVAL &&
+          playlist_scan(&g_fs, C_MUSIC, 0, 1, &dir, &trunc, 0) == FAT32_EINVAL &&
+          playlist_scan(&g_fs, C_MUSIC, g_pl, 1, 0, &trunc, 0) == FAT32_EINVAL &&
+          playlist_scan(&g_fs, C_MUSIC, g_pl, 1, &dir, 0, 0) == FAT32_EINVAL);
 }
 
 /* ---- 2. resolving a playlist into rows ---------------------------------- */
@@ -364,7 +370,7 @@ static void test_scan(void)
 static void test_resolve(void)
 {
     uint32_t dir; int trunc;
-    int n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc);
+    int n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc, 0);
     const playlist_t *fav = find_pl(n, "Favourites");
     playlist_stats_t st;
 
@@ -432,8 +438,9 @@ static void test_resolve(void)
     /* Over the row cap: the first PLAYLIST_TRACKS_MAX, and truncated. */
     r = playlist_resolve(&g_fs, find_pl(n, "Big"), "Music/Playlists",
                          g_rows, PLAYLIST_TRACKS_MAX, &g_scr, &st);
-    check("a 130-entry playlist yields the first 128 rows",
-          r == PLAYLIST_TRACKS_MAX && g_rows[127].clus == C_SONG1);
+    check("a playlist longer than the cap yields exactly the cap's rows",
+          r == PLAYLIST_TRACKS_MAX &&
+          g_rows[PLAYLIST_TRACKS_MAX - 1].clus == C_SONG1);
     check("...and reports the truncation from the parser",
           st.truncated == 1 && st.m3u.total == BIG_LINES);
 
@@ -452,7 +459,7 @@ static void test_resolve(void)
 static void test_errors(void)
 {
     uint32_t dir; int trunc;
-    int n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc);
+    int n = playlist_scan(&g_fs, C_MUSIC, g_pl, PLAYLIST_MAX, &dir, &trunc, 0);
     const playlist_t *fav = find_pl(n, "Favourites");
     playlist_stats_t st;
 
@@ -492,8 +499,8 @@ int main(void)
     check("mount", fat32_mount(&g_fs, mem_read, 0, 0) == 0);
 
     /* The scratch is one static in main.c; keep its size honest. */
-    check("playlist_scratch_t stays under 36 KB",
-          sizeof(playlist_scratch_t) <= 36u * 1024u);
+    check("playlist_scratch_t stays under 140 KB",
+          sizeof(playlist_scratch_t) <= 140u * 1024u);
     printf("sizeof(playlist_scratch_t) = %u\n", (unsigned)sizeof(playlist_scratch_t));
 
     test_scan();

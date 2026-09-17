@@ -93,20 +93,24 @@ static int       fat_cache_valid = 0;
  * Tagged by (fs, FS-sector) exactly like the FAT cache, so a second mounted
  * volume can never be served a stale sector.
  *
- * NEITHER CACHE HAS WRITE INVALIDATION, and ata.c's write primitive IS now
- * wired up — kernel/config.c:625 calls it to persist settings, and config.c's
- * banner records it as qualified on hardware. This comment used to say the
- * write path was "not wired to anything yet", which stopped being true and is
- * exactly the kind of stale reassurance that gets a stale-cache bug written.
+ * NEITHER CACHE INVALIDATES ITSELF ON A WRITE, and ata.c's write primitive
+ * IS wired up — four modules now overwrite bytes of a pre-allocated file:
+ * kernel/config.c (CORECFG.DAT), kernel/evlog.c (CORELOG.BIN),
+ * kernel/otg_store.c (COREOTG.DAT) and library/otg_slot.c (the On-The-Go
+ * slot playlists).
  *
- * It is not live today, and the reason is narrow: BOTH writers — config.c
- * (CORECFG.DAT) and kernel/evlog.c (CORELOG.BIN) — do their own reads
- * through the raw block callback, deliberately bypassing these caches, and
- * nothing else on the device reads either file through the fs paths. Any
- * writer whose file IS read through fat32_read_file / the stream, or any
- * attempt to route those two modules' reads back through fat32, must
- * invalidate both this cache and fat_cache first. (fat_cache holds FAT
- * sectors only, which neither writer ever changes.) */
+ * The first three read their own files through the RAW block callback,
+ * deliberately bypassing these caches, so they cannot be served a stale
+ * sector. THE FOURTH CANNOT: an On-The-Go slot is an ordinary .m3u8 that
+ * library/playlist.c reads back through fat32_read_file and the stream, i.e.
+ * through dat_cache. That is what fat32_cache_drop() below is for, and
+ * otg_slot_save() calls it after its last write. ANY future writer whose
+ * file is read through the fs paths owes the same call — a re-read that
+ * quietly returns the bytes from before the write is the failure mode, and
+ * it looks like a corrupt playlist, not like a cache bug. (fat_cache holds
+ * FAT sectors only, which no writer here ever changes; it is dropped too
+ * because a writer that DID move a chain would otherwise be followed into
+ * the wrong cluster.) */
 static uint8_t   dat_cache[4096];
 static fat32_t  *dat_cache_fs    = 0;
 static uint32_t  dat_cache_sec   = 0;
@@ -527,6 +531,20 @@ static int lfn_to_utf8(const uint16_t *lfn, int len, char *dst, int cap)
 }
 
 /* ---- public API ------------------------------------------------------ */
+
+void fat32_cache_drop(fat32_t *fs)
+{
+    /* Tagged by the fat32_t the sector was read for, so dropping one volume's
+     * cached sectors never costs another volume its cache. A null `fs` means
+     * "drop everything", which is what a caller with no volume in hand (a
+     * teardown, a test) wants. */
+    if (fs == 0 || fat_cache_fs == fs) {
+        fat_cache_valid = 0;
+    }
+    if (fs == 0 || dat_cache_fs == fs) {
+        dat_cache_valid = 0;
+    }
+}
 
 int fat32_mount(fat32_t *fs, fat_read_fn read, void *ud, uint32_t part_lba)
 {

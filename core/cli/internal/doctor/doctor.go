@@ -263,7 +263,11 @@ type VolumeReport struct {
 	// written, so the iPod's own clock is not yet that time.
 	ClockStamped time.Time
 	ClockPending bool
-	Playlists    []string
+	// OTGValid is COREOTG.DAT, the On-The-Go live list; OTGEntries is how
+	// many tracks the newest slot holds.
+	OTGValid   bool
+	OTGEntries int
+	Playlists  []string
 	// Note is the one-line reason the volume half stopped early, when
 	// it did.
 	Note   string
@@ -305,6 +309,7 @@ func CheckVolume(volume string) VolumeReport {
 	checkIndex(r, &rep, filepath.Join(music, devicefs.IndexName))
 	checkConfig(r, &rep, filepath.Join(volume, devicefs.ConfigName))
 	checkLog(r, &rep, filepath.Join(volume, devicefs.LogName))
+	checkOTG(r, &rep, filepath.Join(volume, devicefs.OTGName))
 	checkPlaylists(r, &rep, filepath.Join(music, devicefs.PlaylistDir))
 
 	rep.Checks = r.checks
@@ -331,6 +336,13 @@ func CheckConfig(path string) []Check {
 func CheckLog(path string) []Check {
 	r, rep := &report{}, &VolumeReport{}
 	checkLog(r, rep, path)
+	return r.checks
+}
+
+// CheckOTG checks one COREOTG.DAT.
+func CheckOTG(path string) []Check {
+	r, rep := &report{}, &VolumeReport{}
+	checkOTG(r, rep, path)
 	return r.checks
 }
 
@@ -497,6 +509,39 @@ func checkLog(r *report, rep *VolumeReport, path string) {
 		devicefs.LogName, blocks, devicefs.LogBlockBytes, fileID)
 }
 
+// checkOTG applies otg_store_mount()'s own acceptance test: the file has to
+// be at least two slots long and one of them has to decode, or the On-The-Go
+// list works for the session and persists NOTHING — with no error on screen
+// and nothing in the log to say so.
+func checkOTG(r *report, rep *VolumeReport, path string) {
+	b, err := readHeadFile(path, devicefs.OTGMinBytes)
+	if errors.Is(err, os.ErrNotExist) {
+		r.line(Warn, "on-the-go", "%s is missing; the On-The-Go list works for "+
+			"a session and is lost at the next boot (run `core sync`)", devicefs.OTGName)
+		return
+	}
+	if err != nil {
+		r.line(Fail, "on-the-go", "%v", err)
+		return
+	}
+	seq, ok := devicefs.OTGFileValid(b)
+	if !ok {
+		r.line(Fail, "on-the-go", "%s holds no valid slot (or is shorter than the "+
+			"%d bytes otg_store_mount() requires)", devicefs.OTGName, devicefs.OTGMinBytes)
+		return
+	}
+	n := 0
+	for i := 0; i < devicefs.OTGSlots; i++ {
+		off := i * devicefs.OTGSlotBytes
+		if s, _, entries, valid := devicefs.DecodeOTGSlot(b[off:]); valid && s == seq {
+			n = len(entries)
+		}
+	}
+	rep.OTGValid, rep.OTGEntries = true, n
+	r.line(OK, "on-the-go", "%s valid, newest slot at seq %d, %d track(s)",
+		devicefs.OTGName, seq, n)
+}
+
 func checkPlaylists(r *report, rep *VolumeReport, dir string) {
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -522,10 +567,60 @@ func checkPlaylists(r *report, rep *VolumeReport, dir string) {
 	rep.Playlists = names
 	if len(names) == 0 {
 		r.line(OK, "playlists", "%s/%s/ present, empty", devicefs.MusicDir, devicefs.PlaylistDir)
-		return
+	} else {
+		r.line(OK, "playlists", "%d in %s/%s/ (%s)", len(names),
+			devicefs.MusicDir, devicefs.PlaylistDir, strings.Join(names, ", "))
 	}
-	r.line(OK, "playlists", "%d in %s/%s/ (%s)", len(names),
-		devicefs.MusicDir, devicefs.PlaylistDir, strings.Join(names, ", "))
+
+	// The five On-The-Go slots are device files sitting in the same folder.
+	// They are reported separately because "5 playlists" would otherwise
+	// mean five the user never made, and because a DAMAGED one is a torn
+	// save the device will refuse to open and nothing else would say so.
+	for n := 1; n <= devicefs.OTGPlaylistSlots; n++ {
+		name := devicefs.OTGSlotName(n)
+		info, err := devicefs.OTGSlotFileState(filepath.Join(dir, name))
+		label := fmt.Sprintf("otg slot %d", n)
+		switch {
+		case err != nil:
+			// An unreadable slot file is the same dead end as a foreign one:
+			// the device cannot look inside it, so it will never write to it.
+			r.line(Fail, label, "%s: %v — the device will never write to a slot "+
+				"it cannot read. If the file is not one of yours, delete "+
+				"%s/%s/%s and run `core sync` to put an empty one back",
+				name, err, devicefs.MusicDir, devicefs.PlaylistDir, name)
+		case info.State == devicefs.OTGSlotAbsent:
+			r.line(Warn, label, "%s is missing; Save has one fewer slot "+
+				"(run `core sync`)", name)
+		case info.State == devicefs.OTGSlotForeign:
+			// Two things look identical here and only the user can tell them
+			// apart: a playlist they made, and a slot whose save was
+			// interrupted inside its very last write. Neither will ever be
+			// written to again, so say what the way out is.
+			r.line(Warn, label, "%s carries no On-The-Go header, so the device "+
+				"lists and plays it and NEVER writes to it. If you did not put "+
+				"it there (an interrupted save can leave one looking like "+
+				"this), delete %s/%s/%s and run `core sync` to put an empty "+
+				"one back", name, devicefs.MusicDir, devicefs.PlaylistDir, name)
+		case info.State == devicefs.OTGSlotDamaged:
+			r.line(Fail, label, "%s is a torn save (header gen %d, trailer gen %d, "+
+				"%d entry line(s) against a count of %d); the device opens it to "+
+				"\"Playlist damaged\" with Delete Playlist under it. The slot is NOT "+
+				"free until that Delete rewrites it — Save only ever writes into an "+
+				"empty slot",
+				name, info.Gen, info.TrailerGen, info.Lines, info.Count)
+		case info.Size < devicefs.OTGSlotFileMin ||
+			info.Size%devicefs.OTGSlotSizeGrain != 0:
+			r.line(Fail, label, "%s is %d bytes; the firmware only writes a slot "+
+				"file of at least %d bytes and a multiple of %d, so Save will "+
+				"skip it", name, info.Size, devicefs.OTGSlotFileMin,
+				devicefs.OTGSlotSizeGrain)
+		case info.State == devicefs.OTGSlotEmpty:
+			r.line(OK, label, "%s empty (hidden from the Playlists list, free "+
+				"for Save)", name)
+		default:
+			r.line(OK, label, "%s: %d track(s)", name, info.Count)
+		}
+	}
 }
 
 // readHeadFile reads up to n bytes from the head of a file. A file

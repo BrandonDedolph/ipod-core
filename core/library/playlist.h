@@ -33,14 +33,12 @@
  * BOUNDS. Every cap is a fixed number and every overflow is REPORTED:
  *   PLAYLIST_MAX          playlists listed (the first that many in directory
  *                         order; *truncated says there were more)
- *   PLAYLIST_TRACKS_MAX   rows per playlist — BROWSE_MAX, because the rows
- *                         are what a browse listing is and what
- *                         player_play_queue() takes. A longer file parses to
- *                         its first 128 resolvable-or-not entries and
+ *   PLAYLIST_TRACKS_MAX   rows per playlist — 512. A longer file parses to
+ *                         its first 512 resolvable-or-not entries and
  *                         stats.truncated says so.
  * Nothing recurses (m3u.c does not follow nested playlists; the path walk is
  * a loop), nothing allocates: the working memory is one caller-owned
- * playlist_scratch_t (~35 KB — the parser's scratch, the entry array, one
+ * playlist_scratch_t (~136 KB — the parser's scratch, the entry array, one
  * dirent), so its cost is visible at the one call site that holds it.
  */
 #ifndef CORE_LIBRARY_PLAYLIST_H
@@ -50,11 +48,25 @@
 
 #include "../fs/fat32.h"
 #include "../fs/m3u.h"
-#include "../player/player.h"          /* NAME_MAX, BROWSE_MAX */
+#include "../player/player.h"          /* NAME_MAX */
+#include "otg.h"                       /* OTG_MAX: the row cap              */
 
 #define PLAYLIST_DIR        "Playlists"
 #define PLAYLIST_MAX        64
-#define PLAYLIST_TRACKS_MAX BROWSE_MAX
+
+/*
+ * Rows per playlist. It used to be BROWSE_MAX (128), on the reasoning that a
+ * row is what a browse listing is; it is OTG_MAX now, because a SAVED
+ * On-The-Go list can hold 512 tracks (library/otg.h) and a saved list you
+ * cannot re-open in full is not a saved list. Nothing in the resolve or the
+ * play path depended on the two being equal — playlist_play() enqueues per
+ * row — so the cap is simply its own number now.
+ *
+ * The cost is .bss at the one call site: the scratch's entry array is
+ * 512 * sizeof(m3u_entry_t) = 135 KB, and kernel/main.c's row array and
+ * binding array another 44 KB.
+ */
+#define PLAYLIST_TRACKS_MAX ((int)OTG_MAX)
 
 /* One playlist file, as the Playlists list shows it. */
 typedef struct {
@@ -117,10 +129,23 @@ typedef struct {
  * cannot be trusted is not a listing (see fat32_readdir). On success
  * *dir_clus is the folder's cluster and *truncated is 1 when more than `max`
  * playlists were there (the first `max` in directory order were kept).
+ *
+ * `hide_empty_slots` drops an On-The-Go SLOT FILE that is present but empty
+ * (library/otg_slot.h: a `#CORE-OTG` directive with count = 0) from the
+ * listing, after the sort. The five slot files always exist — the host
+ * creates them, because the firmware cannot — so without this the Playlists
+ * screen would show five playlists nobody made, every one of them opening to
+ * nothing. It costs one 512-byte read per slot file present, and only for
+ * names that are exactly "On-The-Go N". A DAMAGED slot and a foreign .m3u8
+ * at a slot name are both KEPT: the first is something the user saved and
+ * needs to be told about, the second is their own playlist.
+ *
+ * Pass 0 for the old behaviour (every file listed), which is what a caller
+ * that just wants the names — and the tests — want.
  */
 int playlist_scan(fat32_t *fs, uint32_t lib_root_clus,
                   playlist_t *out, int max,
-                  uint32_t *dir_clus, int *truncated);
+                  uint32_t *dir_clus, int *truncated, int hide_empty_slots);
 
 /*
  * Parse `pl` and resolve every entry to a directory entry on the volume,

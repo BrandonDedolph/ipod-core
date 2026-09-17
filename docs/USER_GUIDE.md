@@ -15,7 +15,7 @@ bottom, Left and Right at the sides. The Hold switch is on the top edge.
 | Control | On lists and menus | On Now Playing |
 |---|---|---|
 | Wheel | Moves the selection | Volume. After a Select tap, seeks |
-| Select | Opens the row. On a track, plays it | Tap: scrub mode. Hold: the queue |
+| Select | Opens the row. On a track, plays it. Hold half a second on a song or an album: adds it to On-The-Go | Tap: scrub mode. Hold: the queue |
 | Menu | Back one screen. Hold one second: the main menu | Back to the screen you came from. Hold: the main menu |
 | Play | Tap on an album, artist, genre, playlist or song: plays it. Tap elsewhere: pause or resume. Hold two seconds anywhere: sleep. Hold longer: power off | Tap: pause or resume. Hold: sleep, then power off |
 | Right | Jumps to Now Playing if a track is loaded, playing or paused | Tap: next track. Hold: fast forward |
@@ -26,6 +26,9 @@ on a highlighted song it plays that song — whether something was already playi
 queue is replaced either way. On the Music menu's Shuffle Songs row it deals a fresh shuffle. On
 rows that name no music (the main menu, the rest of the Music menu, Settings) and on an empty
 list, Play stays pause and resume.
+
+A Select TAP now acts when you lift your finger, not when you press — that is what makes room for
+the hold, and it is what the original iPod does. Half a second is the line.
 
 Right on a list pushes Now Playing over it, so Menu brings you back to the exact row you left.
 Left and Right are transport — skip on a tap, seek on a hold — only on Now Playing and the queue.
@@ -96,7 +99,47 @@ is the whole discography, album on the sub-line.
 Songs** deals the whole library and starts playing.
 
 **Playlists** are `.m3u8` files you put in `Music/Playlists/` on the disk (see Putting music on
-it). Select one to see its tracks; Select a track to play the playlist from there.
+it). Select one to see its tracks; Select a track to play the playlist from there. The first row is
+pinned: **On-The-Go**, with the number of tracks in it on the right.
+
+### On-The-Go
+
+The playlist you build as you go. Hold Select for half a second on a song — in Songs, an artist's
+All Songs, a genre, an album's tracklist or another playlist's — or on a song in Search's
+results — and it joins the list; a banner across the top says "Added to On-The-Go" and how many are
+in it now. Hold Select on an ALBUM row
+and the whole album goes in, in its tracklist's order. Holding Select on anything else does
+nothing, and a track your library has no record of says "Not in the library" instead.
+
+Playlists, On-The-Go opens it: two rows at the top, then the tracks.
+
+- **Select a track** plays the list from there. The device remembers you were in it, so a cold boot
+  comes back to the same track.
+- **Hold Select on a track** takes it out again.
+- **Clear Playlist** empties it. It asks twice — the row changes to "Clear? Select again" for three
+  seconds — because there is no undo.
+- **Save Playlist** writes it into the lowest free one of five saved lists, `On-The-Go 1` to
+  `On-The-Go 5`, and empties the live list. The banner names the one it used. A saved list is an
+  ordinary playlist from then on: it appears in Playlists, it plays like any other, and it is a
+  plain `.m3u8` file you can copy off the iPod. When all five are in use, Save is greyed and says
+  so; open a saved one and use **Delete Playlist** at the bottom of it to free a slot. Delete is
+  the only thing that frees a slot — including one whose save was interrupted, which opens to
+  "Playlist damaged — save again" with Delete under it.
+
+A playlist of your own that happens to be called `On-The-Go 3.m3u8` is just a playlist: the device
+lists it, plays it, and never writes to it — it has no Delete row, and Save skips it. The device
+decides that by looking INSIDE the file, not at its name, so the only way it can be wrong is in
+your favour: a slot whose save was interrupted at the very last moment can end up looking like a
+file of yours, and the device will then leave it alone for ever. `core doctor` says so, and the
+fix is below.
+
+A row that reads "Not on this iPod" is a track that was in the list when its file went away — a
+re-sync that renamed or removed it. It is kept rather than dropped, in case a later sync brings it
+back, and it is simply skipped when the list plays. Clear gets rid of them.
+
+The live list survives a power cut: it is written to `COREOTG.DAT` in the volume root, through the
+same rules as the settings (see Disk mode and the files on the drive). A change made while the
+drive is parked lands the next time the drive spins, or when the device sleeps.
 
 The header's right side shows where you are in the list, for example `6 / 17`. A long title
 scrolls while it is selected.
@@ -118,7 +161,7 @@ list.
 | | In the picker | In the results |
 |---|---|---|
 | Wheel | Moves along the strip, wrapping | Moves the selection |
-| Select | Types the character. On DEL, deletes one. On DONE, opens the results | Opens the row |
+| Select | Types the character. On DEL, deletes one. On DONE, opens the results | Opens the row. Hold half a second on a song: adds it to On-The-Go |
 | Right | A space — never a skip, and holding it types one space, not a seek | Jumps to Now Playing |
 | Left | Deletes one character | Nothing |
 | Menu | Back to Music, keeping what you typed | Back to the picker, keeping the results |
@@ -136,8 +179,11 @@ finds *It's Over*. A leading space and a double space are ignored.
 
 Select a result and it does what the same row would do anywhere else: a **song** plays, in its
 album, so Next is the rest of the record; an **artist** opens their albums; an **album** opens its
-tracklist; a **playlist** opens its tracks. Menu comes back to the results every time. A song the
-index lists but the disk no longer has is greyed, and Select does nothing on it.
+tracklist; a **playlist** opens its tracks. Holding Select on a **song** result adds it to
+On-The-Go, exactly as it does on any other song row; on an artist, album or playlist result it does
+nothing, because "add this artist" is not what On-The-Go is. In the picker Select stays a keystroke
+however long you hold it. Menu comes back to the results every time. A song the index lists but the
+disk no longer has is greyed, and Select does nothing on it.
 
 Above two hundred matches the list stops and the corner says how many there really are — type
 another letter. Your query survives leaving the screen and comes back when you return, until the
@@ -376,10 +422,11 @@ core eject D:
 `sync` copies each track to `Music/Artist - Album/NN. Title.flac` (or `.mp3` — nothing is
 converted, each file keeps its own format), writes `folder.art` and
 `folder.thm` beside it from the file's embedded cover, rewrites the playlists to device paths under
-`Music/Playlists/`, creates `CORECFG.DAT` and `CORELOG.BIN` in the volume root if they are missing
-(a valid one is never reset, so your settings survive), **sets the iPod's clock**, and writes
-`Music/CORELIB.IDX` last — last on purpose, so the index never names files a failed copy did not
-leave behind. A track already on
+`Music/Playlists/`, creates `CORECFG.DAT`, `CORELOG.BIN` and `COREOTG.DAT` in the volume root and
+the five `Music/Playlists/On-The-Go N.m3u8` slots if they are missing (an existing one is never
+reset, so your settings, your log and your saved lists survive), **sets the iPod's clock**, and
+writes `Music/CORELIB.IDX` last — last on purpose, so the index never names files a failed copy did
+not leave behind. A track already on
 the device is skipped when its size matches and its timestamp is within two seconds; `--verify`
 compares content instead.
 
@@ -460,11 +507,13 @@ iPod's FAT32 volume.
    placeholder.
 4. **Playlists.** Put `.m3u8` files in `Music/Playlists/`. A path inside that starts with a slash
    is read from the volume root; anything else is read relative to that folder. The firmware reads
-   playlists; it cannot write them.
-5. **Two files it writes to.** `CORECFG.DAT` (settings and resume) and `CORELOG.BIN` (the event
-   log) must exist in the volume root before the first boot: `tools/make_config.py --create
-   <iPod>` and `tools/make_log.py --create <iPod>`. The firmware never creates, grows or moves a
-   file, so it can only write into space that is already there.
+   playlists, and writes back only into the five `On-The-Go N.m3u8` files below; it cannot create
+   one of its own.
+5. **The files it writes to.** `CORECFG.DAT` (settings and resume), `CORELOG.BIN` (the event log),
+   `COREOTG.DAT` (the live On-The-Go list) and the five `Music/Playlists/On-The-Go N.m3u8` saved
+   lists must all exist before the first boot: `tools/make_config.py --create <iPod>`,
+   `tools/make_log.py --create <iPod>` and `tools/make_otg.py --create <iPod>`. The firmware never
+   creates, grows or moves a file, so it can only write into space that is already there.
 
 Library limits: 6000 songs, 1024 albums, 512 artists, 128 genres. Past a limit the About page says
 "Library too large · some items not shown" in red.
@@ -519,8 +568,10 @@ Settings, Disk Mode saves everything and reboots into Apple's USB disk mode. Fro
 Select + Play for the same thing from the boot ROM; that works even if the firmware will not boot.
 
 On the volume you will find, besides your music: `Music/CORELIB.IDX` the library index,
-`Music/Playlists/` your playlists, `CORECFG.DAT` the settings and resume record in the root, and
-`CORELOG.BIN` the 4 MiB event log, also in the root. `tools/make_log.py --dump CORELOG.BIN` prints
+`Music/Playlists/` your playlists — including the five `On-The-Go N.m3u8` saved lists, which are
+ordinary playlist files you can copy off — `CORECFG.DAT` the settings and resume record in the
+root, `COREOTG.DAT` the live On-The-Go list, also in the root, and
+`CORELOG.BIN` the 4 MiB event log. `tools/make_log.py --dump CORELOG.BIN` prints
 the log: every diagnostic line the firmware wrote, with boot boundaries, battery samples and the
 audio counters. If you report a problem, that dump is what explains it.
 
@@ -532,6 +583,12 @@ audio counters. If you report a problem, that dump is what explains it.
 - **The library is missing or stale.** Rebuild `CORELIB.IDX`: `core sync`, or `tools/build_index.py`.
 - **Settings do not stick.** `CORECFG.DAT` must exist in the volume root; `core sync` creates it, or
   `tools/make_config.py --create <iPod>`.
+- **Save says there is no free On-The-Go slot, but one of them looks empty.** `core doctor` names
+  each slot. A slot it calls "a playlist of your own" is one the device will never write to — which
+  is right if you put it there, and is also what the rarest interrupted save leaves behind. Look at
+  `Music/Playlists/On-The-Go N.m3u8` in disk mode; if it is not yours, **delete it** and run
+  `core sync` (or `tools/make_otg.py --create <iPod>`), which puts an empty one back. Neither ever
+  overwrites a file that is already there, which is why the deleting is yours to do.
 - **The clock says Not set, or is wrong.** A flat battery resets it — the clock runs off the same
   cell. Plug the iPod in and run `core sync` or `core eject` (either sets it), then boot the device
   once: the time arrives on that boot, not while it is on the cable. A clock running more than ten

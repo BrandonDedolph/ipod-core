@@ -524,5 +524,45 @@ int main(void)
               search_play_rows(&S, &is_track) == 0 && is_track == 0);
     }
 
+    /* ---- 10. what a HOLD has under the cursor ----------------------------- */
+    /* The same seam for the row-select arbiter (kernel/main.c rowsel_*): a
+     * hold on a result adds it to On-The-Go, which only means anything for a
+     * hit that names ONE TRACK. A song hit hands back its position in the
+     * SORTED song order, which is the one thing main.c has to turn into a
+     * record. The PICKER answers 0 rows on purpose — its SELECT types a
+     * character and must act on the DOWN-EDGE like a key, never wait for a
+     * release — so a press there never enters the arbitration at all. */
+    {
+        int addable = 99, song = 99;
+        fresh("sun");
+        xpect(&c, "a hold in the picker has no row: SELECT stays a keystroke",
+              search_hold_rows(&S, &addable, &song) == 0 &&
+              addable == 0 && song == -1);
+        S.mode = SEARCH_RESULTS;
+        S.sel  = 0;                                   /* the artist hit    */
+        xpect(&c, "an artist result is a TITLE row: nothing to add",
+              search_hold_rows(&S, &addable, &song) == S.nhit &&
+              addable == 0 && song == -1);
+        S.sel = 1;                                    /* the album hit     */
+        xpect(&c, "...an album result likewise",
+              search_hold_rows(&S, &addable, &song) == S.nhit &&
+              addable == 0 && song == -1);
+        S.sel = 2;                                    /* the playlist hit  */
+        xpect(&c, "...and a playlist result",
+              search_hold_rows(&S, &addable, &song) == S.nhit &&
+              addable == 0 && song == -1);
+        S.sel = 3;                                    /* the first song    */
+        xpect(&c, "a song result IS addable, and says which song",
+              search_hold_rows(&S, &addable, &song) == S.nhit &&
+              addable == 1 && song == (int)S.hit[3].idx);
+        xpect(&c, "...and the row count survives NULL out-parameters",
+              search_hold_rows(&S, 0, 0) == S.nhit);
+        fresh("zzz");
+        S.mode = SEARCH_RESULTS;
+        xpect(&c, "RESULTS with nothing in it has nothing to add either",
+              search_hold_rows(&S, &addable, &song) == 0 &&
+              addable == 0 && song == -1);
+    }
+
     return xfail_done(&c);
 }

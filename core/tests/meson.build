@@ -784,6 +784,53 @@ if target == 'sim'
     test('evlog', evlog_test, suite: 'unit')
   endif
 
+  # otg-store: COREOTG.DAT (kernel/otg_store.c) — the THIRD writer to the
+  # user's disk, so it gets the config and evlog treatment over the same kind
+  # of in-RAM volume (BytesPerSector 2048 at a non-zero partition base), with
+  # COREOTG.DAT deliberately FRAGMENTED so a 5120-byte slot straddles cluster
+  # boundaries and slot 1 does not even start on one:
+  #   1. the slot codec: round trips at 0 / 1 / 512 entries, every rejection
+  #      (magic, version 0 and 2, count 513, a flipped bit in the header, an
+  #      entry, the padding or the CRC), a null pair inside the count dropped
+  #      — and the host tool's --emit fixture decoded by the firmware's own
+  #      decoder, which is what stops the two encoders drifting into a fresh
+  #      COREOTG.DAT the device silently refuses;
+  #   2. addressing: every run's LBA against the test's own chain formula,
+  #      with the recorder refusing any write outside the file's clusters or
+  #      across one, plus the refusals (too small, a short chain, a
+  #      misaligned partition base, absent);
+  #   3. mount: newest seq wins, a torn slot loses, the sequence WRAP, both
+  #      slots bad staying writable, an unreadable slot failing closed only
+  #      when nothing else is valid, a transient read error retried;
+  #   4. save: slot alternation and a failed write leaving the bookkeeping —
+  #      and therefore the good slot — alone;
+  #   5. the commit gate through cfg_commit with a hand clock: the debounce,
+  #      the parked-drive refusal for idle AND soft, wake-before-write on a
+  #      forced commit, the battery gate's one exemption, three failures.
+  # Links the real cfg_commit.c, fat32.c and otg.c; the write and wake are
+  # the test's recorder, so no ata.c — the register grammar of a multi-sector
+  # write is ata_trace_test's job.
+  otg_store_test = executable(
+    'otg_store_test',
+    sources: ['kernel/otg_store_test.c',
+              '../kernel/otg_store.c',
+              '../kernel/cfg_commit.c',
+              '../library/otg.c',
+              '../fs/fat32.c'],
+    include_directories: [hw_mmio_inc,
+                          include_directories('../kernel', '../fs')],
+    override_options: test_opts,
+  )
+  if py.found()
+    otg_fixture = custom_target('otg-fixture',
+      output: 'otg_golden.bin',
+      command: [py, files('..' / '..' / 'tools' / 'make_otg.py'),
+                '--emit', '@OUTPUT@'])
+    test('otg-store', otg_store_test, args: [otg_fixture], suite: 'unit')
+  else
+    test('otg-store', otg_store_test, suite: 'unit')
+  endif
+
   # hw-console: the on-screen debug console (framebuffer + 8x8 hex font).
   # Pure rendering logic, no MMIO — verifies glyph output pixel-for-pixel.
   console_test = executable(
@@ -1102,11 +1149,58 @@ if target == 'sim'
   playlist_test = executable(
     'playlist_test',
     sources: ['library/playlist_test.c', '../library/playlist.c',
-              '../library/names.c', '../fs/m3u.c', '../fs/fat32.c'],
+              '../library/names.c', '../library/otg.c', '../library/otg_slot.c',
+              '../lib/mem.c', '../fs/m3u.c', '../fs/fat32.c'],
     include_directories: include_directories('.'),
     override_options: test_opts,
   )
   test('playlist', playlist_test, suite: 'unit')
+
+  # otg: the On-The-Go LIVE list (core/library/otg.c) — the fixed 512-entry
+  # array of (folder_hash, file_hash) locator pairs the user builds by holding
+  # Select. Pure: no disk, no fixture. Pins what the UI leans on — the count
+  # is the number of presses, the order is insertion order, a full list
+  # refuses rather than wraps, the null pair (what the on-disk padding is
+  # made of) is never stored, and `gen` moves exactly once per ACCEPTED
+  # change, which is what tells a torn saved playlist from an intact one.
+  otg_test = executable(
+    'otg_test',
+    sources: ['library/otg_test.c', '../library/otg.c'],
+    include_directories: include_directories('.'),
+    override_options: test_opts,
+  )
+  test('otg', otg_test, suite: 'unit')
+
+  # otg-slot: the five SAVED On-The-Go playlists (core/library/otg_slot.c) —
+  # the FOURTH writer to the user's disk, and the only one whose file is read
+  # back through fs/fat32.c's caches. On an in-RAM volume with the device's
+  # geometry (BytesPerSector 2048, one FS-sector per cluster, a non-zero
+  # partition base) and On-The-Go 1.m3u8 deliberately FRAGMENTED, so a
+  # 4096-byte staging write is always two cluster runs:
+  #   1. naming (which files are slots at all) and the one-sector probe that
+  #      tells empty from used from damaged from foreign;
+  #   2. playlist_scan's hide-empty-slots filter: the five slot files always
+  #      exist, so without it the Playlists screen shows five playlists
+  #      nobody made;
+  #   3. the EXACT BYTES a save puts on the disk — header, entries read back
+  #      out of the directory entries, trailer, newline padding to the last
+  #      byte — and the write ORDER, with stage 0 LAST, which is the whole
+  #      tear-detection argument;
+  #   4. a row that cannot be named or would exceed M3U_PATH_MAX counted, not
+  #      silently dropped; truncation; every refusal;
+  #   5. the parse straight after the save reading what was just written,
+  #      which it does only because otg_slot_save() calls fat32_cache_drop().
+  # Links the real playlist.c and m3u.c, so the round trip is the reader the
+  # device uses and not a re-description of it.
+  otg_slot_test = executable(
+    'otg_slot_test',
+    sources: ['library/otg_slot_test.c', '../library/otg_slot.c',
+              '../library/otg.c', '../library/playlist.c', '../library/names.c',
+              '../lib/mem.c', '../fs/m3u.c', '../fs/fat32.c'],
+    include_directories: include_directories('../hal/hw', '.'),
+    override_options: test_opts,
+  )
+  test('otg-slot', otg_slot_test, suite: 'unit')
 
   # name-hash: the library locator hash. It exists twice — in
   # library/names.c (device) and in tools/build_index.py (host) — and it is
@@ -1393,6 +1487,19 @@ if target == 'sim'
     test('make-log', py,
          args: [meson.current_source_dir() / '..' / '..' / 'tools' /
                 'make_log.py', '--selftest'],
+         suite: 'unit')
+
+    # make-otg: the host half of BOTH On-The-Go formats (tools/make_otg.py).
+    # Round-trips the COREOTG.DAT slot codec (including every rejection, the
+    # dropped null pair and the sequence wrap) and the slot-playlist bytes
+    # (the fixed-width directive and trailer, the newline padding, a torn
+    # file read as damaged, a foreign one read as foreign). The DEVICE side
+    # of the same two formats is tests/kernel/otg_store_test.c and
+    # tests/library/otg_slot_test.c; this tool's --emit fixture is what the
+    # first of those decodes with the firmware's decoder.
+    test('make-otg', py,
+         args: [meson.current_source_dir() / '..' / '..' / 'tools' /
+                'make_otg.py', '--selftest'],
          suite: 'unit')
   endif
 endif

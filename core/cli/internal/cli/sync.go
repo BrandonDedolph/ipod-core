@@ -26,8 +26,9 @@ func newSyncCmd() *cobra.Command {
 		Short: "Put a source music tree on the iPod in the layout the firmware reads",
 		Long: `Copies a source tree of "Album - Artist" folders onto the device as
 Music/<Artist - Album>/NN. Title.flac, bakes the two art sidecars per
-album, rewrites the playlists to device paths, creates CORECFG.DAT and
-CORELOG.BIN if they are missing, and writes Music/CORELIB.IDX last.
+album, rewrites the playlists to device paths, creates CORECFG.DAT,
+CORELOG.BIN, COREOTG.DAT and the five On-The-Go slot playlists if they
+are missing, and writes Music/CORELIB.IDX last.
 
 --dst is the VOLUME ROOT of the iPod (D:\ on Windows), not its Music
 folder.
@@ -203,6 +204,8 @@ func printPlan(w io.Writer, p *syncer.Plan, listSkips bool) {
 		fmt.Fprintf(w, "  %s: clock will be stamped\n", devicefs.ConfigName)
 	}
 	fmt.Fprintf(w, "  %s: %s\n", devicefs.LogName, created(p.Log))
+	fmt.Fprintf(w, "  %s: %s\n", devicefs.OTGName, created(p.OTG))
+	fmt.Fprintf(w, "  On-The-Go slots: %s\n", otgSlots(len(p.OTGSlots)))
 	state := "write"
 	if p.Index.Unchanged {
 		state = "already identical"
@@ -247,6 +250,12 @@ func printReport(w io.Writer, r *syncer.Report) {
 	if r.LogCreated {
 		fmt.Fprintf(w, "%s: created\n", devicefs.LogName)
 	}
+	if r.OTGCreated {
+		fmt.Fprintf(w, "%s: created\n", devicefs.OTGName)
+	}
+	if r.OTGSlotsCreated > 0 {
+		fmt.Fprintf(w, "On-The-Go slots: %d created\n", r.OTGSlotsCreated)
+	}
 	if !r.ClockStamped.IsZero() {
 		// The device takes this at its next boot — it cannot be told the time
 		// while it is on the cable (internal/devicefs/clock.go).
@@ -276,6 +285,16 @@ func printWarnings(w io.Writer, warns []string) {
 	for _, s := range warns {
 		fmt.Fprintf(w, "warning: %s\n", s)
 	}
+}
+
+// otgSlots says how many of the five On-The-Go slot playlists are missing.
+// An existing one is never rewritten, whatever it holds — it may be a list
+// saved on the device, or a playlist of the user's own at that name.
+func otgSlots(missing int) string {
+	if missing == 0 {
+		return "all five already there"
+	}
+	return fmt.Sprintf("%d of %d to create", missing, devicefs.OTGPlaylistSlots)
 }
 
 func created(b bool) string {

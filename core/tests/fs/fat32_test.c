@@ -1114,6 +1114,85 @@ int main(int argc, char **argv)
                        g_fs_overflow.data_start == 0xFFFFFFFFu);
     }
 
+    /* ---- fat32_cache_drop: the companion to the write hole ----
+     *
+     * This reader caches one FAT sector and one data sector and has no write
+     * invalidation, because it has no writes. But four modules overwrite the
+     * data sectors of pre-allocated files behind its back, and one of them —
+     * library/otg_slot.c — writes a .m3u8 that library/playlist.c then reads
+     * back through THESE paths. Without the drop, the read after the write
+     * returns the bytes from before it.
+     *
+     * Staged directly here, on the stream image, so the API is pinned
+     * independently of the module that needs it: read through the cached
+     * path, change the RAM disk underneath, read again (stale), drop, read
+     * again (fresh). Then the same for the FAT cache, whose staleness shows
+     * up as a chain step into the wrong cluster. */
+    {
+        static fat32_t cfs;
+        build_stream_image();
+        fails += check("cache-drop image mounts",
+                       fat32_mount(&cfs, mem_read, NULL, 0) == 0);
+
+        /* A SUB-SECTOR read goes through the data cache (a whole-sector one
+         * is a bulk read straight into the caller's buffer). TWO.TXT's first
+         * bytes are (i * 7) & 0xFF. */
+        uint8_t cbuf[16];
+        fat32_stream_t cst;
+        fat32_stream_open(&cst, &cfs, 4, 1000);
+        fails += check("cached read sees the original bytes",
+                       fat32_stream_read(&cst, cbuf, 8) == 8 && two_ok(cbuf, 8));
+
+        g_mem[4 * MEM_BPS] ^= 0xFF;          /* change it under the reader */
+        fat32_stream_open(&cst, &cfs, 4, 1000);
+        fails += check("without a drop the SAME sector reads STALE",
+                       fat32_stream_read(&cst, cbuf, 8) == 8 && two_ok(cbuf, 8));
+
+        fat32_cache_drop(&cfs);
+        fat32_stream_open(&cst, &cfs, 4, 1000);
+        int fresh = fat32_stream_read(&cst, cbuf, 8) == 8 &&
+                    cbuf[0] == (uint8_t)(0x00 ^ 0xFF);
+        for (int i = 1; i < 8 && fresh; i++) {
+            fresh = cbuf[i] == (uint8_t)((i * 7) & 0xFF);
+        }
+        fails += check("after fat32_cache_drop it reads the new bytes", fresh);
+        g_mem[4 * MEM_BPS] ^= 0xFF;          /* put it back */
+
+        /* The FAT cache. Walking TWO.TXT's chain caches FAT sector 0; point
+         * cluster 4 at cluster 3 instead and the stale cache still steps to
+         * 5, while a dropped one steps to 3 (whose bytes are 0xA5 ^ i). */
+        fat32_stream_open(&cst, &cfs, 4, 1000);
+        fails += check("the chain is walked and its FAT sector cached",
+                       fat32_stream_read(&cst, cbuf, 8) == 8 &&
+                       fat32_stream_skip(&cst, 992 - 8) == 992 - 8);
+        {
+            uint8_t rest[8];
+            fails += check("...into the second cluster",
+                           fat32_stream_read(&cst, rest, 8) == 8 &&
+                           rest[0] == (uint8_t)((1000 - 8) * 7 & 0xFF));
+        }
+        put32(&g_mem[1 * MEM_BPS + 4 * 4], 3);      /* 4 -> 3, not 4 -> 5 */
+        fat32_stream_open(&cst, &cfs, 4, 1000);
+        (void)fat32_stream_skip(&cst, 512);
+        fails += check("without a drop the chain still steps the OLD way",
+                       fat32_stream_read(&cst, cbuf, 4) == 4 &&
+                       cbuf[0] == (uint8_t)((512 * 7) & 0xFF));
+        fat32_cache_drop(&cfs);
+        fat32_stream_open(&cst, &cfs, 4, 1000);
+        (void)fat32_stream_skip(&cst, 512);
+        fails += check("after the drop it follows the new chain",
+                       fat32_stream_read(&cst, cbuf, 4) == 4 &&
+                       cbuf[0] == (uint8_t)(0xA5 ^ 0));
+
+        /* A null fs drops every volume's; dropping twice is harmless. */
+        fat32_cache_drop(NULL);
+        fat32_cache_drop(NULL);
+        fat32_stream_open(&cst, &cfs, 3, 16);
+        fails += check("a null-fs drop is safe and leaves the reader working",
+                       fat32_stream_read(&cst, cbuf, 4) == 4 &&
+                       cbuf[0] == (uint8_t)(0xA5 ^ 0));
+    }
+
     if (fails == 0) {
         printf("ALL PASS\n");
     } else {

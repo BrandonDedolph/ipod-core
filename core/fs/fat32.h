@@ -324,4 +324,22 @@ int fat32_file_lba(const fat32_t *fs, uint32_t first_clus,
 int fat32_file_lba_at(fat32_t *fs, uint32_t first_clus, uint32_t byte_offset,
                       uint32_t *lba, uint32_t *max_sectors);
 
+/*
+ * Drop every sector this reader has cached for `fs` (both the FAT-sector
+ * cache and the data-sector cache); a null `fs` drops them for every volume.
+ *
+ * THE COMPANION TO THE WRITE HOLE ABOVE. This driver is read-only except
+ * that callers overwrite the data sectors of pre-allocated files behind its
+ * back (fat32_file_lba / fat32_file_lba_at). Three of those callers read
+ * their own file through the raw block callback and are immune; the fourth,
+ * library/otg_slot.c, writes a .m3u8 that library/playlist.c then reads back
+ * through fat32_read_file and fat32_stream_read — i.e. through the data
+ * cache, which still holds the bytes from BEFORE the write.
+ *
+ * So: any writer whose file is read through this module must call this after
+ * its last write, before anything reads the file again. Cheap (it clears two
+ * flags) and safe to call at any time — the next read simply re-fetches.
+ */
+void fat32_cache_drop(fat32_t *fs);
+
 #endif /* CORE_FS_FAT32_H */

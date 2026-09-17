@@ -437,6 +437,87 @@ bss +456 B, text +1.2 KB.
   9. Drain or disconnect the cell once and read the raw bytes again: that is
      the reset value, and it settles the "year 00 = unset" row in the doc.
 
+- **On-The-Go — the playlist you build as you go.** Hold Select for 450 ms on
+  a song (Songs, an artist's All Songs, a genre, an album's tracklist, another
+  playlist's, or a song hit in Search's results) and it joins a live list; on an ALBUM row the whole album goes
+  in, in its tracklist's (disc, track) order. A one-second banner across the
+  top chrome — the Hold banner's own primitive with a + in a ring — says
+  "Added to On-The-Go" and the new count, because the list it joined is on
+  another screen and nothing else would tell you the press registered.
+
+  Playlists pins **On-The-Go** as row 0 with its count. Inside: Clear Playlist
+  (two presses — the row becomes "Clear? Select again" for three seconds),
+  Save Playlist, then the tracks in the Songs shape. Select on a track plays
+  the list (`RESUME_KIND_OTG`, so a cold boot comes back into it, paused, on
+  the same track); a hold removes the row. Save writes the lowest free one of
+  five slot playlists, names it in the banner, empties the live list and drops
+  you back on the new row in Playlists — and a list that was PLAYING is
+  re-pointed at the saved file, so playback carries on and the next resume
+  lands in the playlist. A saved slot is an ordinary playlist from then on,
+  and carries a Delete Playlist row so the slot can be freed.
+
+  The cost to everything else: **a Select TAP on a list row now acts on the
+  release**, which is the original iPod's behaviour and the same rule Now
+  Playing's Select has always used. It goes through `ui/keyhold.c` like PLAY,
+  MENU and RIGHT/LEFT — the fifth button on that machine, and the first whose
+  meaning also depends on which ROW was under the thumb, so the down-edge
+  records the row and a per-pass block decides. Only the screens with a hold
+  action arbitrate; Playlists, Artists, Genres, the menus and Search's
+  CHARACTER RING keep Select on the down-edge — the ring's Select types a
+  character and a key that waits for a release is a key that feels broken.
+  Which Search hits are addable is `search_hold_rows()` in ui/search.c, so
+  the rule has a host suite (`search_test` section 10) rather than living
+  only in main.c.
+
+  **Storage.** Two things the firmware cannot create, so the host does:
+  `COREOTG.DAT` in the volume root (`kernel/otg_store.c` — the live list as
+  512 `(folder_hash, file_hash)` locator pairs, the same locator CORELIB.IDX
+  binds a record to its file by, in two CRC-32'd 5120-byte slots; **the third
+  writer to the user's disk**, with `config.c`'s rules copied and not
+  reinterpreted, plus the one thing config.c never needed — a record bigger
+  than a cluster, so a slot is read and written per CLUSTER RUN); and the five
+  `Music/Playlists/On-The-Go N.m3u8` slots (`library/otg_slot.c`, **the
+  fourth** — ordinary extended M3U8 with a `#CORE-OTG` header and trailer, so
+  the Playlists screen, the reader, `--prune` and a desktop player all come
+  free). The slot file is written WHOLE through a 4096-byte staging buffer
+  with **stage 0 written LAST**: that order is the entire tear-detection
+  scheme, because a cut leaves a header whose `gen` disagrees with the
+  trailer's, or a line count that disagrees with the header's `count`. A
+  damaged slot is never believed — it opens to "Playlist damaged — save
+  again" with Delete under it.
+
+  Also: `fat32_cache_drop()` (a slot playlist is the first file the firmware
+  writes AND reads back through fs/fat32.c's caches — removing the call fails
+  three checks in `otg_slot_test`), `PLAYLIST_TRACKS_MAX` 128 → 512 (a saved
+  list that cannot be re-opened whole is not a saved list), `RESUME_KIND_OTG`.
+  Host side: `tools/make_otg.py` and `core/cli/internal/devicefs/otg.go`,
+  byte-identical, with `core sync` creating both files once, keeping all five
+  slot paths out of prune and refusing a source playlist that would land on
+  one; `core doctor` reporting `COREOTG.DAT` and each slot's state; `core
+  install` creating them. Format reference:
+  `core/docs/design/on-the-go.md`.
+
+  78 host suites green (was 74), `make hw && make verify-hw` clean under
+  gcc-16 `-Werror`, `.bss` 11.81 MiB of a 14 MiB budget, text 415 KB,
+  `go test ./...` green, `make_otg.py --selftest` green, the three gallery
+  stills re-render byte-identical.
+
+  **Nothing here was run on the device.** These are the THIRD and FOURTH
+  writers to the user's disk and they owe `kernel/config.c`'s qualification,
+  unchanged — `make_otg.py --verify` against the firmware's own two UART lines
+  BEFORE the first add and BEFORE the first Save. The nine-step bench is
+  first-flash checklist item 10 below.
+
+  The host half of that qualification is done: `make_otg.py --verify` was run
+  against a raw image built with `otg_store_test`'s exact geometry
+  (BytesPerSector 2048, one FS-sector per cluster, part_lba 64, `COREOTG.DAT`
+  fragmented 3 -> 7 -> 4 -> 9 -> 5 -> 11, an MBR bolted on). It prints slot
+  LBAs **0x4C and 0x52** with runs of 4+4+2 and 2+4+4 sectors — byte for byte
+  what the C test's own `expect_runs` formula asserts `otg_store_probe_lba`
+  returns over the same chain, including the slot that does not start on a
+  cluster boundary. Python and C agree on a fragmented file; what is left is
+  the device (plan acceptance criterion 5).
+
 - **Pause on headphone unplug — the policy, and a probe that needs no cable.**
   The pause decision moved out of `kernel/main.c` (five untested inline lines
   over a file-scope `g_hp_last`) into `ui/jackwatch.c`, a pure module with its
@@ -958,6 +1039,54 @@ log capturing the loop.
    `LOG <n> on`; `LOG off` means the file was not found or did not
    validate, and nothing is written.
 
+10. **On-The-Go — the write path's THIRD and FOURTH callers; qualify both
+    before either writes.** `python3 tools/make_otg.py --create` (Windows-native
+    copy + `Write-VolumeCache`) makes `COREOTG.DAT` and the five slot
+    playlists; `core sync` does it too. Then, in this order:
+
+    1. **Before the first add.** `sudo python3 tools/make_otg.py --verify
+       /dev/sdX` on the host; boot and read `core: otg load <n> writable <w> seq
+       <s> lba <A>/<B>`. A and B MUST equal the FIRST cluster run of each slot
+       the tool printed. If they differ, add nothing and power off.
+    2. Hold Select on a Songs row: the banner reads "Added to On-The-Go ·
+       1 SONGS" within ~450 ms, the release does nothing, and Playlists →
+       On-The-Go shows the row. A TAP still plays — check that first, on every
+       list, because this is the change with the widest blast radius. Check
+       Search too, both halves: typing on the ring must still feel instant, and
+       a hold on a song hit must add it.
+    3. Hold on an album row adds its tracks in disc/track order; on the All
+       Songs row nothing happens.
+    4. Wait for `core: otg save rc 00000000 seq 1`, power-cycle, confirm the
+       list came back AND that the music is still there and `chkdsk` /
+       `fsck.vfat -n` reports the volume clean. Repeat twice and confirm
+       `make_otg.py --dump COREOTG.DAT` shows the two slots ALTERNATING.
+    5. **Before the first Save**, check `core: otg slot N lba <X>` against the
+       same tool's slot-file line. Then Save: the banner names the slot, the
+       live list empties, Playlists lists "On-The-Go N" and opens it whole.
+       `fsck` again, and open the `.m3u8` in a desktop player.
+    6. Inside On-The-Go: hold removes; Clear needs two presses; Delete on a
+       saved slot frees it. Delete is the ONLY thing that frees a slot that
+       holds anything — a torn save included; Save only ever writes into an
+       empty one, which is what makes the one tear gen+count cannot see
+       unreachable. And a playlist of your OWN at a slot name must show no
+       Delete row at all: drop an `On-The-Go 4.m3u8` of your own (8 KiB, no
+       `#CORE-OTG` line) on the volume, open it, and confirm there is no
+       Delete row and that `--dump` shows it byte-identical afterwards. That
+       state is a dead end by design — the device never writes to a slot with
+       no header, and the rarest tear (a failure inside the LAST write) leaves
+       one looking the same — so also check the way out: `core doctor` names
+       the slot and says to delete the file and re-sync, and `core sync` /
+       `make_otg.py --create` put an empty one back only when it is ABSENT.
+    7. Power off (hold Play 5 s) and cold boot: the live list is back and
+       resume lands in the OTG queue on the same track, paused. After a Save,
+       the next resume lands in the saved playlist.
+    8. Adding with the drive parked must NOT spin it up (no wake on the UART
+       until the next forced or platter-turning event); Save DOES wake it and
+       shows the load bar.
+    9. With `COREOTG.DAT` absent the session works and nothing persists — the
+       UART says `otg load 0 writable 0`. With no free slot, Save is greyed and
+       says why.
+
 Still open from the audit: the BCM power gate, the ROM's undocumented
 `DEV_EN` bits (USB/FireWire/IDE) and a 32 kHz suspend point — `DEV_EN`
 gating of SER0/PWM/I2C and PLL-off in suspend have since landed, see
@@ -1415,12 +1544,15 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
 
 ## What's NOT done (pick up next)
 
-1. **Playlists — write path.** Reading is done (above, unflashed). Saving
-   or editing a playlist means creating and growing a file, which means
-   **FAT32 cluster allocation**, which does not exist. The only write we
-   have is an in-place overwrite of one pre-allocated file's first cluster
-   (`config.c`). The read path was a day; the write path is a filesystem
-   project.
+1. **Playlists — a write path that MAKES a file.** On-The-Go (above,
+   unflashed) closed most of this: the device now writes a playlist the user
+   built, into one of five `On-The-Go N.m3u8` files the host pre-allocated,
+   overwritten in place — no cluster is allocated and no directory entry is
+   touched. What is still missing is naming one: a playlist of your own,
+   under your own name, means CREATING and GROWING a file, which means
+   **FAT32 cluster allocation**, which does not exist and is a filesystem
+   project. Renaming a saved slot has the same problem. The host does both
+   (`core sync`), and a "Save as..." on the device does not.
 2. **Search** — built (2026-09-16), **not yet flashed**; see that entry's
    bench list. What is still not there: searching by genre or composer, art
    chips on album hits, and any narrowing of the scan (a full library walk
@@ -1457,8 +1589,9 @@ arm-none-eabi-binutils arm-none-eabi-newlib meson ninja pkgconf`, then
    can drift from the device silently. A device capture path would end that.
 8. **Library sync is manual** — build the index on the host
    (`tools/build_index.py`), convert art (`tools/coreart.py`), pre-create
-   `CORECFG.DAT` (`tools/make_config.py`) and `CORELOG.BIN`
-   (`tools/make_log.py`), and copy to the device.
+   `CORECFG.DAT` (`tools/make_config.py`), `CORELOG.BIN`
+   (`tools/make_log.py`) and `COREOTG.DAT` + the five On-The-Go slots
+   (`tools/make_otg.py`), and copy to the device. `core sync` does all of it.
 9. **Host CLI install/flash/recover are stubs** —
     `core/cli/internal/cli/install.go` says so outright; flashing is
     `ipodpatcher` by hand today.

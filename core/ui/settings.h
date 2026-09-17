@@ -135,7 +135,8 @@ typedef struct {
      * remembers. resume_ctx_hash names the one context the song's record
      * cannot: under RESUME_KIND_PLAYLIST it is name_hash() of the playlist's
      * ext-trimmed filename (the same folding as the locator), 0 for every
-     * other kind. All meaningless while resume_kind is RESUME_KIND_NONE, and
+     * other kind — RESUME_KIND_OTG included, because the live list is not a
+     * file and has no name to fold. All meaningless while resume_kind is RESUME_KIND_NONE, and
      * zeroed with the locator (hash 0) on both sides of the codec.
      * resume_flags is reserved (written 0, ignored).
      */
@@ -219,7 +220,13 @@ enum {
     RESUME_KIND_GENRE    = 4,  /* a genre's songs                             */
     RESUME_KIND_SHUFFLE  = 5,  /* Shuffle Songs: the library in seed order    */
     RESUME_KIND_PLAYLIST = 6,  /* an M3U8 playlist: resume_ctx_hash names it  */
-    RESUME_KIND_MAX      = RESUME_KIND_PLAYLIST
+    RESUME_KIND_OTG      = 7,  /* the On-The-Go live list (library/otg.h): it
+                                * is not a file and has no name, so ctx is 0
+                                * and the boot path rebuilds the queue from
+                                * the list COREOTG.DAT restored. A SAVED
+                                * On-The-Go playlist is an ordinary file and
+                                * resumes as KIND_PLAYLIST                    */
+    RESUME_KIND_MAX      = RESUME_KIND_OTG
 };
 
 /* Populate `s` with sensible defaults (shuffle off, repeat off, volume 70 with

@@ -152,8 +152,8 @@ func TestInstallCreatesTheDeviceFilesAndMusicFolder(t *testing.T) {
 		t.Errorf("the elevated child would run\n  %s\nwant\n  %s", got, wantArgs)
 	}
 
-	// The three things the firmware cannot make for itself.
-	for _, name := range []string{devicefs.ConfigName, devicefs.LogName} {
+	// The things the firmware cannot make for itself.
+	for _, name := range []string{devicefs.ConfigName, devicefs.LogName, devicefs.OTGName} {
 		st, err := os.Stat(filepath.Join(volume, name))
 		if err != nil {
 			t.Errorf("%s was not created: %v", name, err)
@@ -167,8 +167,25 @@ func TestInstallCreatesTheDeviceFilesAndMusicFolder(t *testing.T) {
 	if err != nil || !music.IsDir() {
 		t.Errorf("%s\\ was not created: %v", devicefs.MusicDir, err)
 	}
-	if ents, _ := os.ReadDir(filepath.Join(volume, devicefs.MusicDir)); len(ents) != 0 {
-		t.Errorf("%s\\ is not empty", devicefs.MusicDir)
+	// Music\ holds exactly one thing after an install: the Playlists folder
+	// with the five On-The-Go slots in it. The firmware cannot create those
+	// either, and without them Save has nowhere to go.
+	if ents, _ := os.ReadDir(filepath.Join(volume, devicefs.MusicDir)); len(ents) != 1 ||
+		ents[0].Name() != devicefs.PlaylistDir {
+		t.Errorf("%s\\ should hold only %s\\, holds %v",
+			devicefs.MusicDir, devicefs.PlaylistDir, ents)
+	}
+	for n := 1; n <= devicefs.OTGPlaylistSlots; n++ {
+		path := filepath.Join(volume, devicefs.MusicDir, devicefs.PlaylistDir,
+			devicefs.OTGSlotName(n))
+		info, err := devicefs.OTGSlotFileState(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.State != devicefs.OTGSlotEmpty {
+			t.Errorf("%s is %q, want %q", devicefs.OTGSlotName(n), info.State,
+				devicefs.OTGSlotEmpty)
+		}
 	}
 
 	// The device files must be the ones the firmware will accept, not
@@ -180,11 +197,19 @@ func TestInstallCreatesTheDeviceFilesAndMusicFolder(t *testing.T) {
 	if _, ok := devicefs.ConfigFileValid(head); !ok {
 		t.Error("the CORECFG.DAT written does not validate")
 	}
+	otg, err := os.ReadFile(filepath.Join(volume, devicefs.OTGName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := devicefs.OTGFileValid(otg); !ok {
+		t.Error("the COREOTG.DAT written does not validate")
+	}
 
 	for _, want := range []string{
 		"installed: Apple firmware (7.6 MB, entry 0x736000)",
 		devicefs.ConfigName,
 		devicefs.LogName,
+		devicefs.OTGName,
 		"created",
 		backup,
 		"core flash --from-backup " + backup,

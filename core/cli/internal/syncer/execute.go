@@ -48,6 +48,10 @@ type Report struct {
 	// take at its next boot; the zero time means no stamp was written (a dry
 	// run, or a destination that turned out not to be a volume).
 	ClockStamped time.Time `json:"clock_stamped,omitzero"`
+	// OTGCreated is COREOTG.DAT; OTGSlotsCreated counts the On-The-Go slot
+	// playlists that were absent. Both are created once and never reset.
+	OTGCreated      bool `json:"otg_created"`
+	OTGSlotsCreated int  `json:"otg_slots_created"`
 
 	IndexWritten bool `json:"index_written"`
 	IndexBytes   int  `json:"index_bytes"`
@@ -67,7 +71,9 @@ type Report struct {
 //	per album: rename, copy, art     — the files the index will name
 //	playlists                        — they point at those files
 //	prune                            — only with --prune --yes
-//	CORECFG.DAT, CORELOG.BIN         — created only when absent or invalid
+//	CORECFG.DAT, CORELOG.BIN,
+//	COREOTG.DAT, the five On-The-Go
+//	slot playlists                   — created only when absent or invalid
 //	Music/CORELIB.IDX                — LAST, via temp + rename
 //
 // A failure anywhere before the last step returns with the index untouched, so
@@ -111,6 +117,7 @@ func Execute(ctx context.Context, p *Plan, o Options) (*Report, error) {
 		}
 		rep.Pruned, rep.PrunedBytes = len(p.Prune), p.PruneBytes
 		rep.ConfigCreated, rep.LogCreated = p.Config, p.Log
+		rep.OTGCreated, rep.OTGSlotsCreated = p.OTG, len(p.OTGSlots)
 		rep.IndexWritten = !p.Index.Unchanged
 		rep.Elapsed = time.Since(start)
 		return rep, nil
@@ -272,6 +279,23 @@ func Execute(ctx context.Context, p *Plan, o Options) (*Report, error) {
 	rep.LogCreated = created
 	if created {
 		rep.Written = append(rep.Written, filepath.Join(o.Dst, devicefs.LogName))
+	}
+	created, err = devicefs.EnsureOTG(o.Dst)
+	if err != nil {
+		return rep, err
+	}
+	rep.OTGCreated = created
+	if created {
+		rep.Written = append(rep.Written, filepath.Join(o.Dst, devicefs.OTGName))
+	}
+	slots, err := devicefs.EnsureOTGSlots(musicDir)
+	if err != nil {
+		return rep, err
+	}
+	rep.OTGSlotsCreated = len(slots)
+	for _, name := range slots {
+		rep.Written = append(rep.Written,
+			filepath.Join(musicDir, devicefs.PlaylistDir, name))
 	}
 
 	// The clock. It goes here, right after the two device files and before the

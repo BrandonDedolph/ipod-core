@@ -200,6 +200,13 @@ type Plan struct {
 	// run, so making this false there made the line unprintable, which is
 	// how a user ended up with no way to learn that a sync sets the clock.)
 	Clock bool `json:"clock"`
+	// OTG says whether COREOTG.DAT has to be created, and OTGSlots names the
+	// On-The-Go slot playlists that are absent. The same rule as the two
+	// above, only stricter for the slots: an existing slot file is never
+	// rewritten WHATEVER it holds, because it may be a list the user saved
+	// or a playlist of their own that happens to use the name.
+	OTG      bool     `json:"otg"`
+	OTGSlots []string `json:"otg_slots"`
 
 	Warnings []string `json:"warnings"`
 
@@ -429,6 +436,16 @@ func MakePlan(o Options, scan *library.Scan) (*Plan, error) {
 		keep.add(pl.Dst)
 	}
 
+	// The five On-The-Go slot playlists are DEVICE files that happen to live
+	// in the playlists folder. They are kept whether or not they exist yet,
+	// and whether or not any source playlist is planned — pruning one would
+	// throw away a list the user saved on the device, which no source tree
+	// can reproduce.
+	keep.add(filepath.Join(musicDir, devicefs.PlaylistDir))
+	for n := 1; n <= devicefs.OTGPlaylistSlots; n++ {
+		keep.add(filepath.Join(musicDir, devicefs.PlaylistDir, devicefs.OTGSlotName(n)))
+	}
+
 	// Index — built here so --dry-run can report its exact size, written last
 	// by Execute.
 	recs := cidx.RecordsFromScan(scan)
@@ -450,6 +467,8 @@ func MakePlan(o Options, scan *library.Scan) (*Plan, error) {
 	p.Config = !configValid(o.Dst)
 	p.Log = !logValid(o.Dst)
 	p.Clock = true
+	p.OTG = !otgValid(o.Dst)
+	p.OTGSlots = missingOTGSlots(musicDir)
 
 	// Prune: the device, minus the plan.
 	prune, bytes := planPrune(musicDir, keep)
@@ -688,6 +707,29 @@ func configValid(root string) bool {
 	}
 	_, ok := devicefs.ConfigFileValid(b)
 	return ok
+}
+
+// otgValid is what devicefs.EnsureOTG would decide, without writing.
+func otgValid(root string) bool {
+	b, err := os.ReadFile(filepath.Join(root, devicefs.OTGName))
+	if err != nil {
+		return false
+	}
+	_, ok := devicefs.OTGFileValid(b)
+	return ok
+}
+
+// missingOTGSlots is the slot playlists EnsureOTGSlots would create: the ones
+// that are not there. An existing file is never listed, whatever it holds.
+func missingOTGSlots(musicDir string) []string {
+	var out []string
+	for n := 1; n <= devicefs.OTGPlaylistSlots; n++ {
+		name := devicefs.OTGSlotName(n)
+		if _, err := os.Stat(filepath.Join(musicDir, devicefs.PlaylistDir, name)); err != nil {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func logValid(root string) bool {
