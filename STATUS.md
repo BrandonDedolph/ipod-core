@@ -536,8 +536,10 @@ bss +456 B, text +1.2 KB.
   **2026-09-17, Flash 1 done:** About read `JACK 1 n6` with the plug seated
   after three insert/pull cycles — seated = 1, one count per motion, no
   `en=`/`oe=`. `HEADPHONE_DETECT_TRUSTED` is now 1 and `ACTIVE_LOW` stays 0;
-  Flash 2 (steps 8–16 below) is the next bench. The paragraph below describes
-  image 69e1021, which shipped the probe only.
+  Flash 2 (5753ea8) bench step 9: the pull pauses within the debounce, but the
+  Now Playing band kept reading "Now Playing" — the PAUSE branch never set
+  `dirty`, unlike the PLAY tap. One line; fixed in the image after 5753ea8.
+  The paragraph below describes image 69e1021, which shipped the probe only.
 
   **The feature shipped INERT in 69e1021.** `HEADPHONE_DETECT_TRUSTED` was 0, so
   `hal_headphones_present()` answers -1 with no bus traffic and the module

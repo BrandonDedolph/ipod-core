@@ -8436,6 +8436,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                                    pump_t0)) {
             case JACKWATCH_PAUSE:
                 player_pause();
+                dirty = 1;              /* the band must read Paused, like a PLAY tap */
                 uart_puts("core: jack out, pause\n");
                 break;
             case JACKWATCH_OUT:
