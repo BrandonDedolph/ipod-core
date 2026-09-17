@@ -239,10 +239,9 @@ up.
 
 **Headphones.** Pull the plug while a track plays and it pauses; plugging back in does not start
 it again — press Play. Nothing on the cable can control playback: this iPod's jack has no button
-line, and its fourth conductor is a video output, not a remote. *Not switched on in this release.*
-The pin that senses the plug is documented but has never been read on a real device, and sensing
-it backwards would stop the music every time you plugged headphones **in** — so it stays off until
-the reading is taken. Settings, About shows the pin live (`JACK`) for exactly that purpose.
+line, and its fourth conductor is a video output, not a remote. The pin that senses the plug was
+read on the device on 2026-09-17 (seated reads 1), so the pause is switched on from that image.
+Settings, About still shows the pin live (`JACK`) if it ever needs checking again.
 
 ## Settings
 

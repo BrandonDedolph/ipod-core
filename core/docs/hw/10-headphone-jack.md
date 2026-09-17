@@ -8,7 +8,7 @@ below with its evidence:
 |---|---|---|
 | Can the firmware sense an inline headphone button (play/pause, volume) on the 5G/5.5G? | **No.** There is no electrical path from any jack conductor to anything the SoC or the PMU can read, other than the insertion switch. | High — from Apple's own documentation plus the codec datasheet; see "Why buttons cannot work". |
 | Is the jack a plain 3-conductor TRS? | **No — it is 4-pole.** Tip/ring = L/R audio, plus ground, plus **composite video out**. The fourth conductor is an *output*, which is exactly why it is useless for buttons. | High — Apple's spec sheet. |
-| Does the jack have an insertion (plug-present) switch the firmware can read? | **Yes.** Apple's own service diagnostics test it and Apple's firmware pauses on unplug. The public iPodLinux GPIO table puts it on **GPIO port A bit 7**. | Line: medium (public wiki, cross-validated). **Polarity: unconfirmed** — see "Confirming it on the device". <!-- bench result: --> |
+| Does the jack have an insertion (plug-present) switch the firmware can read? | **Yes.** Apple's own service diagnostics test it and Apple's firmware pauses on unplug. The public iPodLinux GPIO table puts it on **GPIO port A bit 7**. | Line: medium (public wiki, cross-validated). **Polarity: CONFIRMED 2026-09-17** on the About-page probe: `JACK 1` with a plug seated, the edge count advancing once per insertion or pull (`n6` after three cycles). Seated = 1, so `HEADPHONE_DETECT_ACTIVE_LOW` stays 0 and `HEADPHONE_DETECT_TRUSTED` is 1 from image 69e1021+1. |
 
 Nothing in this file was derived from Rockbox source. The GPIO assignment
 comes from the iPodLinux **wiki** (documentation, GFDL), the codec facts

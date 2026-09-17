@@ -533,7 +533,13 @@ bss +456 B, text +1.2 KB.
   alongside `PAUSE` so there is exactly one edge detector, and it is the
   tested one.
 
-  **The feature ships INERT.** `HEADPHONE_DETECT_TRUSTED` is still 0, so
+  **2026-09-17, Flash 1 done:** About read `JACK 1 n6` with the plug seated
+  after three insert/pull cycles — seated = 1, one count per motion, no
+  `en=`/`oe=`. `HEADPHONE_DETECT_TRUSTED` is now 1 and `ACTIVE_LOW` stays 0;
+  Flash 2 (steps 8–16 below) is the next bench. The paragraph below describes
+  image 69e1021, which shipped the probe only.
+
+  **The feature shipped INERT in 69e1021.** `HEADPHONE_DETECT_TRUSTED` was 0, so
   `hal_headphones_present()` answers -1 with no bus traffic and the module
   never sees an edge. What is live in this image is the *probe*: Settings >
   About's footer now reads `ADC 2731 · LOG 6 on · JACK 1 n0` — the raw A7

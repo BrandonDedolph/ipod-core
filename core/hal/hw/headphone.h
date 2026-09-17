@@ -54,7 +54,7 @@
 #endif
 /* 0 until the pin has been read on the device: line AND polarity. */
 #ifndef HEADPHONE_DETECT_TRUSTED
-#define HEADPHONE_DETECT_TRUSTED     0
+#define HEADPHONE_DETECT_TRUSTED     1
 #endif
 /* 1 compiles the pin-finding UART probe in (never in a shipping image). */
 #ifndef HEADPHONE_PROBE
