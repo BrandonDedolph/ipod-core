@@ -15,7 +15,7 @@ reviews refer to the branch worktree at the time of that round, not to `main` to
 | 06-08-09-alphabet-search | feat/alphabet-search | 3 | fbc8b2c |
 | 15-mp3 | feat/mp3 | 3 | 4c4ce50 |
 | 14-clock | feat/clock | 4 | b321e78 |
-| 13-on-the-go | feat/on-the-go | in progress | |
+| 13-on-the-go | feat/on-the-go | 3 | 1c059d2 |
 
 Nothing from this job has been flashed. Every STATUS.md entry from the day ends UNFLASHED
 with a bench list.
