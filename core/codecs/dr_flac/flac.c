@@ -145,29 +145,77 @@ static int32_t exp2_q12(int32_t x_q12) {
     return (v + 128) >> 8;
 }
 
-void flac_set_gain_db_q8(decoder_t *d, int db_q8) {
-    if (!d) {
-        return;
-    }
-    /* Cap at +12 dB: a mis-tagged (or hostile) "+60 dB" would otherwise
-     * saturate every sample into a square wave. -30 dB is the low clamp —
-     * below that the Q12 gain is quantization noise anyway. */
-    if (db_q8 > 12 * 256) {
-        db_q8 = 12 * 256;
-    } else if (db_q8 < -30 * 256) {
-        db_q8 = -30 * 256;
-    }
-    /* linear = 10^(dB/20) = 2^(dB * log2(10)/20), and log2(10)/20 = 0.1660964.
-     * Converting Q8 dB to the Q12 octaves exp2_q12 wants is a multiply by
-     * 0.1660964 * 4096/256 = 2.657542; 680/256 = 2.65625 is 0.05% under. */
-    g_gain_q12 = exp2_q12(((int32_t)db_q8 * 680) >> 8);
+/* The range a tagged gain is clamped into before anything else: +12 dB so a
+ * mis-tagged (or hostile) "+60 dB" cannot ask for a square wave even before
+ * the peak cap gets a say, -30 dB because below that the Q12 gain is
+ * quantization noise anyway. */
+#define FLAC_GAIN_MAX_DB_Q8  (12 * 256)
+#define FLAC_GAIN_MIN_DB_Q8  (-30 * 256)
+
+/* linear = 10^(dB/20) = 2^(dB * log2(10)/20), and log2(10)/20 = 0.1660964.
+ * Converting Q8 dB to the Q12 octaves exp2_q12 wants is a multiply by
+ * 0.1660964 * 4096/256 = 2.657542; 680/256 = 2.65625 is 0.05% under. */
+static int32_t db_q8_to_gain_q12(int db_q8) {
+    return exp2_q12(((int32_t)db_q8 * 680) >> 8);
 }
 
-/* Saturating Q12 gain over an interleaved s16 block, in place. */
+/* The inverse, for reporting: the largest dB whose gain does not exceed
+ * `g_q12`. Bisection over the monotonic forward map — ~14 exp2 evaluations,
+ * once per track, and it needs no log table. */
+static int gain_q12_to_db_q8(int32_t g_q12) {
+    int lo = FLAC_GAIN_MIN_DB_Q8, hi = FLAC_GAIN_MAX_DB_Q8;
+    while (lo < hi) {
+        int mid = lo + (hi - lo + 1) / 2;
+        if (db_q8_to_gain_q12(mid) <= g_q12) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+int flac_set_gain_db_q8(decoder_t *d, int db_q8, uint32_t peak_q16) {
+    if (!d) {
+        return 0;
+    }
+    if (db_q8 > FLAC_GAIN_MAX_DB_Q8) {
+        db_q8 = FLAC_GAIN_MAX_DB_Q8;
+    } else if (db_q8 < FLAC_GAIN_MIN_DB_Q8) {
+        db_q8 = FLAC_GAIN_MIN_DB_Q8;
+    }
+    int32_t g = db_q8_to_gain_q12(db_q8);
+
+    /*
+     * THE PEAK CAP. The tagged gain says how loud the track should be; the
+     * tagged peak says how loud it CAN be made before its loudest sample
+     * leaves the int16 range. The scale is held to full_scale / peak, and
+     * an unknown peak is taken as full scale — the one assumption that can
+     * never clip. Without this the multiply below ran uncapped and the
+     * saturate after it did the "clipping handling": on every positive-gain
+     * track with a full-scale peak (34 in the library) that was hard clipping
+     * on every peak, the crunch the device was reported with.
+     */
+    if (peak_q16 == 0) {
+        peak_q16 = 65536u;
+    }
+    int32_t cap = (int32_t)((4096u << 16) / peak_q16);   /* Q12, >= 1 */
+    if (g > cap) {
+        g     = cap;
+        db_q8 = gain_q12_to_db_q8(g);
+    }
+    g_gain_q12 = g;
+    return db_q8;
+}
+
+/* Q12 gain over an interleaved s16 block, in place: round to nearest (an
+ * arithmetic shift alone floors, a -0.5 LSB bias on every sample), then
+ * saturate. With the peak cap in force the saturate is only a backstop for
+ * that rounding at the very top of the range. */
 static void apply_gain_s16(int16_t *p, int samples) {
     int32_t g = g_gain_q12;
     for (int i = 0; i < samples; i++) {
-        int32_t v = ((int32_t)p[i] * g) >> 12;
+        int32_t v = ((int32_t)p[i] * g + 2048) >> 12;
         if (v > 32767) {
             v = 32767;
         } else if (v < -32768) {

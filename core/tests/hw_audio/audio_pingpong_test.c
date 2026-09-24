@@ -904,5 +904,44 @@ int main(void)
               log_first_codec_write(CW_DACCTRL_UNMUTE_B0, CW_DACCTRL_MUTE_B1));
     }
 
+    /* --- 13. audio_fifo_service(): starvation INSIDE a transfer -------- *
+     * The third failure, invisible to `underruns` (needs a short read) and
+     * `late` (needs a late completion): the DMA mid-transfer loses the bus
+     * and the TX FIFO drains. The tick samples IISFIFO_CFG.TX_FREE while
+     * running; 16 free = empty = the DAC is being fed nothing right now. */
+    {
+        fresh_start();
+        /* A healthy stream: the FIFO sits at the request level, 0..4 free. */
+        mmio_mock_set_read(IISFIFO_CFG_ADDR, 3u << IISFIFO_CFG_TXFREE_SHIFT);
+        audio_fifo_service();
+        audio_fifo_service();
+        xpect(&c, "fifo: a fed FIFO counts nothing",
+              audio_fifo_empty_samples() == 0 && audio_fifo_worst_free() == 3u);
+        /* Starved: every slot free. */
+        mmio_mock_set_read(IISFIFO_CFG_ADDR, 16u << IISFIFO_CFG_TXFREE_SHIFT);
+        audio_fifo_service();
+        audio_fifo_service();
+        audio_fifo_service();
+        xpect(&c, "fifo: an empty FIFO is counted once per sample",
+              audio_fifo_empty_samples() == 3 && audio_fifo_worst_free() == 16u);
+        /* Low but not empty: worst tracks it, the empty count does not move. */
+        mmio_mock_set_read(IISFIFO_CFG_ADDR, 12u << IISFIFO_CFG_TXFREE_SHIFT);
+        audio_fifo_service();
+        xpect(&c, "fifo: 12 free is low, not empty", audio_fifo_empty_samples() == 3);
+        /* Stopped: the FIFO is empty by design and must not be counted. */
+        hal_audio_stop();
+        mmio_mock_set_read(IISFIFO_CFG_ADDR, 16u << IISFIFO_CFG_TXFREE_SHIFT);
+        size_t reads_before = mmio_mock_count(MMIO_OP_READ, IISFIFO_CFG_ADDR);
+        audio_fifo_service();
+        xpect(&c, "fifo: nothing is sampled while stopped",
+              audio_fifo_empty_samples() == 3 &&
+              mmio_mock_count(MMIO_OP_READ, IISFIFO_CFG_ADDR) == reads_before);
+        /* A new stream starts its count from zero. */
+        bus_ready();
+        hal_audio_init(44100u, 2u);
+        xpect(&c, "fifo: init zeroes the counters",
+              audio_fifo_empty_samples() == 0 && audio_fifo_worst_free() == 0);
+    }
+
     return xfail_done(&c);
 }

@@ -336,6 +336,58 @@ int main(int argc, char **argv)
         check("hostile-vorbis-survives", rc == 0 && m.have == 1 && m.title[0] == '\0');
     }
 
+    /* --- Test 6: ReplayGain — gains AND peaks, as real scanners write them.
+     * The peak is what lets a positive gain be applied without clipping, and
+     * until 2026-09-24 the reader dropped it on the floor. Values are the
+     * library's own shapes: foobar2000's six-decimal peak, a bare "1", a
+     * true-peak "1.05", and a gain with float noise in it. --- */
+    {
+        static const char *const tags[] = {
+            "REPLAYGAIN_TRACK_GAIN=+3.40 dB",
+            "REPLAYGAIN_TRACK_PEAK=0.988525",
+            "REPLAYGAIN_ALBUM_GAIN=-7.28 dB",
+            "REPLAYGAIN_ALBUM_PEAK=1",
+        };
+        static uint8_t buf[1024];
+        size_t len = build_tagged_flac(buf, 44100, 44100ull * 10,
+                                       tags, sizeof tags / sizeof tags[0]);
+        src_init(&ms, &src, buf, len);
+        int rc = flac_meta_read(&src, &m);
+        check("rg-parse-ok", rc == 0 && m.have == 1);
+        check("rg-all-four-seen",
+              m.have_rg == (FLAC_META_RG_TRACK | FLAC_META_RG_ALBUM |
+                            FLAC_META_RG_TRACK_PEAK | FLAC_META_RG_ALBUM_PEAK));
+        check("rg-track-gain", m.rg_track_q8 == 870);          /* 3.40*256 = 870.4 */
+        check("rg-album-gain", m.rg_album_q8 == -1864);        /* -7.28*256 */
+        /* 0.988525 * 65536 = 64784.0 */
+        check("rg-track-peak-q16", m.rg_track_peak_q16 == 64784);
+        check("rg-album-peak-full-scale", m.rg_album_peak_q16 == 65536);
+        printf("  rg: track %d q8 / peak %u q16, album %d q8 / peak %u q16\n",
+               m.rg_track_q8, m.rg_track_peak_q16, m.rg_album_q8,
+               m.rg_album_peak_q16);
+    }
+    {
+        static const char *const tags[] = {
+            "REPLAYGAIN_TRACK_GAIN=1.6999999999999993 dB",   /* float noise */
+            "REPLAYGAIN_TRACK_PEAK=1.05",                     /* true-peak over */
+            "REPLAYGAIN_ALBUM_PEAK=0",                        /* unusable: refused */
+        };
+        static uint8_t buf[1024];
+        size_t len = build_tagged_flac(buf, 44100, 44100ull,
+                                       tags, sizeof tags / sizeof tags[0]);
+        src_init(&ms, &src, buf, len);
+        int rc = flac_meta_read(&src, &m);
+        check("rg2-parse-ok", rc == 0 && m.have == 1);
+        check("rg2-gain-float-noise-reads-1.69",
+              (m.have_rg & FLAC_META_RG_TRACK) && m.rg_track_q8 == 433); /* 1.69*256 = 432.6 */
+        check("rg2-peak-over-full-scale-kept",
+              (m.have_rg & FLAC_META_RG_TRACK_PEAK) && m.rg_track_peak_q16 == 68813); /* 1.05*65536 */
+        check("rg2-zero-peak-refused",
+              (m.have_rg & FLAC_META_RG_ALBUM_PEAK) == 0 && m.rg_album_peak_q16 == 0);
+        check("rg2-no-album-gain",
+              (m.have_rg & FLAC_META_RG_ALBUM) == 0);
+    }
+
     printf("flac_meta_test: %s\n", g_fail ? "FAIL" : "OK");
     return g_fail ? 1 : 0;
 }

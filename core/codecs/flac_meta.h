@@ -46,7 +46,17 @@ typedef struct {
      * gain, so the flag is what says "a tag was present". */
     int      rg_track_q8;   /* REPLAYGAIN_TRACK_GAIN                          */
     int      rg_album_q8;   /* REPLAYGAIN_ALBUM_GAIN                          */
-    int      have_rg;       /* bit0 = track gain seen, bit1 = album gain seen  */
+    /*
+     * ReplayGain PEAKS, linear in Q16 (so "0.988525" -> 64784, "1" -> 65536).
+     * The peak is what makes a POSITIVE gain safe to apply: the spec writes
+     * it next to the gain precisely so a player can cap the boost where the
+     * loudest sample would clip. Reading the gain without the peak was how
+     * 34 tracks in the library came to hard-clip on every peak (2026-09-24).
+     * Absent -> 0 and the have_rg bit clear; 0 is not a legitimate peak.
+     */
+    uint32_t rg_track_peak_q16;  /* REPLAYGAIN_TRACK_PEAK                     */
+    uint32_t rg_album_peak_q16;  /* REPLAYGAIN_ALBUM_PEAK                     */
+    int      have_rg;       /* FLAC_META_RG_* bits: which of the four were seen */
     /* SEEKTABLE (block type 3) entry count, 0 when the file has none. Only a
      * count: dr_flac parses the seekpoints themselves at open() and seeks
      * through them, so duplicating the table here would be dead weight. This
@@ -54,8 +64,10 @@ typedef struct {
     uint32_t seek_points;
 } flac_meta_t;
 
-#define FLAC_META_RG_TRACK 1u   /* have_rg bit: REPLAYGAIN_TRACK_GAIN present */
-#define FLAC_META_RG_ALBUM 2u   /* have_rg bit: REPLAYGAIN_ALBUM_GAIN present */
+#define FLAC_META_RG_TRACK      1u  /* have_rg bit: REPLAYGAIN_TRACK_GAIN present */
+#define FLAC_META_RG_ALBUM      2u  /* have_rg bit: REPLAYGAIN_ALBUM_GAIN present */
+#define FLAC_META_RG_TRACK_PEAK 4u  /* have_rg bit: REPLAYGAIN_TRACK_PEAK present */
+#define FLAC_META_RG_ALBUM_PEAK 8u  /* have_rg bit: REPLAYGAIN_ALBUM_PEAK present */
 
 /*
  * Parse metadata from an open source positioned at the START of the file.

@@ -62,6 +62,27 @@ uint32_t audio_late_kicks(void);
 uint32_t audio_late_worst_us(void);
 
 /*
+ * The THIRD way audio breaks, which neither counter above can see: the DMA
+ * is mid-transfer, the ring is full, every completion is on time — and the
+ * serializer's TX FIFO still runs dry, because the DMA lost the SDRAM bus to
+ * the CPU for longer than the FIFO's 4-slot request level covers (~90 us at
+ * 44.1 kHz). A late completion is measured only AT completions; a short read
+ * only when the ring is short. A stall inside a 186 ms transfer is neither.
+ *
+ * audio_fifo_service() is the detector: called from the 100 Hz tick ISR
+ * (kernel/timer.c, weak-linked like backlight_service), it samples the
+ * IISFIFO_CFG TX_FREE field while the DMA is running — one status read, no
+ * side effects — and counts the samples that found the FIFO EMPTY (all 16
+ * slots free: nothing is being clocked to the DAC at that instant) plus the
+ * most free slots ever seen. Sampled, not exhaustive: a texture of dropouts
+ * at any audible rate is caught within seconds; a single 100 us event may be
+ * missed, and a single event is not a texture. Zeroed by hal_audio_init.
+ */
+void     audio_fifo_service(void);
+uint32_t audio_fifo_empty_samples(void);
+uint32_t audio_fifo_worst_free(void);
+
+/*
  * Power the codec down across a PAUSE without forgetting where the pause was.
  *
  * hal_audio_stop() is the pause: it mutes and cuts the DMA, and nothing else.

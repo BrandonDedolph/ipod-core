@@ -641,9 +641,11 @@ void decoder_arena_reset(decoder_arena_t *a)
 }
 
 /* ReplayGain pre-scale. Only applied when a REPLAYGAIN_* tag is present, and
- * the fake metadata below never supplies one. */
-void flac_set_gain_db_q8(decoder_t *d, int db_q8)
+ * the fake metadata below never supplies one. Reports the gain as accepted,
+ * uncapped: no fake file carries a peak either. */
+int flac_set_gain_db_q8(decoder_t *d, int db_q8, uint32_t peak_q16)
 {
     (void)d;
-    (void)db_q8;
+    (void)peak_q16;
+    return db_q8;
 }

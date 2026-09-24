@@ -5,6 +5,17 @@ the boot screen and Settings → About show the one the device runs.
 
 ## Unreleased
 
+- **ReplayGain no longer clips.** 897 of the library's 928 FLACs carry a
+  ReplayGain tag and the player has always applied it — but only the gain,
+  never the peak the tag comes with, and a positive gain on a track whose
+  peaks already touch full scale was hard clipping on every one of them: 34
+  tracks, from +1 dB to +21 dB, and "crunchy" was the word for it. The gain
+  is now capped where the tagged peak would clip (the ReplayGain rule for
+  it), a positive gain without a peak tag is not applied at all, and the
+  scale rounds instead of truncating. The 5 s audio log line now says which
+  gain the playing track runs at and whether it was capped, and carries a
+  100 Hz sample of the I2S FIFO so a starved DAC inside a DMA transfer — the
+  one dropout neither existing counter can see — shows up as a number.
 - **The iPod charges while you use it.** The firmware had been asking the
   charger for the USB 100 mA minimum, and on this hardware that budget is
   shared with the device itself: the event log showed the cell sitting

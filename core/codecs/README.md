@@ -156,7 +156,19 @@ seeks an MP3 now instead of cueing it at 0:00.
 reported length only; the decoded stream is not trimmed, so a tagged file plays
 its few tens of milliseconds of encoder padding like any other decoder without
 gapless. An MP3's `TXXX:REPLAYGAIN_*` frames are not read and no gain is
-applied (`player.c` keeps its `fmt != 1` gate); the FLAC path is unchanged.
+applied (`player.c` keeps its `fmt != 1` gate).
+
+**FLAC ReplayGain is applied, and since 2026-09-24 it is capped at the peak.**
+`flac_meta.c` reads `REPLAYGAIN_TRACK/ALBUM_GAIN` and `_PEAK`; `player.c`
+prefers the track pair, falls back to the album pair, and hands both to
+`flac_set_gain_db_q8()`, which holds the scale to full_scale / peak so the
+loudest sample lands at 0 dBFS and never beyond (the spec's "prevent
+clipping"). A positive gain with no peak tag is not applied — nothing says it
+is safe — and a negative one is. Before the cap, the gain ran uncapped into
+an int16 saturate, which on the library's 34 positive-gain, full-scale-peak
+tracks was hard clipping on every peak; `tests/codecs/flac_rg_chain_test.c`
+measures that case at ~20 dB SNR on the old code and > 80 dB now, through the
+same ring and DMA-word packing the device uses.
 
 ### Re-measuring the cost
 

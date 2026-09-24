@@ -3,6 +3,42 @@
 The README is the canonical public story; this doc is the running list of
 what works, what doesn't, and what to pick up next.
 
+## 2026-09-24 — "crunchiness": ReplayGain was clipping, UNFLASHED
+
+The report was a persistent texture during playback, after the pop rounds
+had landed. A whole-path audit (I2S/DMA/cache/codec bits/clocking/decoders,
+against the device's own event log: `underruns` 0, `late` ≤ 2 with a worst of
+1136 us, no IRQ masking anywhere in `lcd.c`/`ata.c`) found the digital path by
+the book and ONE stage that changes samples after the decoder: the FLAC
+ReplayGain pre-scale. It applied the tagged gain uncapped and "handled
+clipping by saturating". A tag scan of the source library: 897/928 FLACs
+tagged, **34 with a positive gain and a full-scale peak** (XXXTENTACION
+"17": The Explanation +21 dB, Dead Inside +11.2, Orlando +4.8, Revenge +1.7;
+Rex Orange County: Corduroy Dreams +3.4, Belly +1.7, Paradise +1.3) — every
+one hard-clipping on every peak.
+
+Fixed, host-proven: `flac_meta.c` reads `REPLAYGAIN_*_PEAK`; `flac.c`'s
+`flac_set_gain_db_q8(d, db, peak)` caps the gain at full_scale/peak (unknown
+peak ⇒ no boost) and rounds instead of truncating; `player.c` passes the
+peak that matches the gain it chose and records the effective gain in
+`player_stats_t`. New suite `flac-rg-chain` (82 total, with the idle-sleep
+suite landed the same day): the sine fixture
+with tags spliced in RAM through flac_meta → flac_open_stream (arena) → RG →
+1024-frame steps → the real `pcm_ring.c` → 8192-frame pulls → DMA words —
+bit-exact untagged, ≥ 80 dB SNR / ≤ 1 LSB tagged, +10 dB capped at the
+peak's headroom (the old code measures ~20 dB there). `flac-meta` pins the
+peak parser.
+
+Instrumented for the bench: the `core: audio` line now ends
+` fifo_empty N fifo_worst_free M rg_q8 G capped C`. `fifo_*` is a 100 Hz tick
+sample of `IISFIFO_CFG.TX_FREE` while the DMA runs — the blind spot: a FIFO
+starved INSIDE a transfer (DMA losing the bus) produces neither a short read
+nor a late completion. `rg_q8`/`capped` say what gain the decoding track runs
+at. Bench: play Revenge and Corduroy Dreams (were clipping; expect
+`rg_q8 0 capped 1`) — crunch gone there settles it; then a negative-gain
+track (`capped 0`): crunch still there ⇒ read `fifo_empty` (climbing ⇒ bus
+starvation; flat ⇒ analog: repeat on battery vs USB, Charge Rate 100 mA).
+
 ## 2026-09-16 — MP3 is on, and UNFLASHED
 
 `dr_mp3` is gone and AOSP's fixed-point **pvmp3** is vendored in its place

@@ -244,6 +244,18 @@ typedef struct {
                                     /*   has been decoded yet.                   */
     uint32_t ring_low_frames;       /* PCM ring low-water since the last present */
     uint32_t underruns;             /* times the ISR found the ring short        */
+    /*
+     * The ReplayGain the track being DECODED runs at, 1/256 dB (0 = none,
+     * i.e. an untagged file or an MP3), and whether the file's peak tag
+     * capped it below what it asked for. "Decoded" leads "heard" by the ring
+     * depth (up to ~6 s) across a gapless prefetch, which is close enough for
+     * a log read. The 5 s `core: audio` log line carries both,
+     * so a listening note can be matched to the gain that was live: a
+     * crunch on a `capped 1` track and none on a `rg_q8 -1864` one is the
+     * clipping class; the same crunch on both is not the gain at all.
+     */
+    int      rg_q8;
+    int      rg_capped;
     uint32_t arena_high_water;      /* peak decoder-arena bytes this session      */
     int      arena_oom;             /* an allocation didn't fit (track ends early) */
 } player_stats_t;

@@ -54,6 +54,30 @@ if target == 'sim'
   )
   test('flac-freestanding', flac_fs_test, args: [vectors_dir], suite: 'unit')
 
+  # flac-rg-chain: the post-decoder chain END TO END, with ReplayGain in it.
+  # Every other codec suite decodes an untagged fixture and stops at the
+  # decoder, so neither the ReplayGain pre-scale (the only arithmetic that
+  # touches a sample after the decoder — and, uncapped, hard clipping on the
+  # library's 34 positive-gain tracks until 2026-09-24) nor the ring ->
+  # ISR-pull -> DMA-word path behind it had a check. This one splices
+  # REPLAYGAIN_* tags into the sine fixture in RAM, runs the SAME
+  # flac_meta.c / flac.c / arena.c / pcm_ring.c the device links, in the
+  # device's step and pull sizes, packs the DMA words, and measures against
+  # the reference: bit-exact untagged, level and waveform (>= 80 dB SNR, no
+  # sample more than 1 LSB off) when tagged, and a positive gain capped at
+  # the tagged peak's headroom — the case the old code fails, at ~20 dB.
+  flac_rg_chain_test = executable(
+    'flac_rg_chain_test',
+    sources: ['codecs/flac_rg_chain_test.c', '../codecs/arena.c',
+              '../codecs/flac_meta.c', '../codecs/meta_text.c',
+              '../kernel/pcm_ring.c'],
+    dependencies: [flac_dep, m_dep],
+    include_directories: include_directories('../codecs', '../codecs/dr_flac',
+                                             '../kernel'),
+    override_options: test_opts,
+  )
+  test('flac-rg-chain', flac_rg_chain_test, args: [vectors_dir], suite: 'unit')
+
   # mp3-freestanding: the STREAMING MP3 decode path used on hw — mirror of
   # flac-freestanding. Open the MP3 through mp3_open_stream (a decoder_source_t
   # pull source) with the static arena instead of libc malloc, decode every

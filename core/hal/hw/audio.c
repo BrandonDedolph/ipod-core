@@ -157,6 +157,14 @@ static volatile int      g_filled[2];
 static volatile uint32_t g_late_kicks;   /* completions serviced past the FIFO */
 static volatile uint32_t g_late_worst_us;/* worst overshoot seen, microseconds */
 /*
+ * FIFO starvation INSIDE a transfer — see audio_fifo_service() in audio.h.
+ * Sampled by the tick ISR while g_running: how many samples found the TX
+ * FIFO empty, and the most free slots any sample saw (16 = empty; a healthy
+ * stream sits at 0..4, the request level).
+ */
+static volatile uint32_t g_fifo_empty;
+static volatile uint32_t g_fifo_worst_free;
+/*
  * Bytes of the outstanding kick already clocked out when hal_audio_stop() cut
  * the DMA — sampled THERE, not recomputed on resume.
  *
@@ -386,6 +394,8 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels)
     g_underruns   = 0;
     g_late_kicks  = 0;
     g_late_worst_us = 0;
+    g_fifo_empty  = 0;
+    g_fifo_worst_free = 0;
     /* A new stream: the DAC has played none of it, and no kick from the old
      * one may be read as its in-flight part. */
     g_played_at_kick = 0;
@@ -793,6 +803,27 @@ void hal_audio_close(void)
 
 uint32_t audio_late_kicks(void)    { return g_late_kicks; }
 uint32_t audio_late_worst_us(void) { return g_late_worst_us; }
+
+void audio_fifo_service(void)
+{
+    /* Only while a transfer is supposed to be feeding the FIFO: stopped, the
+     * FIFO is empty by design and would count every tick. One status read;
+     * the same field i2s_write_stereo polls, so it is known to be live. */
+    if (!g_running) {
+        return;
+    }
+    uint32_t free = (mmio_read32(IISFIFO_CFG_ADDR) >> IISFIFO_CFG_TXFREE_SHIFT)
+                    & IISFIFO_CFG_TXFREE_MASK;
+    if (free > g_fifo_worst_free) {
+        g_fifo_worst_free = free;
+    }
+    if (free >= IIS_TX_FIFO_DEPTH) {
+        g_fifo_empty++;
+    }
+}
+
+uint32_t audio_fifo_empty_samples(void) { return g_fifo_empty; }
+uint32_t audio_fifo_worst_free(void)    { return g_fifo_worst_free; }
 
 uint32_t audio_dma_completions(void)
 {

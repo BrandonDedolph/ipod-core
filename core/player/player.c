@@ -1267,12 +1267,33 @@ static int track_open(int idx, flac_meta_t *meta)
     }
     /* ReplayGain, only when the file actually carries the tag — an untagged
      * file must leave the decode path bit-identical. Track gain preferred;
-     * album gain is the fallback so an album plays at a consistent level. */
+     * album gain is the fallback so an album plays at a consistent level.
+     * The PEAK that goes with the chosen gain goes with it: it is what caps
+     * a positive gain below clipping (flac.h). A gain whose peak tag is
+     * missing is passed with peak 0 — "unknown", which the decoder treats
+     * as full scale, so it can attenuate but never boost. */
+    g_stats.rg_q8     = 0;
+    g_stats.rg_capped = 0;
     if (b->fmt != 1) {
+        int      asked = 0, have = 0;
+        uint32_t peak  = 0;
         if (meta->have_rg & FLAC_META_RG_TRACK) {
-            flac_set_gain_db_q8(&g_dec, meta->rg_track_q8);
+            asked = meta->rg_track_q8;
+            have  = 1;
+            if (meta->have_rg & FLAC_META_RG_TRACK_PEAK) {
+                peak = meta->rg_track_peak_q16;
+            }
         } else if (meta->have_rg & FLAC_META_RG_ALBUM) {
-            flac_set_gain_db_q8(&g_dec, meta->rg_album_q8);
+            asked = meta->rg_album_q8;
+            have  = 1;
+            if (meta->have_rg & FLAC_META_RG_ALBUM_PEAK) {
+                peak = meta->rg_album_peak_q16;
+            }
+        }
+        if (have) {
+            int got = flac_set_gain_db_q8(&g_dec, asked, peak);
+            g_stats.rg_q8     = got;
+            g_stats.rg_capped = (got < asked) ? 1 : 0;
         }
     }
     g_eos = 0;

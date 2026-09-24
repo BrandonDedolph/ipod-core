@@ -130,6 +130,55 @@ static int parse_gain_q8(const uint8_t *src, uint32_t len, int *out)
     return 1;
 }
 
+/*
+ * Parse a ReplayGain PEAK — "0.988525", "1", "1.000000", "1.05" — into linear
+ * Q16 (65536 = full scale). Six fraction digits is what every scanner writes;
+ * more are ignored, fewer are padded. A peak above 1.0 is legitimate (true-
+ * peak scanners report inter-sample overs) and keeps its value: the gain
+ * clamp only ever attenuates further for it. A zero or negative value is
+ * refused — it would make "cap the gain at the peak" divide by nothing — and
+ * so is a sign: peaks are magnitudes. Returns 1 when a usable peak was found.
+ */
+static int parse_peak_q16(const uint8_t *src, uint32_t len, uint32_t *out)
+{
+    uint32_t j = 0;
+
+    while (j < len && (src[j] == ' ' || src[j] == '\t')) {
+        j++;
+    }
+    uint32_t whole = 0;
+    int      any   = 0;
+    while (j < len && src[j] >= '0' && src[j] <= '9') {
+        if (whole < 1000u) {               /* clamp — a peak is ~0..1 */
+            whole = whole * 10u + (uint32_t)(src[j] - '0');
+        }
+        any = 1;
+        j++;
+    }
+    uint32_t frac_millionths = 0;
+    if (j < len && src[j] == '.') {
+        j++;
+        for (int d = 0; d < 6; d++) {
+            uint32_t digit = (j < len && src[j] >= '0' && src[j] <= '9')
+                           ? (uint32_t)(src[j++] - '0') : 0u;
+            frac_millionths = frac_millionths * 10u + digit;
+            any = 1;
+        }
+    }
+    if (!any) {
+        return 0;
+    }
+    /* q16 = (whole*1e6 + millionths) * 65536 / 1e6, rounded. whole is clamped
+     * to 1000 so the 64-bit product cannot overflow. */
+    uint64_t total = (uint64_t)whole * 1000000u + frac_millionths;
+    uint64_t q16   = (total * 65536u + 500000u) / 1000000u;
+    if (q16 == 0) {
+        return 0;
+    }
+    *out = (uint32_t)q16;
+    return 1;
+}
+
 /* Case-insensitive match of key[0..klen) against a NUL-terminated ASCII name. */
 static int key_is(const uint8_t *key, uint32_t klen, const char *name)
 {
@@ -193,6 +242,14 @@ static void apply_comment(flac_meta_t *out, const uint8_t *c, uint32_t len)
     } else if (key_is(key, klen, "REPLAYGAIN_ALBUM_GAIN")) {
         if (parse_gain_q8(val, vlen, &out->rg_album_q8)) {
             out->have_rg |= FLAC_META_RG_ALBUM;
+        }
+    } else if (key_is(key, klen, "REPLAYGAIN_TRACK_PEAK")) {
+        if (parse_peak_q16(val, vlen, &out->rg_track_peak_q16)) {
+            out->have_rg |= FLAC_META_RG_TRACK_PEAK;
+        }
+    } else if (key_is(key, klen, "REPLAYGAIN_ALBUM_PEAK")) {
+        if (parse_peak_q16(val, vlen, &out->rg_album_peak_q16)) {
+            out->have_rg |= FLAC_META_RG_ALBUM_PEAK;
         }
     }
 }

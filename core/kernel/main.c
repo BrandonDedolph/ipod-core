@@ -1119,6 +1119,25 @@ static int battery_refresh(int force)
     uart_puts(" worst_us ");         uart_dec((int)audio_late_worst_us());
     uart_puts(" underruns ");        uart_dec((int)audio_underruns());
     uart_puts(" present_us ");       uart_dec((int)g_present_cost_us);
+    /*
+     * The two readings added for the crunchiness hunt (2026-09-24), each
+     * answering one question the three above cannot:
+     *   fifo_empty / fifo_worst_free — the tick's 100 Hz sample of the I2S
+     *   TX FIFO while the DMA streams (audio.h audio_fifo_service). Climbing
+     *   with `late` and `underruns` flat is starvation INSIDE a transfer —
+     *   the DMA losing the bus — which no completion-side counter can see.
+     *   rg_q8 / capped — the ReplayGain the decoding track runs at, 1/256 dB,
+     *   and whether its peak tag capped it. A texture heard only on
+     *   `capped 1` tracks is the clipping class this line was added to
+     *   settle; heard on `rg_q8 0` tracks too, it is not the gain.
+     */
+    uart_puts(" fifo_empty ");       uart_dec((int)audio_fifo_empty_samples());
+    uart_puts(" fifo_worst_free ");  uart_dec((int)audio_fifo_worst_free());
+    {
+        const player_stats_t *ps = player_stats();
+        uart_puts(" rg_q8 ");        uart_dec(ps ? ps->rg_q8 : 0);
+        uart_puts(" capped ");       uart_dec(ps ? ps->rg_capped : 0);
+    }
     uart_putc('\n');
 
     /*

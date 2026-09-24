@@ -23,6 +23,10 @@
  * links this file without hal/hw/backlight.c, and the call is guarded. */
 __attribute__((weak)) void backlight_service(void);
 
+/* Audio FIFO starvation sampler (hal/hw/audio.c audio_fifo_service): one
+ * I2S status read per tick while the DMA streams. Weak for the same reason. */
+__attribute__((weak)) void audio_fifo_service(void);
+
 /* Monotonic tick counter. In .bss, zeroed by crt0. volatile: written by
  * the ISR, read by mainline code (current_tick / sleep_ms). */
 static volatile uint32_t g_tick;
@@ -153,6 +157,14 @@ void timer_tick_isr(void)
         for (uint32_t i = 0; i < ticks; i++) {
             backlight_service();
         }
+    }
+
+    /* Sample the I2S TX FIFO once per INTERRUPT, not per reconciled tick:
+     * it is a snapshot of "is the DAC being fed right now", and replaying
+     * it for caught-up ticks would count one starved instant several
+     * times. A no-op while nothing is streaming. */
+    if (audio_fifo_service) {
+        audio_fifo_service();
     }
 }
 
