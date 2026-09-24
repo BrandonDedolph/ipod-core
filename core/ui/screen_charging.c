@@ -38,6 +38,12 @@
 #define STAT_BASE 196            /* status line baseline                     */
 #define NOTE_BASE 220            /* the caption's baseline (screen_charging_note) */
 
+/* The corner padlock: the design's top-right token slot (top 8, right 12). */
+#define LOCK_W     8
+#define LOCK_H    10
+#define LOCK_X    (LCD_WIDTH - 12 - LOCK_W)
+#define LOCK_Y     8
+
 /* Clamp a raw charge reading to a drawable 0..100 percent. */
 static int clamp_pct(int pct)
 {
@@ -239,4 +245,18 @@ void screen_charging_note(const char *note)
      * cannot leave the tail of a longer one behind. */
     console_fill_rect(0, NOTE_BASE - 10, LCD_WIDTH, 14, CHG_BG);
     chg_text((LCD_WIDTH - w) / 2, NOTE_BASE, note, f, CHG_MUTED);
+}
+
+void screen_charging_lock_render(void)
+{
+    /* The same four rectangles as kernel/main.c draw_lock_glyph (body +
+     * two posts + arch). A private copy for the reason screen_battery.c
+     * gives for its toast battery: the original is a static in main.c,
+     * which this file cannot reach and must not pull in. */
+    const int x = LOCK_X, y = LOCK_Y;
+    const uint16_t c = CHG_MUTED;
+    console_fill_rect(x,     y + 4, 8, 6, c);   /* body       */
+    console_fill_rect(x + 1, y,     2, 5, c);   /* left post  */
+    console_fill_rect(x + 5, y,     2, 5, c);   /* right post */
+    console_fill_rect(x + 1, y,     6, 2, c);   /* top arch   */
 }

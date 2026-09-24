@@ -21,6 +21,14 @@ the boot screen and Settings → About show the one the device runs.
   charger pins read back from the chip. The charging screen that appears on
   plug-in carries the same numbers as a caption. `core: batt` log lines now
   say which budget was in force and the drift since the cable event.
+- **Hold on the charging screen.** Sliding Hold while the charging screen
+  was up flashed the Locked banner across its top: a light strip over the
+  dark field with the status bar's little battery blinking in above a screen
+  that is already one big battery. That screen (and the low-battery one) has
+  no status bar for the banner to belong to, so it no longer gets one; Hold
+  still locks the wheel there, and a small padlock sits in the top-right
+  corner while it is on. A banner in flight when the cable goes in is
+  dropped, not replayed on the screen underneath afterwards.
 
 - **MP3 plays.** It was compiled and switched off from the beginning because
   `dr_mp3`'s decoder is floating point and this CPU has no FPU — it needed 24

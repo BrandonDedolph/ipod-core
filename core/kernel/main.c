@@ -692,7 +692,9 @@ static int browse_collect(void *ud, const fat32_dirent_t *e)
 /* Hold-switch lock state. While g_locked, all wheel/button input is swallowed
  * (playback keeps running); a brief banner takes the top chrome on the
  * engage/disengage edge and on a refused button press (lock_banner_render),
- * and a small padlock stays in the status strip while held. */
+ * and a small padlock stays in the status strip while held. The dark modals
+ * (charging, low battery) have no chrome and get neither: only the corner
+ * padlock, painted with the screen (banner_hosted). */
 static int         g_locked;
 
 /* Pause-on-unplug (ui/jackwatch.c): the believed jack level, the raw-edge
@@ -968,6 +970,16 @@ static void charging_screen_paint(void)
         note_cat(note, n); note_cat(note, " min");
     }
     screen_charging_note(note);
+    if (g_locked) screen_charging_lock_render();
+}
+
+/* The low-battery modal, painted the same way: the dark field has no strip
+ * for the Hold padlock to live in and no chrome for the banner to take
+ * (banner_hosted), so the corner glyph is all Hold shows on either modal. */
+static void battery_modal_paint(void)
+{
+    screen_battery_render(BATTWARN_DISKSAFE);
+    if (g_locked) screen_charging_lock_render();
 }
 
 /* Would battery_refresh(0) sample now? The suspend loop asks first so it can
@@ -7145,7 +7157,7 @@ static void paint_current_screen(void)
                           player_total_s(), player_buf_pct());
         break;
     case SCR_BATTERY:
-        screen_battery_render(BATTWARN_DISKSAFE);
+        battery_modal_paint();
         break;
     case SCR_CHARGING:
         charging_screen_paint();
@@ -7167,13 +7179,21 @@ static void paint_current_screen(void)
  * longer does: the locked/unlocked flip read as jarring on the device.)
  *
  * The band is whatever the top chrome is on the current screen:
- *   - Now Playing (and the chrome-less modals): the 22 px status row, plus
- *     the border rule under it when the band is not inverted;
+ *   - Now Playing: the 22 px status row, plus the border rule under it when
+ *     the band is not inverted;
  *   - list and Settings screens: status strip + header, through the divider
  *     (39 px); the header line carries the announcement where the title was
  *     and the strip row above keeps its track name (blank when idle) and
  *     battery, recoloured.
  * The battery never leaves — the right cluster does not flicker.
+ *
+ * The dark modals (CHARGING, BATTERY) host no banner at all. They have no
+ * chrome: the band there was a linen strip over the near-black field, with
+ * the STRIP's little battery token blinking in above a screen that is
+ * already one big battery — on the device it read as a nonsense animation.
+ * Hold still locks the wheel there; what shows is the corner padlock the
+ * modal paints itself (screen_charging_lock_render), the persistent glyph
+ * without the flash. banner_hosted() is the one place that rule lives.
  *
  * Design: docs/screens lock.png / locked.png / locked_list.png, from the
  * 2026-09-14 "Hold Plate Redesign" review (pill, banner and card compared;
@@ -7230,14 +7250,22 @@ static void draw_battery_c(int x, int y, int pct, uint16_t outline, uint16_t fil
     }
 }
 
+/* Whether the current screen has top chrome for a banner to take. The dark
+ * modals do not (see above): a Hold edge or a refused press there must not
+ * arm the flash, and a flash armed elsewhere is dropped the moment a modal
+ * is up, so nothing stale is replayed over the screen the modal pops to. */
+static int banner_hosted(void)
+{
+    return !scr_is_modal(scr_cur());
+}
+
 /* Height of the band a banner inverts on the current screen (see above). The
- * present of a banner is exactly this band when nothing else is pending. */
+ * present of a banner is exactly this band when nothing else is pending.
+ * Only meaningful where banner_hosted(). */
 static int top_banner_h(void)
 {
     switch (scr_cur()) {
     case SCR_NOWPLAYING:
-    case SCR_BATTERY:
-    case SCR_CHARGING:
         return 23;                        /* the 22 px row + the rule under it */
     default:
         return HDR_DIV_Y + 1;
@@ -8838,8 +8866,9 @@ _Noreturn static void run_ui(fat32_t *fs)
         }
 
         /* Hold-switch edge (a cheap GPIO read, independent of the wheel block
-         * which is gated off while held): flash the Hold banner and toggle
-         * the input lock. Playback is untouched. */
+         * which is gated off while held): flash the Hold banner (where the
+         * screen has chrome to host it) and toggle the input lock. Playback
+         * is untouched. */
         int held = clickwheel_hold() ? 1 : 0;
         if (held != hold_prev) {
             hold_prev = held;
@@ -8854,7 +8883,13 @@ _Noreturn static void run_ui(fat32_t *fs)
              * from the first edge, so the render guard (!banner_up) suppresses
              * the new banner and the unlock one never shows. */
             banner_up = 0;
-            ui_window_arm(&g_lock_flash);
+            if (banner_hosted()) {
+                ui_window_arm(&g_lock_flash);
+            } else {
+                /* A dark modal: no banner. `dirty` below repaints it, which
+                 * is how its corner padlock comes and goes. */
+                g_lock_flash.armed = 0;
+            }
             last_input = mmio_read32(USEC_TIMER_ADDR);   /* wake the backlight    */
             if (bl_state != BL_FULL) {
                 /* A slept panel is lit by the "Panel wake" block, AFTER its
@@ -8878,10 +8913,12 @@ _Noreturn static void run_ui(fat32_t *fs)
              * reference prototype's blockedByHold, lighting the panel like any
              * other press so the refusal is seen. Wheel motion is dropped
              * silently: pocket friction on the wheel is exactly what Hold is
-             * for, and it must not keep the backlight awake. */
+             * for, and it must not keep the backlight awake. On a dark modal
+             * the padlock is already in the corner; the press only lights
+             * the panel. */
             if (ev.buttons) {
                 banner_up = 0;
-                ui_window_arm(&g_lock_flash);
+                if (banner_hosted()) ui_window_arm(&g_lock_flash);
                 last_input = mmio_read32(USEC_TIMER_ADDR);
                 if (bl_state != BL_FULL) {
                     if (!panel_slept) backlight_set(g_settings.backlight_bright);
@@ -10015,7 +10052,16 @@ _Noreturn static void run_ui(fat32_t *fs)
          * change the user must see — and the other expires underneath;
          * nothing is applied unseen either way, because the input drain
          * disarms the On-The-Go banner on the first press. Both windows are
-         * polled exactly once: ui_window_up DISARMS an expired one. */
+         * polled exactly once: ui_window_up DISARMS an expired one.
+         *
+         * A dark modal hosts neither: a window armed on the screen under it
+         * (a Hold flip, then the cable, inside one second) is dropped here
+         * rather than painted as a linen strip over the field — and so
+         * cannot be replayed on the screen the modal pops back to. */
+        if (!banner_hosted()) {
+            g_lock_flash.armed = 0;
+            g_otg_flash.armed  = 0;
+        }
         int lock_up = ui_window_up(&g_lock_flash, LOCK_FLASH_US, now_us);
         int otg_up  = ui_window_up(&g_otg_flash,  OTG_FLASH_US,  now_us);
         if (lock_up || otg_up) {
@@ -10180,7 +10226,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                     case SCR_QUEUE:   queue_render(g_queue_sel);     break;
                     case SCR_SETTINGS: settings_render_cur();        break;
                     case SCR_BATTERY:
-                        screen_battery_render(BATTWARN_DISKSAFE);
+                        battery_modal_paint();
                         break;
                     case SCR_CHARGING:
                         charging_screen_paint();

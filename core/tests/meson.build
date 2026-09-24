@@ -244,6 +244,22 @@ if target == 'sim'
   )
   test('screen_battery', screen_battery_test, suite: 'unit')
 
+  # screen_charging: the charging screen's Hold treatment. The dark modals
+  # have no chrome, so main.c paints no Hold banner there (banner_hosted) and
+  # the corner padlock (screen_charging_lock_render) is all Hold shows. The
+  # framebuffer proves the top band is bare field either way, that the glyph
+  # lands in the design's corner box in the muted tone, and that it changes
+  # nothing else on either sibling field.
+  screen_charging_test = executable(
+    'screen_charging_test',
+    sources: ['ui/screen_charging_test.c', '../ui/screen_charging.c',
+              '../ui/screen_battery.c', '../ui/chrome.c', '../ui/text.c',
+              '../ui/palette.c', '../kernel/console.c'],
+    include_directories: include_directories('../ui', '../kernel', '../hal'),
+    override_options: test_opts,
+  )
+  test('screen_charging', screen_charging_test, suite: 'unit')
+
   # wheel: the wheel acceleration state machine and A-Z locator
   # (core/ui/wheel.c) — the SAME source the ARM build links into core.elf.
   # Its clock, row-initial source and click are injected, so every event here

@@ -75,4 +75,15 @@ void screen_charging_draw_battery(int x, int y, int w, int h, int pct,
  */
 void screen_charging_note(const char *note);
 
+/*
+ * The Hold padlock, in the top-right corner of the dark field: the 8x10
+ * glyph the status strip shows while Hold is on, in the muted tone, at the
+ * corner ChargingScreen (system-screens.jsx) keeps for its tiny status token
+ * and LockedScreen's "persistent corner lock" sits in. These screens have no
+ * strip and no header, so the Hold banner has nowhere to land — this glyph is
+ * the whole of what Hold shows here. Drawn over whichever sibling painted the
+ * field (charging or low-battery); touches nothing outside its box.
+ */
+void screen_charging_lock_render(void);
+
 #endif /* CORE_UI_SCREEN_CHARGING_H */
