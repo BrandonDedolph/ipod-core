@@ -135,7 +135,8 @@ static const uint16_t EXP2_Q12[17] = {
 
 static int32_t exp2_q12(int32_t x_q12) {
     int32_t oct = x_q12 >> 12;                    /* floor, works for negatives */
-    int32_t fr  = x_q12 - (oct << 12);            /* 0..4095                     */
+    int32_t fr  = x_q12 - oct * 4096;             /* 0..4095; a shift of a       */
+                                                  /* negative oct is UB (UBSan)  */
     int32_t i   = fr >> 8;                        /* 0..15                       */
     int32_t t   = fr & 0xFF;                      /* 0..255                      */
     int32_t lo  = EXP2_Q12[i];
