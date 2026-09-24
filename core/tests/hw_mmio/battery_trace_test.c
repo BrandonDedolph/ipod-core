@@ -439,6 +439,93 @@ static int expect_charging(uint32_t gpiob, int want, const char *label)
 }
 
 /* =====================================================================
+ * Charge-current gate (battery.h, charger_set_max_current /
+ * charger_pin_state).
+ *
+ * The LTC4066's two control pins, as MMIO: the driver must write the LEVEL
+ * first and then take the pin over (GPIO enable, output enable), every write
+ * through the +0x800 masked alias so nothing here is a read-modify-write
+ * against the backlight's GPIOL bits. The readback must read the PAD
+ * (INPUT_VAL) and the two direction registers, six reads and nothing else.
+ * ===================================================================== */
+
+#define BW(a)      ((a) + GPIO_BITWISE_OFFSET)
+#define BW_SET(m)  ((((uint32_t)(m)) << 8) | (uint32_t)(m))
+#define BW_CLR(m)  (((uint32_t)(m)) << 8)
+
+static int expect_charger(int ma, uint32_t hpwr_word, const char *label)
+{
+    mmio_mock_reset();
+    charger_set_max_current(ma);
+
+    trace_cursor tc = trace_begin(label);
+    expect_w(&tc, 32, BW(GPIOL_OUTPUT_VAL_ADDR), BW_CLR(0x04));   /* SUSP low  */
+    expect_w(&tc, 32, BW(GPIOA_OUTPUT_VAL_ADDR), hpwr_word);      /* HPWR      */
+    expect_w(&tc, 32, BW(GPIOL_ENABLE_ADDR),     BW_SET(0x04));   /* own SUSP  */
+    expect_w(&tc, 32, BW(GPIOL_OUTPUT_EN_ADDR),  BW_SET(0x04));
+    expect_w(&tc, 32, BW(GPIOA_ENABLE_ADDR),     BW_SET(0x04));   /* own HPWR  */
+    expect_w(&tc, 32, BW(GPIOA_OUTPUT_EN_ADDR),  BW_SET(0x04));
+    trace_expect_end(&tc);
+    int want = (ma >= 500) ? 500 : 100;
+    if (charger_max_current() != want) {
+        fprintf(stderr, "[%s] charger_max_current: expected %d, got %d\n",
+                label, want, charger_max_current());
+        tc.fails++;
+    }
+    return trace_done(&tc);
+}
+
+static int test_charger_pin_state(void)
+{
+    mmio_mock_reset();
+    /* HPWR high on the pad, GPIO + output; SUSP low, GPIO but NOT output —
+     * the readback must tell those two configurations apart. Other bits are
+     * noise the masks must ignore. */
+    mmio_mock_set_read(GPIOA_INPUT_VAL_ADDR, 0xFF);
+    mmio_mock_set_read(GPIOA_ENABLE_ADDR,    0x04);
+    mmio_mock_set_read(GPIOA_OUTPUT_EN_ADDR, 0x0C);
+    mmio_mock_set_read(GPIOL_INPUT_VAL_ADDR, 0xFB);
+    mmio_mock_set_read(GPIOL_ENABLE_ADDR,    0x04);
+    mmio_mock_set_read(GPIOL_OUTPUT_EN_ADDR, 0xFB);
+
+    charger_pins_t p;
+    charger_pin_state(&p);
+
+    trace_cursor tc = trace_begin("charger_pin_state");
+    expect_r(&tc, 32, GPIOA_INPUT_VAL_ADDR);
+    expect_r(&tc, 32, GPIOA_ENABLE_ADDR);
+    expect_r(&tc, 32, GPIOA_OUTPUT_EN_ADDR);
+    expect_r(&tc, 32, GPIOL_INPUT_VAL_ADDR);
+    expect_r(&tc, 32, GPIOL_ENABLE_ADDR);
+    expect_r(&tc, 32, GPIOL_OUTPUT_EN_ADDR);
+    trace_expect_end(&tc);
+    if (!(p.hpwr == 1 && p.hpwr_gpio == 1 && p.hpwr_out == 1 &&
+          p.susp == 0 && p.susp_gpio == 1 && p.susp_out == 0)) {
+        fprintf(stderr, "[charger_pin_state] hpwr %d/%d/%d susp %d/%d/%d\n",
+                p.hpwr, p.hpwr_gpio, p.hpwr_out, p.susp, p.susp_gpio, p.susp_out);
+        tc.fails++;
+    }
+    return trace_done(&tc);
+}
+
+/* power_source(): the same one read as power_is_external(), as two bits. */
+static int expect_source(uint32_t gpiol, int want, const char *label)
+{
+    mmio_mock_reset();
+    mmio_mock_set_read(GPIOL_INPUT_VAL_ADDR, gpiol);
+    int got = power_source();
+    trace_cursor tc = trace_begin(label);
+    expect_r(&tc, 32, GPIOL_INPUT_VAL_ADDR);
+    trace_expect_end(&tc);
+    if (got != want) {
+        fprintf(stderr, "[%s] GPIOL=%08X: expected %d, got %d\n",
+                label, gpiol, want, got);
+        tc.fails++;
+    }
+    return trace_done(&tc);
+}
+
+/* =====================================================================
  * Low-battery policy (battery.h, "Low-battery policy").
  *
  * The policy is a pure state machine over the clamped mv that battery_sample()
@@ -873,6 +960,19 @@ int main(void)
     /* power_is_charging: bit 0x01 ACTIVE-LOW (clear = charging). */
     fails += expect_charging(0x00, 1, "charging_yes");
     fails += expect_charging(0x01, 0, "charging_no");
+
+    /* power_source: the same word as two bits. */
+    fails += expect_source(0x00, POWER_SRC_MAIN, "source_main");       /* 0x08 clear, 0x10 clear */
+    fails += expect_source(0x18, POWER_SRC_USB,  "source_usb");        /* 0x08 set,   0x10 set   */
+    fails += expect_source(0x10, POWER_SRC_MAIN | POWER_SRC_USB, "source_both");
+    fails += expect_source(0x08, 0,              "source_none");
+
+    /* The charge-current gate: level, then ownership; 500 sets HPWR, anything
+     * less clears it; SUSP is never raised. */
+    fails += expect_charger(500, BW_SET(0x04), "charger_500");
+    fails += expect_charger(100, BW_CLR(0x04), "charger_100");
+    fails += expect_charger(0,   BW_CLR(0x04), "charger_0_is_100_not_suspend");
+    fails += test_charger_pin_state();
 
     return fails == 0 ? 0 : 1;
 }

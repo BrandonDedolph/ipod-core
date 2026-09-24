@@ -253,6 +253,18 @@ enum {
 #define P_TIME_PAD2     (CFG_PAYLOAD_V2S + 14u)  /* 62: u16 reserved (0)      */
 #define CFG_PAYLOAD_V2T (CFG_PAYLOAD_V2S + 16u)  /* = 64                      */
 
+/*
+ * The POWER BLOCK, appended the same way: length 64 -> 68, version still 2.
+ * One byte of setting (Charge Rate) and three reserved. A 64-byte record —
+ * every device that has taken the clock build — reads as CHARGE_RATE_FAST,
+ * which is the new default and the behaviour the setting exists to switch
+ * away from. The host tools (make_config.py --stamp, core sync) copy a record
+ * longer than their own 64 verbatim, so the byte survives a clock stamp.
+ */
+#define P_CHG_RATE      (CFG_PAYLOAD_V2T + 0u)   /* 64: u8  CHARGE_RATE_*     */
+#define P_PWR_PAD       (CFG_PAYLOAD_V2T + 1u)   /* 65: u8 x3 reserved (0)    */
+#define CFG_PAYLOAD_V2P (CFG_PAYLOAD_V2T + 4u)   /* = 68                      */
+
 /* Real-world UTC offsets: UTC-12:00 .. UTC+14:00, in whole minutes. Clamped on
  * decode so a hand-edited or buggy host cannot shift the displayed clock by a
  * year. The epochs are NOT clamped — clamping an epoch would manufacture a
@@ -359,7 +371,7 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
 
     wr32(&rec[CFG_OFF_MAGIC],   CFG_MAGIC);
     wr16(&rec[CFG_OFF_VERSION], (uint16_t)CONFIG_VERSION);
-    wr16(&rec[CFG_OFF_LENGTH],  (uint16_t)CFG_PAYLOAD_V2T);
+    wr16(&rec[CFG_OFF_LENGTH],  (uint16_t)CFG_PAYLOAD_V2P);
     wr32(&rec[CFG_OFF_SEQ],     seq);
 
     uint8_t *p = &rec[CFG_OFF_PAYLOAD];
@@ -431,6 +443,14 @@ void config_encode(uint8_t *rec, const settings_t *s, uint32_t seq)
          (uint16_t)(int16_t)clampi(s->utc_off_min,
                                    CFG_OFF_MIN_MINUTES, CFG_OFF_MAX_MINUTES));
     wr16(&p[P_TIME_PAD2], 0);
+
+    /* The power block. A rate this build does not know is written as FAST,
+     * the same rule every other enumerated byte follows. */
+    p[P_CHG_RATE]    = (uint8_t)(s->charge_rate == CHARGE_RATE_QUIET
+                                 ? CHARGE_RATE_QUIET : CHARGE_RATE_FAST);
+    p[P_PWR_PAD]     = 0;
+    p[P_PWR_PAD + 1] = 0;
+    p[P_PWR_PAD + 2] = 0;
 
     /* settings_t.sleep_timer_min is deliberately ABSENT from the payload: a
      * countdown armed before a power cut means nothing after one, so the
@@ -579,6 +599,15 @@ int config_decode(const uint8_t *rec, settings_t *s, uint32_t *seq)
         s->time_in_title = 0;
         s->applied_epoch = 0;
         s->utc_off_min   = 0;
+    }
+
+    /* The power block, gated on length like every tail before it. A record
+     * without it — every device before Charge Rate existed — reads as FAST,
+     * and so does a byte this build does not know. */
+    if (len >= CFG_PAYLOAD_V2P && p[P_CHG_RATE] == CHARGE_RATE_QUIET) {
+        s->charge_rate = CHARGE_RATE_QUIET;
+    } else {
+        s->charge_rate = CHARGE_RATE_FAST;
     }
 
     /* Never on disk, and config_load() copies this whole decoded struct over

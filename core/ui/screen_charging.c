@@ -23,9 +23,6 @@
 /* Palette: the CHG_* tokens live in screen_charging.h, shared with the
  * low-battery screens (screen_battery.c) that are drawn on the same field. */
 
-/* At or above this, a stopped charger means "full", not "failed". */
-#define CHG_FULL_PCT 90
-
 /* Battery geometry. Centred horizontally: body 150 wide -> the panel centre
  * (160) is the battery centre, so the lightning bolt lands dead-centre. */
 #define BATT_W   150             /* outline width                            */
@@ -39,6 +36,7 @@
 
 #define PCT_BASE  168            /* big percent baseline                     */
 #define STAT_BASE 196            /* status line baseline                     */
+#define NOTE_BASE 220            /* the caption's baseline (screen_charging_note) */
 
 /* Clamp a raw charge reading to a drawable 0..100 percent. */
 static int clamp_pct(int pct)
@@ -228,4 +226,17 @@ void screen_charging_render(int pct, int charging, int external)
     const text_font_t *sfont = text_font_bold_12();
     int ws = text_width(status, sfont);
     chg_text((LCD_WIDTH - ws) / 2, STAT_BASE, status, sfont, status_ink);
+}
+
+void screen_charging_note(const char *note)
+{
+    if (!note || !note[0]) {
+        return;
+    }
+    const text_font_t *f = text_font_regular_9();
+    int w = text_width(note, f);
+    /* Clear the caption band first so a shorter note over a partial repaint
+     * cannot leave the tail of a longer one behind. */
+    console_fill_rect(0, NOTE_BASE - 10, LCD_WIDTH, 14, CHG_BG);
+    chg_text((LCD_WIDTH - w) / 2, NOTE_BASE, note, f, CHG_MUTED);
 }

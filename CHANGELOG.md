@@ -5,6 +5,23 @@ the boot screen and Settings → About show the one the device runs.
 
 ## Unreleased
 
+- **The iPod charges while you use it.** The firmware had been asking the
+  charger for the USB 100 mA minimum, and on this hardware that budget is
+  shared with the device itself: the event log showed the cell sitting
+  paused with the drive parked for 71 minutes at the same voltage, and
+  playing for three hours while gaining 11 mV, with the charger insisting it
+  was charging the whole time. It only ever climbed while the device slept.
+  The firmware now asks for 500 mA, what Apple's firmware asks a PC port for,
+  and makes sure the pin that carries the request is actually driven
+  (nothing had ever checked). Settings → Battery → Charge Rate puts it back
+  to 100 mA if a port objects, or for a quieter headphone jack on a PC.
+- **Settings → Battery.** What the charge is doing, not what the charger
+  claims: the voltage, the supply (USB or dock), the budget, how far the cell
+  has moved since the cable went in, a line of the last hour, and the two
+  charger pins read back from the chip. The charging screen that appears on
+  plug-in carries the same numbers as a caption. `core: batt` log lines now
+  say which budget was in force and the drift since the cable event.
+
 - **MP3 plays.** It was compiled and switched off from the beginning because
   `dr_mp3`'s decoder is floating point and this CPU has no FPU — it needed 24
   times FLAC's work and the audio buffer starved. The decoder is now AOSP's

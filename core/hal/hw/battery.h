@@ -223,15 +223,55 @@ int power_is_external(void);
 int power_is_charging(void);
 
 /*
+ * Which supply is present, as two bits, from the same GPIO word
+ * power_is_external() reads: POWER_SRC_MAIN is the dock / FireWire / wall
+ * input, POWER_SRC_USB the USB cable. 0 = on the cell. A Battery page can
+ * say "USB" or "Dock" with this where power_is_external() only says "yes".
+ */
+#define POWER_SRC_MAIN 0x1
+#define POWER_SRC_USB  0x2
+int power_source(void);
+
+/*
  * Tell the LTC4066 how much input current it may draw (06-power.md, "Charge
  * current control"). 500 => HPWR asserted, the charger may pull up to 500 mA;
  * anything less => the 100 mA default cap. The charger is otherwise autonomous
  * (CV/CC, fast/trickle, end-of-charge are all internal) — this is the only
  * charge knob the firmware has.
  *
+ * Also makes BOTH control pins GPIO outputs (ENABLE + OUTPUT_EN) before it
+ * drives them. The first version only wrote OUTPUT_VAL, on the assumption
+ * that the boot ROM had left the pins configured; nothing ever checked, and
+ * a pin left as an input would have made every request here a no-op while
+ * the charger stayed at whatever its pull-ups gave it. The value is written
+ * first, so the direction flip lands on the intended level.
+ *
  * Deliberately never raises SUSP: a latched SUSP high is "the iPod silently
  * refuses to charge", and we have no feature that needs zero-current mode.
  */
 void charger_set_max_current(int milliamps);
+
+/* The budget last asked for through charger_set_max_current(): 100 or 500.
+ * 100 before the first call — the LTC4066's default with HPWR low. */
+int charger_max_current(void);
+
+/*
+ * The two control pins as the SoC sees them RIGHT NOW: the level on the pin
+ * (INPUT_VAL reads the pad, so this is what the LTC4066 sees, not what was
+ * asked for), and whether the pin is a GPIO driven as an output at all. This
+ * is how "500 mA requested" is separated from "500 mA delivered" on a device
+ * with no current meter: HPWR must read 1 with gpio=1 and out=1, or the
+ * request never reached the charger. Six register reads, no I2C.
+ */
+typedef struct {
+    int8_t hpwr;        /* pin level: 1 = 500 mA select, 0 = 100 mA           */
+    int8_t hpwr_gpio;   /* 1 = the pin is a GPIO (ENABLE bit set)             */
+    int8_t hpwr_out;    /* 1 = driven by us (OUTPUT_EN bit set)               */
+    int8_t susp;        /* pin level: 1 = charging SUSPENDED, 0 = normal      */
+    int8_t susp_gpio;
+    int8_t susp_out;
+} charger_pins_t;
+
+void charger_pin_state(charger_pins_t *out);
 
 #endif /* CORE_HAL_HW_BATTERY_H */

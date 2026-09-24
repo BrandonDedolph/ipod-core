@@ -123,8 +123,9 @@ Seven palettes, swapped live from Settings. Same layout, same type, different in
 
 ### Settings
 
-Playback, Sound (volume limit, EQ presets, tone), Theme, Display, Clicker, Date & Time, About, Boot
-Details, Disk Mode, Reset. Everything but the diagnostics is saved to the disk.
+Playback, Sound (volume limit, EQ presets, tone), Theme, Display, Clicker, Date & Time, Battery
+(charge rate, and what the charge is actually doing), About, Boot Details, Disk Mode, Reset.
+Everything but the diagnostics is saved to the disk.
 
 <p align="center"><img src="docs/screens/settings.gif" alt="a Sound slider, then the theme picker" width="360"></p>
 
@@ -134,6 +135,12 @@ Details, Disk Mode, Reset. Everything but the diagnostics is saved to the disk.
     <td><img src="docs/screens/playback.png" width="260" alt="Playback"></td>
     <td><img src="docs/screens/settime.png" width="260" alt="Set Date &amp; Time"></td>
     <td><img src="docs/screens/about.png" width="260" alt="About"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screens/battery.png" width="260" alt="Battery"></td>
+    <td><img src="docs/screens/bootdetails.png" width="260" alt="Boot Details"></td>
+    <td></td>
+    <td></td>
   </tr>
 </table>
 
@@ -177,7 +184,7 @@ and newlib for the device.
 cd core
 make hw                        # build-hw/core.elf, core.bin
 make ipod                      # build-hw/core.ipod
-make sim && meson test -C build-sim   # host tests, 78 suites
+make sim && meson test -C build-sim   # host tests, 79 suites
 make verify-hw                 # layout, header/doc and size checks on the ARM image
 ```
 

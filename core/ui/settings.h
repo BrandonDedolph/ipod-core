@@ -99,6 +99,17 @@ typedef struct {
                              /* 2 Sage, 3 Plaster, 4 Olive, 5 Umber,          */
                              /* 6 Mushroom — FUNCTIONAL (palette.c theme_set) */
     int  clicker;            /* 0/1 — FUNCTIONAL (piezo click on navigation)  */
+    /*
+     * CHARGE RATE — the input budget asked of the LTC4066 charger while on
+     * external power (hal/hw/battery.h charger_set_max_current). FAST is
+     * 500 mA, what Apple's firmware asks a PC port for and the only setting
+     * at which the device charges while it is being USED: at 100 mA the
+     * budget is the device itself (event log, 2026-09-19). QUIET is the
+     * 100 mA cap — quieter on the headphone jack while on a PC, since the
+     * cable's ground loop carries the port's supply noise in proportion.
+     * Settings > Battery > Charge Rate; persisted (kernel/config.c power
+     * block). */
+    int  charge_rate;        /* CHARGE_RATE_* — FUNCTIONAL (charger HPWR)     */
 
     /*
      * RESUME LOCATOR — runtime state, not a user preference. No Settings row
@@ -229,8 +240,18 @@ enum {
     RESUME_KIND_MAX      = RESUME_KIND_OTG
 };
 
+/* Charge Rate values. On disk as one byte; anything else reads as FAST. */
+enum {
+    CHARGE_RATE_FAST  = 0,   /* 500 mA: HPWR asserted                        */
+    CHARGE_RATE_QUIET = 1,   /* 100 mA: the LTC4066's default cap            */
+};
+
+/* The milliamps a charge_rate value asks the charger for: 500 or 100. */
+int settings_charge_ma(const settings_t *s);
+
 /* Populate `s` with sensible defaults (shuffle off, repeat off, volume 70 with
- * no volume limit, EQ off, backlight 15 s at full brightness, Linen theme). */
+ * no volume limit, EQ off, backlight 15 s at full brightness, Linen theme,
+ * fast charging). */
 void settings_defaults(settings_t *s);
 
 /*
@@ -263,6 +284,14 @@ typedef enum {
      */
     SETTINGS_DATETIME,
     SETTINGS_SETTIME,
+    /*
+     * Battery: one row (Charge Rate) over a live dashboard — the charge
+     * trend, the supply, the charger's pins as the SoC reads them back. The
+     * row is the ordinary list machinery; the dashboard under it is painted
+     * by settings_battery_render() from values only main.c has, the way About
+     * and Boot Details are. Appended so no existing screen id moves.
+     */
+    SETTINGS_BATTERY,
     SETTINGS_SCREEN_COUNT
 } settings_screen_t;
 
@@ -311,7 +340,8 @@ typedef enum {
      * on the names and nothing on disk stores them, so the only thing
      * renumbering would achieve is a diff. */
     SETTINGS_ENTER_DATETIME,
-    SETTINGS_ENTER_SETTIME
+    SETTINGS_ENTER_SETTIME,
+    SETTINGS_ENTER_BATTERY
 } settings_action_t;
 
 /*
@@ -539,5 +569,54 @@ void settings_diag_render(uint32_t total_ms, uint32_t lcd_ms, uint32_t disk_ms,
                           uint32_t lba0, uint32_t lba1,
                           uint32_t log_hdr_lba, uint32_t log_next_lba,
                           const char *build_id);
+
+/*
+ * THE BATTERY PAGE'S LIVE VALUES. main.c fills one of these per paint from
+ * the gauge, the charger's GPIOs and kernel/chargestat.c; this file is
+ * host-built and cannot read any of them. Every field has a "not known"
+ * value the painter draws as a dash rather than as a number.
+ */
+#define BATTERY_SRC_MAIN 0x1      /* dock / FireWire / wall input present   */
+#define BATTERY_SRC_USB  0x2      /* USB cable present                       */
+
+#define BATTERY_PIN_GPIO 0x1      /* the control pin is a GPIO (ENABLE)      */
+#define BATTERY_PIN_OUT  0x2      /* ...driven as an output (OUTPUT_EN)      */
+
+#define BATTERY_HIST_MAX 60       /* minute bins the page can draw           */
+
+typedef struct {
+    int      pct;          /* gauge percent, -1 unknown                       */
+    int      mv;           /* filtered millivolts, -1 unknown                 */
+    int      adc;          /* raw ADC code, -1 unknown                        */
+    int      source;       /* BATTERY_SRC_* bits; 0 = on the cell             */
+    int      charging;     /* the charger's CHRG pin: 1 asserted              */
+    int      rate_ma;      /* the budget the firmware asked for: 100 / 500    */
+    int8_t   hpwr;         /* HPWR pin level read back, -1 unknown            */
+    int8_t   susp;         /* SUSP pin level read back, -1 unknown            */
+    uint8_t  hpwr_cfg;     /* BATTERY_PIN_* of the HPWR pin                   */
+    uint8_t  susp_cfg;     /* BATTERY_PIN_* of the SUSP pin                   */
+    uint32_t session_s;    /* seconds since the cable last went in (or out)   */
+    int      session_mv0;  /* first reading of that session, -1 none          */
+    int      session_dmv;  /* latest reading minus session_mv0                */
+    int      session_chg;  /* % of the session's samples with CHRG asserted   */
+    int      trend_ok;     /* trend_mv is real (enough history)               */
+    int      trend_mv;     /* millivolts moved over the last TREND minutes    */
+    const uint16_t *hist;  /* minute readings, oldest first, 0 = gap; or NULL */
+    int      hist_n;       /* entries in hist (<= BATTERY_HIST_MAX)           */
+    int      playing;      /* transport running (the load the budget feeds)   */
+    int      parked;       /* drive spun down                                 */
+} battery_page_t;
+
+/* The window chargestat_recent_delta is asked for, in minutes. */
+#define BATTERY_TREND_MIN 10
+
+/*
+ * Render the Battery screen: the Charge Rate row (the list machinery, so
+ * `sel` is honoured like any other list) over the dashboard built from
+ * `live`. NULL draws the dashboard with dashes — the placeholder path
+ * settings_render() takes, and what anything without a gauge to read passes.
+ */
+void settings_battery_render(const settings_t *s, int sel,
+                             const battery_page_t *live);
 
 #endif /* CORE_UI_SETTINGS_H */

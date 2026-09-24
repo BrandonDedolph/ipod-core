@@ -1315,6 +1315,49 @@ and SUSPEND_GATE_CLOCKS untested alone, clock_suspend (PLL park) needs a
 rework before it comes back, ATA SLEEP vs STANDBY untested alone, USB
 ground-loop noise is the cable. Nothing pushed.
 
+### 2026-09-19 — charging: the budget was the device, and a Battery page
+
+The owner: "charge isn't happening when plugged into my PC", and "I want to
+see details about the charge". CORELOG.BIN pulled in disk mode (~15 000
+lines, six days) had the answer in the `core: batt` lines, all with the
+cable in and CHRG asserted: paused + parked + awake for 71 min, 3861 → 3867
+mV; playing for three hours, 4037 → 4048 mV; the cell only climbed while
+the device slept. The firmware asked the LTC4066 for 100 mA (the 2026-09-13
+noise bisect), and on a linear PowerPath charger that budget is the device
+itself. Full table in `core/docs/hw/06-power.md`.
+
+Landed (host-verified, NOT flashed):
+- `charger_set_max_current()` owns the pins now (ENABLE + OUTPUT_EN on
+  A2/L2, value first); `charger_pin_state()` reads HPWR/SUSP back from the
+  pad; `power_source()` says USB vs dock. New `GPIOA_ENABLE_ADDR` /
+  `GPIOA_OUTPUT_EN_ADDR` in pp5022.h (the headphone trace test's
+  hand-derived copies now static-assert against them).
+- **Settings → Battery → Charge Rate**, 500 mA default, 100 mA "quiet";
+  `charge_rate` in settings_t, config record 64 → 68 bytes (power block,
+  `P_CHG_RATE`; a 64-byte record reads FAST; make_config.py --verify shows
+  it; the Go stamp copies longer records verbatim — checked).
+  `settings_apply()` pushes it to the pin, so a SELECT on the row is live.
+- **`kernel/chargestat.c`**: session since the last plug edge (mV0, delta,
+  CHRG duty) + one reading a minute for the last hour, ring not cut at the
+  edge. Fed from battery_refresh() — the suspend loop included.
+- **The Battery page** (`settings_battery_render`): status word, mV, the
+  token line (USB · 500 mA · 47% · +56 mV in 24 min), the hour's line with
+  a 10-minute delta, and the pin footer (`CHRG 1 · 98% on · HPWR 1 · SUSP 0
+  · ADC 651`, `en=0`/`oe=0` tails). Repaints on every sample while open.
+- The charging modal carries a caption with the same numbers; `core: batt`
+  lines gained `ma` and `dmv`; a plug edge narrates `core: charger in,
+  session from N mV`.
+- 79 host suites (new: `chargestat`; `config` + `settings` + `hw-battery`
+  extended), `make hw && make verify-hw` clean.
+
+FIRST-FLASH CHECKLIST: (1) cable in → Settings → Battery footer reads
+`HPWR 1 · SUSP 0`, no `en=0`/`oe=0`; (2) leave it an hour paused, awake:
+the line must climb (the log's 71-minute flat is the baseline to beat);
+(3) headphones on USB: if the whine is worse, Charge Rate → 100 mA and
+confirm it persists across a boot; (4) the gauge on plug-in: does the
+percent still step down? (the 500 mA lift correction is 150 mV — watch
+whether it now reads LOW on the cable; the slew hides the step).
+
 ## Where we are right now (2026-07-28)
 
 **A full music player on real hardware, and it is now the device's own

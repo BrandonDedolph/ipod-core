@@ -49,6 +49,10 @@ int main(void)
     check("def-vol-limit", s.volume_limit == 100);   /* 100 = no limit */
     check("def-eq-off",    s.eq == EQ_OFF);
     check("def-resume-on",  s.resume_on_startup == 1);
+    /* Fast by default: 500 mA is the rate at which the device charges while
+     * it is being used; the row exists to opt DOWN to 100 mA. */
+    check("def-charge-fast", s.charge_rate == CHARGE_RATE_FAST &&
+                             settings_charge_ma(&s) == 500);
     /* A fresh (or freshly Reset) settings_t must carry NO resume locator —
      * "Reset Settings" routes through settings_defaults, so this is also what
      * makes a reset forget where you were. */
@@ -217,31 +221,37 @@ int main(void)
           settings_activate(SETTINGS_ROOT, &s, 3) == SETTINGS_ENTER_DISPLAY);
     check("enter-datetime",
           settings_activate(SETTINGS_ROOT, &s, 5) == SETTINGS_ENTER_DATETIME);
+    check("enter-battery",
+          settings_activate(SETTINGS_ROOT, &s, 6) == SETTINGS_ENTER_BATTERY);
     check("enter-about",
-          settings_activate(SETTINGS_ROOT, &s, 6) == SETTINGS_ENTER_ABOUT);
+          settings_activate(SETTINGS_ROOT, &s, 7) == SETTINGS_ENTER_ABOUT);
     check("enter-diag",
-          settings_activate(SETTINGS_ROOT, &s, 7) == SETTINGS_ENTER_DIAG);
+          settings_activate(SETTINGS_ROOT, &s, 8) == SETTINGS_ENTER_DIAG);
     check("diskmode-action",
-          settings_activate(SETTINGS_ROOT, &s, 8) == SETTINGS_ACTION_DISKMODE);
+          settings_activate(SETTINGS_ROOT, &s, 9) == SETTINGS_ACTION_DISKMODE);
     check("reset-action",
-          settings_activate(SETTINGS_ROOT, &s, 9) == SETTINGS_ACTION_RESET);
+          settings_activate(SETTINGS_ROOT, &s, 10) == SETTINGS_ACTION_RESET);
     /* Both fire on SELECT rather than descending — a SUBMENU kind here would
-     * make the UI push a screen that does not exist. Boot Details, by
-     * contrast, IS a screen, so it must stay a SUBMENU: the two action rows
-     * are pinned by index, and inserting a row above them is exactly the edit
-     * that would silently turn "Reset Settings" into "Disk Mode". */
+     * make the UI push a screen that does not exist. Boot Details and
+     * Battery, by contrast, ARE screens, so they must stay SUBMENU: the two
+     * action rows are pinned by index, and inserting a row above them is
+     * exactly the edit that would silently turn "Reset Settings" into "Disk
+     * Mode" (settings.c names the indices for that reason). */
+    check("battery-is-submenu",
+          settings_kind(SETTINGS_ROOT, 6) == SETTINGS_KIND_SUBMENU);
     check("diag-is-submenu",
-          settings_kind(SETTINGS_ROOT, 7) == SETTINGS_KIND_SUBMENU);
+          settings_kind(SETTINGS_ROOT, 8) == SETTINGS_KIND_SUBMENU);
     check("diskmode-is-action",
-          settings_kind(SETTINGS_ROOT, 8) == SETTINGS_KIND_ACTION);
-    check("reset-is-action",
           settings_kind(SETTINGS_ROOT, 9) == SETTINGS_KIND_ACTION);
+    check("reset-is-action",
+          settings_kind(SETTINGS_ROOT, 10) == SETTINGS_KIND_ACTION);
     /* The labels, so an index shift cannot pass by renumbering alone. */
     check("datetime-label", strcmp(settings_label(SETTINGS_ROOT, 5), "Date & Time") == 0);
-    check("about-label",    strcmp(settings_label(SETTINGS_ROOT, 6), "About") == 0);
-    check("diag-label",     strcmp(settings_label(SETTINGS_ROOT, 7), "Boot Details") == 0);
-    check("diskmode-label", strcmp(settings_label(SETTINGS_ROOT, 8), "Disk Mode") == 0);
-    check("reset-label",    strcmp(settings_label(SETTINGS_ROOT, 9), "Reset Settings") == 0);
+    check("battery-label",  strcmp(settings_label(SETTINGS_ROOT, 6), "Battery") == 0);
+    check("about-label",    strcmp(settings_label(SETTINGS_ROOT, 7), "About") == 0);
+    check("diag-label",     strcmp(settings_label(SETTINGS_ROOT, 8), "Boot Details") == 0);
+    check("diskmode-label", strcmp(settings_label(SETTINGS_ROOT, 9), "Disk Mode") == 0);
+    check("reset-label",    strcmp(settings_label(SETTINGS_ROOT, 10), "Reset Settings") == 0);
     check("enter-clicker",
           settings_activate(SETTINGS_ROOT, &s, 4) == SETTINGS_ENTER_CLICKER);
     check("count-clicker", settings_count(SETTINGS_CLICKER) == 8);
@@ -251,7 +261,41 @@ int main(void)
     check("clicker-off", s.clicker == 0);
 
     /* --- Test 11: counts + generic value/kind reporting --- */
-    check("count-root",  settings_count(SETTINGS_ROOT) == 10);
+    check("count-root",  settings_count(SETTINGS_ROOT) == 11);
+
+    /* --- Battery: one SELECT row that flips the charge rate, and says so ---
+     * The value is the budget in milliamps, the unit the hardware doc and
+     * the dashboard under the row both use. SELECT is always a change (two
+     * values), so it is never NOOP: main.c applies it to the charger and
+     * persists it. */
+    {
+        char v[24];
+        int tg = 0, on = 0, num = 0, den = 0;
+        settings_defaults(&s);
+        check("battery-title",  strcmp(settings_title(SETTINGS_BATTERY), "Battery") == 0);
+        check("battery-count",  settings_count(SETTINGS_BATTERY) == 1);
+        check("battery-label",  strcmp(settings_label(SETTINGS_BATTERY, 0), "Charge Rate") == 0);
+        check("battery-kind",   settings_kind(SETTINGS_BATTERY, 0) == SETTINGS_KIND_SELECT);
+        settings_value(SETTINGS_BATTERY, &s, 0, v, &tg, &on, &num, &den);
+        check("battery-val-500", strcmp(v, "500 mA") == 0 && !tg && den == 0);
+        check("battery-flip-quiet",
+              settings_activate(SETTINGS_BATTERY, &s, 0) == SETTINGS_ACTION_NONE &&
+              s.charge_rate == CHARGE_RATE_QUIET && settings_charge_ma(&s) == 100);
+        settings_value(SETTINGS_BATTERY, &s, 0, v, &tg, &on, &num, &den);
+        check("battery-val-100", strcmp(v, "100 mA") == 0);
+        check("battery-flip-fast",
+              settings_activate(SETTINGS_BATTERY, &s, 0) == SETTINGS_ACTION_NONE &&
+              s.charge_rate == CHARGE_RATE_FAST && settings_charge_ma(&s) == 500);
+        check("battery-oob-noop",
+              settings_activate(SETTINGS_BATTERY, &s, 1) == SETTINGS_ACTION_NOOP);
+        check("battery-wheel-inert",
+              settings_adjust(SETTINGS_BATTERY, &s, 0, +1) == 0 &&
+              s.charge_rate == CHARGE_RATE_FAST);
+        /* An unknown stored value still asks for the default budget. */
+        s.charge_rate = 42;
+        check("battery-unknown-is-500", settings_charge_ma(&s) == 500);
+        settings_defaults(&s);
+    }
     check("count-play",  settings_count(SETTINGS_PLAYBACK) == 4);
     check("count-sound", settings_count(SETTINGS_SOUND) == 6);
     /* Addressed BY LABEL, so re-ordering the screen cannot pass by

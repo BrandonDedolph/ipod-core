@@ -187,10 +187,21 @@ static int sleep_step(int mins)
 /* Only rows that actually do something are listed — the cosmetic placeholders
  * (Crossfade, Replaygain, Skip Length, Stereo Width, Shortcuts, Language) were
  * removed so the menu never presents a control that has no effect. */
-static const char *const ROOT_L[10] = {
+static const char *const ROOT_L[11] = {
     "Playback", "Sound", "Theme", "Display", "Clicker", "Date & Time",
-    "About", "Boot Details", "Disk Mode", "Reset Settings",
+    "Battery", "About", "Boot Details", "Disk Mode", "Reset Settings",
 };
+/* Root row indices. The two action rows are pinned BY INDEX in
+ * settings_kind() and settings_activate(); name them once so inserting a row
+ * (Battery, 2026-09-19) is a one-line edit and not a hunt for 8s and 9s. */
+enum {
+    ROOT_PLAYBACK = 0, ROOT_SOUND, ROOT_THEME, ROOT_DISPLAY, ROOT_CLICKER,
+    ROOT_DATETIME, ROOT_BATTERY, ROOT_ABOUT, ROOT_DIAG, ROOT_DISKMODE,
+    ROOT_RESET, ROOT_N
+};
+/* The Battery page's one row. Everything else on that page is painted from
+ * live values by settings_battery_render(). */
+static const char *const BATT_L[1] = { "Charge Rate" };
 /* Resume is back on this list: it was pulled with the other placeholders while
  * nothing could persist it, and it is now the switch that decides whether boot
  * re-opens the track you left off on (kernel/main.c resume_restore). Sleep
@@ -245,6 +256,8 @@ void settings_defaults(settings_t *s)
     s->backlight_bright  = 32;
     s->theme             = 0;
     s->clicker           = 1;
+    /* Fast: the setting is the way DOWN to 100 mA, not the way up. */
+    s->charge_rate       = CHARGE_RATE_FAST;
     /* Nothing to resume from a fresh install — and "Reset Settings" routes
      * through here too, so it also forgets where you were. */
     s->resume_hash       = 0;
@@ -292,10 +305,15 @@ void settings_set_now(int valid, uint32_t local_epoch)
     g_now_local = local_epoch;
 }
 
+int settings_charge_ma(const settings_t *s)
+{
+    return s->charge_rate == CHARGE_RATE_QUIET ? 100 : 500;
+}
+
 int settings_count(int screen)
 {
     switch (screen) {
-    case SETTINGS_ROOT:     return 10;
+    case SETTINGS_ROOT:     return ROOT_N;
     case SETTINGS_PLAYBACK: return 4;
     case SETTINGS_SOUND:    return 6;
     case SETTINGS_DISPLAY:  return 2;
@@ -303,6 +321,7 @@ int settings_count(int screen)
     case SETTINGS_DIAG:     return 1;   /* non-interactive info page */
     case SETTINGS_DATETIME: return 3;
     case SETTINGS_SETTIME:  return 1;   /* the editor; main.c drives it */
+    case SETTINGS_BATTERY:  return 1;   /* Charge Rate, over the dashboard */
     case SETTINGS_THEME:    return THEME_COUNT;
     case SETTINGS_CLICKER:  return CLICK_N;   /* Off + sound profiles */
     default:                return 0;
@@ -320,6 +339,7 @@ const char *settings_label(int screen, int idx)
     case SETTINGS_SOUND:    return SOUND_L[idx];
     case SETTINGS_DISPLAY:  return DISP_L[idx];
     case SETTINGS_DATETIME: return DT_L[idx];
+    case SETTINGS_BATTERY:  return BATT_L[idx];
     case SETTINGS_THEME:    return THEME_L[idx];
     case SETTINGS_CLICKER:  return CLICK_L[idx];
     default:                return "";
@@ -355,6 +375,7 @@ const char *settings_title(int screen)
     case SETTINGS_SETTIME:  return "Set Date & Time";
     case SETTINGS_ABOUT:    return "About";
     case SETTINGS_DIAG:     return "Boot Details";
+    case SETTINGS_BATTERY:  return "Battery";
     default:                return "";
     }
 }
@@ -364,8 +385,10 @@ int settings_kind(int screen, int idx)
     switch (screen) {
     case SETTINGS_ROOT:
         /* Disk Mode + Reset Settings both fire on SELECT; the rest descend. */
-        if (idx == 8 || idx == 9) return SETTINGS_KIND_ACTION;
+        if (idx == ROOT_DISKMODE || idx == ROOT_RESET) return SETTINGS_KIND_ACTION;
         return SETTINGS_KIND_SUBMENU;                 /* incl. Clicker submenu */
+    case SETTINGS_BATTERY:
+        return SETTINGS_KIND_SELECT;       /* Charge Rate: 500 <-> 100 mA      */
     case SETTINGS_CLICKER:
         return SETTINGS_KIND_SELECT;                  /* radio pick, marked active */
     case SETTINGS_PLAYBACK:
@@ -402,10 +425,18 @@ void settings_value(int screen, const settings_t *s, int idx,
     switch (screen) {
     case SETTINGS_ROOT:
         /* Theme + Clicker carry a right value (the current choice); rest chevrons. */
-        if (idx == 2) {
+        if (idx == ROOT_THEME) {
             scopy(buf, settings_theme_name(s->theme));
-        } else if (idx == 4) {
+        } else if (idx == ROOT_CLICKER) {
             scopy(buf, settings_clicker_name(s->clicker));
+        }
+        break;
+
+    case SETTINGS_BATTERY:
+        /* The budget in the unit the hardware doc uses, so the row and the
+         * dashboard's "500 mA" token below it cannot disagree. */
+        if (idx == 0) {
+            scopy(buf, s->charge_rate == CHARGE_RATE_QUIET ? "100 mA" : "500 mA");
         }
         break;
 
@@ -516,18 +547,29 @@ int settings_activate(int screen, settings_t *s, int idx)
     switch (screen) {
     case SETTINGS_ROOT:
         switch (idx) {
-        case 0: return SETTINGS_ENTER_PLAYBACK;
-        case 1: return SETTINGS_ENTER_SOUND;
-        case 2: return SETTINGS_ENTER_THEME;
-        case 3: return SETTINGS_ENTER_DISPLAY;
-        case 4: return SETTINGS_ENTER_CLICKER;
-        case 5: return SETTINGS_ENTER_DATETIME;
-        case 6: return SETTINGS_ENTER_ABOUT;
-        case 7: return SETTINGS_ENTER_DIAG;
-        case 8: return SETTINGS_ACTION_DISKMODE;
-        case 9: return SETTINGS_ACTION_RESET;
+        case ROOT_PLAYBACK: return SETTINGS_ENTER_PLAYBACK;
+        case ROOT_SOUND:    return SETTINGS_ENTER_SOUND;
+        case ROOT_THEME:    return SETTINGS_ENTER_THEME;
+        case ROOT_DISPLAY:  return SETTINGS_ENTER_DISPLAY;
+        case ROOT_CLICKER:  return SETTINGS_ENTER_CLICKER;
+        case ROOT_DATETIME: return SETTINGS_ENTER_DATETIME;
+        case ROOT_BATTERY:  return SETTINGS_ENTER_BATTERY;
+        case ROOT_ABOUT:    return SETTINGS_ENTER_ABOUT;
+        case ROOT_DIAG:     return SETTINGS_ENTER_DIAG;
+        case ROOT_DISKMODE: return SETTINGS_ACTION_DISKMODE;
+        case ROOT_RESET:    return SETTINGS_ACTION_RESET;
         default: return SETTINGS_ACTION_NOOP;
         }
+
+    case SETTINGS_BATTERY:
+        /* Two values, so SELECT always changes something. main.c applies it
+         * to the charger in settings_apply() and persists it. */
+        if (idx == 0) {
+            s->charge_rate = (s->charge_rate == CHARGE_RATE_QUIET)
+                             ? CHARGE_RATE_FAST : CHARGE_RATE_QUIET;
+            return SETTINGS_ACTION_NONE;
+        }
+        return SETTINGS_ACTION_NOOP;
 
     case SETTINGS_DATETIME:
         switch (idx) {

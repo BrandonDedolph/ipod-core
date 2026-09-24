@@ -23,6 +23,7 @@
 
 #include "settings.h"
 #include "settime.h"                          /* the Date & Time editor model */
+#include "screen_charging.h"                   /* CHG_FULL_PCT, shared with the modal */
 #include "chrome.h"
 #include "palette.h"                          /* live theme palette (g_pal[]) */
 
@@ -55,6 +56,7 @@
 #define S_WARN     0xE125u
 #define S_SEL_TRK  g_pal[PAL_SEL_TRK]  /* slider track on a selected row         */
 #define S_PILL_OFF g_pal[PAL_PILL_OFF] /* toggle pill OFF fill                   */
+#define S_PLATE_C  g_pal[PAL_PLATE]    /* raised plate (About's gauge cards)     */
 
 /* Nunito faces (see ui/text.h). */
 #define F_BIG    text_font_bold_18()
@@ -307,6 +309,10 @@ void settings_render(int screen, const settings_t *s, int sel)
          * placeholder path keeps settings_render total over every screen. */
         settings_about_render(-1, -1, -1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, ABOUT_LOG_OFF,
                               0, "v0.0.0", NULL);
+        return;
+    }
+    if (screen == SETTINGS_BATTERY) {
+        settings_battery_render(s, sel, NULL);       /* same idea: dashes */
         return;
     }
 
@@ -914,4 +920,252 @@ void settime_render(const settime_t *t)
                        " Select next " UI_GLYPH_MIDDOT " Menu cancels";
     int hw = text_width(hint, F_SMALL);
     st_text((LCD_WIDTH - hw) / 2, ST_HINT_Y, hint, F_SMALL, S_MUTED2);
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Battery (SETTINGS_BATTERY)
+ * ------------------------------------------------------------------------- */
+
+/*
+ * The Charge Rate row over a small dashboard: what the charger has actually
+ * been doing, which the charging screen's "CHARGING" cannot say.
+ *
+ *   ‹ Battery
+ *   [ Charge Rate                              500 mA ]
+ *   Charging                                  3912 mV
+ *   USB · 500 mA · 47% · +38 mV in 12 min
+ *   ┌ LAST HOUR                    +21 mV / 10 min ┐
+ *   │ 3940                                   ╱─    │
+ *   │ 3860 ───────────────────────╱──╱             │
+ *   └──────────────────────────────────────────────┘
+ *        CHRG 1 · 75% on · HPWR 1 · SUSP 0 · ADC 651
+ *
+ * WHY A TREND AND NOT A CURRENT. The iPod has no current sense; the only
+ * measurement is the terminal voltage every 5 s. The LTC4066's CHRG pin says
+ * the charger is TRYING, and the 2026-09-19 event log has it asserted for
+ * three hours of playback during which the cell moved 11 mV — so the pin
+ * alone would have read "charging" through every hour the cell was not. The
+ * line is the answer: rising, flat or falling, over the last hour, with the
+ * cable's edges left in (kernel/chargestat.h on why it is not reset).
+ *
+ * THE FOOTER is the pin probe, the same idea as About's JACK token: HPWR is
+ * read back from the pad, so "500 mA" on the row and "HPWR 0" on the footer
+ * together say the request never reached the charger — and "oe=0" says why
+ * (the pin is not being driven). The one thing this page cannot do is
+ * confirm the port DELIVERS 500 mA; the line above it does that, slowly.
+ */
+#define BP_HEAD_BASE   92          /* status word + millivolts baseline       */
+#define BP_SUB_BASE    108         /* the token line under them               */
+#define BP_PLATE_Y     116
+#define BP_PLATE_H     92          /* ...to 208                               */
+#define BP_PLATE_X     16
+#define BP_PLATE_W     (LCD_WIDTH - 2 * BP_PLATE_X)
+#define BP_LABEL_BASE  (BP_PLATE_Y + 18)
+#define BP_CHART_X     62          /* the mV labels take 26..58               */
+#define BP_CHART_W     (BP_PLATE_X + BP_PLATE_W - 10 - BP_CHART_X)   /* 232  */
+#define BP_CHART_Y     (BP_PLATE_Y + 26)                             /* 142  */
+#define BP_CHART_H     56                                            /* ..198*/
+#define BP_FOOT_BASE   232
+#define BP_MIN_SPAN_MV 40          /* the chart never zooms tighter than this */
+
+/* "+38 mV" / "-12 mV" / "0 mV". */
+static void fmt_smv(char *d, int mv)
+{
+    int i = 0;
+    if (mv > 0) d[i++] = '+';
+    if (mv < 0) { d[i++] = '-'; mv = -mv; }
+    i += su_to_str(d + i, (unsigned)mv);
+    su_copy(d + i, " mV");
+}
+
+/* "12 min" / "1 h 5 min" (never called under a minute: see the token line). */
+static void fmt_span(char *d, uint32_t secs)
+{
+    uint32_t m = secs / 60u;
+    if (m == 0) { su_copy(d, "<1 min"); return; }
+    if (m < 60u) {
+        int i = su_to_str(d, m);
+        su_copy(d + i, " min");
+        return;
+    }
+    int i = su_to_str(d, m / 60u);
+    su_copy(d + i, " h ");
+    i += 3;
+    i += su_to_str(d + i, m % 60u);
+    su_copy(d + i, " min");
+}
+
+/* 1-px line from (x0,y0) to (x1,y1), Bresenham over console_fill_rect. Two
+ * pixels tall so the trace reads at arm's length on a 320x240 panel. */
+static void bp_line(int x0, int y0, int x1, int y1, uint16_t c)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        console_fill_rect(x0, y0, 1, 2, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* The hour's line. The time axis is fixed — the right edge is now, the left
+ * edge an hour ago — so a device up for ten minutes shows ten minutes of
+ * line at the right, not ten minutes stretched across the plate. */
+static void bp_chart(const battery_page_t *live)
+{
+    int x0 = BP_CHART_X, y0 = BP_CHART_Y, w = BP_CHART_W, h = BP_CHART_H;
+    console_fill_rect(x0, y0 + h - 1, w, 1, S_TRK);        /* the floor    */
+
+    int n = (live && live->hist) ? live->hist_n : 0;
+    if (n > BATTERY_HIST_MAX) n = BATTERY_HIST_MAX;
+    int lo = 0, hi = 0, readings = 0;
+    for (int i = 0; i < n; i++) {
+        int v = live->hist[i];
+        if (v == 0) continue;
+        if (!readings || v < lo) lo = v;
+        if (!readings || v > hi) hi = v;
+        readings++;
+    }
+    if (readings < 2) {
+        ui_text_centered(y0 + h / 2 + 3, "Collecting", F_SMALL, S_MUTED);
+        return;
+    }
+    /* Scale: at least BP_MIN_SPAN_MV tall, centred on the readings, so a
+     * flat hour draws flat in the middle rather than as noise filling the
+     * plate; labelled top and bottom. */
+    int span = hi - lo;
+    if (span < BP_MIN_SPAN_MV) {
+        int pad = (BP_MIN_SPAN_MV - span) / 2;
+        lo -= pad;
+        hi  = lo + BP_MIN_SPAN_MV;
+        span = BP_MIN_SPAN_MV;
+    }
+    char v[12];
+    su_to_str(v, (unsigned)hi);
+    st_text(BP_CHART_X - 4 - text_width(v, F_SMALL), y0 + 8, v, F_SMALL, S_MUTED2);
+    su_to_str(v, (unsigned)lo);
+    st_text(BP_CHART_X - 4 - text_width(v, F_SMALL), y0 + h - 1, v, F_SMALL, S_MUTED2);
+
+    int px = -1, py = -1, lx = -1, ly = -1;
+    for (int i = 0; i < n; i++) {
+        int mv = live->hist[i];
+        /* Bin i of n sits at (i + 60 - n) of 60 along the fixed hour. */
+        int x = x0 + ((i + BATTERY_HIST_MAX - n) * (w - 1)) / (BATTERY_HIST_MAX - 1);
+        if (mv == 0) { px = -1; continue; }              /* a gap breaks the line */
+        int y = y0 + (h - 2) - ((mv - lo) * (h - 2)) / span;
+        if (px >= 0) {
+            bp_line(px, py, x, y, S_INK);
+        } else {
+            console_fill_rect(x, y, 1, 2, S_INK);         /* a lone reading */
+        }
+        px = x; py = y; lx = x; ly = y;
+    }
+    if (lx >= 0) {
+        console_fill_rect(lx - 1, ly - 1, 3, 4, S_INK);   /* now: a heavier dot */
+    }
+}
+
+void settings_battery_render(const settings_t *s, int sel,
+                             const battery_page_t *live)
+{
+    char v[96], w[24];
+
+    console_clear(S_SURFACE);
+    ui_header(settings_title(SETTINGS_BATTERY), "", 1);
+    list_render(SETTINGS_BATTERY, s, sel);            /* the Charge Rate row */
+
+    /* --- headline: the status word left, millivolts right --- */
+    const char *status = "--";
+    if (live && (live->pct >= 0 || live->mv >= 0)) {
+        if (live->source == 0)                         status = "On battery";
+        else if (live->charging)                       status = "Charging";
+        else if (live->pct >= CHG_FULL_PCT)            status = "Charged";
+        else                                           status = "Not charging";
+    }
+    st_text(16, BP_HEAD_BASE, status, F_BIG, S_INK);
+    if (live && live->mv >= 0) {
+        su_to_str(v, (unsigned)live->mv); su_append(v, " mV");
+        st_text_right(16, BP_HEAD_BASE, v, F_BIG, S_INK);
+    } else {
+        st_text_right(16, BP_HEAD_BASE, "--", F_BIG, S_MUTED);
+    }
+
+    /* --- the token line: supply · budget · percent · the session --- */
+    v[0] = '\0';
+    if (live) {
+        if (live->source == 0) {
+            su_copy(v, "BATTERY");
+        } else {
+            su_copy(v, (live->source & BATTERY_SRC_USB) ? "USB" : "DOCK");
+            if ((live->source & (BATTERY_SRC_USB | BATTERY_SRC_MAIN)) ==
+                (BATTERY_SRC_USB | BATTERY_SRC_MAIN)) {
+                su_append(v, "+DOCK");
+            }
+            su_append(v, " " UI_GLYPH_MIDDOT " ");
+            su_to_str(w, (unsigned)live->rate_ma); su_append(v, w); su_append(v, " mA");
+        }
+        if (live->pct >= 0) {
+            su_append(v, " " UI_GLYPH_MIDDOT " ");
+            su_to_str(w, (unsigned)live->pct); su_append(v, w); su_append(v, "%");
+        }
+        /* The session's drift, once it has had a minute to mean something:
+         * "+0 mV in <1 min" is not information. */
+        if (live->session_mv0 >= 0 && live->session_s >= 60u) {
+            su_append(v, " " UI_GLYPH_MIDDOT " ");
+            fmt_smv(w, live->session_dmv); su_append(v, w);
+            su_append(v, " in ");
+            fmt_span(w, live->session_s); su_append(v, w);
+        }
+    }
+    if (v[0]) {
+        st_text(16, BP_SUB_BASE, v, F_SMALL, S_MUTED_D);
+    }
+
+    /* --- the plate: the last hour, and the last ten minutes as a number --- */
+    ui_round_rect(BP_PLATE_X, BP_PLATE_Y, BP_PLATE_W, BP_PLATE_H, 6, S_PLATE_C);
+    st_text(BP_PLATE_X + 10, BP_LABEL_BASE, "LAST HOUR", F_SMALL, S_MUTED);
+    if (live && live->trend_ok) {
+        fmt_smv(v, live->trend_mv);
+    } else {
+        su_copy(v, "--");
+    }
+    su_append(v, " / ");
+    su_to_str(w, (unsigned)BATTERY_TREND_MIN); su_append(v, w); su_append(v, " min");
+    st_text_right(BP_PLATE_X + 10, BP_LABEL_BASE, v, F_SMALL, S_MUTED_D);
+    bp_chart(live);
+
+    /* --- the footer: the charger's pins, as the SoC reads them back --- */
+    if (live) {
+        char adc[16];
+        su_copy(v, "CHRG ");
+        su_append(v, live->charging ? "1" : "0");
+        if (live->session_mv0 >= 0) {
+            su_append(v, " " UI_GLYPH_MIDDOT " ");
+            su_to_str(w, (unsigned)live->session_chg); su_append(v, w);
+            su_append(v, "% on");
+        }
+        su_append(v, " " UI_GLYPH_MIDDOT " HPWR ");
+        su_append(v, live->hpwr < 0 ? "?" : live->hpwr ? "1" : "0");
+        if (!(live->hpwr_cfg & BATTERY_PIN_GPIO)) su_append(v, " en=0");
+        if (!(live->hpwr_cfg & BATTERY_PIN_OUT))  su_append(v, " oe=0");
+        su_append(v, " " UI_GLYPH_MIDDOT " SUSP ");
+        su_append(v, live->susp < 0 ? "?" : live->susp ? "1" : "0");
+        if (!(live->susp_cfg & BATTERY_PIN_GPIO)) su_append(v, " en=0");
+        if (!(live->susp_cfg & BATTERY_PIN_OUT))  su_append(v, " oe=0");
+        adc[0] = '\0';
+        if (live->adc >= 0) {
+            su_copy(adc, " " UI_GLYPH_MIDDOT " ADC ");
+            su_to_str(w, (unsigned)live->adc); su_append(adc, w);
+        }
+        /* The ADC code is the least useful token and the first to go when
+         * the pin tails make the line too wide (same rule as About). */
+        int fits = text_width(v, F_SMALL) + text_width(adc, F_SMALL) <= LCD_WIDTH - 32;
+        if (fits) su_append(v, adc);
+        ui_text_centered(BP_FOOT_BASE, v, F_SMALL, S_MUTED);
+    }
 }

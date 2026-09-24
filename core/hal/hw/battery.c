@@ -465,9 +465,16 @@ battery_event_t battery_policy_feed(int mv, int external)
 
 int power_is_external(void)
 {
+    return power_source() != 0;
+}
+
+int power_source(void)
+{
     uint32_t l = mmio_read32(GPIOL_INPUT_VAL_ADDR);
-    return ((l & POWER_MAIN_CHARGER_BIT) == 0)   /* active-low  */
-        || ((l & POWER_USB_CHARGER_BIT) != 0);   /* active-high */
+    int src = 0;
+    if ((l & POWER_MAIN_CHARGER_BIT) == 0) src |= POWER_SRC_MAIN;   /* active-low  */
+    if ((l & POWER_USB_CHARGER_BIT)  != 0) src |= POWER_SRC_USB;    /* active-high */
+    return src;
 }
 
 int power_is_charging(void)
@@ -479,40 +486,87 @@ int power_is_charging(void)
 /* ---------- Charge-current gate (LTC4066) ----------------------------
  * 06-power.md, "Charge current control": the charger is autonomous and the
  * firmware can only gate it with two GPIO outputs.
- *   HPWR = GPIOA_OUTPUT_VAL bit 0x04 — high = 500 mA permitted, low = 100 mA
- *   SUSP = GPIOL_OUTPUT_VAL bit 0x04 — high = suspend ALL charging
+ *   HPWR = GPIOA bit 0x04 — high = 500 mA permitted, low = 100 mA
+ *   SUSP = GPIOL bit 0x04 — high = suspend ALL charging
  *
- * Nothing in this firmware ever wrote either bit, so we inherited whatever the
- * boot ROM left — i.e. the 100 mA cap. Since the LTC4066 is a LINEAR charger,
- * system load and battery charge share that input budget: at ~24 mA idle plus
- * ~20 mA of backlight the cell was seeing well under half of it, and during
- * playback with disk spin-ups the draw can exceed 100 mA outright, so the
- * battery DISCHARGES while nominally charging.
+ * Since the LTC4066 is a LINEAR charger with the system load in front of the
+ * cell, system load and battery charge share that input budget. At the
+ * 100 mA cap the budget is the device: the event log of 2026-09-19 has the
+ * cell sitting PAUSED with the drive parked and the backlight on for 71
+ * minutes at 3861 -> 3867 mV, and PLAYING for three hours at 4037 -> 4048 mV,
+ * both with the charger's CHRG pin asserted the whole time — "charging"
+ * that never gets anywhere. The same log shows the cell only climbing while
+ * the device slept. 500 mA is what Apple's firmware asks a PC port for, and
+ * it is the difference between a device that charges while it is used and
+ * one that only charges while it is off.
  *
  * Writes go through the atomic +GPIO_BITWISE_OFFSET alias (one masked 32-bit
  * write, no read-modify-write), so this cannot race the backlight driver's
- * unrelated GPIOL bit.
+ * unrelated GPIOL bits. The direction registers are written the same way.
  *
  * SPEC NOTE: 500 mA without USB enumeration is out of spec for a PC port — we
  * have no USB stack, so we can never be *entitled* to it. The hardware does not
  * interlock the two (HPWR is a dumb current-limit select), and this is exactly
  * what Apple's own firmware asserts after it negotiates. Safe on wall chargers
  * and on essentially all PC root ports; a strictly limited hub port may fold
- * back until replug.
+ * back until replug. Settings > Battery > Charge Rate is the way back to
+ * 100 mA (it is also the quieter setting on the headphone jack, since the
+ * cable's ground loop carries whatever the port's supply does).
  *
- * UNVERIFIED ON HARDWARE — confirm with an inline USB current meter, and read
- * GPIOA_INPUT_VAL bit 2 back to check the write sticks.
+ * The pin level is read back by charger_pin_state(): GPIOA_INPUT_VAL reads
+ * the pad, so a 1 there with the pin enabled and output-driven is the request
+ * ARRIVING at the charger, which is the closest thing to a current meter this
+ * device has.
  */
-#define CHG_HPWR_BIT  0x04
-#define CHG_SUSP_BIT  0x04
+#define CHG_HPWR_BIT  0x04u
+#define CHG_SUSP_BIT  0x04u
+
+/* Masked-write words for the +0x800 alias: set = (m << 8) | m, clear = m << 8. */
+#define GPIO_BW_SET(m)   ((((uint32_t)(m)) << 8) | (uint32_t)(m))
+#define GPIO_BW_CLEAR(m) (((uint32_t)(m)) << 8)
+
+static int s_charger_ma = 100;      /* HPWR low is the LTC4066's reset state */
 
 void charger_set_max_current(int milliamps)
 {
-    /* SUSP low in both cases: never suspend charging. */
+    int fast = milliamps >= 500;
+
+    /* Levels first: SUSP low (never suspend charging), HPWR per request. On a
+     * pin the ROM already drives these are the whole operation; on one it
+     * left as an input they are the value the pin will show the moment the
+     * direction flips below, so there is no glitch through the wrong level. */
     mmio_write32(GPIOL_OUTPUT_VAL_ADDR + GPIO_BITWISE_OFFSET,
-                 (uint32_t)CHG_SUSP_BIT << 8);
+                 GPIO_BW_CLEAR(CHG_SUSP_BIT));
     mmio_write32(GPIOA_OUTPUT_VAL_ADDR + GPIO_BITWISE_OFFSET,
-                 (milliamps >= 500)
-                     ? (((uint32_t)CHG_HPWR_BIT << 8) | CHG_HPWR_BIT)
-                     : ((uint32_t)CHG_HPWR_BIT << 8));
+                 fast ? GPIO_BW_SET(CHG_HPWR_BIT) : GPIO_BW_CLEAR(CHG_HPWR_BIT));
+
+    /* Then own the pins: GPIO function, output direction. Idempotent. */
+    mmio_write32(GPIOL_ENABLE_ADDR    + GPIO_BITWISE_OFFSET, GPIO_BW_SET(CHG_SUSP_BIT));
+    mmio_write32(GPIOL_OUTPUT_EN_ADDR + GPIO_BITWISE_OFFSET, GPIO_BW_SET(CHG_SUSP_BIT));
+    mmio_write32(GPIOA_ENABLE_ADDR    + GPIO_BITWISE_OFFSET, GPIO_BW_SET(CHG_HPWR_BIT));
+    mmio_write32(GPIOA_OUTPUT_EN_ADDR + GPIO_BITWISE_OFFSET, GPIO_BW_SET(CHG_HPWR_BIT));
+
+    s_charger_ma = fast ? 500 : 100;
+}
+
+int charger_max_current(void)
+{
+    return s_charger_ma;
+}
+
+void charger_pin_state(charger_pins_t *out)
+{
+    uint32_t a_in = mmio_read32(GPIOA_INPUT_VAL_ADDR);
+    uint32_t a_en = mmio_read32(GPIOA_ENABLE_ADDR);
+    uint32_t a_oe = mmio_read32(GPIOA_OUTPUT_EN_ADDR);
+    uint32_t l_in = mmio_read32(GPIOL_INPUT_VAL_ADDR);
+    uint32_t l_en = mmio_read32(GPIOL_ENABLE_ADDR);
+    uint32_t l_oe = mmio_read32(GPIOL_OUTPUT_EN_ADDR);
+
+    out->hpwr      = (a_in & CHG_HPWR_BIT) ? 1 : 0;
+    out->hpwr_gpio = (a_en & CHG_HPWR_BIT) ? 1 : 0;
+    out->hpwr_out  = (a_oe & CHG_HPWR_BIT) ? 1 : 0;
+    out->susp      = (l_in & CHG_SUSP_BIT) ? 1 : 0;
+    out->susp_gpio = (l_en & CHG_SUSP_BIT) ? 1 : 0;
+    out->susp_out  = (l_oe & CHG_SUSP_BIT) ? 1 : 0;
 }

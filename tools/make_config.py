@@ -174,6 +174,17 @@ TIME_FIELDS = [
 ]
 PAYLOAD_TIME_LEN = PAYLOAD_LEN + 16                        # 64
 
+# The POWER BLOCK, appended the same way (length 64 -> 68, version still 2).
+# Mirrors P_CHG_RATE in config.c: Settings > Battery > Charge Rate, 0 = fast
+# (500 mA, the default), 1 = quiet (100 mA). A 64-byte record reads as fast.
+# --stamp copies a record longer than PAYLOAD_TIME_LEN verbatim, so the byte
+# survives a clock stamp; --emit and --create still write PAYLOAD_LEN (48).
+POWER_FIELDS = [
+    ("charge_rate",       "<B", 64),   # 0 fast (500 mA) / 1 quiet (100 mA)
+    ("power_pad",         "<B", 65),   # reserved, 0 (x3)
+]
+PAYLOAD_POWER_LEN = PAYLOAD_TIME_LEN + 4                   # 68
+
 SIGNED = {"bass", "treble", "balance"}
 
 FILENAME = "CORECFG.DAT"
@@ -244,6 +255,9 @@ def decode(rec: bytes):
             out[name] = struct.unpack_from(fmt, rec, OFF_PAYLOAD + off)[0]
     if length >= PAYLOAD_TIME_LEN:
         for name, fmt, off in TIME_FIELDS:
+            out[name] = struct.unpack_from(fmt, rec, OFF_PAYLOAD + off)[0]
+    if length >= PAYLOAD_POWER_LEN:
+        for name, fmt, off in POWER_FIELDS:
             out[name] = struct.unpack_from(fmt, rec, OFF_PAYLOAD + off)[0]
     return seq, out
 

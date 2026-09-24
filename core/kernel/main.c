@@ -38,6 +38,7 @@
 #include "resume_ctx.h"
 #include "cfg_commit.h"
 #include "evlog.h"
+#include "chargestat.h"
 #include "otg_store.h"
 #include "core_version.h"       /* CORE_BUILD_ID: meson vcs_tag, git describe   */
 #include "core_version_tag.h"   /* CORE_VERSION:  meson vcs_tag, nearest tag    */
@@ -819,13 +820,15 @@ static void draw_lock_glyph(int x, int y, uint16_t c)
 /* Cached battery/power readout. The gauge read is an I2C transaction (slow, and
  * shares the codec bus), so sample it a few seconds apart — NOT every present —
  * and hold the last value. mv/pct < 0 means the read failed / not yet sampled. */
-/* Charger input budget asked of the LTC4066 (HPWR). 100 mA for now: on USB
- * the jack carried the drive and the piezo (a cable ground loop) plus a whine,
- * and the owner found 100 mA better (device, 2026-09-13). Also the charge
- * current the gauge corrects for while on external power. */
-#ifndef CHARGER_MAX_MA
-#define CHARGER_MAX_MA 100
-#endif
+/* The charger's input budget (LTC4066 HPWR) is Settings > Battery > Charge
+ * Rate now — 500 mA by default, 100 mA as the quiet option (2026-09-13's
+ * ground-loop finding). charger_apply() pushes the setting to the pin; the
+ * gauge corrects for whatever charger_max_current() says was asked. */
+
+/* What the cell has been doing lately (kernel/chargestat.h): fed by every
+ * battery sample, read by the Battery page and the charging screen's
+ * caption. */
+static chargestat_t g_chg;
 
 static int      g_bat_mv  = -1;
 static int      g_bat_pct = -1;
@@ -913,6 +916,60 @@ _Static_assert(ABOUT_JACK_PIN_ENABLED == HEADPHONE_PIN_ENABLED &&
  * About screen. g_free_mb == 0xFFFFFFFF means the FSInfo free count was absent. */
 static uint32_t g_total_mb, g_free_mb = 0xFFFFFFFFu;
 
+/*
+ * Push Settings > Battery > Charge Rate to the LTC4066. Called at run_ui's
+ * start (defaults), from settings_apply() after config_load and after every
+ * row change, so the pin always follows the record. Idempotent and cheap
+ * (six masked GPIO writes), so re-applying with the codec settings is fine.
+ */
+static void charger_apply(void)
+{
+    charger_set_max_current(settings_charge_ma(&g_settings));
+}
+
+/*
+ * The charging screen, plus its caption: the numbers the big percent hides.
+ * "3912 mV · 500 mA · +38 mV in 12 min" — the session drift is the one
+ * honest answer to "is it actually charging" this device can give (see
+ * kernel/chargestat.h), and it belongs on the screen that pops up when the
+ * cable goes in, not only on a Settings page.
+ */
+static void note_cat(char *d, const char *w)
+{
+    while (*d) d++;
+    while (*w) *d++ = *w++;
+    *d = '\0';
+}
+
+static void charging_screen_paint(void)
+{
+    screen_charging_render(g_bat_pct, power_is_charging(), power_is_external());
+    char note[64], n[16];
+    note[0] = '\0';
+    if (g_bat_mv_filt >= 0) {
+        u32_to_dec(n, (unsigned)g_bat_mv_filt);
+        note_cat(note, n); note_cat(note, " mV");
+    }
+    if (power_is_external()) {
+        if (note[0]) note_cat(note, " " UI_GLYPH_MIDDOT " ");
+        u32_to_dec(n, (unsigned)charger_max_current());
+        note_cat(note, n); note_cat(note, " mA");
+    }
+    uint32_t secs = chargestat_session_s(&g_chg, mmio_read32(USEC_TIMER_ADDR));
+    if (chargestat_session_mv0(&g_chg) >= 0 && secs >= 60u) {
+        /* Once the session is a minute old; "+0 mV in <1 min" says nothing. */
+        int d = chargestat_session_delta_mv(&g_chg);
+        if (note[0]) note_cat(note, " " UI_GLYPH_MIDDOT " ");
+        if (d > 0) note_cat(note, "+");
+        if (d < 0) { note_cat(note, "-"); d = -d; }
+        u32_to_dec(n, (unsigned)d);
+        note_cat(note, n); note_cat(note, " mV in ");
+        u32_to_dec(n, secs / 60u);
+        note_cat(note, n); note_cat(note, " min");
+    }
+    screen_charging_note(note);
+}
+
 /* Would battery_refresh(0) sample now? The suspend loop asks first so it can
  * bring the clocks back before the sample rather than after finding out. */
 static int battery_due(void)
@@ -971,7 +1028,8 @@ static int battery_refresh(int force)
      * terminal voltage, so the shown number moves at most one point per
      * sample (5 s) toward the estimate. Seeded on the first good sample.
      */
-    int est = g_bat_ext ? battery_percent_charging(g_bat_mv_filt, CHARGER_MAX_MA)
+    int est = g_bat_ext ? battery_percent_charging(g_bat_mv_filt,
+                                                   charger_max_current())
                         : battery_percent_from_mv(g_bat_mv_filt);
     if (g_bat_pct < 0 || est < 0) {
         g_bat_pct = est;                        /* first sample, or none */
@@ -1001,6 +1059,17 @@ static int battery_refresh(int force)
      * plausibility clamp is engaging, which is the difference between a flat
      * cell and a bad read.
      */
+    /* The trend record. Fed the FILTERED value, like the policy: the page
+     * draws the cell, not the spin-up sag. A plug/unplug edge is narrated
+     * once so the log shows where a session began. */
+    int chg_now = power_is_charging();
+    if (chargestat_feed(&g_chg, g_bat_mv_filt, g_bat_ext, chg_now, now)) {
+        uart_puts(g_bat_ext ? "core: charger in, " : "core: charger out, ");
+        uart_puts("session from ");
+        uart_dec(g_bat_mv_filt);
+        uart_puts(" mV\n");
+    }
+
     uart_puts("core: batt raw ");   uart_dec(g_bat_raw);
     uart_puts(" mv ");              uart_dec(g_bat_mv_raw);
     uart_puts(" clamped ");         uart_dec(g_bat_mv);
@@ -1008,7 +1077,11 @@ static int battery_refresh(int force)
     uart_puts(" lvl ");             uart_dec((int)battery_policy_level());
     uart_puts(" pct ");             uart_dec(g_bat_pct);
     uart_puts(" ext ");             uart_dec(g_bat_ext);
-    uart_puts(" chg ");             uart_dec(power_is_charging());
+    uart_puts(" chg ");             uart_dec(chg_now);
+    /* The budget asked of the charger, and the session's drift: the two
+     * numbers the 2026-09-19 log could only be read for by hand. */
+    uart_puts(" ma ");              uart_dec(charger_max_current());
+    uart_puts(" dmv ");             uart_dec(chargestat_session_delta_mv(&g_chg));
     uart_puts(" play ");            uart_dec(player_active());
     uart_puts(" paused ");          uart_dec(player_paused());
     /* No backlight state: it is a local in the main loop, not a global, and
@@ -3359,6 +3432,7 @@ static void settings_apply(void)
                        &curve);
     hal_eq_set(curve.gain_db, curve.cutoff, curve.narrow);
     theme_set(g_settings.theme);           /* Linen / Onyx -> live palette swap */
+    charger_apply();                       /* Charge Rate -> LTC4066 HPWR       */
 }
 
 /*
@@ -4400,6 +4474,41 @@ static void settings_render_cur(void)
                              g_diag_cfg_lba[0], g_diag_cfg_lba[1],
                              g_diag_log_lba[0], g_diag_log_lba[1],
                              CORE_BUILD_ID);
+    } else if (g_set_screen == SETTINGS_BATTERY) {
+        /* The Battery page: everything on it but the Charge Rate row is a
+         * live value, and this is the only place that has them. The pins
+         * are read back per paint (six GPIO reads, no I2C) — the point of
+         * the footer is that it shows the pad, not the request. The trend
+         * comes from the record every 5 s sample feeds (chargestat). */
+        charger_pins_t pins;
+        charger_pin_state(&pins);
+        static uint16_t hist[BATTERY_HIST_MAX];
+        battery_page_t bp;
+        uint32_t now = mmio_read32(USEC_TIMER_ADDR);
+        bp.pct         = g_bat_pct;
+        bp.mv          = g_bat_mv_filt;
+        bp.adc         = g_bat_raw;
+        bp.source      = power_source();
+        bp.charging    = power_is_charging();
+        bp.rate_ma     = charger_max_current();
+        bp.hpwr        = pins.hpwr;
+        bp.susp        = pins.susp;
+        bp.hpwr_cfg    = (uint8_t)((pins.hpwr_gpio ? BATTERY_PIN_GPIO : 0) |
+                                   (pins.hpwr_out  ? BATTERY_PIN_OUT  : 0));
+        bp.susp_cfg    = (uint8_t)((pins.susp_gpio ? BATTERY_PIN_GPIO : 0) |
+                                   (pins.susp_out  ? BATTERY_PIN_OUT  : 0));
+        bp.session_s   = chargestat_session_s(&g_chg, now);
+        bp.session_mv0 = chargestat_session_mv0(&g_chg);
+        bp.session_dmv = chargestat_session_delta_mv(&g_chg);
+        bp.session_chg = chargestat_session_chg_pct(&g_chg);
+        bp.trend_ok    = chargestat_recent_delta(&g_chg, BATTERY_TREND_MIN,
+                                                 &bp.trend_mv);
+        if (!bp.trend_ok) bp.trend_mv = 0;
+        bp.hist_n      = chargestat_history(&g_chg, hist);
+        bp.hist        = hist;
+        bp.playing     = player_active() && !player_paused();
+        bp.parked      = ata_is_parked();
+        settings_battery_render(&g_settings, g_set_sel, &bp);
     } else if (g_set_screen == SETTINGS_SETTIME) {
         settime_render(&g_settime);
     } else {
@@ -7039,7 +7148,7 @@ static void paint_current_screen(void)
         screen_battery_render(BATTWARN_DISKSAFE);
         break;
     case SCR_CHARGING:
-        screen_charging_render(g_bat_pct, power_is_charging(), power_is_external());
+        charging_screen_paint();
         break;
     }
 }
@@ -7913,12 +8022,16 @@ _Noreturn static void run_ui(fat32_t *fs)
 {
     clickwheel_init();
     player_init(fs);
-    /* DEVICE BISECT 2026-09-13: on USB, the drive's spin-up, the piezo burst
-     * and a high-pitched whine were audible on the jack; unplugged, silent.
-     * A shared-ground loop over the cable explains the first two; the whine
-     * may be an unenumerated port current-limiting under a 500 mA pull. This
-     * flash asks for 100 mA so the owner can compare. */
-    charger_set_max_current(CHARGER_MAX_MA); /* LTC4066 HPWR: 100 mA cap until asserted */
+    /* The charger's budget, from the setting (defaults until config_load
+     * below, then settings_apply() re-applies the saved choice). Done this
+     * early so a device booted on the cable draws the budget from the first
+     * second: at the LTC4066's 100 mA default the boot-time library load and
+     * spin-ups run off the cell even with the cable in. DEVICE 2026-09-13:
+     * on USB the jack carried the drive and the piezo (a cable ground loop)
+     * and a whine, and 100 mA was quieter — that is what Charge Rate = 100 mA
+     * is for. DEVICE 2026-09-19 (event log): at 100 mA the cell did not
+     * climb while the device was used at all. */
+    charger_apply();
     artcache_init();                  /* ways must start at key -1; .bss gives 0,
                                        * which is album 0's real index */
     /*
@@ -8356,8 +8469,9 @@ _Noreturn static void run_ui(fat32_t *fs)
              * for a sample that rounds to the same picture. The charging
              * screen shows the number itself, so every sample is a change. */
             int key = battery_glyph_key(g_bat_pct);
-            if (key != bat_glyph_prev || scr_cur() == SCR_CHARGING) {
-                bat_glyph_prev = key;
+            if (key != bat_glyph_prev || scr_cur() == SCR_CHARGING ||
+                (scr_cur() == SCR_SETTINGS && g_set_screen == SETTINGS_BATTERY)) {
+                bat_glyph_prev = key;      /* the Battery page IS the sample */
                 dirty = 1;
             }
         }
@@ -9491,6 +9605,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                         case SETTINGS_ENTER_THEME:    target = SETTINGS_THEME;    break;
                         case SETTINGS_ENTER_CLICKER:  target = SETTINGS_CLICKER;  break;
                         case SETTINGS_ENTER_DIAG:     target = SETTINGS_DIAG;     break;
+                        case SETTINGS_ENTER_BATTERY:  target = SETTINGS_BATTERY;  break;
                         case SETTINGS_ENTER_DATETIME: target = SETTINGS_DATETIME; break;
                         case SETTINGS_ENTER_SETTIME:
                             /* Seed the editor from the best time we have —
@@ -10068,8 +10183,7 @@ _Noreturn static void run_ui(fat32_t *fs)
                         screen_battery_render(BATTWARN_DISKSAFE);
                         break;
                     case SCR_CHARGING:
-                        screen_charging_render(g_bat_pct, power_is_charging(),
-                                               power_is_external());
+                        charging_screen_paint();
                         break;
                     default: break;                 /* NOWPLAYING handled above */
                     }

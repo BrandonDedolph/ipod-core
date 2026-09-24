@@ -49,4 +49,4 @@
 # Hardware-free like evlog.c — the write and the wake are injected — so
 # tests/kernel/otg_store_test.c drives the codec, the addressing, the mount
 # and the commit policy on the host.
-kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c', 'otg_store.c', 'datetime.c', 'timesync.c', 'wallclock.c')
+kernel_sources = files('main.c', 'sched.c', 'switch.S', 'irq.c', 'timer.c', 'clock.c', 'console.c', 'pcm_ring.c', 'cache.c', 'panic.c', 'config.c', 'cfg_commit.c', 'evlog.c', 'otg_store.c', 'datetime.c', 'timesync.c', 'wallclock.c', 'chargestat.c')

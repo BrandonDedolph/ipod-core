@@ -1289,6 +1289,19 @@ if target == 'sim'
   )
   test('datetime', datetime_test, suite: 'unit')
 
+  # chargestat: the charge trend record (core/kernel/chargestat.c) the
+  # Battery page and the charging screen's caption read — session since the
+  # last plug edge, one reading a minute for the last hour. Pure: the clock is
+  # passed in, so every case is exact microsecond stamps and exact millivolts,
+  # including the ring's wrap at sixty and the timer's wrap at 2^32.
+  chargestat_test = executable(
+    'chargestat_test',
+    sources: ['kernel/chargestat_test.c', '../kernel/chargestat.c'],
+    include_directories: include_directories('../kernel', '.'),
+    override_options: test_opts,
+  )
+  test('chargestat', chargestat_test, suite: 'unit')
+
   # timesync: what the firmware does at boot with the clock stamp the host
   # leaves in CORECFG.DAT (core/kernel/timesync.c), and the software clock that
   # carries the time between the rare RTC reads (core/kernel/wallclock.c) —

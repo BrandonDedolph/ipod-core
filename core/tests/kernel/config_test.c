@@ -247,7 +247,8 @@ static int settings_eq(const settings_t *a, const settings_t *b)
            a->utc_off_min == b->utc_off_min &&
            a->host_epoch == b->host_epoch &&
            a->host_off_min == b->host_off_min &&
-           a->applied_epoch == b->applied_epoch;
+           a->applied_epoch == b->applied_epoch &&
+           a->charge_rate == b->charge_rate;
     /* sleep_timer_min is deliberately NOT compared: it is runtime-only and
      * never rides the record (settings.h), so decode always writes 0 into it
      * whatever the encoded struct held. test_codec pins that directly. */
@@ -282,6 +283,9 @@ static void spicy(settings_t *s)
     s->time_24h = 1; s->time_in_title = 1;
     s->utc_off_min = 840; s->host_off_min = -720;
     s->host_epoch = 1789555320u; s->applied_epoch = 1789555000u;
+    /* The power block: the non-default rate, so a codec that dropped the
+     * byte would read the default back. */
+    s->charge_rate = CHARGE_RATE_QUIET;
 }
 
 /* ---- mock-bus programming ---------------------------------------------- */
@@ -532,10 +536,12 @@ static void test_codec(void)
 #define T_LEN_V2Q     44u          /* + the resume queue context (same ver) */
 #define T_LEN_V2S     48u          /* + the sound tail (limit, EQ; same ver) */
 #define T_LEN_V2T     64u          /* + the time block (host stamp + mark)  */
+#define T_LEN_V2P     68u          /* + the power block (charge rate)       */
 #define T_OFF_RES     (T_OFF_PAYLOAD + T_LEN_V1)   /* 24: resume_hash      */
 #define T_OFF_CTX     (T_OFF_PAYLOAD + T_LEN_V2)   /* 36: resume_kind      */
 #define T_OFF_SND     (T_OFF_PAYLOAD + T_LEN_V2Q)  /* 56: volume_limit     */
 #define T_OFF_TIME    (T_OFF_PAYLOAD + T_LEN_V2S)  /* 60: host_epoch       */
+#define T_OFF_PWR     (T_OFF_PAYLOAD + T_LEN_V2T)  /* 76: charge_rate      */
 #define T_RESUME_MAX  86400u       /* the decoder's ceiling on both counts  */
 
 static void put32le(uint8_t *p, uint32_t v)
@@ -576,8 +582,8 @@ static void test_resume_record(void)
     config_encode(rec, &in, 7);
     check("record is version 2", rec[T_OFF_VERSION] == 2 &&
                                  rec[T_OFF_VERSION + 1] == 0);
-    check("record declares the v2 payload length, time block included",
-          rec[T_OFF_LENGTH] == T_LEN_V2T && rec[T_OFF_LENGTH + 1] == 0);
+    check("record declares the v2 payload length, power block included",
+          rec[T_OFF_LENGTH] == T_LEN_V2P && rec[T_OFF_LENGTH + 1] == 0);
     check("resume fields land at the documented offsets",
           get32le(&rec[T_OFF_RES])     == 0xDEADBEEFu &&
           get32le(&rec[T_OFF_RES + 4]) == 1234u &&
@@ -1502,8 +1508,11 @@ static void test_time_block(void)
     {
         uint8_t patched[CONFIG_SLOT_BYTES];
         memcpy(patched, rec, sizeof patched);
-        patched[T_OFF_LENGTH]     = (uint8_t)T_LEN_V2T;
-        patched[T_OFF_LENGTH + 1] = 0;
+        /* The patch grows `length` to 64 only when it is SHORTER; this
+         * record already declares 68, so the host leaves it alone — which is
+         * what carries the power block through a clock stamp. */
+        check("a record longer than the host's 64 keeps its length",
+              patched[T_OFF_LENGTH] == T_LEN_V2P);
         put32le(&patched[T_OFF_TIME], 1789555320u);          /* host_epoch */
         patched[T_OFF_TIME + 4] = 0x4A;                      /* +330 min   */
         patched[T_OFF_TIME + 5] = 0x01;
@@ -1525,7 +1534,8 @@ static void test_time_block(void)
               out.applied_epoch == in.applied_epoch &&
               out.utc_off_min == in.utc_off_min &&
               out.time_24h == in.time_24h &&
-              out.time_in_title == in.time_in_title);
+              out.time_in_title == in.time_in_title &&
+              out.charge_rate == in.charge_rate);
     }
 
     /* The host's two fields ride through a FIRMWARE save unchanged — that is
@@ -1616,6 +1626,69 @@ static void test_host_fixture(const char *path)
           config_decode(&blob[CONFIG_SLOT_BYTES], &s, &seq) == 0);
 }
 
+/* ---- the power block ----------------------------------------------------
+ *
+ * One byte, appended after the time block: Charge Rate. What it must get
+ * right is the same as every tail before it — the byte lands where the doc
+ * says, a record from before it existed reads as the default, and a value
+ * this build does not know reads as the default too. The default is FAST
+ * (500 mA), because that is the behaviour the setting exists to opt OUT of.
+ */
+static void test_power_block(void)
+{
+    uint8_t rec[CONFIG_SLOT_BYTES];
+    settings_t in, out;
+    uint32_t seq = 0;
+
+    defaults(&in);
+    spicy(&in);                              /* charge_rate = QUIET */
+    config_encode(rec, &in, 21);
+    check("charge_rate lands at payload offset 64, reserved bytes 0",
+          rec[T_OFF_PWR] == CHARGE_RATE_QUIET &&
+          rec[T_OFF_PWR + 1] == 0 && rec[T_OFF_PWR + 2] == 0 &&
+          rec[T_OFF_PWR + 3] == 0);
+    memset(&out, 0xA5, sizeof out);
+    check("the power block round-trips",
+          config_decode(rec, &out, &seq) == 1 && out.charge_rate == CHARGE_RATE_QUIET);
+
+    in.charge_rate = CHARGE_RATE_FAST;
+    config_encode(rec, &in, 22);
+    check("FAST encodes as 0",
+          rec[T_OFF_PWR] == 0 &&
+          config_decode(rec, &out, &seq) == 1 && out.charge_rate == CHARGE_RATE_FAST);
+
+    /* A record from before Charge Rate existed — 64 bytes, which is what
+     * every device that has taken the clock build is writing. */
+    in.charge_rate = CHARGE_RATE_QUIET;
+    config_encode(rec, &in, 23);
+    rec[T_OFF_LENGTH] = (uint8_t)T_LEN_V2T;
+    recrc(rec);
+    memset(&out, 0x5A, sizeof out);
+    check("a 64-byte record reads as FAST, and keeps its clock",
+          config_decode(rec, &out, &seq) == 1 &&
+          out.charge_rate == CHARGE_RATE_FAST &&
+          out.host_epoch == in.host_epoch && out.utc_off_min == in.utc_off_min);
+
+    /* One byte short: `length` decides, not the byte sitting there. */
+    config_encode(rec, &in, 24);
+    rec[T_OFF_LENGTH] = (uint8_t)(T_LEN_V2P - 1u);
+    recrc(rec);
+    check("a length one byte short of the power block reads as FAST",
+          config_decode(rec, &out, &seq) == 1 && out.charge_rate == CHARGE_RATE_FAST);
+
+    /* A value from a future build. */
+    config_encode(rec, &in, 25);
+    rec[T_OFF_PWR] = 7;
+    recrc(rec);
+    check("an unknown rate byte reads as FAST",
+          config_decode(rec, &out, &seq) == 1 && out.charge_rate == CHARGE_RATE_FAST);
+
+    /* A settings_t holding an unknown value encodes as FAST too. */
+    in.charge_rate = 99;
+    config_encode(rec, &in, 26);
+    check("an unknown rate in the struct is written as FAST", rec[T_OFF_PWR] == 0);
+}
+
 int main(int argc, char **argv)
 {
     test_file_lba();
@@ -1624,6 +1697,7 @@ int main(int argc, char **argv)
     test_resume_context();
     test_sound_tail();
     test_time_block();
+    test_power_block();
     test_seq_order();
     test_two_slot();
     test_write_trace();

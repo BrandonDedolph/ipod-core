@@ -1128,6 +1128,120 @@ def screen_locked_list():
     return sc.img
 
 
+# -- battery -----------------------------------------------------------------
+# Settings > Battery (core/ui/screen_settings.c settings_battery_render): the
+# Charge Rate row (list machinery) over a live dashboard. The values are the
+# shape of a real session on the device: USB, 500 mA, a cell that has climbed
+# 56 mV in 24 minutes, with the dip where the cable came out at minute 30.
+BT_PCT, BT_MV, BT_ADC = 47, 3978, 651
+BT_RATE_MA = 500
+BT_SESSION_S, BT_SESSION_DMV, BT_SESSION_CHG = 24 * 60 + 12, 56, 98
+BT_TREND_MV = 21
+BT_HIST = []
+for _i in range(60):
+    _v = 3860 + _i * 2
+    if 30 <= _i < 36:
+        _v -= 40 - (_i - 30) * 5
+    BT_HIST.append(_v)
+
+BP_HEAD_BASE, BP_SUB_BASE = 92, 108
+BP_PLATE_X, BP_PLATE_Y, BP_PLATE_H = 16, 116, 92
+BP_PLATE_W = W - 2 * BP_PLATE_X
+BP_LABEL_BASE = BP_PLATE_Y + 18
+BP_CHART_X = 62
+BP_CHART_W = BP_PLATE_X + BP_PLATE_W - 10 - BP_CHART_X          # 232
+BP_CHART_Y, BP_CHART_H = BP_PLATE_Y + 26, 56
+BP_FOOT_BASE = 232
+BP_MIN_SPAN_MV = 40
+BATTERY_HIST_MAX, BATTERY_TREND_MIN = 60, 10
+
+def _fmt_smv(mv):
+    return ("+%d mV" % mv) if mv > 0 else ("%d mV" % mv)
+
+def _fmt_span(secs):
+    m = secs // 60
+    if m == 0:
+        return "<1 min"
+    if m < 60:
+        return "%d min" % m
+    return "%d h %d min" % (m // 60, m % 60)
+
+def _bp_line(sc, x0, y0, x1, y1, c):
+    """bp_line: Bresenham, two pixels tall."""
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+    err = dx - dy
+    while True:
+        sc.fill_rect(x0, y0, 1, 2, c)
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x0 += sx
+        if e2 < dx:
+            err += dx
+            y0 += sy
+
+def _bp_chart(sc, hist):
+    x0, y0, w, h = BP_CHART_X, BP_CHART_Y, BP_CHART_W, BP_CHART_H
+    sc.fill_rect(x0, y0 + h - 1, w, 1, TRK)
+    n = len(hist)
+    readings = [v for v in hist if v]
+    if len(readings) < 2:
+        sc.text_centered(y0 + h // 2 + 3, "Collecting", FONT_SMALL, MUTED)
+        return
+    lo, hi = min(readings), max(readings)
+    span = hi - lo
+    if span < BP_MIN_SPAN_MV:
+        pad = (BP_MIN_SPAN_MV - span) // 2
+        lo -= pad
+        hi = lo + BP_MIN_SPAN_MV
+        span = BP_MIN_SPAN_MV
+    sc.text_right(BP_CHART_X - 4, y0 + 8, str(hi), FONT_SMALL, MUTED2)
+    sc.text_right(BP_CHART_X - 4, y0 + h - 1, str(lo), FONT_SMALL, MUTED2)
+    px = py = lx = ly = -1
+    for i, mv in enumerate(hist):
+        x = x0 + ((i + BATTERY_HIST_MAX - n) * (w - 1)) // (BATTERY_HIST_MAX - 1)
+        if mv == 0:
+            px = -1
+            continue
+        y = y0 + (h - 2) - ((mv - lo) * (h - 2)) // span
+        if px >= 0:
+            _bp_line(sc, px, py, x, y, INK)
+        else:
+            sc.fill_rect(x, y, 1, 2, INK)
+        px, py, lx, ly = x, y, x, y
+    if lx >= 0:
+        sc.fill_rect(lx - 1, ly - 1, 3, 4, INK)
+
+def screen_battery_page():
+    sc = Screen()
+    header(sc, "Battery", back=True)
+    status_strip(sc)                 # main.c settings_render_cur
+    # the Charge Rate row, selected (the only row)
+    _sel_bar(sc, LIST_Y0, ROW_H, 0)
+    sc.text(14, LIST_Y0 + 15, "Charge Rate", FONT_HEADER, SEL_FG)
+    sc.text_right(W - 16, LIST_Y0 + 15, "%d mA" % BT_RATE_MA, regular_11, SEL_SUB)
+    # headline
+    sc.text(16, BP_HEAD_BASE, "Charging", FONT_TITLE, INK)
+    sc.text_right(W - 16, BP_HEAD_BASE, "%d mV" % BT_MV, FONT_TITLE, INK)
+    tokens = ["USB", "%d mA" % BT_RATE_MA, "%d%%" % BT_PCT,
+              _fmt_smv(BT_SESSION_DMV) + " in " + _fmt_span(BT_SESSION_S)]
+    sc.text(16, BP_SUB_BASE, (" " + MIDDOT + " ").join(tokens), FONT_SMALL, MUTED_D)
+    # the plate
+    sc.fill_round_rect(BP_PLATE_X, BP_PLATE_Y, BP_PLATE_W, BP_PLATE_H, 6, PLATE)
+    sc.text(BP_PLATE_X + 10, BP_LABEL_BASE, "LAST HOUR", FONT_SMALL, MUTED)
+    sc.text_right(W - BP_PLATE_X - 10, BP_LABEL_BASE,
+                  _fmt_smv(BT_TREND_MV) + " / %d min" % BATTERY_TREND_MIN, FONT_SMALL, MUTED_D)
+    _bp_chart(sc, BT_HIST)
+    # the footer: the charger's pins read back
+    foot = (" " + MIDDOT + " ").join(["CHRG 1", "%d%% on" % BT_SESSION_CHG,
+                                       "HPWR 1", "SUSP 0", "ADC %d" % BT_ADC])
+    sc.text_centered(BP_FOOT_BASE, foot, FONT_SMALL, MUTED)
+    return sc.img
+
+
 # -- about -------------------------------------------------------------------
 def fmt_gb(mb):
     """settings_about_render's fmt_gb: whole megabytes as 'W.F GB'."""
@@ -1920,11 +2034,11 @@ def screen_search_results(sel=0):
 def _sel_bar(sc, y0, rowh, r):
     sc.fill_round_rect(6, y0 + r * rowh + 1, W - 16, rowh - 2, 4, SEL_BG)
 
-# The root Settings list — core/ui/settings.c ROOT_L, all ten rows. Ten rows
+# The root Settings list — core/ui/settings.c ROOT_L, all eleven rows. They
 # do not fit in the eight the panel has room for, so this list SCROLLS and
 # carries a scrollbar (core/ui/screen_settings.c list_render / st_scrollbar).
 ROOT_L = ["Playback", "Sound", "Theme", "Display", "Clicker", "Date & Time",
-          "About", "Boot Details", "Disk Mode", "Reset Settings"]
+          "Battery", "About", "Boot Details", "Disk Mode", "Reset Settings"]
 ROOT_SEL = 1   # Sound
 
 def scroll_window(sel, total, visible):
@@ -2320,7 +2434,7 @@ def _bolt(sc, cx, y0, bh, c):
             if R > L:
                 sc.fill_rect(L, y, R - L, 1, c)
 
-def screen_charging(pct=64, charging=True, external=True):
+def screen_charging(pct=64, charging=True, external=True, note=None):
     CHG_BG = rgb565(0x0861)
     CHG_OUTLINE = rgb565(0x5A89)
     CHG_FILL = rgb565(0xEF3B)
@@ -2365,6 +2479,9 @@ def screen_charging(pct=64, charging=True, external=True):
     else:
         status, sink = "NOT CHARGING", CHG_MUTED
     sc.text_centered(196, status, bold_11, sink)
+    # the caption (screen_charging_note): the numbers behind the percent
+    if note:
+        sc.text_centered(220, note, FONT_SMALL, CHG_MUTED)
     return sc.img
 
 
@@ -2493,6 +2610,7 @@ def main():
     outputs.append(save_png(screen_settime(), "settime.png"))
     outputs.append(save_png(screen_mainmenu_clock(), "mainmenu_clock.png"))
     outputs.append(save_png(screen_diag(), "bootdetails.png"))
+    outputs.append(save_png(screen_battery_page(), "battery.png"))
     outputs.append(save_png(screen_sound(), "sound.png"))
     outputs.append(save_png(screen_playback(), "playback.png"))
     outputs.append(save_png(screen_clicker(), "clicker.png"))
@@ -2502,7 +2620,8 @@ def main():
     outputs.append(save_png(screen_nowplaying_sage(), "nowplaying_sage.png"))
     outputs.append(save_png(screen_albums_onyx(), "albums_onyx.png"))
     # --- new: system ---
-    outputs.append(save_png(screen_charging(), "charging.png"))
+    outputs.append(save_png(screen_charging(
+        note="3978 mV " + MIDDOT + " 500 mA " + MIDDOT + " +56 mV in 24 min"), "charging.png"))
     outputs.append(save_png(screen_battery_low(), "battery_low.png"))
     outputs.append(save_png(screen_boot(), "boot.png"))
     outputs.append(save_png(screen_loading(), "loading.png"))

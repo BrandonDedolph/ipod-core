@@ -37,6 +37,10 @@
 #define CHG_UNIT    0xACF2u      /* #a89e92 muted "%" unit / body copy       */
 #define CHG_MUTED   0x7B8Du      /* #7a736a muted status / "not charging"    */
 
+/* At or above this percent, a stopped charger on external power means
+ * "full", not "failed". Shared with the Battery page's status word. */
+#define CHG_FULL_PCT 90
+
 /*
  * Render the charging screen into the console framebuffer.
  *
@@ -61,5 +65,14 @@ void screen_charging_render(int pct, int charging, int external);
  */
 void screen_charging_draw_battery(int x, int y, int w, int h, int pct,
                                   uint16_t fill);
+
+/*
+ * One muted caption under the status line — the numbers behind the big
+ * percent: millivolts, the budget asked of the charger, what the cell has
+ * done since the cable went in ("3912 mV · 500 mA · +38 mV in 12 min").
+ * Drawn over the field screen_charging_render() painted; the caller builds
+ * the string (it has the numbers) and passes "" or NULL for none.
+ */
+void screen_charging_note(const char *note);
 
 #endif /* CORE_UI_SCREEN_CHARGING_H */

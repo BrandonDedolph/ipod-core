@@ -142,6 +142,55 @@ void usb_charging_maxcurrent_change(int milliamps) {
 The charger handles CV/CC topology, fast/trickle transitions, and
 end-of-charge internally — we just say "0 / 100 / 500 mA cap."
 
+### The pins have to be driven, and the budget is shared with the device
+
+Two things the table above does not say, both learned on this device.
+
+**Direction.** `charger_set_max_current()` (`hal/hw/battery.c`) writes the
+level AND takes the pin over — `GPIOA_ENABLE` (`0x6000D000`) /
+`GPIOA_OUTPUT_EN` (`0x6000D010`) for HPWR, `GPIOL_ENABLE` (`0x6000D10C`) /
+`GPIOL_OUTPUT_EN` (`0x6000D11C`) for SUSP — every write through the masked
+`+0x800` alias. The first version wrote `OUTPUT_VAL` only, on the assumption
+that the boot ROM had configured the pins, and nothing ever checked. The
+level is read back from the pad (`INPUT_VAL`) by `charger_pin_state()` and
+shown on Settings → Battery as `HPWR n` / `SUSP n`, with `en=0` / `oe=0`
+tails when the pin is not a driven GPIO. Bench: with the cable in, the
+footer must read `HPWR 1 · SUSP 0` and no tails; then the LINE on that page
+is the measurement (below).
+
+**Budget.** The LTC4066 is a linear charger with the system load in front
+of the cell, so the input limit is shared: charge current = limit − system
+draw. At the 100 mA cap the budget IS the device. The event log pulled
+2026-09-19 (CORELOG.BIN, ~15 000 lines across six days, `core: batt` every
+5 s) says so directly, all with `ext 1 chg 1` — cable in, CHRG asserted:
+
+| State (log-derived)              | Duration | Filtered mV        | Net    |
+|----------------------------------|----------|--------------------|--------|
+| paused, drive parked, awake      | 71 min   | 3861 → 3867        | +6 mV  |
+| playing (drive up ~40 %)         | 45 min   | 4037 → 4048        | +11 mV |
+| playing                          | 71 min   | 4048 → 4048        | 0      |
+| mostly idle, drive parked        | 54 min   | 4048 → 4160        | +112   |
+| asleep (suspend), then 45 min later | —     | 3832 → 4224 (raw)  | +390   |
+
+The gauge ALSO drops on plug-in (96 → 92 in one session) because the
+charge-lift correction and a spin-up sag land together, which is what made
+"it isn't charging on the PC" the natural reading. The CHRG pin is not the
+answer either: it stays asserted while the charger is starved — it means
+"trying", not "getting anywhere". The trend is the only honest signal this
+hardware has, hence `kernel/chargestat.c` and the Battery page.
+
+So: **500 mA is the default** (Settings → Battery → Charge Rate, persisted;
+`CHARGE_RATE_QUIET` = 100 mA is the way back). Out of spec on an
+un-enumerated PC port, in practice what every root port supplies; a port
+that folds back does so until replug and the setting covers it. The
+2026-09-13 finding stands: on USB the headphone jack carries the drive, the
+piezo and a whine through the cable's ground loop, louder at 500 mA — that
+is what the quiet setting is for.
+
+**Still unmeasured:** the actual current (needs an inline USB meter), and
+whether the cell climbs while PLAYING at 500 mA. The page's line answers
+the second in an hour of use.
+
 ## Battery capacity
 
 | Variant             | Default mAh | Notes |

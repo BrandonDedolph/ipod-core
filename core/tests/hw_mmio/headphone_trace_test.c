@@ -84,8 +84,14 @@ static void pin_set(int seated)
  * group +0x00 and OUTPUT_EN group +0x10. Hand-derived here rather than
  * shared with the driver on purpose — a typo in the driver's copy is
  * exactly what this is for. */
-#define GPIOA_ENABLE_ADDR     0x6000D000u
-#define GPIOA_OUTPUT_EN_ADDR  0x6000D010u
+#define T_GPIOA_ENABLE_ADDR     0x6000D000u
+#define T_GPIOA_OUTPUT_EN_ADDR  0x6000D010u
+/* pp5022.h now carries the driver's own copy of both (the charger gate
+ * needs them); the hand-derived values above must agree with it, and this
+ * is where that is checked. */
+_Static_assert(T_GPIOA_ENABLE_ADDR == GPIOA_ENABLE_ADDR &&
+               T_GPIOA_OUTPUT_EN_ADDR == GPIOA_OUTPUT_EN_ADDR,
+               "pp5022.h's port A ENABLE/OUTPUT_EN disagree with 10-headphone-jack.md");
 
 /*
  * headphone_pin_cfg() is what the About screen's JACK token shows when the
@@ -102,12 +108,12 @@ static int test_pin_cfg_grammar(void)
     mmio_mock_reset();
     trace_cursor tc = trace_begin("pin_cfg_grammar");
 
-    mmio_mock_set_read(GPIOA_ENABLE_ADDR, 0x80);      /* A7 is a GPIO...  */
-    mmio_mock_set_read(GPIOA_OUTPUT_EN_ADDR, 0x00);   /* ...and an input  */
+    mmio_mock_set_read(T_GPIOA_ENABLE_ADDR, 0x80);      /* A7 is a GPIO...  */
+    mmio_mock_set_read(T_GPIOA_OUTPUT_EN_ADDR, 0x00);   /* ...and an input  */
     int got = headphone_pin_cfg();
 
-    expect_r(&tc, 32, GPIOA_ENABLE_ADDR);
-    expect_r(&tc, 32, GPIOA_OUTPUT_EN_ADDR);
+    expect_r(&tc, 32, T_GPIOA_ENABLE_ADDR);
+    expect_r(&tc, 32, T_GPIOA_OUTPUT_EN_ADDR);
     trace_expect_end(&tc);
     if (got != HEADPHONE_PIN_ENABLED) {
         fprintf(stderr, "[%s] enabled input: expected %d, got %d\n", tc.name,
@@ -126,16 +132,16 @@ static int test_pin_cfg_grammar(void)
     };
     for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         mmio_mock_reset();
-        mmio_mock_set_read(GPIOA_ENABLE_ADDR, cases[i].en);
-        mmio_mock_set_read(GPIOA_OUTPUT_EN_ADDR, cases[i].oe);
+        mmio_mock_set_read(T_GPIOA_ENABLE_ADDR, cases[i].en);
+        mmio_mock_set_read(T_GPIOA_OUTPUT_EN_ADDR, cases[i].oe);
         int cfg = headphone_pin_cfg();
         if (cfg != cases[i].want) {
             fprintf(stderr, "[%s] en=%08X oe=%08X: expected %d, got %d\n",
                     tc.name, cases[i].en, cases[i].oe, cases[i].want, cfg);
             tc.fails++;
         }
-        if (mmio_mock_count(MMIO_OP_WRITE, GPIOA_ENABLE_ADDR) != 0 ||
-            mmio_mock_count(MMIO_OP_WRITE, GPIOA_OUTPUT_EN_ADDR) != 0) {
+        if (mmio_mock_count(MMIO_OP_WRITE, T_GPIOA_ENABLE_ADDR) != 0 ||
+            mmio_mock_count(MMIO_OP_WRITE, T_GPIOA_OUTPUT_EN_ADDR) != 0) {
             fprintf(stderr, "[%s] the driver WROTE a GPIO config register\n",
                     tc.name);
             tc.fails++;
