@@ -1344,6 +1344,20 @@ if target == 'sim'
   )
   test('chargestat', chargestat_test, suite: 'unit')
 
+  # idlesleep: the idle-sleep policy (core/kernel/idlesleep.c) — nothing
+  # playing and no input for two minutes puts the device into the suspend
+  # that a PLAY hold enters, and so onto its 30-minute escalation to a PMU
+  # standby. Pure, so the host runs the SAME source the ARM build links
+  # through a script of main-loop passes. Written against the 2026-09-24
+  # drain log, where a paused device sat awake for twelve hours.
+  idlesleep_test = executable(
+    'idlesleep_test',
+    sources: ['kernel/idlesleep_test.c', '../kernel/idlesleep.c'],
+    include_directories: include_directories('../kernel', '.'),
+    override_options: test_opts,
+  )
+  test('idlesleep', idlesleep_test, suite: 'unit')
+
   # timesync: what the firmware does at boot with the clock stamp the host
   # leaves in CORECFG.DAT (core/kernel/timesync.c), and the software clock that
   # carries the time between the rare RTC reads (core/kernel/wallclock.c) —

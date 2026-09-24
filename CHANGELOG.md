@@ -16,6 +16,16 @@ the boot screen and Settings → About show the one the device runs.
   gain the playing track runs at and whether it was capped, and carries a
   100 Hz sample of the I2S FIFO so a starved DAC inside a DMA transfer — the
   one dropout neither existing counter can see — shows up as a number.
+- **A paused iPod goes to sleep.** Pause a track and put the device down
+  and, two minutes after the last press, it sleeps the way holding Play
+  sleeps it: any button wakes it instantly, still paused, and half an hour
+  later on battery it powers off properly. Before this nothing ever took an
+  idle device out of its main loop: the event log showed it paused, drive
+  parked, screen dark, and still awake for twelve hours at a stretch, the
+  cell falling ~34 mV an hour — "20 % in two hours doing nothing" — until it
+  was empty. On the cable it stays awake as before. The log's last minutes
+  now reach the disk on a power-off too, so the next log can say whether a
+  session ended in a sleep or a crash.
 - **The iPod charges while you use it.** The firmware had been asking the
   charger for the USB 100 mA minimum, and on this hardware that budget is
   shared with the device itself: the event log showed the cell sitting

@@ -162,6 +162,9 @@ static void build_image(uint32_t nblocks, const uint32_t *chain,
 
 /* The small, FRAGMENTED file: six blocks, chain 3 -> 5 -> 4 -> 7 -> 6 -> 8. */
 static const uint32_t CHAIN6[6] = { 3, 5, 4, 7, 6, 8 };
+/* A wider file for the overflow drain: eleven ring slots, so the nine blocks
+ * a full 16 KiB ring drains into can all be read back without a lap. */
+static const uint32_t CHAIN12[12] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
 
 /* ---- read side: fault injection as in config_test ---------------------- */
 
@@ -204,6 +207,7 @@ static uint32_t g_writes;
 static uint32_t g_last_wlba;
 static int      g_stray_write;
 static int      g_wfail_left;       /* fail the next N writes with -3 */
+static int      g_fail_after_ok;    /* let one write land, fail the next (a drain mid-way) */
 static uint32_t g_wakes;
 
 static int mem_write(uint32_t lba, uint32_t count, const void *buf)
@@ -225,6 +229,13 @@ static int mem_write(uint32_t lba, uint32_t count, const void *buf)
         g_stray_write = 1;
         return -1;
     }
+    if (g_fail_after_ok == 2) {
+        g_fail_after_ok = 0;
+        return -3;
+    }
+    if (g_fail_after_ok == 1) {
+        g_fail_after_ok = 2;            /* this one lands; the next does not */
+    }
     if (g_wfail_left > 0) {
         g_wfail_left--;
         return -3;
@@ -243,7 +254,7 @@ static void reset_io(void)
 {
     fail_none();
     g_reads = 0; g_writes = 0; g_last_wlba = 0; g_stray_write = 0;
-    g_wfail_left = 0; g_wakes = 0;
+    g_wfail_left = 0; g_fail_after_ok = 0; g_wakes = 0;
 }
 
 /* ---- helpers ------------------------------------------------------------ */
@@ -623,32 +634,36 @@ static void test_flush_policy(void)
           disk_block(2, &seq, &boot, &len, &final, &text) && seq == 2 &&
           text[0] == 'x' && text[4] == 'x' && text[5] == 'y');
 
-    /* Forced with a parked drive: wake FIRST, then write. */
+    /* Forced with a parked drive: wake FIRST, then write — and a forced
+     * flush DRAINS (2026-09-24): the full block AND the 5-byte remainder,
+     * two blocks, both FINAL, one wake. */
     e = env_at(30000000, 1, 1);
-    check("policy: forced, parked -> wakes then WROTE",
-          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_WROTE && g_wakes == 1 && g_writes == 5);
+    check("policy: forced, parked -> wakes then WROTE, draining both blocks",
+          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_WROTE && g_wakes == 1 && g_writes == 6);
     check("policy: forced block is FINAL and full",
           disk_block(4, &seq, &boot, &len, &final, &text) && seq == 4 && final && len == EVLOG_TEXT_BYTES);
+    check("policy: the remainder followed in its own FINAL block, ring empty",
+          disk_block(5, &seq, &boot, &len, &final, &text) && seq == 5 && final && len == 5 &&
+          text[0] == 'y' && evlog_pending() == 0 && evlog_seq() == 6);
 
     /* Battery below disk-safe: idle and forced are refused, LAST is not.
-     * Top the 5 leftover bytes up to exactly one block first, so idle has
-     * a block to be refused over. */
-    say_n(EVLOG_TEXT_BYTES - 5, 'z');
+     * Exactly one block pending, so idle has a block to be refused over. */
+    say_n(EVLOG_TEXT_BYTES, 'z');
     check("policy: exactly one block pending", evlog_pending() == EVLOG_TEXT_BYTES);
     e = env_at(40000000, 0, 0);
     check("policy: idle below disk-safe, inside the debounce -> NONE (the gate debounces first)",
-          evlog_flush(CFG_COMMIT_IDLE, &e) == EVLOG_FLUSH_NONE && g_writes == 5);
+          evlog_flush(CFG_COMMIT_IDLE, &e) == EVLOG_FLUSH_NONE && g_writes == 6);
     e = env_at(40000000 + CFG_SAVE_DEBOUNCE_US, 0, 0);
     check("policy: idle below disk-safe -> DEFERRED (logged once)",
-          evlog_flush(CFG_COMMIT_IDLE, &e) == EVLOG_FLUSH_DEFERRED && g_writes == 5);
+          evlog_flush(CFG_COMMIT_IDLE, &e) == EVLOG_FLUSH_DEFERRED && g_writes == 6);
     check("policy: idle below disk-safe again -> DEFERRED_QUIET",
-          evlog_flush(CFG_COMMIT_IDLE, &e) == EVLOG_FLUSH_DEFERRED_QUIET && g_writes == 5);
+          evlog_flush(CFG_COMMIT_IDLE, &e) == EVLOG_FLUSH_DEFERRED_QUIET && g_writes == 6);
     check("policy: forced below disk-safe -> DEFERRED_QUIET (same episode)",
-          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_DEFERRED_QUIET && g_writes == 5);
+          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_DEFERRED_QUIET && g_writes == 6);
     check("policy: LAST below disk-safe -> WROTE (the exempt flush)",
-          evlog_flush(CFG_COMMIT_LAST, &e) == EVLOG_FLUSH_WROTE && g_writes == 6);
+          evlog_flush(CFG_COMMIT_LAST, &e) == EVLOG_FLUSH_WROTE && g_writes == 7);
     check("policy: the last write's block is FINAL",
-          disk_block(5, &seq, &boot, &len, &final, &text) && seq == 5 && final);
+          disk_block(6, &seq, &boot, &len, &final, &text) && seq == 6 && final);
     check("policy: ring drained", evlog_pending() == 0);
     check("policy: no stray write anywhere", !g_stray_write);
 
@@ -658,10 +673,24 @@ static void test_flush_policy(void)
     e = env_at(50000000, 0, 1);
     check("policy: failed write -> FAILED, rc -3, bytes still pending, seq unchanged",
           evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_FAILED && evlog_last_rc() == -3 &&
-          evlog_pending() == 10 && evlog_seq() == 6 && evlog_failures() == 1 && evlog_enabled());
+          evlog_pending() == 10 && evlog_seq() == 7 && evlog_failures() == 1 && evlog_enabled());
     check("policy: the next forced flush retries the SAME block and succeeds",
-          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_WROTE && evlog_seq() == 7 &&
+          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_WROTE && evlog_seq() == 8 &&
           evlog_failures() == 0 && evlog_pending() == 0);
+
+    /* A drain that lands a block and then fails: the call WROTE (what
+     * landed stays landed, seq advanced past it), the rest is still
+     * pending, and it is one failure, not a lost episode. */
+    say_n(EVLOG_TEXT_BYTES + 7, 'w');
+    g_wfail_left = 0;
+    g_fail_after_ok = 1;                    /* first write lands, second fails */
+    check("policy: drain with a failure mid-way -> WROTE, remainder pending, one failure",
+          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_WROTE && evlog_seq() == 9 &&
+          evlog_pending() == 7 && evlog_failures() == 1 && evlog_enabled());
+    g_fail_after_ok = 0;
+    check("policy: the remainder lands on the next forced flush",
+          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_WROTE && evlog_seq() == 10 &&
+          evlog_pending() == 0 && evlog_failures() == 0);
     say("core: two\n");
     g_wfail_left = 3;
     check("policy: three failures in a row",
@@ -688,7 +717,7 @@ static void test_flush_policy(void)
     /* Overflow: the ring keeps the NEWEST bytes and the next block says how
      * many were lost. */
     drain_ring();
-    build_image(6, CHAIN6, 0, 0, 1);
+    build_image(12, CHAIN12, 0, 0, 1);
     mount_fs();
     evlog_mount(&g_fs, mem_write, mem_wake);
     reset_io();
@@ -703,12 +732,18 @@ static void test_flush_policy(void)
     check("overflow: the block opens with the drop marker",
           disk_block(0, &seq, &boot, &len, &final, &text) && len == EVLOG_TEXT_BYTES &&
           memcmp(text, marker, sizeof marker - 1) == 0 && text[sizeof marker - 1] == 'o');
+    /* A FORCED flush drains the ring in ONE call (evlog.h,
+     * EVLOG_FORCE_MAX_BLOCKS): 16384 B + the 22-byte marker over 2032-byte
+     * blocks is 9 blocks, each FINAL, and nothing is left pending. Before
+     * 2026-09-24 this wrote one block per call, so a power-off with a full
+     * ring landed the OLDEST 2 KiB and lost the `suspend: entering` line. */
+    check("overflow: one forced call drained the ring: 9 blocks, nothing pending",
+          g_writes == 9 && evlog_pending() == 0 && evlog_seq() == 9);
     check("overflow: the marker is not repeated",
-          evlog_dropped() == 0 && evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_WROTE &&
-          disk_block(1, &seq, &boot, &len, &final, &text) && text[0] == 'o');
-    for (int i = 0; i < 8 && evlog_pending(); i++) {
-        (void)evlog_flush(CFG_COMMIT_FORCE, &e);
-    }
+          evlog_dropped() == 0 &&
+          disk_block(1, &seq, &boot, &len, &final, &text) && text[0] == 'o' && final);
+    check("overflow: an empty ring has nothing to force",
+          evlog_flush(CFG_COMMIT_FORCE, &e) == EVLOG_FLUSH_NONE && g_writes == 9);
     check("overflow: the newest line came through last",
           evlog_pending() == 0 &&
           disk_block(evlog_seq() - 1, &seq, &boot, &len, &final, &text) &&

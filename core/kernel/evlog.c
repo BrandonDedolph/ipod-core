@@ -611,58 +611,78 @@ int evlog_flush(int mode, const cfg_commit_env_t *env_in)
         (void)g_ev.wake();              /* spin-up on the read path, not in the DRQ budget */
     }
 
-    /* RE-RESOLVE the address. Nothing above this line is a cached LBA. */
-    uint32_t lba = 0;
-    if (seq_lba(g_ev.seq, &lba) != 0) {
-        g_ev.last_rc = -2;
-        goto failed;
-    }
-
-    /* Build the block IN the static buffer: zero it, a drop marker first if
-     * the ring overflowed since the last block, then as much of the ring
-     * as fits, then the header. */
-    uint8_t *blk  = (uint8_t *)g_blk;
-    uint8_t *text = blk + B_OFF_TEXT;
-    for (uint32_t i = 0; i < EVLOG_BLOCK_BYTES; i++) {
-        blk[i] = 0;
-    }
-    uint32_t n    = 0;
-    uint32_t drop = g_dropped;
-    if (drop) {
-        n = put_drop_marker(text, drop);
-    }
-    uint32_t take = avail;
-    if (take > EVLOG_TEXT_BYTES - n) {
-        take = EVLOG_TEXT_BYTES - n;
-    }
-    for (uint32_t i = 0; i < take; i++) {
-        text[n + i] = g_ring[(tail0 + i) & (EVLOG_RING_BYTES - 1u)];
-    }
-    n += take;
-    block_finish(blk, g_ev.seq, g_ev.boot, n, mode != CFG_COMMIT_IDLE);
-
-    int rc = g_ev.write(lba, EVLOG_BLOCK_SECTORS, g_blk);
-    g_ev.last_rc = rc;
-    (void)cfg_commit_result(&g_ev.commit, rc, env_in->now_us);
-    if (rc != 0) {
-        goto failed;
-    }
-
-    /* On the platter. Consume what was written (a capture that overflowed
-     * mid-copy advanced tail itself; never move it backwards), clear the
-     * drop count the marker reported, advance the cursor. */
-    {
-        uint32_t want = tail0 + take;
-        if ((int32_t)(want - g_tail) > 0) {
-            g_tail = want;
+    /* One block per pass at idle; a forced or last flush drains the ring
+     * (bounded), so the newest lines — the ones that say why the device is
+     * going down — reach the platter before it stops (evlog.h). */
+    uint32_t limit = (mode == CFG_COMMIT_IDLE) ? 1u : EVLOG_FORCE_MAX_BLOCKS;
+    uint32_t wrote = 0;
+    while (wrote < limit && avail != 0) {
+        /* RE-RESOLVE the address. Nothing above this line is a cached LBA. */
+        uint32_t lba = 0;
+        if (seq_lba(g_ev.seq, &lba) != 0) {
+            g_ev.last_rc = -2;
+            goto failed;
         }
+
+        /* Build the block IN the static buffer: zero it, a drop marker first if
+         * the ring overflowed since the last block, then as much of the ring
+         * as fits, then the header. */
+        uint8_t *blk  = (uint8_t *)g_blk;
+        uint8_t *text = blk + B_OFF_TEXT;
+        for (uint32_t i = 0; i < EVLOG_BLOCK_BYTES; i++) {
+            blk[i] = 0;
+        }
+        uint32_t n    = 0;
+        uint32_t drop = g_dropped;
+        if (drop) {
+            n = put_drop_marker(text, drop);
+        }
+        uint32_t take = avail;
+        if (take > EVLOG_TEXT_BYTES - n) {
+            take = EVLOG_TEXT_BYTES - n;
+        }
+        for (uint32_t i = 0; i < take; i++) {
+            text[n + i] = g_ring[(tail0 + i) & (EVLOG_RING_BYTES - 1u)];
+        }
+        n += take;
+        block_finish(blk, g_ev.seq, g_ev.boot, n, mode != CFG_COMMIT_IDLE);
+
+        int rc = g_ev.write(lba, EVLOG_BLOCK_SECTORS, g_blk);
+        g_ev.last_rc = rc;
+        (void)cfg_commit_result(&g_ev.commit, rc, env_in->now_us);
+        if (rc != 0) {
+            goto failed;
+        }
+
+        /* On the platter. Consume what was written (a capture that overflowed
+         * mid-copy advanced tail itself; never move it backwards), clear the
+         * drop count the marker reported, advance the cursor. */
+        {
+            uint32_t want = tail0 + take;
+            if ((int32_t)(want - g_tail) > 0) {
+                g_tail = want;
+            }
+        }
+        g_dropped = g_dropped - drop;
+        g_ev.seq++;
+        g_ev.failures = 0;
+        wrote++;
+
+        /* The next block starts where this one stopped consuming. */
+        tail0 = g_tail;
+        avail = (uint32_t)(g_head - tail0);
     }
-    g_dropped = g_dropped - drop;
-    g_ev.seq++;
-    g_ev.failures = 0;
     return EVLOG_FLUSH_WROTE;
 
 failed:
+    if (wrote != 0) {
+        /* A drain that landed something and then failed: what landed is on
+         * the platter with its seq advanced; the rest waits for the next
+         * flush like any other failure, but the call did write. */
+        g_ev.failures++;
+        cfg_commit_clear(&g_ev.commit);
+        return EVLOG_FLUSH_WROTE;
+    }
     cfg_commit_clear(&g_ev.commit);     /* a fresh attempt gets its own debounce */
     g_ev.failures++;
     if (g_ev.failures >= EVLOG_MAX_FAILURES) {

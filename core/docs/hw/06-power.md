@@ -191,6 +191,61 @@ is what the quiet setting is for.
 whether the cell climbs while PLAYING at 500 mA. The page's line answers
 the second in an hour of use.
 
+## Idle policy: a paused iPod sleeps (2026-09-24)
+
+**What the log said.** CORELOG.BIN pulled 2026-09-24 (37 boots, 8,243
+`core: batt` lines) has the same session twice: a track paused, the drive
+parked, the backlight off, the codec cold — and the main loop still awake,
+sampling every 5 s, until the cell read 3556 mV (0 %). Reading it needs two
+facts: `up` is a 32-bit second counter that wraps every 4295 s, and the
+evlog's 16 KiB RAM ring drops everything while the drive is parked, so the
+`<evlog: N B dropped>` count is a clock (~44 B/s paused-idle):
+
+| Boot (UTC)      | State                              | Span              | Filtered mV | Rate                 |
+|-----------------|------------------------------------|-------------------|-------------|----------------------|
+| 27, 09-17 21:02 | paused, parked, awake              | 57 → 90 min       | 3943 → 3925 | −33 mV/h, −5.6 %/h   |
+| 27              | same, behind a 1.5 MB drop         | 90 min → ~12 h    | 3925 → 3556 | −34 mV/h             |
+| 35, 09-23 13:59 | playing (drive bursts every ~40 s) | 0 → 63 min        | 4054 → 3972 | −78 mV/h, −7.6 %/h   |
+| 35              | paused, parked, behind a 1.9 MB drop | 63 min → ~13 h  | 3972 → 3556 | −34 mV/h             |
+| 37, 09-24 14:02 | charged to the 4200 clamp, unplugged, paused | ≥ 31 min | 4200 → 3984 | relaxation, not drain |
+
+On the 600 mAh figure above and the 2005 curve, −34 mV/h paused is ~36–38 mA
+(an upper bound; an aged cell holds less). Rockbox's estimate for the same
+device awake and idle is `CURRENT_NORMAL` = 24 mA. Playing is ~46 mA.
+"20 % in two hours doing nothing" is that slope through the curve's middle
+(30 mV per 10 % between 3750 and 3840 mV → ~11 %/h). Boot 37 is the other
+thing the owner sees: on the cable the lift correction tapers to zero at the
+4200 mV clamp (`battery_percent_charging`), so "100 %" is the charger's CV
+hold, and the cell relaxes 100–200 mV after the unplug with nothing drawn.
+
+**Why.** Nothing ever took an untouched device out of the main loop.
+`suspend_to_ram` — and with it the 30-minute escalation to a PMU standby —
+was reachable from a PLAY hold and the sleep timer only. Where a PLAY hold
+was used (boots 12/18/20/26/34) the log shows the escalation working: the
+tail samples sit at up ~1331–1390 and a final block follows, i.e. suspend →
+30 min → `standby: entering`.
+
+**The rule** (`kernel/idlesleep.c`, fed in the main loop's one sleep site
+next to the sleep timer): nothing playing (`player_playing`, not
+`player_active`), no input, not on external power, no sleep timer armed,
+for **2 minutes** (Apple's figure) → `suspend_to_ram`, the same suspend a
+PLAY hold enters: any button wakes it instantly, paused; on battery it
+escalates to a PMU standby 30 minutes later. The countdown restarts from the
+most recent of the last input and the last busy pass, so a pause or an
+unplug gets a fresh two minutes. A refused PMU standby latches it off for the
+session. A forgotten device now costs ~32 min at ~35 mA (≈ 3 %) instead of
+36 mA until empty. On the cable it stays awake as before: nothing to save,
+and the Battery page is what the bench watches.
+
+**Reading the next log.** A forced evlog flush now DRAINS the ring (up to
+10 blocks) instead of landing its oldest 2 KiB, so a session's last minutes
+reach the platter. The proof that the policy engaged is this sequence in the
+final block(s): `core: idle: nothing playing, no input for 120 s, sleeping`
+→ `core: suspend: entering` → `core: suspend: idle loop` → 30 min of
+`core: batt` at 5 s with no `core: ui` lines → `core: standby: entering`.
+The suspend draw itself is still unmeasured: compare the `core: batt` slope
+inside that 30-minute window against −34 mV/h.
+
 ## Battery capacity
 
 | Variant             | Default mAh | Notes |

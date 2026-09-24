@@ -39,6 +39,7 @@
 #include "cfg_commit.h"
 #include "evlog.h"
 #include "chargestat.h"
+#include "idlesleep.h"
 #include "otg_store.h"
 #include "core_version.h"       /* CORE_BUILD_ID: meson vcs_tag, git describe   */
 #include "core_version_tag.h"   /* CORE_VERSION:  meson vcs_tag, nearest tag    */
@@ -600,6 +601,13 @@ static settings_t g_settings;
  * pass (config_decode zeroes the field for exactly that reason).
  */
 static sleeptimer_t g_sleep;
+/* The idle-sleep policy (kernel/idlesleep.h): nothing playing and no input
+ * for two minutes -> the same suspend a PLAY hold enters, and so its
+ * 30-minute escalation to a PMU standby. Device, 2026-09-24: a paused iPod
+ * sat awake for twelve hours at ~35 mA because nothing ever took it out of
+ * this loop. Fed once per pass next to the sleep timer; latched off for the
+ * session by a refused standby. */
+static idlesleep_t  g_idlesleep;
 
 /* fat32_readdir callback: collect music subdirectories + playable files into
  * g_browse. Directories named like iPod/OS system folders (or dotfolders) are
@@ -8383,6 +8391,10 @@ _Noreturn static void run_ui(fat32_t *fs)
     int      panel_slept = 0;
     uint32_t panel_refused_at_sleep = 0;  /* lcd_presents_refused() at the sleep */
     uint32_t last_input = mmio_read32(USEC_TIMER_ADDR);
+    idlesleep_reset(&g_idlesleep, last_input);   /* two minutes from here, untouched,
+                                                  * and a fresh boot sleeps too — a
+                                                  * cold boot from a dead cell used
+                                                  * to sit awake until dead again */
 
     /* Seeded from the LIVE transport, not from zero: a successful resume_restore
      * has already left a track loaded, and a `was_active` of 0 would read the
@@ -8728,6 +8740,39 @@ _Noreturn static void run_ui(fat32_t *fs)
                 break;
             }
 
+            /*
+             * IDLE SLEEP (kernel/idlesleep.h). Two minutes with nothing
+             * playing and no input, on battery, with no sleep timer running,
+             * and the device sleeps the way a PLAY hold sleeps it: the same
+             * suspend_to_ram, so the same wake (any button, instant) and the
+             * same 30-minute escalation to a PMU standby. This is the rule
+             * that was missing on 2026-09-24: paused, parked, dark and cold,
+             * the loop still ran — twelve hours of it in one log, 3972 to
+             * 3556 mV.
+             *
+             * `busy` is every reason to stay up: the DAC running
+             * (player_playing, NOT player_active — active is true across a
+             * pause), external power (nothing to save, and the Battery page
+             * is what the bench watches), a sleep timer armed (a suspend
+             * would disarm it). Fed every pass so the stamps stay current;
+             * the answer is taken only when nothing else is sleeping us.
+             * The origin is now: there is no press to time an escalation
+             * from, exactly as the sleep timer's FIRE above.
+             */
+            {
+                int idle_fire = idlesleep_feed(&g_idlesleep, nowp, last_input,
+                                               player_playing() ||
+                                               power_is_external() ||
+                                               sleeptimer_armed(&g_sleep));
+                if (idle_fire && !want_suspend) {
+                    uart_puts("core: idle: nothing playing, no input for ");
+                    uart_dec((int)(IDLESLEEP_TIMEOUT_US / 1000000u));
+                    uart_puts(" s, sleeping\n");
+                    want_suspend   = 1;
+                    suspend_origin = nowp;
+                }
+            }
+
             if (want_suspend) {
                 /* ANY suspend leaves the timer Off — in one place, so a new
                  * sleep site cannot forget one of the two sides (the FIRE
@@ -8767,6 +8812,15 @@ _Noreturn static void run_ui(fat32_t *fs)
                 seekhold_reset(&g_rw);
 
                 suspend_to_ram(suspend_origin);              /* returns on wake */
+                if (g_standby_refused) {
+                    /* The escalation (or the 5 s hold) asked the PMU for a
+                     * standby and it refused; enter_standby stopped the
+                     * player and relit the screen. Do not have the idle
+                     * policy ask again every 32 minutes — once is the
+                     * diagnosis. The flag itself is consumed below. */
+                    idlesleep_off(&g_idlesleep);
+                    uart_puts("core: idle sleep: off for this session (standby refused)\n");
+                }
                 last_input   = mmio_read32(USEC_TIMER_ADDR);
                 last_present = last_input;      /* suspend just presented the wake
                                                  * frame: pace the loop's own

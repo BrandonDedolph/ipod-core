@@ -39,6 +39,50 @@ at. Bench: play Revenge and Corduroy Dreams (were clipping; expect
 track (`capped 0`): crunch still there ⇒ read `fifo_empty` (climbing ⇒ bus
 starvation; flat ⇒ analog: repeat on battery vs USB, Charge Rate 100 mA).
 
+## 2026-09-24 — the paused iPod never slept: idle sleep, UNFLASHED
+
+The owner: "just sitting there not playing anything and the battery went
+down like 20 % over 2 hours". CORELOG.BIN (37 boots) says the device was
+AWAKE the whole time: paused, drive parked, backlight off, codec cold, the
+5 s `core: batt` cadence intact — for ~12 h in boot 27 (09-17) and ~13 h
+in boot 35 (09-23), both ending at 3556 mV / 0 %. The paused-idle slope is
+−34 mV/h in every stretch it is visible (≈ 36–38 mA on the 600 mAh figure;
+Rockbox's idle figure for this device is 24 mA), and through the middle of
+the curve that IS ~11 %/h. Two log gotchas made this hard to see: `up` is
+a 32-bit second counter (wraps at 4295 s), and the evlog's forced flush
+wrote only the ring's OLDEST 2 KiB, so no session tail ever carried its
+`suspend: entering` line. Full table in `core/docs/hw/06-power.md`, "Idle
+policy"; parser and plan in the session scratchpad (`batt_table.py`,
+`plan_idle_drain.md`).
+
+Root cause: no idle → sleep policy existed. `suspend_to_ram` and its
+30-minute escalation to PMU standby were reachable from a PLAY hold and the
+sleep timer only; where a PLAY hold was used the log shows the escalation
+firing exactly on time.
+
+Landed (host-verified, NOT flashed):
+- `kernel/idlesleep.{h,c}` + suite `idlesleep`: nothing playing, no input,
+  on battery, no sleep timer armed, for 2 minutes → the same suspend a PLAY
+  hold enters (instant wake; PMU standby 30 min later). Countdown restarts
+  from the last input or the last busy pass; a refused standby latches it
+  off. Fed in `run_ui`'s single sleep site; `core: idle: nothing playing,
+  no input for 120 s, sleeping` narrates it. A cold boot nobody touches
+  sleeps too (boot 36 sat DISKSAFE at 3421 mV).
+- `kernel/evlog.c`: a FORCE/LAST flush drains the ring (≤ 10 blocks) so
+  the last minutes land; idle stays one block per pass. `evlog` suite
+  extended (two-block drain from a parked drive, nine-block drain of a full
+  ring, a mid-drain failure keeps the remainder).
+- 81 host suites, `make hw` + `make verify-hw` clean.
+
+BENCH: (1) pause, hands off: ~2 min later the drive spins briefly and the
+screen goes white; any button wakes it paused. (2) pause and leave 40 min:
+OFF; a press cold-boots to the paused track. (3) pull the log: the final
+blocks must read idle → suspend: entering → suspend: idle loop → 30 min of
+5 s samples without `core: ui` → standby: entering. (4) the `core: batt`
+slope inside that window is the first suspend-draw measurement; if it is
+still −34 mV/h the parks (GATE_CLOCKS / SLOW_TICK / PARK_PLL) and the BCM
+gate are next, one at a time.
+
 ## 2026-09-16 — MP3 is on, and UNFLASHED
 
 `dr_mp3` is gone and AOSP's fixed-point **pvmp3** is vendored in its place

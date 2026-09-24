@@ -98,6 +98,14 @@
                                      * dropped bytes on the device during a
                                      * paused/parked stretch (no flush) */
 #define EVLOG_MIN_BLOCKS    2u      /* header + one ring slot                 */
+/* A FORCED or LAST flush drains the ring: as many blocks as it holds, in one
+ * call, while the drive is up for the settings write anyway. Bounded by
+ * what the ring can hold plus the drop marker's spill. DEVICE 2026-09-24:
+ * the final block used to carry the OLDEST 2 KiB of a 16 KiB ring, so the
+ * `suspend: entering` / `standby: entering` lines — the newest text, the
+ * one thing a session's tail needed to say — were lost on every power-off
+ * whose ring was full; the log could not tell a sleep from a crash. */
+#define EVLOG_FORCE_MAX_BLOCKS ((EVLOG_RING_BYTES / EVLOG_TEXT_BYTES) + 2u)  /* 10 */
 #define EVLOG_MAX_BLOCKS    65536u  /* ceiling on a header's count (128 MiB) */
 #define EVLOG_VERSION       1u
 #define EVLOG_LEN_MASK      0x7FFFu
@@ -185,8 +193,12 @@ enum {
  * DISKSAFE edge's last write: exempt from the battery gate). `env` is what
  * the caller gathered for its settings commit — now_us, parked,
  * player_active, battery_ok; `writable` is ignored (this module knows
- * whether IT is writable). A forced or last flush marks its block FINAL.
- * Returns an EVLOG_FLUSH_* code.
+ * whether IT is writable). A forced or last flush marks its blocks FINAL
+ * and DRAINS the ring — up to EVLOG_FORCE_MAX_BLOCKS in one call, so the
+ * newest lines (the ones that say why the device is going down) land; an
+ * idle flush writes at most one block. Returns an EVLOG_FLUSH_* code for
+ * the call: WROTE if at least one block landed, FAILED if a write failed
+ * (what landed before it stays landed).
  */
 int evlog_flush(int mode, const cfg_commit_env_t *env);
 
