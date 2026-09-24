@@ -1539,5 +1539,15 @@ int main(void)
     xpect(&c, "elapsed/total read as zero when nothing is loaded",
           player_elapsed_s() == 0u && player_total_s() == 0u);
 
+    /* The one transport discipline, across every scenario above (Next and
+     * Prev while playing, row play over a playing track, the rate-change
+     * hand-over, the paused skips and their resumes): the HAL is never
+     * re-initialised under a running DAC. On the device a stop is a
+     * soft-mute ramp and a DMA cut, and the re-init that follows is what
+     * decides whether the codec is touched at all; a re-init over a live
+     * stream would put the retune under an unmuted DAC. */
+    xpect(&c, "no scenario ever re-initialised the HAL under a running DAC",
+          stub_audio_inits_while_running == 0);
+
     return xfail_done(&c);
 }

@@ -139,6 +139,80 @@ static void collect_kicks(void)
     }
 }
 
+/* ---- bus ORDER at a transition --------------------------------------
+ * The DMA kick/stop and the codec's DACCTRL writes land in the same log, in
+ * the order the driver issued them. That order is the whole difference
+ * between a silent transition and an audible one: an unmute that precedes
+ * the kick plays the idle serializer, a DMA cut that precedes the mute cuts
+ * a live DAC. These return log INDICES so a test can compare them. */
+
+/* First DMA0_CMD write whose START bit is set (started=1, a kick) or clear
+ * (started=0, a stop); -1 if none. */
+static long log_first_dma_cmd(int started)
+{
+    const mmio_event *log = mmio_mock_log();
+    size_t len = mmio_mock_log_len();
+    for (size_t i = 0; i < len; i++) {
+        if (log[i].op == MMIO_OP_WRITE && log[i].addr == DMA0_CMD_ADDR &&
+            ((log[i].value & DMA_CMD_START) != 0) == (started != 0)) {
+            return (long)i;
+        }
+    }
+    return -1;
+}
+
+/* First codec control write carrying payload (b0, b1) — the DATA0 write's
+ * index, its DATA1 partner being the next DATA1 write after it; -1 if none.
+ * b0 = reg<<1 | data bit 8, b1 = data low byte (05-audio.md). */
+static long log_first_codec_write(uint8_t b0, uint8_t b1)
+{
+    const mmio_event *log = mmio_mock_log();
+    size_t len = mmio_mock_log_len();
+    for (size_t i = 0; i < len; i++) {
+        if (log[i].op != MMIO_OP_WRITE || log[i].addr != I2C_DATA0_ADDR ||
+            log[i].value != b0) {
+            continue;
+        }
+        for (size_t j = i + 1; j < len; j++) {
+            if (log[j].op == MMIO_OP_WRITE && log[j].addr == I2C_DATA1_ADDR) {
+                if (log[j].value == b1) {
+                    return (long)i;
+                }
+                break;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Codec payloads the ordering cases look for (reg<<1 | bit8, low byte). */
+#define CW_DACCTRL_UNMUTE_B0  0x14   /* DACCTRL 0x0A                          */
+#define CW_DACCTRL_UNMUTE_B1  0x08   /*   = DACOSR128                          */
+#define CW_DACCTRL_MUTE_B1    0x48   /*   = DACOSR128 | SOFTMUTE               */
+#define CW_DACCTRL_OSR64_B1   0x40   /*   = SOFTMUTE alone (OSR dropped): bad  */
+#define CW_PWRMGMT1_OFF_B0    0x02   /* PWRMGMT1 0x01 = 0: VMID/BIAS/PLL off  */
+#define CW_PWRMGMT1_PLLOFF_B1 0x0D   /*   = BIASEN|BUFIOEN|VMIDSEL_75K         */
+#define CW_PWRMGMT1_RUN_B1    0x2D   /*   = PLLEN|BIASEN|BUFIOEN|VMIDSEL_75K   */
+#define CW_RESET_B0           0x00   /* WM_RESET                               */
+#define CW_OUT4TOADC_B0       0x54   /* OUT4TOADC 0x2A                         */
+#define CW_OUT4TOADC_DRAIN_B1 0x14   /*   = POBCTRL | VMIDTOG: VMID discharge  */
+#define CW_PLLN_B0            0x48   /* PLLN 0x24                              */
+#define CW_PLLN_48_B1         0x18   /*   = PLLPRESCALE | 8 (the 48 kHz preset)*/
+
+/* First write of `value` to `addr`; -1 if none. */
+static long log_first_write(uint32_t addr, uint32_t value)
+{
+    const mmio_event *log = mmio_mock_log();
+    size_t len = mmio_mock_log_len();
+    for (size_t i = 0; i < len; i++) {
+        if (log[i].op == MMIO_OP_WRITE && log[i].addr == addr &&
+            log[i].value == value) {
+            return (long)i;
+        }
+    }
+    return -1;
+}
+
 /* Physical address audio.c hands the DMA for a given host buffer. */
 static uint32_t phys_of(const int16_t *p)
 {
@@ -685,6 +759,150 @@ int main(void)
     at_us(100000u);
     xpect(&c, "played: counts at the stream's own rate (48 kHz: 4800 in 100 ms)",
           hal_audio_frames_played() == 4800u);
+
+    /* --- bus order at every transition -----------------------------------
+     * The noise on Play (device, 2026-09-22). The DAC was unmuted BEFORE the
+     * DMA was kicked — over a TX FIFO that had been empty since the stop —
+     * so the soft-unmute ramp played the serializer's underrun output, on a
+     * cold start for the length of two buffer fills. The stop cut the DMA
+     * the instant the mute write was issued (before the transaction was even
+     * on the wire, and long before the ramp ended), and both writes flipped
+     * the DAC's oversampling bit along with the mute. These pin the order:
+     * kick, THEN unmute; mute (OSR kept), THEN stop; and a warm re-init
+     * powers the codec down before it resets it. */
+    {
+        fresh_start();                            /* log holds only the start */
+        long kick   = log_first_dma_cmd(1);
+        long unmute = log_first_codec_write(CW_DACCTRL_UNMUTE_B0,
+                                            CW_DACCTRL_UNMUTE_B1);
+        xpect(&c, "order: a cold start kicks the DMA and unmutes the DAC",
+              kick >= 0 && unmute >= 0);
+        xpect(&c, "order: cold start — the kick comes BEFORE the unmute",
+              kick >= 0 && unmute >= 0 && kick < unmute);
+        xpect(&c, "order: cold start — nothing ever drops the DAC to 64x OSR",
+              log_first_codec_write(CW_DACCTRL_UNMUTE_B0,
+                                    CW_DACCTRL_OSR64_B1) < 0);
+
+        bus_ready();
+        hal_audio_stop();
+        long mute = log_first_codec_write(CW_DACCTRL_UNMUTE_B0,
+                                          CW_DACCTRL_MUTE_B1);
+        long stop = log_first_dma_cmd(0);
+        xpect(&c, "order: a stop soft-mutes the DAC and stops the DMA",
+              mute >= 0 && stop >= 0);
+        xpect(&c, "order: stop — the mute comes BEFORE the DMA cut",
+              mute >= 0 && stop >= 0 && mute < stop);
+        xpect(&c, "order: stop — the mute keeps DACOSR128 set",
+              log_first_codec_write(CW_DACCTRL_UNMUTE_B0,
+                                    CW_DACCTRL_OSR64_B1) < 0);
+        xpect(&c, "order: stop — the mute waits out the ramp (reads the timer)",
+              mmio_mock_count(MMIO_OP_READ, USEC_TIMER_ADDR) > 1);
+
+        bus_ready();
+        hal_audio_stop();                         /* stop while stopped */
+        xpect(&c, "order: a stop while stopped touches the codec not at all",
+              mmio_mock_count(MMIO_OP_WRITE, I2C_ADDR_ADDR) == 0);
+
+        bus_ready();
+        hal_audio_start();                        /* resume */
+        kick   = log_first_dma_cmd(1);
+        unmute = log_first_codec_write(CW_DACCTRL_UNMUTE_B0,
+                                       CW_DACCTRL_UNMUTE_B1);
+        xpect(&c, "order: resume — the kick comes BEFORE the unmute",
+              kick >= 0 && unmute >= 0 && kick < unmute);
+
+        /* A re-init on a WARM codec (Next/Prev, a track started from a row,
+         * a rate change) does NOT reset it — the noise on every skip
+         * (device, 2026-09-22) was the WM_RESET + VMID cycle this used to
+         * run per track, and since this morning a power-down in front of
+         * it. At the same rate it writes NOTHING to the codec; at a new rate
+         * it re-programs the PLL under the mute with PLLEN toggled. Never a
+         * reset, never the rails, never a VMID discharge, and the DAC is
+         * unmuted only by the start that follows, after its kick. */
+        hal_audio_stop();
+        bus_ready();
+        xpect(&c, "order: warm re-init succeeds", hal_audio_init(44100u, 2u) == 0);
+        xpect(&c, "order: warm re-init at the same rate writes NOTHING to the codec",
+              mmio_mock_count(MMIO_OP_WRITE, I2C_ADDR_ADDR) == 0);
+        xpect(&c, "order: warm re-init — no WM_RESET, no rails off, no VMID discharge",
+              log_first_codec_write(CW_RESET_B0, 0x00) < 0 &&
+              log_first_codec_write(CW_PWRMGMT1_OFF_B0, 0x00) < 0 &&
+              log_first_codec_write(CW_OUT4TOADC_B0, CW_OUT4TOADC_DRAIN_B1) < 0);
+        xpect(&c, "order: warm re-init still resets the I2S FIFO and re-arms the DMA",
+              log_first_write(IISCONFIG_ADDR, IIS_RESET) >= 0 &&
+              mmio_mock_count(MMIO_OP_WRITE, DMA0_PER_ADDR_ADDR) == 1);
+        source_reset();
+        bus_ready();
+        hal_audio_set_source(counting_source, 0);
+        hal_audio_start();
+        kick   = log_first_dma_cmd(1);
+        unmute = log_first_codec_write(CW_DACCTRL_UNMUTE_B0,
+                                       CW_DACCTRL_UNMUTE_B1);
+        xpect(&c, "order: the start after a warm re-init kicks BEFORE it unmutes",
+              kick >= 0 && unmute >= 0 && kick < unmute);
+
+        /* A warm re-init at a NEW rate (a 48 kHz album after a 44.1 kHz
+         * one): PLLEN off, the PLL re-programmed, PLLEN on, and only then
+         * the I2S FIFO reset. Still no reset, no rails, no unmute. */
+        hal_audio_stop();
+        bus_ready();
+        xpect(&c, "order: warm re-init at 48 kHz succeeds", hal_audio_init(48000u, 2u) == 0);
+        long plloff = log_first_codec_write(CW_PWRMGMT1_OFF_B0, CW_PWRMGMT1_PLLOFF_B1);
+        long plln   = log_first_codec_write(CW_PLLN_B0, CW_PLLN_48_B1);
+        long pllon  = log_first_codec_write(CW_PWRMGMT1_OFF_B0, CW_PWRMGMT1_RUN_B1);
+        long fifo   = log_first_write(IISCONFIG_ADDR, IIS_RESET);
+        xpect(&c, "order: rate change — PLLEN off, PLL re-programmed, PLLEN on, in that order",
+              plloff >= 0 && plln >= 0 && pllon >= 0 && plloff < plln && plln < pllon);
+        xpect(&c, "order: rate change — the I2S FIFO reset comes AFTER the PLL is back",
+              fifo >= 0 && fifo > pllon);
+        xpect(&c, "order: rate change — no WM_RESET, no rails off, no VMID discharge",
+              log_first_codec_write(CW_RESET_B0, 0x00) < 0 &&
+              log_first_codec_write(CW_PWRMGMT1_OFF_B0, 0x00) < 0 &&
+              log_first_codec_write(CW_OUT4TOADC_B0, CW_OUT4TOADC_DRAIN_B1) < 0);
+        xpect(&c, "order: rate change — the DAC is never unmuted inside the re-init",
+              log_first_codec_write(CW_DACCTRL_UNMUTE_B0,
+                                    CW_DACCTRL_UNMUTE_B1) < 0);
+
+        /* A re-init issued over a RUNNING stream (no caller does it, and
+         * the discipline must not depend on that): the stop happens first —
+         * mute, DMA cut — and only then the retune. */
+        source_reset();
+        bus_ready();
+        hal_audio_set_source(counting_source, 0);
+        hal_audio_start();
+        bus_ready();
+        xpect(&c, "order: re-init over a running stream succeeds",
+              hal_audio_init(44100u, 2u) == 0);
+        long mute2 = log_first_codec_write(CW_DACCTRL_UNMUTE_B0, CW_DACCTRL_MUTE_B1);
+        long stop2 = log_first_dma_cmd(0);
+        plloff = log_first_codec_write(CW_PWRMGMT1_OFF_B0, CW_PWRMGMT1_PLLOFF_B1);
+        xpect(&c, "order: re-init over a running stream — mute, DMA cut, THEN the retune",
+              mute2 >= 0 && stop2 >= 0 && plloff >= 0 &&
+              mute2 < stop2 && stop2 < plloff);
+
+        /* A re-init on a COLD codec (after close / suspend / boot_quiet):
+         * the rails are already off, so the first codec write is the reset,
+         * and the close's power-down drained VMID before it dropped them. */
+        bus_ready();
+        hal_audio_close();
+        long drain = log_first_codec_write(CW_OUT4TOADC_B0, CW_OUT4TOADC_DRAIN_B1);
+        long off   = log_first_codec_write(CW_PWRMGMT1_OFF_B0, 0x00);
+        xpect(&c, "order: close — VMID discharge begun, the drain waited out, THEN rails off",
+              drain >= 0 && off >= 0 && drain < off &&
+              mmio_mock_count(MMIO_OP_READ, USEC_TIMER_ADDR) > 1);
+        bus_ready();
+        xpect(&c, "order: cold re-init succeeds", hal_audio_init(44100u, 2u) == 0);
+        long reset  = log_first_codec_write(CW_RESET_B0, 0x00);
+        long pd_off = log_first_codec_write(CW_PWRMGMT1_OFF_B0, 0x00);
+        xpect(&c, "order: cold re-init — WM_RESET is the first codec write, "
+                  "no power-down against cold rails",
+              reset >= 0 && (pd_off < 0 || pd_off > reset) &&
+              log_first_codec_write(CW_DACCTRL_UNMUTE_B0,
+                                    CW_DACCTRL_MUTE_B1) > reset);
+        xpect(&c, "order: cold re-init — POBCTRL off is the last codec write, after the DAC mute",
+              log_first_codec_write(CW_OUT4TOADC_B0, 0x00) >
+              log_first_codec_write(CW_DACCTRL_UNMUTE_B0, CW_DACCTRL_MUTE_B1));
+    }
 
     return xfail_done(&c);
 }

@@ -67,6 +67,7 @@ int  stub_audio_cold;     /* codec powered down (suspend/close), not by stop */
 int  stub_audio_suspends;
 int  stub_audio_wakes;
 int  stub_audio_suspends_while_running;
+int  stub_audio_inits_while_running;
 int  stub_audio_drains;
 int  stub_audio_drained_while_running;  /* drains issued BEFORE the stop      */
 int  stub_ata_standbys;
@@ -139,6 +140,7 @@ void stub_reset(void)
     stub_audio_drained_while_running = 0;
     stub_audio_cold = stub_audio_suspends = stub_audio_wakes = 0;
     stub_audio_suspends_while_running = 0;
+    stub_audio_inits_while_running = 0;
     stub_ata_standbys = stub_ata_reads = stub_meta_reads = 0;
     stub_ata_wakeups = stub_disk_pumps = 0;
     g_ata_parked = 0;
@@ -438,6 +440,13 @@ int hal_audio_init(uint32_t rate, uint16_t channels)
      * as well, so a format change between tracks is reachable. */
     if ((rate != 44100u && rate != g_stub_rate) || channels != 2u) {
         return -1;
+    }
+    /* A re-init under a running DAC is a caller bug: the real one stops the
+     * stream itself first (mute ramp, DMA cut), but a caller that relies on
+     * that has skipped the stop the transport contract asks for. Counted,
+     * never refused, so a scenario can see it. */
+    if (stub_audio_running) {
+        stub_audio_inits_while_running++;
     }
     /* A full bring-up: the codec is up and, as on the device, the buffers are
      * severed from whatever stream came before — and the DAC's count restarts. */

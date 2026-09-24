@@ -70,9 +70,11 @@ static void codec_write(uint8_t reg, uint16_t data)
 /*
  * Cached codec state. This driver is the single owner of everything the user
  * can change on the codec, and it must be able to reconstruct all of it from
- * RAM: hal_audio_init() issues a full WM_RESET once per track, so any setting
- * that lives only in a codec register is gone at every track boundary. See
- * hal_codec_restore() at the bottom of this file.
+ * RAM: every COLD bring-up (boot, the Play after a persistent pause, the
+ * first play after a close) is a full WM_RESET, so any setting that lives
+ * only in a codec register is gone at each of them. A track change on a warm
+ * codec resets nothing (wm8758_retune). See hal_codec_restore() at the
+ * bottom of this file.
  */
 static int g_percent = VOL_DEFAULT_PCT;
 static int g_balance = 0;                /* -100 (full left) .. +100 (full right) */
@@ -279,7 +281,7 @@ static void eq_bands_write(void)
  *       already in place — so it takes the first branch for determinism.
  *
  * g_dac_precut is what the codec is believed to hold, not what the cached
- * curve implies: hal_codec_restore() resets it to 0 because the per-track
+ * curve implies: hal_codec_restore() resets it to 0 because the cold-path
  * wm8758_init() has just written 0xFF (0 dB) over whatever was there, and a
  * replay must therefore re-cut before it re-boosts.
  *
@@ -333,7 +335,9 @@ int hal_volume_get(void)
 /*
  * Push the whole cached state back into a freshly reset codec. Called from
  * wm8758_init() through the wm8758_set_restore() hook (registered by
- * hal/hw/audio.c), so it runs at the tail of every per-track bring-up.
+ * hal/hw/audio.c), so it runs at the datasheet's "unmute outputs and set
+ * desired volume" step of every cold bring-up — never on a track change,
+ * where nothing was reset.
  *
  * Order: output gains first, then the EQ curve (whose own DACVOL pre-cut
  * leads, see eq_latch). Both are ordinary latched writes — the OUT1 pair
@@ -342,8 +346,8 @@ int hal_volume_get(void)
  * the caller guarantees by construction.
  *
  * Deliberately unconditional: writing the defaults back when nothing was
- * changed costs nine I2C transactions (~a millisecond) once per track and
- * removes an entire class of "was it dirty?" reasoning.
+ * changed costs nine I2C transactions (~a millisecond) once per cold
+ * bring-up and removes an entire class of "was it dirty?" reasoning.
  */
 void hal_codec_restore(void)
 {

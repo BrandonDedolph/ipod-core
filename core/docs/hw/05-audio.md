@@ -61,46 +61,86 @@ Source: `firmware/export/wm8758.h`.
 
 ## DAC init sequence
 
-The power-up order is dictated by the codec: bias and protection first,
-everything muted, rails up, then interface/clocking, then route the DAC
-to the outputs, and unmute **last** so no partially-configured state is
-audible. On a chainloaded device where Apple's firmware may have left
-codec state behind, issue a soft reset (write register `RESET`) first so
-we start from datasheet defaults. Our driver
-(`core/hal/hw/wm8758.c`, `wm8758_init`) implements the sequence as a
-register-write table; the concrete bit values are in the appendix.
+The bring-up is the WM8758B datasheet's **Recommended Power Up Sequence**,
+and it runs only on a **cold** codec: at boot, on the Play after a
+persistent pause has powered the codec down, and on the first play after a
+close. **It is not per track.** A track change on a warm codec (Next/Prev,
+a row played over a playing track, a rate change at a gapless boundary) is
+`wm8758_retune` — see "Track change" below. Until 2026-09-22 the whole
+reset + VMID cycle ran on every track, and every cycle was a thump on the
+jack.
+
+On a chainloaded device where Apple's firmware may have left codec state
+behind, the sequence starts with a soft reset (write register `RESET`) so
+it begins from datasheet defaults. Our driver (`core/hal/hw/wm8758.c`,
+`wm8758_init`) implements it as register-write tables; the concrete bit
+values are in the appendix.
 
 1. **Soft reset** (`RESET`) — return to power-on defaults.
-2. **Bias mode** for a low noise floor (`BIASCTRL` = BIASCUT).
+2. **Low bias mode** (`BIASCTRL` = BIASCUT).
 3. **Output buffers + protection** (`OUTCTRL` = HP/LINE common | TSOPCTRL
    | TSDEN | VROI).
 4. **Mute everything** before the rails come up: `L/ROUT1VOL`,
    `L/ROUT2VOL` = `0x140` (VU + mute), `OUT3MIX`/`OUT4MIX` = `0x40`.
-5. **Enable headphone outputs** (`PWRMGMT2` = LOUT1EN | ROUT1EN).
-6. **VMID-independent bias toggle on** (`OUT4TOADC` = POBCTRL).
+5. **Enable headphone outputs** (`PWRMGMT2` = LOUT1EN | ROUT1EN) — while
+   VMID is still at zero, so their outputs follow it up rather than
+   snapping to it later.
+6. **VMID-independent bias on** (`OUT4TOADC` = POBCTRL) — the amps are
+   biased from AVDD until VMID exists.
 7. **Enable DACs + mixers** (`PWRMGMT3` = DACENL/R | LMIXEN/RMIXEN).
-8. **Bias rails up**, VMID at 10 kΩ for a fast settle (`PWRMGMT1` = PLLEN
-   | BIASEN | BUFIOEN | VMIDSEL_10K).
+8. **Bias rails up**, VMID on its normal-operation 75 kΩ divider
+   (`PWRMGMT1` = PLLEN | BIASEN | BUFIOEN | VMIDSEL_75K). The datasheet
+   starts the charge on THIS divider (VMIDSEL=01), not the 10 kΩ fast one:
+   the coupling caps into the headphones charge at the VMID ramp rate, and
+   the fast divider is a 7× bigger thump.
 9. **Interface**: I²S, 16-bit (`AINTFCE`).
 10. **Become I²S clock master** (`CLKCTRL` = MS). MCLK must already be
     running from the SoC (see below) or the codec masters a clock that
     doesn't exist → silence + a click.
-11. **Program 44.1 kHz** (PLL coefficients + `CLKCTRL` + `ADDCTRL` — see
+11. **Program the rate** (PLL coefficients + `CLKCTRL` + `ADDCTRL` — see
     the appendix's resolved sequence).
 12. **Route the DAC to the mixers** — `LOUTMIX` = DACL2LMIX, `ROUTMIX` =
     DACR2RMIX. **Critical**: without this the DAC is powered but
     unrouted, i.e. silence.
-13. **Drop the bias toggle** (`OUT4TOADC` = 0).
+13. **Wait 100 ms** for VMID to rise (the datasheet's figure; a bounded
+    `USEC_TIMER` wait in the driver). POBCTRL stays set through it.
+14. **Clear low bias** (`BIASCTRL` = 0), DAC volume to full scale, then
+    **unmute the headphone outputs and set the volume** (`L/ROUT1VOL`
+    with ZC; the user's volume/balance/EQ are restored here through the
+    `wm8758_set_restore` hook), `DACCTRL` = DACOSR128 | SOFTMUTE — the
+    bring-up **leaves the DAC soft-muted**.
+15. **Drop the VMID-independent bias LAST** (`OUT4TOADC` = 0): the amps now
+    run from the VMID that rose underneath them. The driver used to clear
+    it at step 12, ~3 ms into the charge, which handed the amps to a bias
+    that did not exist yet.
 
-Postinit then switches VMID to the low-power 500 kΩ divider (`PWRMGMT1`
-… VMIDSEL_500K), clears low-bias (`BIASCTRL` = 0), sets the output/DAC
-volumes, and finally **unmutes** (`DACCTRL` = DACOSR128) as the last
-write.
+No PCM is flowing when this returns (the TX FIFO was just reset and the
+DMA has not been kicked), and a DAC unmuted over an idle serializer plays
+whatever it emits on underrun. The stream unmutes itself once the DMA is
+running (see "Mute").
 
 Note that DAC digital volume is a single global attenuator shared by
 every output path — it affects the headphone amp and the line-out
 together, so per-output balance has to be trimmed at the mixer/amp
 stage, not the DAC.
+
+## Track change (warm codec)
+
+`hal_audio_init` on a warm codec does not reset it. With the DAC already
+soft-muted and the DMA cut (every stop leaves the codec that way, and init
+stops a running stream itself first), `wm8758_retune` compares the rate the
+stream wants with what the PLL and dividers are programmed for:
+
+- **same rate**: no codec write at all;
+- **different rate**: `PWRMGMT1` with PLLEN cleared, the six rate registers
+  (`PLLN`, `PLLK1..3`, `CLKCTRL`, `ADDCTRL`), `PWRMGMT1` with PLLEN back,
+  then a bounded ~5 ms lock wait. The codec masters BCLK/LRCLK from this
+  PLL, so the link loses and re-finds its clocks under the mute with
+  nothing in flight.
+
+Then the I²S block is reset (FIFO flushed after any clock wobble) and the
+DMA channel re-armed, exactly as on a cold init; the stream primes, kicks,
+and unmutes. VMID, bias and the headphone amps never move.
 
 ## DAC sample-rate setup
 
@@ -231,26 +271,49 @@ dock connector's line-out pins are wired to OUT2.
 
 ## Mute
 
-Muting writes `DACCTRL` with the soft-mute bit set; unmuting writes it
-with `DACOSR128` (128× oversampling), which is also the implicit
-"unmuted" state.
+Muting writes `DACCTRL` = DACOSR128 | SOFTMUTE; unmuting writes
+`DACCTRL` = DACOSR128. The oversampling bit is held constant in both
+directions — flipping it with the mute (as the driver once did) is a DAC
+filter reconfiguration at the instant of every pause and play.
+
+SOFTMUTE is a **ramp**, not a cut, and the I2C write returns before the
+transaction is even on the wire, so:
+
+- **Pause** (`hal_audio_stop`): write the mute, then wait the ramp out
+  (`wm8758_mute` does — 1024 sample periods at the programmed rate, ~23 ms
+  at 44.1 kHz) with the DMA still feeding real PCM, and only then stop the
+  DMA. The ramp fades music, not the serializer's underrun output.
+- **Play** (`hal_audio_start`): kick the DMA first, then unmute. The
+  unmute ramp then fades real audio in. Unmuting before the kick (as the
+  driver once did) played the idle serializer for the duration of two
+  buffer fills, plus the volume/EQ restore on a fresh bring-up.
+- **A warm codec is never reset** (a track started from a row, a rate
+  change): see "Track change" — a retune under the mute, no rails moved.
 
 ## Shutdown
 
-Ordered teardown, mirror-image of bring-up:
+`wm8758_powerdown` — the datasheet's **Recommended Power Down Sequence**,
+run on the persistent-pause timer (`hal_audio_suspend`), at close (end of
+queue, stop, standby, disk mode) and once at boot (`hal_audio_boot_quiet`,
+against whatever the previous image left live):
 
-1. Soft-mute the DAC.
-2. Put the outputs into common-mode (`OUTCTRL` = HP common | VROI).
-3. Begin VMID discharge (`OUT4TOADC` VMID-toggle bit), then set `PWRMGMT1`
-   to bias + PLL with `VMIDSEL_OFF` so the VMID rail drains.
-4. **Wait ~300 ms** for VMID to fully drain.
-5. Clear `PWRMGMT2`, `PWRMGMT3`, then `PWRMGMT1` (all rails off).
+1. Soft-mute the DAC, mute the headphone outputs (ours: nothing is live
+   while VMID falls).
+2. Thermal shutdown off (`OUTCTRL` without TSDEN).
+3. Begin VMID discharge (`OUT4TOADC` = POBCTRL | VMIDTOG), then `PWRMGMT1`
+   = PLLEN | BIASEN — VMID divider and I/O buffer off — so the rail drains.
+4. **Wait ~300 ms** for VMID to fully drain (a bounded `USEC_TIMER` wait in
+   the driver; the datasheet gives no figure, it depends on the VMID
+   capacitor, so this is device-gated).
+5. Clear `PWRMGMT1`, `PWRMGMT2`, `PWRMGMT3` (all rails off).
 
-On the I²S side, stop the DMA, spin until the TX FIFO is empty, then mark
-the stream idle.
+On the I²S side, the DMA is already stopped (the stop preceded this); the
+TX FIFO enable and the I²S + MCLK clock gates are dropped after.
 
-The 300 ms VMID drain is non-negotiable — skipping it gives a loud DC pop
-in the headphones.
+The 300 ms VMID drain is non-negotiable — skipping it cuts the headphone
+amps with VMID at midrail, a loud DC pop through the coupling caps. The
+driver used to skip it (three back-to-back writes, ~150 µs after the
+discharge began).
 
 ## Source citations
 
@@ -438,7 +501,7 @@ firmware has always emitted.
   | equal | `DACVOL` first (nothing to sequence; deterministic) |
 
   The driver tracks what the codec *holds*, not what the cached curve implies:
-  `hal_codec_restore()` zeroes it first, because the per-track `wm8758_init()`
+  `hal_codec_restore()` zeroes it first, because the cold-path `wm8758_init()`
   has just written `0xFF` over it, so a replay re-cuts before it re-boosts.
   Both directions are pinned as literal bus bytes in
   `tests/hw_mmio/volume_trace_test.c`.
@@ -448,8 +511,8 @@ firmware has always emitted.
   (`DACCTRL_SOFTMUTE`, already used by `wm8758_mute`) around `hal_eq_set` is the
   fallback — **not yet needed or tried on hardware**.
 - **The curve is cached in RAM** and replayed by `hal_codec_restore()` through
-  the `wm8758_set_restore` hook, because `hal_audio_init()` resets the codec
-  once per track.
+  the `wm8758_set_restore` hook, because every cold bring-up (boot, the Play
+  after a persistent pause, the first play after a close) resets the codec.
 
 The preset gains themselves are **not** a hardware fact and do not live here:
 they are `core/ui/eq.c`'s table, host-tested, and this file only says how a

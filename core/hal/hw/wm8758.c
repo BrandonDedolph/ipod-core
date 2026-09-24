@@ -5,19 +5,29 @@
  *
  * Reaches the codec over the SoC I2C controller (i2c.c). Register/bit
  * numbers are the WM8758B datasheet's own register map (see wm8758.h).
- * The init order follows the datasheet's power-up requirements — the
- * "Recommended Power Up Sequence" (bias/VMID and POBCTRL pop-suppression
- * before the output rails, VMID 10K fast-charge then 500K hold), I2S
- * interface + PLL for 44.1 kHz, DAC routed to the mixers, then outputs
- * un-muted last with the zero-cross + volume-update latches. It is
- * expressed here as a data table so the exact bus grammar is easy to
- * assert in the trace tests.
+ * wm8758_init follows the datasheet's "Recommended Power Up Sequence" step
+ * for step: low bias, outputs muted and ENABLED, POBCTRL (the VMID-
+ * independent bias) on, DACs and mixers on, then VMID on its normal 75k
+ * divider with BIASEN + BUFIOEN, the interface and PLL, a 100 ms wait for
+ * VMID to rise, the output unmute + volume, and POBCTRL off LAST. It is
+ * expressed as data tables so the exact bus grammar is easy to assert in
+ * the trace tests. wm8758_powerdown is the datasheet's "Recommended Power
+ * Down Sequence", drain wait included.
  *
- * Asm-free so it host-compiles for the mock-bus tests. It is NO LONGER
- * delay-free: the datasheet's VMID settle between the 10k fast-charge and the
- * 500k hold is supplied here (a bounded USEC_TIMER wait), because the one
- * caller never did and this now runs once per track — i.e. the missing settle
- * was a pop at every track boundary, not just at boot.
+ * THE BRING-UP IS NOT PER TRACK. It runs when the codec is COLD: at boot,
+ * after the persistent-pause power-down, after a close. A track change on a
+ * warm codec is wm8758_retune() — nothing at all when the rate is unchanged,
+ * and a muted PLL re-program when it is not. The reset + VMID cycle used to
+ * run on every Next, every row play and every rate change, and each cycle
+ * was a thump in the headphones (device, 2026-09-22); the datasheet
+ * sequence is a power-up procedure, not a track-change one.
+ *
+ * Asm-free so it host-compiles for the mock-bus tests. NOT delay-free: the
+ * VMID rise, the VMID drain, the PLL lock and the DAC soft-mute ramp are all
+ * bounded USEC_TIMER waits here, where the sequence needs them.
+ *
+ * The bring-up ends with the DAC SOFT-MUTED. Unmuting is the stream's job,
+ * after the DMA is feeding the serializer (hal/hw/audio.c).
  */
 
 #include "wm8758.h"
@@ -61,20 +71,50 @@ struct wm_write {
 #define WM_HP_GAIN_0DB 0x39
 
 /*
- * VMID settle between the 10k fast-charge and the 500k hold (05-audio.md, the
- * datasheet pop-suppression sequence). The file header used to declare itself
- * "delay-free ... any VMID settle delay is the caller's responsibility" — and
- * the only caller runs i2c_init(); i2s_init(); wm8758_init(); dma_playback_init()
- * back to back, so the delay never existed. Now that wm8758_init runs once per
- * TRACK, that omission is a pop at every track boundary, so the driver supplies
- * it here where the sequence actually needs it.
- *
- * DEVICE-GATED: 40 ms is a compromise, not a measured value — long enough for
- * a meaningful fraction of the 10k charge, short enough to hide inside a track
- * change (which already spins the disk and refills the decode buffer). If a
- * pop is still audible on hardware, raise it; this constant is the knob.
+ * PWRMGMT1 in normal operation: PLL, bias and the I/O buffer on, VMID on the
+ * 75k divider. The datasheet's power-up sequence puts VMID on THIS divider
+ * from the start (VMIDSEL=01) and waits for it to rise, rather than the 10k
+ * fast-charge this driver used while the bring-up ran once per track: the
+ * headphone amps are enabled before VMID charges, so their outputs (and the
+ * coupling caps into the headphones) follow the VMID ramp, and a 7x faster
+ * ramp is a 7x bigger thump. Now that the bring-up is a power-up and not a
+ * track change, the slower charge costs nothing that matters. Also the value
+ * wm8758_retune restores after it has toggled PLLEN.
  */
-#define WM_VMID_SETTLE_US   40000u
+#define WM_PWRMGMT1_RUN  (PWRMGMT1_PLLEN | PWRMGMT1_BIASEN \
+                          | PWRMGMT1_BUFIOEN | PWRMGMT1_VMIDSEL_75K)
+
+/*
+ * The VMID rise: the datasheet's "Wait 100ms to allow VMID to rise
+ * sufficiently before unmuting outputs", between the PWRMGMT1 write that
+ * starts the charge and the output unmute. It used to be 40 ms, chosen to
+ * hide inside a per-track bring-up; that bring-up no longer exists (see the
+ * file header), so the datasheet's own number stands. Paid at boot, on the
+ * Play after a persistent pause, and on the first play after a close.
+ */
+#define WM_VMID_SETTLE_US   100000u
+
+/*
+ * The VMID drain: the datasheet's "Wait for VMID to discharge" between
+ * cutting the VMID divider (VMIDTOG set, VMIDSEL off) and switching the
+ * output amps and bias off. Powering the amps off with VMID still at midrail
+ * steps their outputs to ground through the coupling caps — the DC pop on
+ * every power-down, which 05-audio.md always said needs ~300 ms and which the
+ * table below never waited for. DEVICE-GATED: the datasheet gives no figure
+ * (it depends on the VMID capacitor); 300 ms is the doc's. Paid only where
+ * nobody is waiting on a button: 5 s into a pause, at close, at standby, and
+ * once at boot (hal_audio_boot_quiet cannot tell a live codec from a cold
+ * one — the control port is write-only).
+ */
+#define WM_VMID_DRAIN_US    300000u
+
+/*
+ * PLL re-lock after wm8758_retune re-programs it with PLLEN toggled. The DAC
+ * is soft-muted and the DMA is off for the whole retune, so an unlocked clock
+ * reaches nothing audible; this only keeps the I2S block from being reset
+ * (i2s_init follows) under a still-wandering BCLK. Not a datasheet figure.
+ */
+#define WM_PLL_LOCK_US      5000u
 
 /*
  * Guard on the settle loop. USEC_TIMER is a free-running 1 MHz counter so on
@@ -140,6 +180,12 @@ static const struct wm_rate rate_table[] = {
 /* Index into rate_table; 0 (44.1 kHz) until wm8758_set_rate says otherwise. */
 static unsigned g_rate_idx;
 
+/* The rate_table entry the codec's PLL/dividers are ACTUALLY programmed
+ * with: set by wm8758_init and wm8758_retune, -1 while the codec is cold
+ * (nothing is programmed after a reset or a power-down). What lets a retune
+ * at an unchanged rate be zero writes. */
+static int g_prog_idx = -1;
+
 int wm8758_set_rate(uint32_t sample_rate)
 {
     for (unsigned i = 0; i < sizeof rate_table / sizeof rate_table[0]; i++) {
@@ -160,8 +206,11 @@ void wm8758_set_restore(void (*fn)(void))
 }
 
 /*
- * Bring-up, part A: soft reset through the VMID 10k fast-charge, then the
- * fixed interface config. Everything before the rate program.
+ * Bring-up, part A: soft reset through the start of the VMID charge, then
+ * the fixed interface config. Everything before the rate program. The order
+ * is the datasheet's: outputs muted and enabled, POBCTRL on, DACs/mixers on,
+ * THEN VMID + bias — the amps come up on the VMID-independent bias and their
+ * outputs follow VMID up from zero instead of snapping to it later.
  */
 static const struct wm_write init_seq_a[] = {
     /* --- soft reset to known power-on defaults ---------------------- *
@@ -189,8 +238,7 @@ static const struct wm_write init_seq_a[] = {
     { WM_OUT4TOADC, OUT4TOADC_POBCTRL },         /* VMID-independent bias */
     { WM_PWRMGMT3,  PWRMGMT3_DACENL | PWRMGMT3_DACENR
                     | PWRMGMT3_LMIXEN | PWRMGMT3_RMIXEN },
-    { WM_PWRMGMT1,  PWRMGMT1_PLLEN | PWRMGMT1_BIASEN
-                    | PWRMGMT1_BUFIOEN | PWRMGMT1_VMIDSEL_10K },
+    { WM_PWRMGMT1,  WM_PWRMGMT1_RUN },           /* VMID starts charging */
 
     /* --- interface + clocking: I2S 16-bit, codec is master ---------- */
     { WM_AINTFCE,   AINTFCE_FORMAT_I2S | AINTFCE_IWL_16BIT },
@@ -199,39 +247,49 @@ static const struct wm_write init_seq_a[] = {
 
 /*
  * Bring-up, part B: the DAC route, issued after the rate program. Ends just
- * before the VMID settle.
+ * before the VMID settle. POBCTRL is NOT dropped here: it used to be, ~3 ms
+ * after VMID began charging and 40 ms before the settle ended, which handed
+ * the output amps to a VMID-derived bias that did not exist yet. The
+ * datasheet clears it as the very last step, after the outputs are unmuted;
+ * wm8758_init does.
  */
 static const struct wm_write init_seq_b[] = {
     /* --- route DAC to the output mixers (without this: silence) ----- */
     { WM_LOUTMIX,   LOUTMIX_DACL2LMIX },
     { WM_ROUTMIX,   ROUTMIX_DACR2RMIX },
-    { WM_OUT4TOADC, 0 },                         /* drop the bias toggle */
 };
 
 /*
- * Bring-up, part C: everything AFTER the VMID settle — hand VMID over to the
- * NORMAL-operation divider, drop the low-bias, then volume and unmute last.
+ * Bring-up, part C: everything AFTER the VMID settle — drop the low-bias,
+ * then volume and the output unmute. VMID is already on the 75k divider it
+ * plays through (WM_PWRMGMT1_RUN), so there is no hand-over write here.
  *
- * Not the 500k "low-power hold". That is the datasheet's standby divider:
+ * Never the 500k "low-power hold". That is the datasheet's standby divider:
  * the reference sits behind the highest impedance the part offers, so every
  * supply disturbance walks straight onto the outputs. On the device it did:
  * the drive's spin-up current, the piezo's PWM burst and a steady hiss were
- * all audible on the headphone jack while playing (2026-09-13). The 75k
- * divider is what the part is meant to play through; the power-down path
- * still drains VMID properly on the way to cold.
+ * all audible on the headphone jack while playing (2026-09-13).
  */
 static const struct wm_write init_seq_c[] = {
-    /* --- postinit: normal-operation VMID, clear low-bias ------------ */
-    { WM_PWRMGMT1,  PWRMGMT1_PLLEN | PWRMGMT1_BIASEN
-                    | PWRMGMT1_BUFIOEN | PWRMGMT1_VMIDSEL_75K },
+    /* --- postinit: clear low-bias ------------------------------------ */
     { WM_BIASCTRL,  0 },
 
-    /* --- volume + unmute -------------------------------------------- */
+    /* --- volume; the bring-up ENDS SOFT-MUTED ------------------------ */
     { WM_LDACVOL,   DACVOL_0DB },                /* full-scale, no VU yet */
     { WM_RDACVOL,   DACVOL_0DB | DACVOL_DACVU },  /* VU latches L+R */
     { WM_LOUT1VOL,  WM_HP_GAIN_0DB | OUTVOL_ZC },
     { WM_ROUT1VOL,  WM_HP_GAIN_0DB | OUTVOL_ZC | OUTVOL_VU },
-    { WM_DACCTRL,   DACCTRL_DACOSR128 },         /* unmute (128x OSR) */
+    /*
+     * 128x OSR, DAC still soft-muted. This used to be the unmute, "last so
+     * no partially-configured state is audible" — but at this point NO PCM
+     * is flowing: the I2S TX FIFO was just reset and the DMA has not been
+     * kicked, and after this come the user's volume/EQ writes over I2C
+     * (milliseconds) before hal_audio_start ever runs. An unmuted DAC fed by
+     * an idle serializer plays whatever that serializer emits on underrun,
+     * and the soft-unmute ramp makes it audible. The stream unmutes itself
+     * (wm8758_mute(false)) once the DMA is actually streaming — audio.c.
+     */
+    { WM_DACCTRL,   DACCTRL_DACOSR128 | DACCTRL_SOFTMUTE },
 };
 
 /* Run one table, accumulating the failed-write count. */
@@ -266,53 +324,146 @@ int wm8758_init(void)
 
     bad += WM_RUN(init_seq_b);
 
-    /* THE VMID SETTLE. Bias is still on the 10k fast-charge path set in
-     * init_seq_a; hold here so the rail is actually up before we hand it to
-     * the 500k keeper and unmute. Skipping it is the pop. */
+    /* THE VMID RISE. VMID has been charging on the 75k divider since the
+     * PWRMGMT1 write in init_seq_a, with the output amps enabled on the
+     * VMID-independent bias; hold here so the rail is up before the outputs
+     * are unmuted. Skipping it, or shortening it, is the pop. */
     wm8758_settle_us(WM_VMID_SETTLE_US);
 
     bad += WM_RUN(init_seq_c);
 
-    /* Finally, put the user's settings back. The WM_RESET at the top of this
-     * function wiped volume, balance and the EQ back to datasheet defaults,
-     * and this runs once per track — without this the codec would come up at
-     * 0 dB with flat tone on every track change. Deliberately AFTER the
-     * unmute: no PCM is flowing yet (hal_audio_start has not been called), so
-     * there is nothing to click, and it keeps the documented bring-up
-     * sequence itself byte-for-byte unchanged. */
+    /* Put the user's settings back. The WM_RESET at the top of this function
+     * wiped volume, balance and the EQ back to datasheet defaults. This is
+     * the datasheet's "unmute L/ROUT1 and set desired volume" step: the
+     * DAC is still soft-muted (init_seq_c leaves it so) and the OUT1VOL
+     * writes carry ZC, so nothing in this restore can be heard. */
     if (g_restore) {
         g_restore();
     }
+
+    /* And LAST, the VMID-independent bias off: the amps now run from the
+     * VMID that has risen underneath them. The datasheet's final step. */
+    bad += (wm8758_write(WM_OUT4TOADC, 0) != 0);
+
+    g_prog_idx = (int)g_rate_idx;
     return bad;
 }
 
-void wm8758_mute(bool mute)
+/*
+ * A track change on a WARM codec. The rate the caller last set
+ * (wm8758_set_rate) is compared with what the PLL and dividers are actually
+ * programmed with: equal, and this touches nothing — the codec is already
+ * clocked right, muted (every stop leaves it so), and warm. Different, and
+ * the six rate registers are re-programmed with the PLL disabled across
+ * the write and re-enabled after, then a bounded lock wait.
+ *
+ * PRECONDITIONS the caller owns (hal/hw/audio.c): the DAC is soft-muted and
+ * the DMA is stopped, so the codec, which masters BCLK/LRCLK from this PLL,
+ * can lose and re-find its clocks with nothing audible on the output and
+ * nothing in flight on the link. The caller resets the I2S FIFO AFTER this
+ * returns, so whatever the serializer did under a re-locking clock is
+ * flushed before the next kick.
+ *
+ * This is what replaced the per-track wm8758_init. Returns the number of
+ * writes that failed, as wm8758_init does; 0 when nothing was written.
+ */
+int wm8758_retune(void)
 {
-    (void)wm8758_write(WM_DACCTRL, mute ? DACCTRL_SOFTMUTE : DACCTRL_DACOSR128);
+    if (g_prog_idx == (int)g_rate_idx) {
+        return 0;
+    }
+    const struct wm_rate *r = &rate_table[g_rate_idx];
+    int bad = 0;
+
+    bad += (wm8758_write(WM_PWRMGMT1, WM_PWRMGMT1_RUN & ~PWRMGMT1_PLLEN) != 0);
+    bad += (wm8758_write(WM_PLLN,    r->plln)    != 0);
+    bad += (wm8758_write(WM_PLLK1,   r->pllk1)   != 0);
+    bad += (wm8758_write(WM_PLLK2,   r->pllk2)   != 0);
+    bad += (wm8758_write(WM_PLLK3,   r->pllk3)   != 0);
+    bad += (wm8758_write(WM_CLKCTRL, r->clkctrl) != 0);
+    bad += (wm8758_write(WM_ADDCTRL, r->addctrl) != 0);
+    bad += (wm8758_write(WM_PWRMGMT1, WM_PWRMGMT1_RUN) != 0);
+    wm8758_settle_us(WM_PLL_LOCK_US);
+
+    g_prog_idx = (int)g_rate_idx;
+    return bad;
 }
 
 /*
- * Pop-suppressed power-DOWN — the datasheet "Recommended Power Down Sequence"
- * run in the reverse spirit of init_seq: soft-mute the DAC and mute the
- * headphone outputs FIRST (so nothing is live when the rails collapse), assert
- * POBCTRL + VMIDTOG to discharge VMID through the pop-suppression path, then
- * drop the output amps, the VMID/BIAS/PLL rail, and the DAC/mixers. Leaves the
- * codec cold; the next wm8758_init() (issued per track via hal_audio_init) does
- * a full WM_RESET + pop-suppressed bring-up, so this is fully recoverable and
- * resume audio is clean. Delay-free (MCLK is still running when this is called;
- * the caller gates clocks AFTER).
+ * DACMU is a SOFT mute: the DAC ramps its output to zero over many sample
+ * periods rather than cutting it. Two consequences the caller cannot see
+ * from a register write:
+ *
+ *  - The write returns before the ramp has even begun. i2c_send() returns
+ *    with the transaction still on the wire (09-i2c.md; i2c.c drains it
+ *    lazily at the NEXT call), so a caller that cuts the DMA straight after
+ *    "muting" cuts it with the DAC still live, and the remainder of the ramp
+ *    then rides whatever the starved serializer emits — the click on pause.
+ *    So a mute waits here until the ramp is over, and the PCM keeps flowing
+ *    underneath it: the ramp fades real audio, not underrun garbage. The wait
+ *    is bounded and mock-guarded exactly like the VMID settle.
+ *
+ *  - DACOSR128 lives in the same register. The old mute wrote SOFTMUTE alone
+ *    and the unmute wrote DACOSR128 alone, so every pause dropped the DAC to
+ *    64x oversampling and every play put it back — a filter reconfiguration
+ *    at the exact instant the listener is most likely to hear it. OSR is
+ *    128x always; only DACMU moves.
+ *
+ * WM_MUTE_RAMP_FRAMES is the datasheet-uncertain constant: Wolfson soft-mute
+ * ramps in this family are a few hundred to ~1024 sample periods, so 1024 at
+ * the programmed rate (23 ms at 44.1 kHz, 46 ms at 22.05 kHz) covers the
+ * longest of them. Too long only delays a pause by that much; too short
+ * leaves a tail of the ramp on the underrun output.
  */
-static const struct wm_write powerdown_seq[] = {
-    { WM_DACCTRL,   DACCTRL_SOFTMUTE },                       /* ramp DAC to mute   */
+#define WM_MUTE_RAMP_FRAMES  1024u
+
+void wm8758_mute(bool mute)
+{
+    if (!mute) {
+        (void)wm8758_write(WM_DACCTRL, DACCTRL_DACOSR128);
+        return;
+    }
+    (void)wm8758_write(WM_DACCTRL, DACCTRL_DACOSR128 | DACCTRL_SOFTMUTE);
+    uint32_t rate = rate_table[g_rate_idx].rate;
+    wm8758_settle_us((uint32_t)(((uint64_t)WM_MUTE_RAMP_FRAMES * 1000000u)
+                                / rate));
+}
+
+/*
+ * Pop-suppressed power-DOWN — the datasheet "Recommended Power Down
+ * Sequence": thermal shutdown off, VMIDTOG on, the VMID divider and the I/O
+ * buffer off, WAIT for VMID to discharge, and only then R1/R2/R3 = 0. The
+ * DAC soft-mute and the headphone-output mutes in front of it are ours (so
+ * nothing is live while VMID falls); POBCTRL is asserted alongside VMIDTOG
+ * for the same reason the power-up asserts it while VMID is absent.
+ *
+ * The drain wait used to be missing: the amps, VMID and bias were cut in
+ * three consecutive I2C writes, ~150 us after the discharge began, i.e.
+ * with VMID still at midrail — the DC pop on every power-down. Leaves the
+ * codec cold; the next wm8758_init() does the full reset + bring-up, so this
+ * is fully recoverable. MCLK is still running when this is called; the
+ * caller gates clocks AFTER.
+ */
+static const struct wm_write powerdown_pre[] = {
+    { WM_DACCTRL,   DACCTRL_DACOSR128 | DACCTRL_SOFTMUTE },   /* DAC muted (OSR kept) */
     { WM_LOUT1VOL,  OUTVOL_VU | OUTVOL_MUTE },                /* mute HP outputs    */
     { WM_ROUT1VOL,  OUTVOL_VU | OUTVOL_MUTE },
+    { WM_OUTCTRL,   OUTCTRL_HP_COM | OUTCTRL_LINE_COM | OUTCTRL_TSOPCTRL
+                    | OUTCTRL_VROI },                         /* thermal shutdown off */
     { WM_OUT4TOADC, OUT4TOADC_POBCTRL | OUT4TOADC_VMIDTOG },  /* pop ctrl + VMID discharge */
+    { WM_PWRMGMT1,  PWRMGMT1_PLLEN | PWRMGMT1_BIASEN },       /* VMID divider + BUFIO off */
+};
+
+static const struct wm_write powerdown_post[] = {
+    { WM_PWRMGMT1,  0 },                                      /* BIAS + PLL off     */
     { WM_PWRMGMT2,  0 },                                      /* output amps off    */
-    { WM_PWRMGMT1,  0 },                                      /* VMID + BIAS + PLL off */
     { WM_PWRMGMT3,  0 },                                      /* DAC + mixers off   */
 };
 
 void wm8758_powerdown(void)
 {
-    (void)WM_RUN(powerdown_seq);
+    (void)WM_RUN(powerdown_pre);
+    wm8758_settle_us(WM_VMID_DRAIN_US);       /* VMID to ground BEFORE the amps go */
+    (void)WM_RUN(powerdown_post);
+    g_prog_idx = -1;                          /* nothing is programmed in a cold codec */
 }

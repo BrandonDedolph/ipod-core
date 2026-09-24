@@ -117,6 +117,7 @@ extern int stub_audio_cold;     /* 1 while the codec is powered down         */
 extern int stub_audio_suspends; /* hal_audio_suspend() calls that took effect */
 extern int stub_audio_wakes;    /* hal_audio_wake() calls that took effect    */
 extern int stub_audio_suspends_while_running; /* caller bug: suspend under DMA */
+extern int stub_audio_inits_while_running;    /* caller bug: init under DMA    */
 extern int stub_audio_drains;
 extern int stub_audio_drained_while_running;
 extern int stub_seeks;

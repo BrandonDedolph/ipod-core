@@ -21,7 +21,7 @@
 #include "wm8758.h"
 #include "i2s.h"
 #include "dma.h"
-#include "volume.h"       /* hal_codec_restore(): re-apply user state per track */
+#include "volume.h"       /* hal_codec_restore(): re-apply user state after a reset */
 #include "irqlock.h"      /* hw_irq_save/restore: set_source quiescence          */
 #include "audio.h"
 #include "../../kernel/cache.h"   /* cache_commit(): flush before DMA reads */
@@ -324,13 +324,53 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels)
     }
     g_channels = channels;
 
+    /*
+     * ONE discipline for every stream start, whatever the caller did first.
+     * A new stream over a running one is stopped here — soft-mute ramp over
+     * the last of the old audio, THEN the DMA cut — so nothing below ever
+     * re-clocks a DAC that is live or resets a FIFO the engine is feeding.
+     * No caller does this today (the player stops before every open); the
+     * invariant the rest of this function rests on — "not running means
+     * muted" — should not depend on that staying true.
+     */
+    if (g_running) {
+        hal_audio_stop();
+    }
+
     i2c_init();
-    i2s_init();
-    /* Hand the codec its state-restore hook BEFORE bring-up: wm8758_init's
-     * first act is a full WM_RESET, which wipes the user's volume/balance/
-     * bass/treble, and this runs once per TRACK. */
-    wm8758_set_restore(hal_codec_restore);
-    int codec_bad = wm8758_init();
+    int codec_bad;
+    if (g_cold) {
+        /*
+         * COLD (boot, after the persistent-pause power-down, after a close):
+         * the datasheet power-up, a WM_RESET first and a 100 ms VMID rise
+         * inside. MCLK first — i2s_init ungates DEV_EXTCLOCKS, and the codec
+         * masters its clocks from a PLL that needs it. The restore hook is
+         * handed over BEFORE the bring-up: the reset wipes the user's
+         * volume/balance/bass/treble and wm8758_init puts them back at the
+         * datasheet's unmute-and-set-volume step.
+         */
+        i2s_init();
+        wm8758_set_restore(hal_codec_restore);
+        codec_bad = wm8758_init();
+    } else {
+        /*
+         * WARM (a track change: Next/Prev, a row played over a playing
+         * track, a rate change at a gapless boundary, the Play after a
+         * paused skip): the codec is NOT reset. It used to be — a full
+         * WM_RESET + VMID cycle per track, and since this morning a
+         * power-down in front of it — and every one of those cycles was a
+         * thump on the jack: the datasheet sequence is a power-up, and the
+         * rails have no business moving between two songs. The codec is
+         * muted (the stop left it so), warm, and clocked at the previous
+         * track's rate; wm8758_retune writes nothing when that rate is this
+         * stream's, and re-programs the PLL under the mute when it is not.
+         * The I2S FIFO reset comes AFTER the retune so any clock wobble the
+         * re-lock put on the link is flushed before the first kick. Nothing
+         * to restore: no reset, so the user's codec state is still there.
+         */
+        codec_bad = wm8758_retune();
+        i2s_init();
+    }
     dma_playback_init();
 
     g_rate        = sample_rate;
@@ -341,7 +381,7 @@ int hal_audio_init(uint32_t sample_rate, uint16_t channels)
     g_primed      = 0;
     g_filled[0]   = 0;
     g_filled[1]   = 0;
-    g_cold        = 0;       /* wm8758_init + i2s_init just brought it all up */
+    g_cold        = 0;       /* brought up (cold) or still up (warm) either way */
     g_completions = 0;
     g_underruns   = 0;
     g_late_kicks  = 0;
@@ -391,7 +431,18 @@ void hal_audio_start(void)
         return;
     }
     i2s_tx_enable();
-    wm8758_mute(false);                        /* undo the mute from stop */
+    /*
+     * The DAC stays SOFT-MUTED until the DMA is streaming — the unmute is the
+     * last thing this function does, after the kick, on both paths below.
+     *
+     * It used to be here, first. But the TX FIFO has been empty since the
+     * stop (it drains in ~363 us) or since the reset a bring-up did, and
+     * nothing feeds it until audio_kick: between the two the serializer emits
+     * whatever it emits on underrun, and an unmuting DAC — ramping UP out of
+     * soft-mute — plays it. On a cold start that window also holds two
+     * 32 KB buffer fills and cache flushes. That was the noise on every
+     * Play. With the kick first, the unmute ramp fades in real audio.
+     */
     clock_set_audio_dma_active(1);             /* freeze the CPU/SDRAM clocks */
     mmio_write32(CPU_INT_EN_ADDR, DMA_MASK);   /* enable IRQ 26 */
 
@@ -445,6 +496,7 @@ void hal_audio_start(void)
         }
         g_running = 1;
         audio_kick(g_active, done, left);
+        wm8758_mute(false);              /* PCM is flowing: NOW undo the stop's mute */
         return;
     }
 
@@ -457,6 +509,7 @@ void hal_audio_start(void)
     g_running     = 1;
     g_primed      = 1;
     audio_kick(0, 0, AUDIO_BUF_BYTES);
+    wm8758_mute(false);                  /* PCM is flowing: NOW undo the bring-up's mute */
 }
 
 void audio_dma_isr(void)
@@ -540,23 +593,32 @@ int hal_audio_drain(uint32_t timeout_ms)
 void hal_audio_stop(void)
 {
     /*
-     * MUTE FIRST. Cutting the DMA with the DAC live leaves the serializer
-     * repeating whatever the FIFO last held and drops the output rail
-     * mid-waveform — the click on every stop and every skip. wm8758_mute()
-     * has existed since bring-up and was called from nowhere.
+     * MUTE FIRST, and let the mute FINISH. Cutting the DMA with the DAC live
+     * leaves the serializer repeating whatever the FIFO last held and drops
+     * the output rail mid-waveform — the click on every stop and every skip.
+     * wm8758_mute(true) does not return until the soft-mute ramp is over, so
+     * the ramp fades the real audio the DMA is still delivering, and the cut
+     * below lands on a DAC that is already silent.
+     *
+     * Only while running: a DAC that is not streaming is muted by invariant
+     * (the bring-up leaves it muted, and only hal_audio_start unmutes), so a
+     * stop-while-stopped — a seek while paused — has nothing to mute and
+     * should not pay the ramp wait for it.
      */
     int was_running = g_running;
 
-    wm8758_mute(true);
+    if (was_running) {
+        wm8758_mute(true);
+    }
     g_running = 0;
     mmio_write32(CPU_INT_DIS_ADDR, DMA_MASK);   /* mask IRQ 26 */
     dma_playback_stop();
     /*
      * Sample the DMA position NOW — after dma_playback_stop(), because the
-     * engine kept clocking bytes through the mute above (wm8758_mute is an
-     * I2C transfer, milliseconds of audio at 44.1 kHz), and before any more
-     * time can pass. Rounded DOWN to a whole frame so L/R phase cannot
-     * invert.
+     * engine kept clocking bytes through the mute above (the I2C transfer
+     * plus the ramp it waits out: ~23 ms of audio at 44.1 kHz, faded, and
+     * the resume picks up after it), and before any more time can pass.
+     * Rounded DOWN to a whole frame so L/R phase cannot invert.
      *
      * ONLY when we were actually running. Stopping an already-stopped engine
      * used to recompute this from now - g_kick_us, which counts the entire

@@ -541,10 +541,11 @@ static int test_eq_write_order_both_ways(void)
 }
 
 /*
- * Case 12: hal_audio_init resets the codec once per TRACK, so everything here
- * has to come back from RAM. hal_codec_restore must replay the OUT1 pair and
- * then the whole EQ burst — the same nine writes, same order — or the user's
- * preset would last exactly one track.
+ * Case 12: every COLD bring-up (boot, the Play after a persistent pause, the
+ * first play after a close) resets the codec, so everything here has to come
+ * back from RAM. hal_codec_restore must replay the OUT1 pair and then the
+ * whole EQ burst — the same nine writes, same order — or the user's preset
+ * would last exactly one pause.
  */
 static int test_codec_restore_replays_eq(void)
 {

@@ -1308,10 +1308,13 @@ static void player_advance(void);   /* fwd: a refused bring-up skips too */
 /*
  * Bring the DAC up at `rate` and begin pulling from the ring.
  *
- * hal_audio_init RESETS the WM8758 and writes 0 dB headphone gain, so the
- * user's volume and balance have to be re-applied — and re-applied BEFORE the
- * DMA is kicked, not after, or every track change emits ~30-80 ms at unity
- * gain. The bug this fixes was worse than that: the only re-apply anywhere was
+ * hal_audio_init on a COLD codec RESETS the WM8758 and writes 0 dB headphone
+ * gain, so the user's volume and balance have to be re-applied — and
+ * re-applied BEFORE the DMA is kicked, not after, or the first play emits
+ * ~30-80 ms at unity gain. (On a warm codec — a track change — the HAL
+ * resets nothing and the re-apply is two same-value writes; the player does
+ * not know which it got and does not need to.) The bug this fixes was worse
+ * than that: the only re-apply anywhere was
  * a POINTER compare in main.c (`tn != last_tn` against &g_queue[idx].name), so
  * whenever Repeat-One or a Prev-restart reopened the same queue index the
  * pointer was identical, the branch never fired, and the codec stayed at unity
@@ -1438,9 +1441,11 @@ static int player_open_current(int paused)
     g_boundary = 0;
     decode_pump();                       /* prime */
 
-    /* Full audio bring-up per track (proven by the old sequential player):
-     * player_stop() has already cleanly stopped any previous track, so re-init
-     * here is over a quiescent HAL. The rate comes from the FILE now — the old
+    /* hal_audio_init per track — the HAL decides what that costs: a full
+     * bring-up when the codec is cold, a retune (nothing, at the same rate)
+     * when it is warm. player_stop() has already cleanly stopped any previous
+     * track, so re-init here is over a quiescent HAL. The rate comes from the
+     * FILE now — the old
      * hard `!= 44100 || != 2` rejection meant a 48 kHz album or a mono podcast
      * scrolled past unplayed and unexplained. Mono is up-mixed to stereo in
      * the decode step, so the DAC only ever sees 2 channels and we depend on

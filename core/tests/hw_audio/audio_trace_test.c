@@ -13,8 +13,12 @@
  *      drains the bus on every later call (the reset is one-shot).
  *   2. i2c_send emits the exact controller sequence (addr, write-mode,
  *      data, count, strobe) and rejects bad lengths / BUSY timeout.
- *   3. wm8758_init issues all 30 codec writes, with correct 9-bit
- *      framing, the DAC->mixer route present, and unmute (DACCTRL) LAST.
+ *   3. wm8758_init is the datasheet's power-up sequence: 30 codec writes
+ *      with correct 9-bit framing, the DAC->mixer route present, VMID on
+ *      the 75k divider with a 100 ms rise waited out before the output
+ *      unmute, POBCTRL dropped LAST, the DAC left soft-muted; and its two
+ *      companions — wm8758_powerdown drains VMID for 300 ms before the
+ *      rails go, wm8758_retune re-clocks a warm codec without a reset.
  *   4. i2s_init emits the exact clock-plumbing + FIFO reset/format
  *      grammar.
  *   5. i2s_write_stereo polls TXFree then writes one packed [R<<16|L]
@@ -272,25 +276,98 @@ static int test_i2c_send_guards(void)
     return fails;
 }
 
-/* Case 4: wm8758_init completeness + framing + ordering. 30 codec
+/* Log index of the first codec write carrying (b0, b1) — the DATA0 write's
+ * index, its DATA1 partner being the next DATA1 write; -1 if none. Lets a
+ * case order codec writes against each other and against the timer waits. */
+static long codec_write_index(uint8_t b0, uint8_t b1)
+{
+    const mmio_event *log = mmio_mock_log();
+    size_t len = mmio_mock_log_len();
+    for (size_t i = 0; i < len; i++) {
+        if (log[i].op != MMIO_OP_WRITE || log[i].addr != I2C_DATA0_ADDR ||
+            log[i].value != b0) {
+            continue;
+        }
+        for (size_t j = i + 1; j < len; j++) {
+            if (log[j].op == MMIO_OP_WRITE && log[j].addr == I2C_DATA1_ADDR) {
+                if (log[j].value == b1) {
+                    return (long)i;
+                }
+                break;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Log index of the first read of `addr`; -1 if none. */
+static long first_read_index(uint32_t addr)
+{
+    const mmio_event *log = mmio_mock_log();
+    size_t len = mmio_mock_log_len();
+    for (size_t i = 0; i < len; i++) {
+        if (log[i].op == MMIO_OP_READ && log[i].addr == addr) {
+            return (long)i;
+        }
+    }
+    return -1;
+}
+
+/* Codec payloads (reg<<1 | data bit 8, data low byte) the sequencing cases
+ * look for. Hand-packed from wm8758.h's register numbers and bit values. */
+#define CW_RESET_B0          0x00
+#define CW_PWRMGMT1_B0       0x02
+#define CW_PWRMGMT1_RUN_B1   0x2D   /* PLLEN|BIASEN|BUFIOEN|VMIDSEL_75K       */
+#define CW_PWRMGMT1_10K_B1   0x2F   /* ...|VMIDSEL_10K: the old fast charge   */
+#define CW_PWRMGMT1_PLLOFF_B1 0x0D  /* BIASEN|BUFIOEN|VMIDSEL_75K (PLLEN off) */
+#define CW_PWRMGMT1_DRAIN_B1 0x28   /* PLLEN|BIASEN: VMID divider + BUFIO off */
+#define CW_PWRMGMT2_B0       0x04
+#define CW_PWRMGMT3_B0       0x06
+#define CW_DACCTRL_B0        0x14
+#define CW_DACCTRL_MUTED_B1  0x48   /* DACOSR128 | SOFTMUTE                   */
+#define CW_DACCTRL_UNMUTE_B1 0x08   /* DACOSR128 alone                        */
+#define CW_PLLN_B0           0x48
+#define CW_PLLN_44_B1        0x17
+#define CW_PLLN_48_B1        0x18
+#define CW_ADDCTRL_B0        0x0E
+#define CW_OUT4TOADC_B0      0x54
+#define CW_OUT4TOADC_POB_B1  0x04   /* POBCTRL                                */
+#define CW_OUT4TOADC_DRAIN_B1 0x14  /* POBCTRL | VMIDTOG                      */
+#define CW_OUTCTRL_B0        0x63   /* OUTCTRL 0x31, bit 8 (HP_COM) set       */
+#define CW_OUTCTRL_NOTSD_B1  0x85   /* HP_COM|LINE_COM|TSOPCTRL|VROI, no TSDEN*/
+#define CW_BIASCTRL_B0       0x7A   /* BIASCTRL 0x3D, bit 8 clear (= 0)       */
+#define CW_LOUT1VOL_B0       0x68
+#define CW_LOUT1VOL_0DB_B1   0xB9   /* 0x39 | ZC                              */
+#define CW_ROUT1VOL_B0       0x6B   /* ROUT1VOL 0x35 with VU (bit 8)          */
+
+/* Case 4: wm8758_init is the datasheet's power-up sequence. 30 codec
  * writes; correct 9-bit packing on the first (BIASCTRL) and the 44.1k
- * CLKCTRL; the DAC->mixer route present; unmute (DACCTRL) issued LAST. */
+ * CLKCTRL; the DAC->mixer route present; VMID charged on the 75k divider
+ * (never the 10k fast one); the VMID rise waited out for 100 ms AFTER the
+ * charge starts and BEFORE the outputs are unmuted; POBCTRL held through
+ * that wait and dropped as the LAST write; the DAC left soft-muted. */
 static int test_wm8758_init(void)
 {
     int fails = 0;
+    /* USEC_TIMER script: t0, then 40 ms (the OLD settle — a driver still
+     * waiting 40 ms exits here), 99 999 us (still short), 100 000 (done).
+     * Every read after the last repeats it. Exactly four reads means the
+     * wait is precisely 100 ms; two would mean 40. */
+    static const uint32_t rise[] = { 0u, 40000u, 99999u, 100000u };
     mmio_mock_reset();
     mmio_mock_set_read(I2C_STATUS_ADDR, 0);
     mmio_mock_set_read(I2C_CTRL_ADDR,   0);
+    mmio_mock_queue_read(USEC_TIMER_ADDR, rise, 4);
 
     wm8758_init();
 
-    /* One I2C_ADDR write per codec register write (31 = reset + 30). */
-    fails += check("wm8758_init: 31 codec writes",
-                   count_writes(I2C_ADDR_ADDR) == 31);
+    /* One I2C_ADDR write per codec register write (30 = reset + 29). */
+    fails += check("wm8758_init: 30 codec writes",
+                   count_writes(I2C_ADDR_ADDR) == 30);
     /* Every transaction addresses the codec (0x1a<<1). */
     fails += check("wm8758_init: all addressed to 0x34",
                    nth_write(I2C_ADDR_ADDR, 0) == 0x34 &&
-                   nth_write(I2C_ADDR_ADDR, 30) == 0x34);
+                   nth_write(I2C_ADDR_ADDR, 29) == 0x34);
     /* First write is the soft RESET(0x00)=0: b0 = 0x00, b1 = 0x00. */
     fails += check("wm8758_init: first write is soft RESET (0x00/0x00)",
                    nth_write(I2C_DATA0_ADDR, 0) == 0x00 &&
@@ -305,11 +382,168 @@ static int test_wm8758_init(void)
      * Without this the DAC is powered but unrouted -> silence. */
     fails += check("wm8758_init: DAC->mixer route present (0x64/0x01)",
                    has_codec_write(0x64, 0x01));
-    /* LAST codec write must be the unmute DACCTRL(0x0a)=DACOSR128(0x08):
-     * b0 = 0x14, b1 = 0x08. Unmuting before routing/rails would click. */
-    fails += check("wm8758_init: unmute (DACCTRL) is the LAST write",
-                   nth_write(I2C_DATA0_ADDR, 30) == 0x14 &&
-                   nth_write(I2C_DATA1_ADDR, 30) == 0x08);
+    /* DACCTRL(0x0a) = DACOSR128|SOFTMUTE (0x48) is written, and the bring-up
+     * ENDS MUTED — nothing feeds the serializer yet, and an unmuted DAC over
+     * an idle serializer plays its underrun output; hal_audio_start unmutes
+     * after the DMA kick. No write in the whole bring-up ever unmutes. */
+    fails += check("wm8758_init: DACCTRL = OSR128 | SOFTMUTE is written",
+                   has_codec_write(CW_DACCTRL_B0, CW_DACCTRL_MUTED_B1));
+    fails += check("wm8758_init: never unmutes the DAC",
+                   !has_codec_write(CW_DACCTRL_B0, CW_DACCTRL_UNMUTE_B1));
+
+    /* --- the datasheet's sequencing ------------------------------------ */
+    long vmid_on  = codec_write_index(CW_PWRMGMT1_B0, CW_PWRMGMT1_RUN_B1);
+    long pob_on   = codec_write_index(CW_OUT4TOADC_B0, CW_OUT4TOADC_POB_B1);
+    long route    = codec_write_index(0x64, 0x01);
+    long wait     = first_read_index(USEC_TIMER_ADDR);
+    long bias_ok  = codec_write_index(CW_BIASCTRL_B0, 0x00);
+    long unmute_l = codec_write_index(CW_LOUT1VOL_B0, CW_LOUT1VOL_0DB_B1);
+    long unmute_r = codec_write_index(CW_ROUT1VOL_B0, CW_LOUT1VOL_0DB_B1);
+    long dacmute  = codec_write_index(CW_DACCTRL_B0, CW_DACCTRL_MUTED_B1);
+    long pob_off  = codec_write_index(CW_OUT4TOADC_B0, 0x00);
+
+    /* VMID charges on the divider it plays through. The 10k fast charge was
+     * a per-track-bring-up compromise, and a 7x steeper thump. */
+    fails += check("wm8758_init: VMID charged on the 75k divider (PWRMGMT1 = 0x2D)",
+                   vmid_on >= 0);
+    fails += check("wm8758_init: never the 10k fast charge (no PWRMGMT1 = 0x2F)",
+                   !has_codec_write(CW_PWRMGMT1_B0, CW_PWRMGMT1_10K_B1));
+    /* POBCTRL is on before VMID starts charging, and the amps are already
+     * enabled by then (PWRMGMT2 precedes PWRMGMT1 in the table). */
+    fails += check("wm8758_init: POBCTRL set BEFORE VMID starts charging",
+                   pob_on >= 0 && vmid_on >= 0 && pob_on < vmid_on);
+    /* The rise is waited out AFTER the charge starts and the interface, PLL
+     * and route are programmed, and BEFORE anything is unmuted. */
+    fails += check("wm8758_init: the VMID wait follows the charge start and the DAC route",
+                   wait >= 0 && wait > vmid_on && wait > route);
+    fails += check("wm8758_init: the VMID wait is 100 ms (exactly four timer reads)",
+                   mmio_mock_count(MMIO_OP_READ, USEC_TIMER_ADDR) == 4);
+    fails += check("wm8758_init: low-bias cleared and outputs unmuted only AFTER the wait",
+                   bias_ok > wait && unmute_l > wait && unmute_r > wait &&
+                   dacmute > wait);
+    /* POBCTRL comes off LAST — after the output unmute, after DACCTRL. It
+     * used to come off before the wait even began. */
+    fails += check("wm8758_init: POBCTRL dropped AFTER the output unmute",
+                   pob_off >= 0 && pob_off > unmute_r && pob_off > dacmute);
+    fails += check("wm8758_init: OUT4TOADC = 0 (POBCTRL off) is the LAST codec write",
+                   nth_write(I2C_DATA0_ADDR, 29) == CW_OUT4TOADC_B0 &&
+                   nth_write(I2C_DATA1_ADDR, 29) == 0x00);
+    return fails;
+}
+
+/* Case 4b: wm8758_powerdown is the datasheet's power-down sequence: DAC and
+ * outputs muted, thermal shutdown off, VMID discharge begun (POBCTRL |
+ * VMIDTOG) and the VMID divider + I/O buffer dropped, THEN a 300 ms drain,
+ * and only after it the amps, bias/PLL and DAC/mixers off. The drain used
+ * to be missing: three back-to-back writes cut the amps with VMID at
+ * midrail. */
+static int test_wm8758_powerdown(void)
+{
+    int fails = 0;
+    /* t0, 150 ms (an under-length drain exits here), 299 999, 300 000. */
+    static const uint32_t drain[] = { 0u, 150000u, 299999u, 300000u };
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_STATUS_ADDR, 0);
+    mmio_mock_set_read(I2C_CTRL_ADDR,   0);
+    mmio_mock_queue_read(USEC_TIMER_ADDR, drain, 4);
+
+    wm8758_powerdown();
+
+    long dacmute = codec_write_index(CW_DACCTRL_B0, CW_DACCTRL_MUTED_B1);
+    long no_tsd  = codec_write_index(CW_OUTCTRL_B0, CW_OUTCTRL_NOTSD_B1);
+    long vmidtog = codec_write_index(CW_OUT4TOADC_B0, CW_OUT4TOADC_DRAIN_B1);
+    long divoff  = codec_write_index(CW_PWRMGMT1_B0, CW_PWRMGMT1_DRAIN_B1);
+    long wait    = first_read_index(USEC_TIMER_ADDR);
+    long r1_off  = codec_write_index(CW_PWRMGMT1_B0, 0x00);
+    long r2_off  = codec_write_index(CW_PWRMGMT2_B0, 0x00);
+    long r3_off  = codec_write_index(CW_PWRMGMT3_B0, 0x00);
+
+    fails += check("wm8758_powerdown: 9 codec writes",
+                   count_writes(I2C_ADDR_ADDR) == 9);
+    fails += check("wm8758_powerdown: DAC soft-muted first",
+                   dacmute == codec_write_index(CW_DACCTRL_B0, CW_DACCTRL_MUTED_B1) &&
+                   dacmute >= 0 && dacmute < no_tsd);
+    fails += check("wm8758_powerdown: thermal shutdown off, then VMIDTOG, then the divider off",
+                   no_tsd >= 0 && vmidtog >= 0 && divoff >= 0 &&
+                   no_tsd < vmidtog && vmidtog < divoff);
+    fails += check("wm8758_powerdown: the drain wait follows the divider-off write",
+                   wait >= 0 && wait > divoff);
+    fails += check("wm8758_powerdown: the drain is 300 ms (exactly four timer reads)",
+                   mmio_mock_count(MMIO_OP_READ, USEC_TIMER_ADDR) == 4);
+    fails += check("wm8758_powerdown: amps, bias/PLL and DAC/mixers off only AFTER the drain",
+                   r1_off > wait && r2_off > wait && r3_off > wait);
+    fails += check("wm8758_powerdown: never a WM_RESET",
+                   !has_codec_write(CW_RESET_B0, 0x00));
+    return fails;
+}
+
+/* Case 4c: wm8758_retune, the warm track change. At the rate the codec is
+ * already programmed for it writes nothing; at a new rate it re-programs
+ * the PLL and dividers with PLLEN cleared across the write and restored
+ * after, then waits for lock — and never resets, never touches the rails,
+ * never touches DACCTRL. Runs after case 4 left the codec at 44.1 kHz. */
+static int test_wm8758_retune(void)
+{
+    int fails = 0;
+
+    /* Case 4b left the codec COLD (a power-down forgets what was
+     * programmed, correctly — the next bring-up is a reset). Warm it at
+     * 44.1 kHz first; a retune is only defined against a warm codec. */
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_STATUS_ADDR, 0);
+    mmio_mock_set_read(I2C_CTRL_ADDR,   0);
+    (void)wm8758_set_rate(44100u);
+    (void)wm8758_init();
+
+    /* Same rate: silence on the bus. */
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_STATUS_ADDR, 0);
+    mmio_mock_set_read(I2C_CTRL_ADDR,   0);
+    fails += check("wm8758_retune: 44.1k -> 44.1k accepted", wm8758_set_rate(44100u) == 0);
+    fails += check("wm8758_retune: returns 0 at an unchanged rate", wm8758_retune() == 0);
+    fails += check("wm8758_retune: an unchanged rate writes NOTHING",
+                   mmio_mock_log_len() == 0);
+
+    /* New rate: PLLEN off, six rate writes, PLLEN on, lock wait. */
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_STATUS_ADDR, 0);
+    mmio_mock_set_read(I2C_CTRL_ADDR,   0);
+    fails += check("wm8758_retune: 48k accepted", wm8758_set_rate(48000u) == 0);
+    fails += check("wm8758_retune: returns 0 at 48k", wm8758_retune() == 0);
+
+    long plloff = codec_write_index(CW_PWRMGMT1_B0, CW_PWRMGMT1_PLLOFF_B1);
+    long plln   = codec_write_index(CW_PLLN_B0, CW_PLLN_48_B1);
+    long addctl = codec_write_index(CW_ADDCTRL_B0, 0x01);
+    long pllon  = codec_write_index(CW_PWRMGMT1_B0, CW_PWRMGMT1_RUN_B1);
+    long wait   = first_read_index(USEC_TIMER_ADDR);
+    fails += check("wm8758_retune: 8 codec writes for a rate change",
+                   count_writes(I2C_ADDR_ADDR) == 8);
+    fails += check("wm8758_retune: PLLEN off BEFORE the PLL is re-programmed",
+                   plloff >= 0 && plln >= 0 && plloff < plln);
+    fails += check("wm8758_retune: PLLEN back on AFTER the last rate register",
+                   addctl >= 0 && pllon >= 0 && addctl < pllon && plln < addctl);
+    fails += check("wm8758_retune: the lock wait follows PLLEN on",
+                   wait >= 0 && wait > pllon);
+    fails += check("wm8758_retune: the 48k CLKCTRL 0x145 is present",
+                   has_codec_write(0x0D, 0x45));
+    fails += check("wm8758_retune: no WM_RESET, no rails, no DACCTRL, no POBCTRL",
+                   !has_codec_write(CW_RESET_B0, 0x00) &&
+                   !has_codec_write(CW_PWRMGMT1_B0, 0x00) &&
+                   !has_codec_write(CW_PWRMGMT2_B0, 0x00) &&
+                   !has_codec_write(CW_DACCTRL_B0, CW_DACCTRL_MUTED_B1) &&
+                   !has_codec_write(CW_DACCTRL_B0, CW_DACCTRL_UNMUTE_B1) &&
+                   !has_codec_write(CW_OUT4TOADC_B0, 0x00) &&
+                   !has_codec_write(CW_OUT4TOADC_B0, CW_OUT4TOADC_DRAIN_B1));
+
+    /* And back: the change is what is written, not the rate itself. */
+    mmio_mock_reset();
+    mmio_mock_set_read(I2C_STATUS_ADDR, 0);
+    mmio_mock_set_read(I2C_CTRL_ADDR,   0);
+    (void)wm8758_set_rate(44100u);
+    (void)wm8758_retune();
+    fails += check("wm8758_retune: 48k -> 44.1k re-programs (PLLN 0x17 present)",
+                   has_codec_write(CW_PLLN_B0, CW_PLLN_44_B1) &&
+                   count_writes(I2C_ADDR_ADDR) == 8);
     return fails;
 }
 
@@ -483,6 +717,8 @@ int main(void)
     fails += test_i2c_send_grammar();
     fails += test_i2c_send_guards();
     fails += test_wm8758_init();
+    fails += test_wm8758_powerdown();
+    fails += test_wm8758_retune();
     fails += test_i2s_init_grammar();
     fails += test_i2s_write();
     fails += test_i2s_write_noclock();

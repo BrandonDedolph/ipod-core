@@ -635,9 +635,11 @@ if target == 'sim'
   # automated check of the audio register grammar — clicky models no
   # I2C/I2S/DAC and the device needs a logic analyzer; sound itself is
   # the on-device proof. Asserts i2c_init/i2c_send grammar + guards, the
-  # 30-write wm8758_init with correct 9-bit framing / DAC route / unmute-
-  # last ordering, i2s_init clock+FIFO grammar, and the polled write
-  # (TXFree poll + packed word, plus the no-drain bail).
+  # 30-write wm8758_init as the datasheet power-up (75k VMID, the 100 ms
+  # rise before the output unmute, POBCTRL off last, DAC left muted), the
+  # draining wm8758_powerdown, the reset-free wm8758_retune, i2s_init
+  # clock+FIFO grammar, and the polled write (TXFree poll + packed word,
+  # plus the no-drain bail).
   audio_trace_test = executable(
     'audio_trace_test',
     sources: ['hw_audio/audio_trace_test.c',

@@ -88,16 +88,17 @@ uint32_t audio_late_worst_us(void);
  *
  * hal_audio_wake() is the inverse: it re-runs the codec bring-up (a WM_RESET,
  * so the user's volume/balance/tone are re-latched through the restore hook,
- * exactly as per-track hal_audio_init does), re-ungates the clocks and re-arms
+ * exactly as a cold hal_audio_init does), re-ungates the clocks and re-arms
  * the DMA block, and touches none of the buffer state. A following
  * hal_audio_start() then resumes INTO the retained buffers, at the retained
  * offset, precisely as an un-suspended unpause would. Returns 0, or -2 when
  * the codec did not answer on I2C (same signal as hal_audio_init). A no-op
  * returning 0 when the codec is not cold.
  *
- * The pair costs a codec reset plus the VMID settle (~40 ms) on the way back,
- * which is why the player only reaches for it once a pause has PERSISTED — a
- * quick pause/unpause never pays it.
+ * The pair costs the VMID drain (~300 ms) on the way down and a codec reset
+ * plus the VMID rise (~100 ms) on the way back, which is why the player only
+ * reaches for it once a pause has PERSISTED — a quick pause/unpause never
+ * pays either.
  */
 void hal_audio_suspend(void);
 

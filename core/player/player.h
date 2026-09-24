@@ -176,8 +176,9 @@ int  player_playing(void);
  * resume, re-latching volume/balance/tone, resuming from the exact position
  * and without a click.
  *
- * Why not immediately: the wake is a codec reset plus a ~40 ms VMID settle,
- * which a pause/unpause to answer a question should never pay. Why 5 s and not
+ * Why not immediately: the power-down is a ~300 ms VMID drain and the wake a
+ * codec reset plus a ~100 ms VMID rise, which a pause/unpause to answer a
+ * question should never pay. Why 5 s and not
  * 30: the cases split cleanly by duration. A pause that is about to be undone
  * is undone within a couple of seconds; anything longer is the device being
  * put down, and the first five seconds of a thirty-minute pause is a rounding

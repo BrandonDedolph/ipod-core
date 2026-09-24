@@ -231,15 +231,20 @@
 int wm8758_set_rate(uint32_t sample_rate);
 
 /*
- * Register a callback invoked at the very END of wm8758_init(), after the
- * unmute. hal/hw/audio.c points this at hal_codec_restore() so the user's
- * volume/balance/bass/treble survive the full WM_RESET that starts every
- * per-track bring-up. NULL (the default) disables it.
+ * Register a callback invoked near the end of wm8758_init(), at the
+ * datasheet's "unmute outputs and set desired volume" step (the DAC is
+ * still soft-muted; only POBCTRL-off follows it). hal/hw/audio.c points this
+ * at hal_codec_restore() so the user's volume/balance/bass/treble survive
+ * the full WM_RESET that starts every cold bring-up. NULL (the default)
+ * disables it.
  */
 void wm8758_set_restore(void (*fn)(void));
 
 /*
- * Bring the codec up. Returns the number of control writes that FAILED
+ * Bring a COLD codec up: the datasheet's power-up sequence, WM_RESET first,
+ * a 100 ms VMID rise inside, DAC left soft-muted. Boot, the Play after a
+ * persistent pause, the first play after a close — never a track change
+ * (that is wm8758_retune). Returns the number of control writes that FAILED
  * (0 = the whole sequence was accepted). See wm8758.c for what that number
  * can actually detect: the PP502x controller has no per-byte NAK status, so
  * the only observable failure is a wedged bus (BUSY never clearing) — but
@@ -247,11 +252,30 @@ void wm8758_set_restore(void (*fn)(void));
  * no indication anywhere.
  */
 int  wm8758_init(void);
+
+/*
+ * Re-clock a WARM codec to the rate last given to wm8758_set_rate. No writes
+ * at all when the codec is already programmed for it; otherwise the PLL and
+ * dividers are re-programmed with PLLEN toggled around the write and a
+ * bounded lock wait after. The caller guarantees the DAC is soft-muted and
+ * the DMA stopped (hal/hw/audio.c does), and resets the I2S FIFO afterwards.
+ * Same return as wm8758_init. Meaningless on a cold codec — use wm8758_init.
+ */
+int  wm8758_retune(void);
+/*
+ * DAC soft-mute. The bring-up leaves the DAC muted; the stream unmutes once
+ * PCM is actually flowing. A mute does not return until the ramp is over
+ * (bounded USEC_TIMER wait, ~23 ms at 44.1 kHz), so the caller may cut the
+ * data the moment it returns. Neither direction touches the oversampling
+ * ratio. Callable in any codec state; a mute of a cold codec is a harmless
+ * write plus the wait.
+ */
 void wm8758_mute(bool mute);
 
-/* Pop-suppressed power-down: mute, discharge VMID, drop all power rails. The
- * codec is left cold — call wm8758_init() (per track via hal_audio_init) to
- * bring it back. Call while MCLK is still running; gate clocks afterwards. */
+/* Pop-suppressed power-down: mute, discharge VMID, WAIT for it to drain
+ * (~300 ms, bounded), then drop all power rails. The codec is left cold —
+ * wm8758_init() brings it back. Call while MCLK is still running; gate
+ * clocks afterwards. Blocks for the drain, so not on a button's path. */
 void wm8758_powerdown(void);
 #endif
 
