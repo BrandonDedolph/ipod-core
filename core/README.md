@@ -278,15 +278,16 @@ partition: boot + MMAP0 remap, LCD, click-wheel, backlight, WM8758B audio,
 DMA streaming playback, ATA + FAT32, and streaming FLAC off the device's disk,
 with the full menu / browser /
 now-playing UI, seven themes, persistent settings, resume-on-boot, sleep /
-power-off from the Play button, and the on-disk event log. Music → Search
-(a wheel-driven character ring over song titles, artists, albums and playlist
-names) and the A-Z locator plate on every long list are in the tree but have
-not been flashed.
+power-off from the Play button, the sleep timer and the idle sleep, Music →
+Search (a wheel-driven character ring over song titles, artists, albums and
+playlist names), the A-Z locator plate on every long list, On-The-Go, the
+clock, and the on-disk event log.
 
 Not yet confirmed on hardware: MP3 playback in real time (it is switched on
 and correct on the host — see "Audio path" — but the DECODE percentage has
 never been read off a device playing an MP3), gapless playback, playlists with
 real `.m3u8` files, and the post-fix FLAC seek timing (the fix is in — see
 [`codecs/README.md`](codecs/README.md) — but the improvement has not been
-re-measured on the device). The charger is held at 100 mA. See
-[`../STATUS.md`](../STATUS.md) for the running list.
+re-measured on the device), and the draw of the idle sleep itself. The
+charger is asked for 500 mA, with Settings → Battery → Charge Rate as the
+100 mA fallback. See [`../STATUS.md`](../STATUS.md) for the running list.

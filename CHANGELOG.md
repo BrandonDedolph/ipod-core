@@ -3,7 +3,11 @@
 Each release lists what changed on the device since the previous one. Versions are git tags;
 the boot screen and Settings → About show the one the device runs.
 
-## Unreleased
+## v0.2.0 — 2026-09-24
+
+Since v0.1.3. MP3 plays, Search and the A–Z letter are on every list, On-The-Go, Shuffle
+Albums, the clock, Volume Limit and EQ presets, the charger asks for what it needs, the pops and
+the crunch are out of the audio path, and a paused iPod finally goes to sleep.
 
 - **ReplayGain no longer clips.** 897 of the library's 928 FLACs carry a
   ReplayGain tag and the player has always applied it — but only the gain,
@@ -16,6 +20,18 @@ the boot screen and Settings → About show the one the device runs.
   gain the playing track runs at and whether it was capped, and carries a
   100 Hz sample of the I2S FIFO so a starved DAC inside a DMA transfer — the
   one dropout neither existing counter can see — shows up as a number.
+- **No pop on Play, and none between songs.** Pressing Play unmuted the DAC before the first
+  DMA transfer had started, so the codec's own fade-in played whatever the empty serialiser put
+  out; the mute write also flipped the DAC's oversampling bit each way. The transfer now starts
+  first and the unmute comes last, mute waits out its own 23 ms ramp before the DMA stops, and
+  oversampling is left alone. Every track change then turned out to run the whole codec
+  power-up — a reset and a rail cycle, per song — and that power-up released the anti-pop bias
+  before the reference had settled: the thump at boot, at every Next, and on Play after a pause.
+  A track change now only retunes the codec's PLL when the sample rate actually changes (nothing
+  is written for a same-rate skip), the cold bring-up follows the datasheet's own sequence — slow
+  reference charge, 100 ms, pop bias released last — and the power-down drains the reference for
+  300 ms before the rails go. Next and Prev are about 50 ms quicker for it; the first Play after a
+  long pause is about 60 ms slower.
 - **A paused iPod goes to sleep.** Pause a track and put the device down
   and, two minutes after the last press, it sleeps the way holding Play
   sleeps it: any button wakes it instantly, still paused, and half an hour

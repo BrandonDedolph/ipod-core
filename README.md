@@ -40,9 +40,10 @@ New to the device? Read the [user guide](docs/USER_GUIDE.md).
 - **Remembers.** Settings, the resume position, the queue it was in and the live On-The-Go list
   persist to pre-allocated files on the disk, CRC-checked, never moving a cluster. A 4 MiB on-disk
   event log captures every diagnostic line.
-- **Sleeps.** Hold Play to sleep, or set a sleep timer of 15 to 120 minutes; the drive parks, the
-  panel and codec go down, the CPU idles. On battery, a sleeping device powers itself off after
-  thirty minutes.
+- **Sleeps.** Hold Play to sleep, set a sleep timer of 15 to 120 minutes, or just put a paused
+  iPod down: two minutes after the last press it sleeps on its own. The drive parks, the panel and
+  codec go down, the CPU idles. On battery, a sleeping device powers itself off after thirty
+  minutes.
 - **Knows what time it is.** The PMIC's always-on clock, read at boot and carried in software, with
   the time optionally in the title bar. The iPod cannot be told the time over the cable — on it,
   Apple's disk mode is what answers the computer — so `core sync` and `core eject` leave the time in
@@ -250,13 +251,14 @@ ROM; nothing this firmware writes can remove it. Reflash, or restore the partiti
 
 ## Status
 
-Runs on the device: direct boot, FLAC playback, the library, themes, settings and resume, sleep
-and power-off, the event log. Built but not yet flashed: MP3 playback, Search, the A–Z letter on
-every list, and On-The-Go. Not there: podcasts. MP3 decodes correctly and within budget on the
-host; whether it holds real time on the device is the next bench. Playlists are read from the disk
-and On-The-Go writes five saved slots the host pre-allocated; making a playlist file of your own on
-the device still needs a filesystem writer that does not exist. The running list of what works and
-what is next is [`STATUS.md`](STATUS.md).
+Runs on the device: direct boot, FLAC playback, the library, Search, the A–Z letter, On-The-Go,
+themes, settings and resume, the clock, pause on unplug, sleep and power-off — held, timed or
+idle — the charger at 500 mA, and the event log. On the device but not yet benched: MP3 in real
+time (it decodes correctly and within budget on the host; Boot Details' DECODE percentage is the
+reading to take), and the idle sleep's own draw. Not there: podcasts. Playlists are read from the
+disk and On-The-Go writes five saved slots the host pre-allocated; making a playlist file of your
+own on the device still needs a filesystem writer that does not exist. The running list of what
+works and what is next is [`STATUS.md`](STATUS.md).
 
 Versions are git tags, `v0.1.0` and up. The boot screen's bottom-right stamp and Settings → About
 show the version the device runs; an untagged build shows the nearest tag, the commit distance and

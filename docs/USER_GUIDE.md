@@ -1,6 +1,6 @@
 # Using core
 
-This guide describes Core v0.1.3. The device shows its version bottom-right on the boot screen and
+This guide describes Core v0.2.0. The device shows its version bottom-right on the boot screen and
 in Settings → About; Boot Details shows the full build string.
 
 This is the guide for the person holding the iPod. It covers the controls, every screen, the `core`
@@ -330,6 +330,13 @@ until the device sleeps or powers off, so leaving Settings never makes you wait.
   </tr>
 </table>
 
+- **Battery.** What the charge is doing, as opposed to what the charger claims: the cell's
+  voltage, the supply (USB or dock) and the budget asked of it, how far the cell has moved since
+  the cable went in, a line of the last hour, and the charger's two control pins read back from
+  the chip. **Charge Rate** is 500 mA or 100 mA. 500 is what Apple's firmware asks a computer for
+  and is the default; 100 is the USB minimum, for a port that objects to more, or for a quieter
+  headphone jack while plugged into a PC. Note that at 100 mA the device itself uses most of the
+  budget: paused with the drive parked it barely charges, and playing it does not charge at all.
 - **About.** The firmware version, model, song, album and artist counts, storage free, battery
   percentage and voltage, the event log's state, and the headphone jack's switch — `JACK 1` when a
   plug is seated, `JACK 0` when it is not, followed by `n` and the number of times it has changed
@@ -523,9 +530,14 @@ The battery in the status strip is an estimate from the cell's voltage. An old c
 drive spins and rebounds after, so the percentage can move several points in a minute; the
 voltage on the About page is steadier.
 
-- **Charging.** Plug in and the charging screen shows the percentage; any button dismisses it, and
-  that press does nothing else. The gauge reads the cell, not the charger, so it does not jump to
-  full when you plug in.
+- **Charging.** Plug in and the charging screen shows the percentage, with the voltage, the
+  budget asked of the charger and — once the cable has been in a minute — how far the cell has
+  moved since, in a caption underneath; any button dismisses it, and that press does nothing
+  else. The gauge reads the cell, not the charger, so it does not jump to full when you plug in.
+  Hold works on this screen, but shows only a small padlock in the top-right corner rather than
+  the banner. Settings, Battery has the same numbers and the Charge Rate.
+- **On the cable it stays awake.** The idle sleep below is for battery; plugged in, a paused iPod
+  keeps its screen and stays where it is.
 - **Low.** At 3.7 V a small toast says the battery is low.
 - **Very low.** At 3.5 V a full-screen warning: the drive parks whenever playback does not need it,
   and the device stops writing settings and the log until you plug in. Plug in now to keep listening.
@@ -547,6 +559,13 @@ voltage on the About page is steadier.
   drive spins it up before the music starts.
 - **Sleep.** Hold Play two seconds. Playback pauses and the position is saved, the drive parks, the
   screen and backlight go off, the codec powers down. Any button wakes it back where it was.
+  Headphones pulled out while it sleeps make it wake paused instead of resuming, even if you plug
+  them back in before waking it.
+- **Idle sleep.** Pause a track, or stop, and put the device down: two minutes after the last
+  press it sleeps exactly as a held Play sleeps it, and any button wakes it, still paused. It
+  only happens while nothing is playing and only on battery; while a sleep timer is running the
+  timer is in charge instead. Before this an idle iPod stayed awake for as long as its battery
+  lasted.
 - **Sleep timer.** Settings, Playback, Sleep Timer arms a countdown of 15 to 120 minutes; SLEEP and
   the minutes left show in the top band. It runs whatever the device is doing — playing, paused,
   or with Hold on and the thing in your pocket — and nothing you press resets it: it is a duration,
@@ -554,9 +573,6 @@ voltage on the About page is steadier.
   it wakes **paused**: you fell asleep, so the next press is where was I, not play. Thirty minutes
   later, on battery, it powers itself off like any sleeping device. Waking it with Hold on needs
   Hold off first, as always. The timer reads Off again afterwards, and after any restart.
-  screen and backlight go off, the codec powers down. Any button wakes it back where it was. (Once
-  jack sensing is switched on — see Now Playing — headphones pulled out while it sleeps make it
-  wake paused instead of resuming, even if you plug them back in before waking it.)
 - **Power off.** Hold Play past five seconds, or leave a sleeping device on battery for thirty
   minutes: it powers itself off. The next press cold boots; with Resume on you come back on the
   same track, paused.
